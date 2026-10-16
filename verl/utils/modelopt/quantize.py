@@ -13,6 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Builds ModelOpt (mtq) quantization configs for NVFP4 weight-only (W4A16) QAT and applies them
+# to Megatron models. Holds a module-level quantizer config: weight quantizers use FP4 E2M1
+# (num_bits (2,1)) with dynamic block size 16 along the last axis and FP8 E4M3 scales (scale_bits
+# (4,3)); input quantizers are disabled. Ignore patterns given in HF naming are translated to
+# Megatron naming before being disabled.
 """ModelOpt NVFP4 quantization config and application for Megatron QAT."""
 
 import copy
@@ -33,6 +39,14 @@ _NVFP4_W4A16_QUANTIZER_CFG = {
 
 
 def _ignore_patterns_to_quant_cfg(ignore_patterns: list[str]) -> list[dict]:
+    # [FUNCTION DOC]
+    # HELPER: Converts user ignore patterns into ModelOpt quantizer-disable entries.
+    # Behavior: for each pattern, translate known HF-style names to Megatron-style wildcards
+    # ("lm_head" -> "*output_layer*", "*mlp.gate" -> "*router*", "*self_attn*" -> "*self_attention*");
+    # other patterns pass through unchanged. Each yields an entry with quantizer_name=<pattern>, enable=False.
+    # Inputs: ignore_patterns - list of glob-style module name patterns.
+    # Outputs: list of dicts, in input order.
+    # Exceptions: none. Side effects: none.
     cfg = []
     mapping = {
         "lm_head": "*output_layer*",
@@ -51,6 +65,14 @@ def build_quantize_config(
     qat_mode: str,
     ignore_patterns: list[str] | None = None,
 ) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: validates mode, normalizes the NVFP4 W4A16 quantizer config into list form, appends a
+    # deep copy of ModelOpt's default disabled-quantizer config (normalized if it is a dict), then the
+    # ignore-pattern disable entries (later entries take precedence in ModelOpt).
+    # Inputs: qat_mode - must be "w4a16"; ignore_patterns - optional list (None treated as empty).
+    # Outputs: dict with "quant_cfg" (list of entries) and "algorithm" = "max" (max calibration).
+    # Exceptions: ValueError when qat_mode is not "w4a16".
+    # Side effects: none (defaults are deep-copied).
     """Build a complete ModelOpt quantization config for ``mtq.quantize``."""
     if qat_mode != "w4a16":
         raise ValueError(f"Only 'w4a16' is supported, got: {qat_mode}")
@@ -74,6 +96,13 @@ def apply_qat(
     qat_mode: str,
     ignore_patterns: list[str] | None = None,
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # Behavior: builds the config via build_quantize_config and calls mtq.quantize on the model with
+    # no calibration forward loop, inserting fake-quant quantizer modules.
+    # Inputs: model - Megatron nn.Module; qat_mode, ignore_patterns - as for build_quantize_config.
+    # Outputs: the same model object (quantized in place).
+    # Exceptions: ValueError from build_quantize_config; any ModelOpt errors propagate.
+    # Side effects: mutates model in place.
     """Apply Quantization-Aware Training to a Megatron model."""
     config = build_quantize_config(qat_mode, ignore_patterns)
     mtq.quantize(model, config)

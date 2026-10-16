@@ -13,6 +13,10 @@
 # limitations under the License.
 
 
+# [MODULE DOC]
+# Unpad/pad utilities for variable-length (packed) attention on NPU, copied from flash-attention's
+# bert_padding: custom autograd functions for gathering/scattering along the first axis and helpers
+# to convert between padded (batch, seqlen, ...) and packed (total_nnz, ...) layouts.
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
@@ -20,8 +24,17 @@ from einops import rearrange, repeat
 
 # Copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py
 class IndexFirstAxis(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd function that gathers rows of a tensor along dim 0 by integer indices (faster than
+    # advanced indexing); backward scatters gradients back into a zero tensor of the original shape.
+    # Exposed as index_first_axis.
     @staticmethod
     def forward(ctx, input, indices):
+        # [FUNCTION DOC]
+        # Behavior: saves indices; flattens all trailing dims, gathers rows at indices, reshapes back to
+        # (len(indices), *original trailing shape). Stores original first-dim size on ctx.
+        # Inputs: ctx - autograd context; input - tensor with ndim >= 2; indices - 1-D long tensor.
+        # Outputs: gathered tensor. Exceptions: AssertionError if input.ndim < 2. Side effects: mutates ctx.
         ctx.save_for_backward(indices)
         assert input.ndim >= 2
         ctx.first_axis_dim, other_shape = input.shape[0], input.shape[1:]
@@ -34,6 +47,12 @@ class IndexFirstAxis(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC]
+        # Behavior: creates zeros of shape (first_axis_dim, flattened trailing), scatters grad rows into
+        # positions given by saved indices, reshapes to original shape.
+        # Inputs: ctx; grad_output - gradient with ndim >= 2.
+        # Outputs: (grad_input, None) - no gradient for indices.
+        # Exceptions: AssertionError if grad_output.ndim < 2. Side effects: none.
         (indices,) = ctx.saved_tensors
         assert grad_output.ndim >= 2
         other_shape = grad_output.shape[1:]
@@ -54,8 +73,17 @@ index_first_axis = IndexFirstAxis.apply
 
 # Copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py
 class IndexPutFirstAxis(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd function that scatters rows into a new zero tensor of first-dim size first_axis_dim at
+    # given indices; backward gathers gradient rows at those indices. Exposed as index_put_first_axis.
     @staticmethod
     def forward(ctx, values, indices, first_axis_dim):
+        # [FUNCTION DOC]
+        # Behavior: saves indices; allocates zeros (first_axis_dim, *values.shape[1:]) on values' device/dtype
+        # and assigns values into rows at indices.
+        # Inputs: ctx; values - (n, ...) with ndim >= 2; indices - 1-D, length n; first_axis_dim - int.
+        # Outputs: the filled tensor.
+        # Exceptions: AssertionError if indices not 1-D or values.ndim < 2. Side effects: mutates ctx.
         ctx.save_for_backward(indices)
         assert indices.ndim == 1
         assert values.ndim >= 2
@@ -67,6 +95,9 @@ class IndexPutFirstAxis(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC]
+        # Behavior: selects grad_output rows at saved indices.
+        # Inputs: ctx; grad_output. Outputs: (grad_values, None, None). Exceptions: none. Side effects: none.
         (indices,) = ctx.saved_tensors
         # TD [2022-03-04] For some reason torch.gather is a bit faster than indexing.
         grad_values = grad_output[indices]
@@ -79,6 +110,10 @@ index_put_first_axis = IndexPutFirstAxis.apply
 
 # Copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py
 def pad_input(hidden_states, indices, batch, seqlen):
+    # [FUNCTION DOC]
+    # Behavior: scatters packed hidden states into a flat (batch*seqlen, ...) zero tensor at indices and
+    # reshapes to (batch, seqlen, ...). Differentiable via IndexPutFirstAxis.
+    # Inputs/Outputs: see docstring. Exceptions: assertion errors from IndexPutFirstAxis. Side effects: none.
     """
     Arguments:
         hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
@@ -97,6 +132,15 @@ def pad_input(hidden_states, indices, batch, seqlen):
 
 # Copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py
 def unpad_input(hidden_states, attention_mask, unused_mask=None):
+    # [FUNCTION DOC]
+    # Behavior: combines attention_mask with optional unused_mask (sum), computes per-row token counts
+    # (int32) from the combined mask and separately from attention_mask alone, flat nonzero indices of the
+    # combined mask, max sequence length (as Python int, forces device sync), and cu_seqlens as cumulative
+    # counts left-padded with 0. Gathers selected tokens from the flattened hidden states.
+    # Inputs: see docstring.
+    # Outputs: tuple (packed hidden_states, indices, cu_seqlens, max_seqlen_in_batch, used_seqlens_in_batch);
+    # the last counts attention_mask only (excludes unused_mask).
+    # Exceptions: none explicit. Side effects: GPU/NPU sync via item().
     """
     Arguments:
         hidden_states: (batch, seqlen, ...)
