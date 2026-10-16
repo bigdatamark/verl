@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for the actor config dataclasses (ActorConfig and its FSDP and
+# Megatron variants): instantiation via _target_ dicts and the Hydra actor YAML
+# configs, dict-like access compatibility, frozen-field enforcement, and the
+# validation performed at construction and by validate().
+# Note: the YAML tests resolve verl/trainer/config/actor relative to the current
+# working directory, so they must run from the repository root.
 
 import os
 import unittest
@@ -25,9 +32,14 @@ from verl.workers.config import (
 
 
 class TestActorConfig(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests ActorConfig construction, access and validation.
     """Test the ActorConfig dataclass and its variants."""
 
     def test_config_inheritance(self):
+        # [FUNCTION DOC]
+        # Behavior: Megatron and FSDP actor dicts (with their optimizer config targets)
+        # both convert to ActorConfig instances and agree on mini-batch size and clip ratio.
         """Test that the inheritance hierarchy works correctly."""
         megatron_dict = {
             "_target_": "verl.workers.config.McoreActorConfig",
@@ -64,6 +76,10 @@ class TestActorConfig(unittest.TestCase):
         self.assertEqual(megatron_config.clip_ratio, fsdp_config.clip_ratio)
 
     def test_actor_config_from_yaml(self):
+        # [FUNCTION DOC]
+        # Behavior: composing the "actor" YAML with strategy fsdp and micro batch 128
+        # converts to an ActorConfig with strategy fsdp.
+        # Side effects: initializes Hydra global state within the context.
         """Test creating ActorConfig from YAML file."""
         from hydra import compose, initialize_config_dir
 
@@ -76,6 +92,9 @@ class TestActorConfig(unittest.TestCase):
         self.assertEqual(config.strategy, "fsdp")
 
     def test_fsdp_actor_config_from_yaml(self):
+        # [FUNCTION DOC]
+        # Behavior: composing "dp_actor" with strategy fsdp2 yields an FSDPActorConfig
+        # with strategy fsdp2.
         """Test creating FSDPActorConfig from YAML file."""
         from hydra import compose, initialize_config_dir
 
@@ -88,6 +107,8 @@ class TestActorConfig(unittest.TestCase):
         self.assertEqual(config.strategy, "fsdp2")
 
     def test_megatron_actor_config_from_yaml(self):
+        # [FUNCTION DOC]
+        # Behavior: composing "megatron_actor" yields a McoreActorConfig with strategy megatron.
         """Test creating McoreActorConfig from YAML file."""
         from hydra import compose, initialize_config_dir
 
@@ -100,6 +121,8 @@ class TestActorConfig(unittest.TestCase):
         self.assertEqual(config.strategy, "megatron")
 
     def test_config_get_method(self):
+        # [FUNCTION DOC]
+        # Behavior: get returns field values, None for unknown keys, or the supplied default.
         """Test the get method for backward compatibility."""
         config_dict = {
             "_target_": "verl.workers.config.ActorConfig",
@@ -121,6 +144,9 @@ class TestActorConfig(unittest.TestCase):
         self.assertEqual(config.get("non_existing", "default"), "default")
 
     def test_config_dict_like_access(self):
+        # [FUNCTION DOC]
+        # Behavior: item access returns field values, iteration yields field names
+        # (including strategy and ppo_mini_batch_size), and length is positive.
         """Test dictionary-like access to config fields."""
         config_dict = {
             "_target_": "verl.workers.config.ActorConfig",
@@ -145,6 +171,9 @@ class TestActorConfig(unittest.TestCase):
         self.assertGreater(len(config), 0)
 
     def test_frozen_fields_modification_raises_exception(self):
+        # [FUNCTION DOC]
+        # Behavior: assigning strategy or clip_ratio raises AttributeError (frozen),
+        # while assigning ppo_mini_batch_size succeeds.
         """Test that modifying frozen fields raises an exception."""
         config_dict = {
             "_target_": "verl.workers.config.ActorConfig",
@@ -169,6 +198,12 @@ class TestActorConfig(unittest.TestCase):
         self.assertEqual(config.ppo_mini_batch_size, 512)
 
     def test_actor_config_validation_exceptions(self):
+        # [FUNCTION DOC]
+        # Behavior: construction fails (ValueError or AssertionError) for an invalid
+        # loss_agg_mode ("Invalid loss_agg_mode"), for setting both micro batch size
+        # variants without dynamic batching ("You have set both"), and for setting
+        # neither ("Please set at least one"); setting neither with dynamic batching
+        # succeeds.
         """Test that ActorConfig.__post_init__ raises appropriate validation exceptions."""
         optim = OptimizerConfig(lr=0.1)
         with self.assertRaises((ValueError, AssertionError)) as cm:
@@ -215,6 +250,10 @@ class TestActorConfig(unittest.TestCase):
         self.assertIsNotNone(config)  # Should not raise an exception
 
     def test_fsdp_actor_config_validation_exceptions(self):
+        # [FUNCTION DOC]
+        # Behavior: FSDPActorConfig.validate with Ulysses sequence parallel size 2 and
+        # remove-padding disabled in the model config raises ValueError requiring
+        # use_remove_padding.
         """Test that FSDPActorConfig.validate() raises appropriate validation exceptions."""
         optim = OptimizerConfig(lr=0.1)
         config = FSDPActorConfig(
@@ -231,6 +270,10 @@ class TestActorConfig(unittest.TestCase):
         self.assertIn("you must enable `use_remove_padding`", str(cm.exception))
 
     def test_actor_config_validate_method_exceptions(self):
+        # [FUNCTION DOC]
+        # Behavior: ActorConfig.validate raises ValueError mentioning train_batch_size
+        # for train batch 128 vs mini-batch 256, and "must be >= n_gpus" for 16 GPUs with
+        # train batch 512.
         """Test that ActorConfig.validate() raises appropriate validation exceptions."""
         optim = OptimizerConfig(lr=0.1)
         config = ActorConfig(

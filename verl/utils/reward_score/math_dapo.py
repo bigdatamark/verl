@@ -12,12 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
+# [MODULE DOC]
+# DAPO-style math reward (adapted from lm-eval-harness Hendrycks MATH utils). Extracts an answer
+# from "Answer: ..." lines (Minerva style) or the last \boxed{...}, normalizes it with string
+# substitutions/regexes, and compares it to the normalized ground truth. Reward is +1 / -1.
+# Module constants SUBSTITUTIONS (ordered string replacements) and REMOVED_EXPRESSIONS (unit words
+# and LaTeX fragments deleted) drive normalization.
 
 import re
 from typing import Optional
 
 
 def last_boxed_only_string(string: str) -> Optional[str]:
+    # [FUNCTION DOC]
+    # HELPER: Finds the last occurrence of "\boxed{" and scans forward counting braces until the
+    # matching close brace. Returns the substring from "\boxed{" through that brace, or None if no
+    # "\boxed{" exists or braces never balance. Only the "\boxed{" form is recognized (not "\boxed ").
     """Extract the last LaTeX boxed expression from a string.
 
     Args:
@@ -48,6 +58,9 @@ def last_boxed_only_string(string: str) -> Optional[str]:
 
 
 def remove_boxed(s: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Strips the leading "\boxed{" and trailing "}" from s and returns the inner content.
+    # Exceptions: AssertionError if s does not start with "\boxed{" or does not end with "}".
     """Remove the LaTeX boxed command from a string.
 
     Args:
@@ -122,6 +135,13 @@ REMOVED_EXPRESSIONS = [
 
 
 def normalize_final_answer(final_answer: str) -> str:
+    # [FUNCTION DOC]
+    # Normalizes an answer string for comparison. Steps in order: keep only text after the last "=";
+    # apply each SUBSTITUTIONS replacement; delete each REMOVED_EXPRESSIONS entry; if a $...$ span
+    # exists keep only its first inner content wrapped in $; unwrap \text{}, \textbf{}, \overline{}
+    # (non-greedy) and \boxed{} (greedy); rewrite shorthand "fracab" to "frac{a}{b}" and "sqrta" to
+    # "sqrt{a}"; delete "$"; if the result is digits after removing commas, drop the commas; strip
+    # whitespace. Outputs: normalized string. No side effects.
     """Normalize a final answer to a quantitative reasoning question.
 
     Args:
@@ -165,6 +185,12 @@ def normalize_final_answer(final_answer: str) -> str:
 def is_correct_minerva(
     solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
 ) -> tuple[bool, str]:
+    # [FUNCTION DOC]
+    # Extracts the last match of answer_pattern (default case-insensitive "Answer: <rest of line>"),
+    # or "[INVALID]" if none, and normalizes it. The ground truth is normalized directly, or, if
+    # gt_need_extract, after extracting its last boxed content.
+    # Outputs: tuple (pred equals normalized gt, normalized pred).
+    # Exceptions: if gt_need_extract and gt has no box, remove_boxed receives None and fails (TypeError).
     """Check if the solution is correct according to Minerva criteria.
 
     Args:
@@ -193,6 +219,12 @@ def is_correct_minerva(
 def is_correct_strict_box(
     pred: str, gt: str, pause_tokens_index: Optional[list[int]] = None
 ) -> tuple[int, Optional[str]]:
+    # [FUNCTION DOC]
+    # Checks only the tail of pred: the last 100 characters, or, when pause_tokens_index (exactly 4
+    # indices) is given, from 100 characters before the last index onward. Extracts the last boxed
+    # content and compares it to gt by exact string equality (no normalization).
+    # Outputs: tuple (1 if equal else -1, extracted content or None).
+    # Exceptions: AssertionError if pause_tokens_index length is not 4.
     """Check if the prediction is correct using strict boxed answer criteria.
 
     Args:
@@ -220,6 +252,12 @@ def is_correct_strict_box(
 def verify(
     solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: Optional[list[int]] = None
 ) -> bool:
+    # [FUNCTION DOC]
+    # Decides correctness. If strict_box_verify, uses is_correct_strict_box only. Otherwise tries
+    # Minerva extraction; if it found an answer returns its result; else falls back to strict box
+    # check and returns that if a box was found; else returns the Minerva result ("[INVALID]" pred).
+    # Outputs: tuple (bool correct, extracted prediction string or None).
+    # KNOWN ISSUE: annotated and documented as returning bool, but it returns a (bool, pred) tuple.
     """Verify if the solution is correct.
 
     Args:
@@ -252,6 +290,10 @@ def compute_score(
     strict_box_verify: bool = False,
     pause_tokens_index: Optional[list[int]] = None,
 ) -> float:
+    # [FUNCTION DOC]
+    # Truncates solution_str to its last 300 characters, runs verify, and builds the result.
+    # Outputs: dict with "score" (1.0 if correct else -1.0), "acc" (bool) and "pred" (extracted answer).
+    # KNOWN ISSUE: annotated/documented as returning float, but returns a dict.
     """Compute the reward score for a solution.
 
     Args:
