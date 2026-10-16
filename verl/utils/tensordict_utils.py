@@ -895,7 +895,6 @@ def pad_to_divisor(data: TensorDict, size_divisor: int):
     # Pads the batch dimension up to a multiple of size_divisor by appending repeated leading slices of the data (as many
     # copies as needed), returning (padded data, pad size). Empty data with no padding needed logs a warning.
     # Exceptions: AssertionError for non-TensorDict.
-    # KNOWN ISSUE: empty data whose length is not divisible cannot occur (0 is divisible), but the loop would never terminate for empty data with a nonzero pad.
     """Pad a TensorDict's batch dimension to be divisible by a given divisor.
 
     If the TensorDict's length is not evenly divisible by size_divisor,

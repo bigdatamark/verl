@@ -11,6 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Bucketed weight transfer between a trainer-side sender and a vLLM-worker-side receiver
+# over a ZMQ REQ/REP pair, using one fixed-size byte buffer shared via CUDA IPC (or POSIX
+# shared memory, e.g. for NPU). Protocol: sender binds REQ and sends the buffer handle (or
+# {name, size} of the shm segment); receiver connects REP, rebuilds the buffer and acks.
+# Then per bucket the sender fills the buffer, synchronizes the device and sends
+# {"bucket_meta": mapping name -> TensorMetadata, "is_last": bool}; the receiver views each
+# tensor from the buffer (or rebuilds a per-tensor IPC handle for oversize weights), calls
+# the callback and acks. The final ack is deferred until the receiver released its buffer.
+# Module state: logger (level from VERL_LOGGING_LEVEL, default INFO).
 """
 Bucketed weight transfer via ZMQ + IPC (or shared memory fallback).
 
@@ -33,6 +43,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 class TensorMetadata(TypedDict):
+    # [CLASS DOC]
+    # Typed mapping describing one tensor in a bucket: name, shape, dtype, byte offset in the
+    # shared buffer, and handle (an IPC rebuild handle for directly sent tensors, else None).
     name: str
     shape: torch.Size
     dtype: torch.dtype
@@ -42,6 +55,10 @@ class TensorMetadata(TypedDict):
 
 # copy from https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/rlhf_utils.py
 def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Rebuild a tensor from a torch IPC handle (rebuild function, args), replacing
+    # argument index 6 (the device index) with device_id when given so processes with
+    # different visible-device sets map to the right GPU. Returns the tensor.
     func, args = handle
     list_args = list(args)
     if device_id is not None:
@@ -53,6 +70,11 @@ def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) ->
 
 
 def create_shared_memory(size: int, name: str):
+    # [FUNCTION DOC]
+    # Create a POSIX shared-memory segment of size bytes with the given name, or attach to an
+    # existing one of that name.
+    # Exceptions: AssertionError if an existing segment is smaller than size.
+    # Outputs: the SharedMemory object (caller must close/unlink).
     """Create shared memory for weight transfer. If already exists, attach to it."""
     try:
         shm = shared_memory.SharedMemory(name=name, create=True, size=size)
@@ -63,6 +85,9 @@ def create_shared_memory(size: int, name: str):
 
 
 def rebuild_shared_memory(name: str, size: int, dtype=torch.uint8):
+    # [FUNCTION DOC]
+    # Attach to the shared-memory segment name and expose its first size bytes as a 1-D
+    # tensor of dtype (zero-copy). Outputs: (tensor, SharedMemory handle kept alive by caller).
     """Rebuild tensor from shared memory."""
     shm = shared_memory.SharedMemory(name=name)
     tensor = torch.frombuffer(shm.buf[:size], dtype=dtype)
@@ -71,6 +96,9 @@ def rebuild_shared_memory(name: str, size: int, dtype=torch.uint8):
 
 
 class BucketedWeightSender:
+    # [CLASS DOC]
+    # Sender side of the protocol. Attributes: zmq_handle, bucket_size_mb, bucket_size
+    # (bytes), use_shm, shared ZMQ context, socket/buffer/shm created per send.
     """
     Send model weights via bucketed IPC transfer over ZMQ.
 
@@ -89,6 +117,9 @@ class BucketedWeightSender:
         bucket_size_mb: int = 512,
         use_shm: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Store the endpoint, bucket size (MiB converted to bytes) and transport mode; obtain the
+        # process-wide ZMQ context. No sockets are opened yet.
         self.zmq_handle = zmq_handle
         self.bucket_size_mb = bucket_size_mb
         self.bucket_size = int(bucket_size_mb) << 20
@@ -100,6 +131,18 @@ class BucketedWeightSender:
         self.shm = None
 
     async def async_send_weights(self, weights):
+        # [FUNCTION DOC]
+        # Send all weights as one sync round.
+        # Behavior: opens the socket and buffer. For each (name, tensor): rounds the offset up to
+        # the tensor's element size; if it would overflow a non-empty bucket, synchronizes and
+        # sends the bucket (is_last False), waits for the ack and resets. If the tensor alone
+        # exceeds the bucket, sends it directly by IPC handle (not allowed with shm). Otherwise
+        # records its metadata and asynchronously copies it into the buffer at the offset. Finally
+        # synchronizes and sends the remaining bucket with is_last True and waits for the ack.
+        # Always cleans up.
+        # Inputs: weights - sync or async iterable of (name, tensor) on the device.
+        # Exceptions: AssertionError for an oversize tensor in shm mode; ZMQ errors.
+        # Side effects: binds an IPC socket, allocates device/shared memory.
         """
         Send weights to the receiver. Accepts a sync generator or async iterator.
 
@@ -166,6 +209,9 @@ class BucketedWeightSender:
             self._cleanup()
 
     def _init_socket(self):
+        # [FUNCTION DOC]
+        # HELPER: Remove any stale IPC socket file for an "ipc://" endpoint, then create a REQ
+        # socket and bind it.
         """Initialize ZMQ REQ socket and bind."""
         if self.zmq_handle.startswith("ipc://"):
             ipc_path = self.zmq_handle[len("ipc://") :]
@@ -177,6 +223,10 @@ class BucketedWeightSender:
         self.socket.bind(self.zmq_handle)
 
     def _init_buffer(self):
+        # [FUNCTION DOC]
+        # HELPER: Allocate the transfer buffer: a uint8 device tensor of bucket_size bytes whose
+        # IPC handle is sent, or a uniquely named shared-memory segment whose {name, size} is
+        # sent; wait for the receiver's ack and store buffer/shm.
         """build communication buffer"""
         buffer, shm = None, None
         if not self.use_shm:
@@ -199,6 +249,9 @@ class BucketedWeightSender:
         self.shm = shm
 
     def _cleanup(self):
+        # [FUNCTION DOC]
+        # HELPER: Close the socket, remove the IPC socket file, drop the buffer, close and unlink
+        # the shared memory, collect IPC memory if supported and empty the device cache.
         """clean up"""
         if self.socket is not None:
             self.socket.close()
@@ -221,6 +274,9 @@ class BucketedWeightSender:
         get_torch_device().empty_cache()
 
     def _direct_send_large_weight(self, name: str, weight: torch.Tensor):
+        # [FUNCTION DOC]
+        # HELPER: Send one oversize weight as its own bucket containing an IPC handle to the
+        # tensor itself (offset 0, is_last False) and wait for the ack.
         """Send a weight larger than the bucket size via cuda ipc or share memory."""
         logger.debug(f"Direct sending large weight {name}({weight.shape}, {weight.dtype})")
         # TODO: support fallback to shared memory
@@ -238,6 +294,9 @@ class BucketedWeightSender:
 
 
 class BucketedWeightReceiver:
+    # [CLASS DOC]
+    # Receiver side of the protocol. Attributes: zmq_handle, target device, use_shm, ZMQ
+    # context, socket, buffer, shm, and _ack_pending (final ack deferred to cleanup).
     """
     Receive model weights via bucketed IPC transfer over ZMQ.
 
@@ -256,6 +315,8 @@ class BucketedWeightReceiver:
         device: torch.device,
         use_shm: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Store endpoint, target device and transport mode; obtain the ZMQ context.
         self.zmq_handle = zmq_handle
         self.device = device
         self.use_shm = use_shm
@@ -267,6 +328,15 @@ class BucketedWeightReceiver:
         self._ack_pending = False
 
     def receive_weights(self, on_bucket_received: callable):
+        # [FUNCTION DOC]
+        # Receive one sync round, invoking on_bucket_received(weights, is_last) per bucket.
+        # Behavior: connects and rebuilds the buffer. Loops: receives metadata; for each entry
+        # rebuilds the tensor from its own IPC handle if present, else views it out of the shared
+        # buffer at its offset (moved to the device in shm mode). Calls the callback, synchronizes
+        # the device, then acks unless it was the last bucket, in which case the ack is deferred to
+        # cleanup. Tensors passed to the callback alias the shared buffer and are only valid during
+        # the callback. Always cleans up.
+        # Side effects: device synchronization, ZMQ traffic.
         """
         Receive weights from sender and process each bucket via callback.
 
@@ -309,11 +379,16 @@ class BucketedWeightReceiver:
             self._cleanup()
 
     def _init_socket(self):
+        # [FUNCTION DOC]
+        # HELPER: Create a REP socket and connect to the sender's endpoint.
         """Initialize ZMQ REP socket and connect."""
         self.socket = self.zmq_context.socket(zmq.REP)
         self.socket.connect(self.zmq_handle)
 
     def _init_buffer(self):
+        # [FUNCTION DOC]
+        # HELPER: Receive the buffer descriptor, rebuild the CUDA IPC uint8 buffer on this device
+        # (asserting uint8) or attach to the shared-memory segment, ack, and store buffer/shm.
         """Receive and rebuild communication buffer from sender."""
         comm_metadata = self.socket.recv_pyobj()
         buffer, shm = None, None
@@ -330,6 +405,10 @@ class BucketedWeightReceiver:
         self.shm = shm
 
     def _cleanup(self):
+        # [FUNCTION DOC]
+        # HELPER: Synchronize the device, drop the buffer, close (not unlink) shared memory,
+        # collect IPC memory and empty the cache, then send the deferred final ack if pending and
+        # close the socket.
         """clean up"""
         # Synchronize before releasing the buffer to ensure all async ops
         # referencing it (e.g. clone, .to()) have completed.

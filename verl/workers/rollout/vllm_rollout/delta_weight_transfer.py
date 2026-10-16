@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# vLLM worker-side weight-transfer engine for verl's delta checkpoint engine. Registers a
+# vLLM WeightTransferEngine backend ("verl_delta_ipc") that receives each DeltaFlush
+# payload over the bucketed ZMQ/CUDA-IPC channel, decodes it into vLLM
+# CheckpointWeightPatch objects and applies them with vLLM's checkpoint patch loader.
+# Import-time requirement: raises RuntimeError if vLLM lacks the weight_transfer modules.
+# Module state: VERL_DELTA_WEIGHT_TRANSFER_BACKEND name, _REGISTERED flag.
 """Receive ``DeltaFlush`` payloads inside vLLM workers.
 
 VERL sends each payload through its existing ZMQ/CUDA-IPC channel. This
@@ -54,6 +61,11 @@ _REGISTERED = False
 
 
 def _checkpoint_patch_api():
+    # [FUNCTION DOC]
+    # HELPER: Import and return (CheckpointWeightPatch, load_checkpoint_weight_patches) from
+    # vLLM's checkpoint_weight_patch module.
+    # Exceptions: RuntimeError with upgrade guidance if that module is missing; other import
+    # errors propagate.
     try:
         from vllm.model_executor.model_loader.checkpoint_weight_patch import (
             CheckpointWeightPatch,
@@ -71,6 +83,10 @@ def _checkpoint_patch_api():
 
 
 def require_vllm_delta_support() -> None:
+    # [FUNCTION DOC]
+    # Check that WeightTransferEngine.__init__ accepts config, vllm_config, device and model
+    # and that the checkpoint patch API exists.
+    # Exceptions: RuntimeError when either is unavailable.
     """Verify that vLLM provides the required weight transfer and checkpoint patch APIs."""
 
     init_parameters = inspect.signature(WeightTransferEngine.__init__).parameters
@@ -85,6 +101,11 @@ def require_vllm_delta_support() -> None:
 
 
 def is_moe_model(hf_config) -> bool:
+    # [FUNCTION DOC]
+    # Return whether vLLM would treat hf_config as MoE: uses vLLM's model-arch config
+    # convertor for the model type to get the expert count (> 0). On any failure falls back to
+    # inspecting the text config for num_experts / moe_num_experts / n_routed_experts /
+    # num_local_experts (first element if a list).
     """Whether vLLM will treat this HF config as a MoE model.
 
     Delta updates require the Triton MoE backend, so this check must agree with
@@ -118,16 +139,22 @@ def is_moe_model(hf_config) -> bool:
 
 @dataclass
 class VerlDeltaIPCInitInfo(WeightTransferInitInfo):
+    # [CLASS DOC]
+    # Empty init-info dataclass for this transport (no setup data needed).
     """No initialization data is needed for the local IPC transport."""
 
 
 @dataclass
 class VerlDeltaIPCUpdateInfo(WeightTransferUpdateInfo):
+    # [CLASS DOC]
+    # Per-flush update info carrying the worker-local ZMQ endpoint (zmq_handle).
     """Connection details for one flush."""
 
     zmq_handle: str | None = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Validate zmq_handle. Exceptions: ValueError if it is not a non-empty string.
         if not isinstance(self.zmq_handle, str) or not self.zmq_handle:
             raise ValueError("VERL delta IPC updates require a worker-local zmq_handle")
 
@@ -135,6 +162,18 @@ class VerlDeltaIPCUpdateInfo(WeightTransferUpdateInfo):
 def decode_delta_payload(
     named_tensors: Iterable[tuple[str, torch.Tensor]],
 ) -> tuple[str, list[CheckpointWeightPatch]]:
+    # [FUNCTION DOC]
+    # Validate and decode one DeltaFlush into vLLM patches.
+    # Behavior: builds a mapping from the named tensors; parses "__delta_spec__" bytes as JSON;
+    # requires "__values__"; encoding must be "dense" or "indices". Positions default to an
+    # empty uint8 tensor; dense flushes must have no positions and indices flushes must carry
+    # "__positions__". Verifies the checksum over positions and values. For each param spec
+    # builds a CheckpointWeightPatch with name, shape, dtype, the values slice and, for
+    # indices, the positions slice viewed as int32 (requires pos_width 4 and 4 bytes per
+    # value); dense patches have no indices.
+    # Outputs: (encoding, list of patches).
+    # Exceptions: ValueError for missing tensors, invalid JSON, unsupported encoding or
+    # inconsistent slices; RuntimeError on checksum mismatch or missing vLLM API.
     """Validate and decode one DeltaFlush into vLLM checkpoint patches."""
 
     from verl.checkpoint_engine.delta_sync.encode import checksum
@@ -196,6 +235,11 @@ def decode_delta_payload(
 
 
 class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
+    # [CLASS DOC]
+    # vLLM WeightTransferEngine consuming verl DeltaFlush payloads. Tracks the encoding of the
+    # current update session (all flushes of one update must share it) and a sticky failure
+    # flag that blocks further updates after any partial failure. Does not support draft
+    # (speculative) weight updates; sending is not supported.
     """Consume VERL DeltaFlush payloads over the colocated CUDA-IPC channel."""
 
     init_info_cls = VerlDeltaIPCInitInfo
@@ -209,11 +253,17 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         device: torch.device,
         model: torch.nn.Module,
     ) -> None:
+        # [FUNCTION DOC]
+        # Initialize the vLLM base engine and reset session encoding and failure flag.
         super().__init__(config, vllm_config, device, model)
         self._session_encoding: str | None = None
         self._update_failed = False
 
     def _validate_configuration(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Ensure the environment is supported: delta API present, CUDA device, data and
+        # pipeline parallel sizes 1, BF16 model dtype, no quantization, no speculative decoding.
+        # Exceptions: RuntimeError or NotImplementedError describing the unsupported condition.
         require_vllm_delta_support()
         if not is_cuda_available or self.device.type != get_device_name():
             raise NotImplementedError("VERL delta weight transfer requires CUDA")
@@ -229,9 +279,14 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
             raise NotImplementedError("VERL delta weight transfer does not support speculative decoding")
 
     def init_transfer_engine(self, init_info: VerlDeltaIPCInitInfo) -> None:
+        # [FUNCTION DOC]
+        # Validate configuration; no other initialization is needed (init_info unused).
         self._validate_configuration()
 
     def start_weight_update(self) -> None:
+        # [FUNCTION DOC]
+        # Begin an update session by clearing the session encoding.
+        # Exceptions: RuntimeError if a previous update failed (the job must be restarted).
         if self._update_failed:
             raise RuntimeError(
                 "A previous delta update did not complete; restart the full job so every rollout worker receives a "
@@ -241,6 +296,11 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         self._session_encoding = None
 
     def _receive_payload(self, *, zmq_handle: str) -> list[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Receive one flush through a BucketedWeightReceiver (CUDA IPC, no shm) on this
+        # device, cloning each received tensor because the IPC buffer is reused. Errors raised in
+        # the callback are deferred until the receive handshake completes, then re-raised.
+        # Outputs: list of (name, tensor) pairs.
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
             BucketedWeightReceiver,
         )
@@ -254,6 +314,9 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         callback_error: BaseException | None = None
 
         def retain_bucket(weights: list[tuple[str, torch.Tensor]], _is_last: bool) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Bucket callback that appends clones of the bucket's tensors to the payload,
+            # recording the first error and ignoring later buckets once one occurred.
             nonlocal callback_error
             if callback_error is not None:
                 return
@@ -271,6 +334,12 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         return payload
 
     def receive_weights(self, update_info: VerlDeltaIPCUpdateInfo) -> None:
+        # [FUNCTION DOC]
+        # Receive, decode and apply one flush. The first flush fixes the session encoding (dense
+        # initializes vLLM's layerwise reload on the model); later flushes must match it. Applies
+        # patches with duplicate-index validation disabled.
+        # Exceptions: ValueError on mixed encodings; any error sets the sticky failure flag and is
+        # re-raised. Side effects: mutates model weights.
         assert update_info.zmq_handle is not None
         try:
             payload = self._receive_payload(zmq_handle=update_info.zmq_handle)
@@ -305,6 +374,9 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
             raise
 
     def finish_weight_update(self) -> None:
+        # [FUNCTION DOC]
+        # End the session: for dense sessions finalize the layerwise reload (failure sets the
+        # failure flag and re-raises); then clear the session encoding.
         if self._session_encoding == "dense":
             # Dense updates use vLLM's layerwise reload lifecycle. Finalize it
             # once after the last flush to run model-specific post-load work.
@@ -322,6 +394,8 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         self._session_encoding = None
 
     def shutdown(self) -> None:
+        # [FUNCTION DOC]
+        # Clear the session encoding.
         self._session_encoding = None
 
     @staticmethod
@@ -329,10 +403,15 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         iterator: Iterator[Any],
         trainer_args: dict[str, Any] | Any,
     ) -> None:
+        # [FUNCTION DOC]
+        # Not supported on this receive-only adapter. Exceptions: always NotImplementedError.
         raise NotImplementedError("VERL sends DeltaFlush payloads; this adapter only receives them")
 
 
 def register_verl_delta_weight_transfer_engine() -> None:
+    # [FUNCTION DOC]
+    # Register VerlDeltaIPCWeightTransferEngine with vLLM's WeightTransferEngineFactory under
+    # the verl backend name, once per process (idempotent via the module flag).
     """Register the adapter before vLLM creates its worker-side engine."""
 
     global _REGISTERED

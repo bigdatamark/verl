@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Request routing for rollout server replicas: the load-balancer protocol, the default global
+# sticky-session + least-in-flight balancer (run as a Ray actor), and factories that create either
+# the default balancer (optionally a user subclass) or a user plugin balancer described by a YAML
+# file naming its class. Default sticky cache size 10000. Module logger level from
+# VERL_LOGGING_LEVEL (default WARN).
 
 import logging
 import os
@@ -30,12 +36,18 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
 class RequestLoadBalancer(Protocol):
+    # [CLASS DOC]
+    # Structural interface every balancer actor must satisfy: acquire/release, declared extra fields,
+    # bulk add/remove, listing, status, sticky-cache clearing, and total in-flight count.
     """Protocol for rollout inference load balancers.
 
     All strategies must satisfy this interface via structural subtyping.
     """
 
     def acquire_server(self, request_id: str, **extra) -> tuple[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: protocol stub; returns (server id, handle) for a request using declared extra fields.
+        # Exceptions: RuntimeError when no servers are available.
         """Acquire a server for the given request.
 
         Args:
@@ -53,17 +65,23 @@ class RequestLoadBalancer(Protocol):
         ...
 
     def require_acquire_fields(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Behavior: protocol stub; names generate() kwargs needed at acquire time.
         """``generate()`` kwargs this router consumes at acquire time; only
         these are serialized into the ``acquire_server`` RPC (e.g.
         ``["prompt_ids"]``; ``[]`` if routing on ``request_id`` alone)."""
         ...
 
     def require_release_fields(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Behavior: protocol stub; names identity fields needed at release (only "request_id" currently).
         """Identity fields this router consumes at release time (currently
         only ``"request_id"``); ``[]`` if counting by ``server_id`` alone."""
         ...
 
     def release_server(self, server_id: str, request_id: str | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: protocol stub; decrements load for a server after a request.
         """Release a server after a request completes.
 
         Args:
@@ -76,6 +94,8 @@ class RequestLoadBalancer(Protocol):
         ...
 
     def add_servers(self, servers: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # Behavior: protocol stub; bulk-add server id to handle mapping.
         """Bulk-add servers to the load balancer pool.
 
         Args:
@@ -84,6 +104,8 @@ class RequestLoadBalancer(Protocol):
         ...
 
     def remove_servers(self, server_ids: list[str]) -> None:
+        # [FUNCTION DOC]
+        # Behavior: protocol stub; bulk-remove servers by id.
         """Bulk-remove servers from the load balancer pool.
 
         Args:
@@ -92,6 +114,8 @@ class RequestLoadBalancer(Protocol):
         ...
 
     def get_all_servers(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Behavior: protocol stub; list active server ids.
         """List all active server IDs.
 
         Returns:
@@ -100,6 +124,8 @@ class RequestLoadBalancer(Protocol):
         ...
 
     def get_status(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: protocol stub; debugging state dict.
         """Return current load balancer state for debugging.
 
         Returns:
@@ -109,6 +135,8 @@ class RequestLoadBalancer(Protocol):
         ...
 
     def clear_sticky_cache(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: protocol stub; clear sticky routing state, returning diagnostics.
         """Clear sticky-session state to force request redistribution.
 
         Called by trainers on training/rollout phase switches and by
@@ -122,6 +150,8 @@ class RequestLoadBalancer(Protocol):
         ...
 
     def get_total_inflight(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: protocol stub; total in-flight requests.
         """Return the total in-flight requests across registered servers.
 
         Polled by fully-async drain/rebalance loops to wait for the
@@ -131,6 +161,9 @@ class RequestLoadBalancer(Protocol):
 
 
 class GlobalRequestLoadBalancer:
+    # [CLASS DOC]
+    # Default balancer: server id to handle mapping, per-server in-flight counts (the set of active
+    # servers), an LRU cache from request id to server id, and a determinism flag.
     """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers.
 
     When a sticky session points to a removed server, the cache entry is
@@ -159,6 +192,9 @@ class GlobalRequestLoadBalancer:
         max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE,
         full_determinism: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Behavior: copies the server mapping, zeros in-flight counts for each, creates the LRU sticky cache
+        # with max_cache_size, stores the determinism flag. Empty server sets are allowed.
         # Allow empty initial servers: in dynamic-resource-scheduling mode all
         # replicas are hybrid and will be registered later via add_servers().
 
@@ -168,6 +204,16 @@ class GlobalRequestLoadBalancer:
         self._full_determinism = full_determinism
 
     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+        # [FUNCTION DOC]
+        # Behavior: if the request id is cached and its server is still active, increments that server's
+        # count and returns it; a stale entry is dropped. Raises when no servers are active. Otherwise
+        # selects deterministically (index = hash of request id modulo number of servers, over insertion
+        # order) when full determinism is on, else uniformly at random among servers with the minimum
+        # in-flight count. Caches the choice, increments its count and returns (id, handle).
+        # Exceptions: RuntimeError("No available servers in load balancer").
+        # Side effects: mutates counts and cache.
+        # KNOWN ISSUE: string hashing is salted per process unless PYTHONHASHSEED is fixed in the balancer's
+        # process, so "deterministic" routing may differ across runs.
         """Acquire a server for the given request (sticky + least-loaded).
 
         Args:
@@ -204,6 +250,8 @@ class GlobalRequestLoadBalancer:
         return server_id, self._servers[server_id]
 
     def release_server(self, server_id: str, request_id: str | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: if the server is active and its count is positive, decrements it; request_id ignored.
         """Release a server after a request completes.
 
         ``request_id`` is accepted for signature parity with content-aware
@@ -217,14 +265,21 @@ class GlobalRequestLoadBalancer:
             self._inflight_requests[server_id] -= 1
 
     def require_acquire_fields(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Behavior: returns an empty list (routing uses request id only).
         """Sticky + least-inflight routing keys on ``request_id`` alone."""
         return []
 
     def require_release_fields(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Behavior: returns an empty list.
         """Counts by ``server_id``; no identity needed at release."""
         return []
 
     def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
+        # [FUNCTION DOC]
+        # Behavior: for each given server sets its count to 0 (resetting existing ones) and stores the
+        # handle; logs the number added.
         """Atomically add multiple servers to the load balancer pool.
 
         This is more efficient than calling :meth:`add_server` in a loop
@@ -240,6 +295,9 @@ class GlobalRequestLoadBalancer:
         logger.info(f"[GlobalLoadBalancer] added {len(servers)} servers")
 
     def remove_servers(self, server_ids: list[str]) -> None:
+        # [FUNCTION DOC]
+        # Behavior: removes each id from counts and handles (missing ids ignored); logs the number.
+        # Note: sticky cache entries are invalidated lazily on next acquire.
         """Atomically remove multiple servers from the load balancer pool.
 
         More efficient than calling :meth:`remove_server` in a loop.
@@ -253,14 +311,20 @@ class GlobalRequestLoadBalancer:
         logger.info(f"[GlobalLoadBalancer] removed {len(server_ids)} servers")
 
     def get_inflight_count(self, server_id: str) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns the server's in-flight count, 0 if unknown.
         """Get number of in-flight requests for a server."""
         return self._inflight_requests.get(server_id, 0)
 
     def get_all_servers(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Behavior: returns the list of active server ids.
         """Get list of all active server IDs."""
         return list(self._inflight_requests.keys())
 
     def clear_sticky_cache(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: counts and clears the sticky cache, logs, and returns cleared count and a copy of loads.
         """Clear the sticky-session cache to force request redistribution.
 
         After clearing, all subsequent ``acquire_server()`` calls will select
@@ -285,6 +349,8 @@ class GlobalRequestLoadBalancer:
         }
 
     def get_status(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: returns loads, total in-flight, active server count, and registered handle ids.
         """Return current load balancer state for debugging."""
         return {
             "servers": dict(self._inflight_requests),
@@ -294,6 +360,8 @@ class GlobalRequestLoadBalancer:
         }
 
     def get_total_inflight(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns the sum of in-flight counts.
         """Return the sum of in-flight requests across all currently registered servers."""
         return sum(self._inflight_requests.values())
 
@@ -303,6 +371,10 @@ def _create_global_sticky_inflight(
     full_determinism: bool = False,
     load_balancer_cls: type | None = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Builds kwargs (servers, default cache size), adding full_determinism only when the class is
+    # exactly the default balancer, wraps the class as a Ray actor and instantiates it.
+    # Outputs: actor handle.
     """Factory for the default sticky-session + least-inflight strategy.
 
     Args:
@@ -323,6 +395,10 @@ def _create_global_sticky_inflight(
 
 
 def _load_router_yaml(router_config_path: str) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Resolves the path, requires the file to exist, loads it with OmegaConf, rejects a
+    # "defaults" block, and returns a resolved plain container.
+    # Exceptions: FileNotFoundError; ValueError for defaults blocks.
     """Load a router YAML config into a plain dict.
 
     Hydra ``defaults`` blocks are rejected: inline the referenced configs or
@@ -343,6 +419,9 @@ def _load_router_yaml(router_config_path: str) -> dict:
 
 
 def _resolve_router_class(router_class: str) -> type:
+    # [FUNCTION DOC]
+    # HELPER: Imports the object named by the fully qualified string and requires it to be callable.
+    # Exceptions: TypeError if not callable; import errors propagate.
     """Validate and import a load-balancer class from an FQN string.
 
     Raises:
@@ -361,6 +440,10 @@ def _create_plugin_extension(
     servers: dict[str, Any],
     router_config_path: str,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Loads the YAML, requires "router_class", resolves it, logs, wraps it as a Ray actor unless
+    # it already is one, and instantiates it with (servers, whole YAML dict) positionally.
+    # Exceptions: ValueError when router_class is missing; plus loader errors.
     """Factory for a user-defined load balancer loaded from an external YAML.
 
     The file must contain ``router_class`` (FQN); the whole loaded dict is
@@ -400,6 +483,11 @@ def get_router_handle(
     full_determinism: bool = False,
     load_balancer_cls: type | None = None,
 ) -> Any:
+    # [FUNCTION DOC]
+    # Behavior: with a router config path and no injected class, creates the plugin balancer. Otherwise
+    # (warning when both are given) creates the default sticky/in-flight balancer using the injected class
+    # or the default class, forwarding determinism.
+    # Outputs: Ray actor handle.
     """Create a load balancer instance from router configuration.
 
     Args:

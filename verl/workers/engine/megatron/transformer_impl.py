@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Megatron-Core engines: MegatronEngine (model-parallel init, Megatron-Bridge model/config building, distributed optimizer, LR scheduler, offload, checkpoints, HF weight export incl. sharded/delta export, MoE router replay, dynamic context parallelism (DCP), pipeline forward/backward via Megatron schedules), its train/eval contexts, and registered LM-head and value-head variants.
+
 import inspect
 import logging
 import os
@@ -88,6 +91,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Returns the single scalar temperature required by fused linear cross-entropy, clamped to at least 1e-8.
+    # Inputs: temperature - float or tensor.
+    # Exceptions: ValueError when empty or non-finite; NotImplementedError when values are not all equal.
     """Return the scalar temperature required by fused linear cross entropy."""
     values = torch.as_tensor(temperature).detach().flatten()
     if values.numel() == 0 or not torch.isfinite(values).all().item():
@@ -101,6 +108,9 @@ def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
 
 
 def _validate_dcp_world_size(dpcp_size: int) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Validates the DPxCP world size for dynamic CP.
+    # Exceptions: ValueError unless it is an even integer of at least 2.
     """Validate the topology accepted by Megatron-Core's dynamic group builder."""
     if dpcp_size < 2 or dpcp_size % 2 != 0:
         raise ValueError(
@@ -109,6 +119,10 @@ def _validate_dcp_world_size(dpcp_size: int) -> None:
 
 
 def _check_dcp_unsupported_features(engine_config, model_config, tf_config=None, batch=None) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Rejects configurations dynamic CP does not support; no-op when DCP is disabled.
+    # Behavior: always requires use_remove_padding and rejects pad_to_length, value models, multimodal (vision_config) models and virtual pipeline size other than None/1. With tf_config also rejects FP8 and router replay combined with moe_router_fusion. With a batch also rejects top-K distillation or distillation_only.
+    # Exceptions: ValueError / NotImplementedError as listed.
     """Validate DCP capabilities as model, transformer, and batch state become available."""
     if not engine_config.dynamic_context_parallel:
         return
@@ -137,6 +151,11 @@ def _check_dcp_unsupported_features(engine_config, model_config, tf_config=None,
 
 
 def _attach_dcp_recorded_routes(losses_reduced: list[dict], layers_topk_idx: torch.Tensor) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Distributes recorded router top-k indices to DCP micro-batch outputs.
+    # Behavior: splits recorded routes along dim 0 and, walking micro-batches in order, assigns as many routes as the micro-batch has sample ids, stored as a jagged nested tensor under model_output "routed_experts".
+    # Inputs: losses_reduced - list of micro-batch output mappings (mutated); layers_topk_idx - stacked routes per sample.
+    # Exceptions: RuntimeError for a micro-batch without sample ids, too few routes, or leftover routes.
     """Attach recorded routes to DCP micro-batches without dropping or inventing samples."""
     recorded_routes = list(layers_topk_idx.unbind())
     cursor = 0
@@ -162,6 +181,8 @@ def _attach_dcp_recorded_routes(losses_reduced: list[dict], layers_topk_idx: tor
 
 
 class MegatronEngine(BaseEngine):
+    # [CLASS DOC]
+    # Megatron-Core engine. Class attribute delta_pin_snapshots is False (pageable snapshots avoid pinned-memory exhaustion). Key attributes: configs, offload flags, mode, layer_name_mapping, weight_converter, QAT and router-replay settings; after initialize: bridge/provider, tf_config, peft_cls, module (list of model chunks), optimizer, lr_scheduler, checkpoint manager.
     # mcore keeps model-parallel-local params resident and moves large host
     # buffers every step; pinning the whole delta snapshot set on top of that
     # starves the node's cudaHostAlloc pool and surfaces as CUDA OOM in
@@ -171,6 +192,8 @@ class MegatronEngine(BaseEngine):
 
     @staticmethod
     def _get_context_parallel_layout(unwrapped_model) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns "contiguous" CP layout when the model config uses the "dsv4_hybrid" attention variant, else "zigzag".
         if getattr(unwrapped_model.config, "experimental_attention_variant", None) == "dsv4_hybrid":
             return "contiguous"
         return "zigzag"
@@ -182,6 +205,10 @@ class MegatronEngine(BaseEngine):
         optimizer_config: McoreOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
+        # [FUNCTION DOC]
+        # Stores configs, asserts use_mbridge, validates DCP features, initializes model parallel state, seeds RNGs, records offload flags, QAT (rejecting vanilla mbridge) and router-replay settings (applying the replay patch and creating the mini-batch top-k list), and applies MTP-inference (NPU with Megatron 0.16.0+) or recomputation-backward (CUDA) patches.
+        # Exceptions: AssertionError without use_mbridge; ValueError for QAT with vanilla mbridge; DCP validation errors.
+        # KNOWN ISSUE: the Megatron version check compares version strings lexicographically, so e.g. "0.9.0" is treated as at least "0.16.0".
         super().__init__()
 
         self.model_config = model_config
@@ -237,6 +264,11 @@ class MegatronEngine(BaseEngine):
             apply_patch_megatron_recomputation_backward()
 
     def _init_device_mesh(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes Megatron model-parallel state once.
+        # Behavior: with DCP loads the scheduler class first. If already initialized: with DCP validates the DPxCP size and that dynamic DPxCP groups exist, then returns. Otherwise (asserting the Megatron version supports DCP when enabled) validates DPxCP = world/(TP*PP) and calls initialize_model_parallel with TP, PP, VPP, CP, EP, ETP sizes, no SHARP and the DCP flag.
+        # Exceptions: RuntimeError when DCP is requested but existing state lacks dynamic groups; AssertionError/ValueError for unsupported DCP setups.
+        # Side effects: creates global process groups.
         # TODO: set different parallelism for actor, critic, ref
         if self.engine_config.dynamic_context_parallel:
             get_megatron_dynamic_cp_scheduler_cls()
@@ -281,6 +313,11 @@ class MegatronEngine(BaseEngine):
         )
 
     def _build_tf_config(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds the Megatron transformer config / provider and bridge.
+        # Behavior: sets is_value_model, share_embeddings flag, validates MTP config, param dtype. Maps override_transformer_config attention backend strings; value models force untied embeddings; DCP adds per-token loss, CP size, max seqlen per DPxCP rank (and disables Megatron's own DCP scheduling); DeepSeek-V4 with CP uses contiguous partitioning and the dynamic-CP packing scheduler. Vanilla mbridge: builds bridge from HF config with extra args, sets fp16/bf16 and untied embeddings for value models. Otherwise Megatron-Bridge: from HF pretrained, gets a provider without weights and applies overrides (parallel sizes, sequence parallel, p2p comm settings, variable seq lengths, flash attention, alltoall dispatcher, no load balancing, user overrides, value-model untie, DeepSeek-V4 MTP removal and CSA ratio truncation when MTP is disabled, routing replay flag, modelopt layer spec for QAT), finalizing via the available API; tf_config stays None until model creation. Sets router replay on an existing tf_config, prints tf_config on rank 0, and resolves the PEFT class.
+        # Side effects: mutates hf_config for value models; reads HF config from disk.
+        # KNOWN ISSUE: the weight_converter branch is dead code because a bridge is always set.
         from verl.utils.megatron_utils import mapping_string_to_attn_backend
         from verl.utils.torch_dtypes import PrecisionType
 
@@ -437,6 +474,8 @@ class MegatronEngine(BaseEngine):
         )
 
     def _resolve_override_ddp_config(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns the DDP override config: copies override_ddp_config; unless explicitly set, grad_reduce_in_fp32 is false only when the precision-aware optimizer is used with a non-fp32 main_grads_dtype; for Muon layer-wise optimizers defaults use_layer_wise_param_layout to true.
         """Keep the DDP grad-bucket dtype consistent with the optimizer's grad buffer.
 
         Default to FP32 gradient reduction for the conventional optimizer. When
@@ -463,6 +502,11 @@ class MegatronEngine(BaseEngine):
         return override_ddp_config
 
     def _build_megatron_module(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates the Megatron model chunks and loads weights.
+        # Behavior: wraps with DDP unless forward_only, configuring distributed / layer-wise / Megatron-FSDP options; builds the module via make_megatron_module with tf/hf configs, bridge/provider, override configs, PEFT class and LoRA config, storing the updated tf_config. Loads weights from a dist checkpoint if configured, else via vanilla bridge load_weights or Megatron-Bridge load_hf_weights (value models allow a mismatched output_layer.weight). Prints model size on rank 0 and router replay layer count.
+        # Outputs: list of model chunks.
+        # Side effects: prints, disk reads.
         from verl.utils.megatron.optimizer import is_muon_layer_wise_config
         from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
         from verl.utils.model import print_model_size
@@ -520,6 +564,8 @@ class MegatronEngine(BaseEngine):
         return module
 
     def _maybe_enable_fused_kernels(self):
+        # [FUNCTION DOC]
+        # HELPER: Enables the fused-kernel forward if configured: disables it with a warning (mutating engine_config.use_fused_kernels to false) when remove-padding is off, for value models, or with MTP enabled; otherwise patches every model chunk's forward with the fused implementation.
         if not self.engine_config.use_fused_kernels:
             return
 
@@ -537,6 +583,8 @@ class MegatronEngine(BaseEngine):
             patch_fused_forward(model)
 
     def _build_optimizer(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds the Megatron optimizer (distributed per config, fp16/bf16 per param dtype) over all model chunks and registers training hooks. Returns the optimizer.
         from verl.utils.megatron.optimizer import get_megatron_optimizer, init_megatron_optim_config
 
         optim_config_megatron = init_megatron_optim_config(
@@ -550,6 +598,8 @@ class MegatronEngine(BaseEngine):
         return optimizer
 
     def _build_lr_scheduler(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds and returns the Megatron optimizer param scheduler from the optimizer config.
         from verl.utils.megatron.optimizer import get_megatron_optimizer_param_scheduler
 
         optimizer_scheduler = get_megatron_optimizer_param_scheduler(
@@ -559,13 +609,19 @@ class MegatronEngine(BaseEngine):
 
     @property
     def is_param_offload_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns the param offload flag.
         return self._is_offload_param
 
     @property
     def is_optimizer_offload_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns the optimizer offload flag.
         return self._is_offload_optimizer
 
     def is_mp_src_rank_with_outputs(self):
+        # [FUNCTION DOC]
+        # True for TP rank 0, last PP stage, CP rank 0 and (with DCP) DP rank 0.
         return (
             mpu.get_tensor_model_parallel_rank() == 0
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
@@ -574,6 +630,10 @@ class MegatronEngine(BaseEngine):
         )
 
     def initialize(self):
+        # [FUNCTION DOC]
+        # Builds everything for training or inference.
+        # Behavior: resets cached export tasks, builds tf config/bridge, re-validates DCP with tf_config, builds model chunks, applies QAT (training only), maybe enables fused kernels, applies MTP patches (or a postprocess patch for forward-only with mtp_num_layers 0). Forward-only: no optimizer/scheduler, offloads the model if param offload, returns. Otherwise builds optimizer and scheduler, a MegatronCheckpointManager (role actor or critic, reshardable-optimizer options) stored as checkpoint_mananager, and offloads per flags.
+        # Side effects: GPU allocation, logging.
         self._hf_export_tasks = None
         self._build_tf_config()
         _check_dcp_unsupported_features(self.engine_config, self.model_config, tf_config=self.tf_config)
@@ -657,6 +717,8 @@ class MegatronEngine(BaseEngine):
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
     def train_mode(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns an EngineTrainModeCtx (kwargs forwarded).
         """
         Context manager entry for switching the engine and model into training mode.
 
@@ -667,6 +729,8 @@ class MegatronEngine(BaseEngine):
         return EngineTrainModeCtx(self, **kwargs)
 
     def eval_mode(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns an EngineEvalModeCtx (kwargs forwarded).
         """
         Context manager entry for switching the engine and model into evaluation mode.
 
@@ -677,6 +741,8 @@ class MegatronEngine(BaseEngine):
         return EngineEvalModeCtx(self, **kwargs)
 
     def optimizer_zero_grad(self):
+        # [FUNCTION DOC]
+        # Zeroes optimizer gradients and every chunk's DDP grad buffer.
         """
         Zero out gradients of all parameters before starting a new backward pass.
         """
@@ -687,6 +753,10 @@ class MegatronEngine(BaseEngine):
             chunk.zero_grad_buffer()
 
     def optimizer_step(self):
+        # [FUNCTION DOC]
+        # Steps the Megatron optimizer (which clips and checks for non-finite grads), emptying the device cache first when top-K distillation was active.
+        # Outputs: grad norm returned by the optimizer.
+        # Exceptions: NotImplementedError when the optimizer reports an unsuccessful update (e.g. skipped due to inf/nan).
         """
         Perform an optimization step to update model parameters based on accumulated gradients.
 
@@ -708,6 +778,8 @@ class MegatronEngine(BaseEngine):
         return grad_norm
 
     def lr_scheduler_step(self):
+        # [FUNCTION DOC]
+        # Steps the scheduler by one and returns the last LR via the Megatron helper.
         """
         Advance the learning rate scheduler by one step.
 
@@ -720,6 +792,9 @@ class MegatronEngine(BaseEngine):
         return get_megatron_last_lr(self.optimizer)
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+        # [FUNCTION DOC]
+        # Moves model chunks (with grads when grad is true on load) and/or optimizer state between CPU and accelerator regardless of offload config.
+        # Exceptions: AssertionError for other devices.
         """
         Move model parameters, optimizer states, or both to the specified device.
         Note that this function executes irrespective of offload config. It serves as manual control
@@ -748,27 +823,37 @@ class MegatronEngine(BaseEngine):
             raise ValueError(f"Invalid device type: {device}")
 
     def get_data_parallel_rank(self):
+        # [FUNCTION DOC]
+        # Returns 0 under DCP (whole batch replicated), else Megatron's DP rank.
         if self.engine_config.dynamic_context_parallel:
             # in order to let every dp-cp group has full data to split, we set dp=1
             return 0
         return mpu.get_data_parallel_rank()
 
     def get_data_parallel_size(self):
+        # [FUNCTION DOC]
+        # Returns 1 under DCP, else Megatron's DP world size.
         if self.engine_config.dynamic_context_parallel:
             # in order to let every dp-cp group has full data to split, we set dp=1
             return 1
         return mpu.get_data_parallel_world_size()
 
     def get_data_parallel_group(self):
+        # [FUNCTION DOC]
+        # Returns the dynamic DPxCP group of size 1 under DCP, else Megatron's DP group.
         if self.engine_config.dynamic_context_parallel:
             # The replicated DCP batch is one logical data-parallel replica.
             return mpu.get_dynamic_data_context_parallel_groups(group_size=1)
         return mpu.get_data_parallel_group()
 
     def get_model_parallel_group(self):
+        # [FUNCTION DOC]
+        # Returns Megatron's model-parallel group.
         return mpu.get_model_parallel_group()
 
     def get_context_parallel_group(self):
+        # [FUNCTION DOC]
+        # Returns Megatron's context-parallel group.
         return mpu.get_context_parallel_group()
 
     def save_checkpoint(
@@ -779,6 +864,8 @@ class MegatronEngine(BaseEngine):
         max_ckpt_to_keep: int | None = None,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC]
+        # Saves via the Megatron checkpoint manager, loading the model (with grads) to GPU first when offloaded or on CPU; barriers and re-offloads when param offload is on.
         """
         Save model, optimizer, and scheduler states to a checkpoint.
 
@@ -801,6 +888,8 @@ class MegatronEngine(BaseEngine):
     def load_checkpoint(
         self, local_path: str, hdfs_path: str | None = None, del_local_after_load: bool = True, **kwargs
     ) -> None:
+        # [FUNCTION DOC]
+        # Loads via the Megatron checkpoint manager, loading the model to GPU first when offloaded, then re-offloads model and optimizer per flags.
         """
         Load model, optimizer, and scheduler states from a checkpoint.
 
@@ -820,6 +909,9 @@ class MegatronEngine(BaseEngine):
             offload_megatron_optimizer(self.optimizer)
 
     def _routed_num_tokens(self, data: TensorDict) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Counts real tokens seen by the MoE router: sum of attention_mask if present; else for nested input ids the last offset; else total element count.
+        # Outputs: scalar tensor.
         """Real (unpadded) tokens fed to the MoE router: attention_mask in the padded RL
         path, else the packed input_ids count in the no-padding SFT path. Not loss_mask,
         which counts response tokens only and would under-normalize the router loss."""
@@ -832,6 +924,13 @@ class MegatronEngine(BaseEngine):
         return torch.tensor(input_ids.numel(), device=input_ids.device)
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
+        # [FUNCTION DOC]
+        # Runs Megatron's pipelined forward/backward over a batch.
+        # Behavior: records whether top-K distillation is active and sp_size (CP size); validates DCP batch features; computes loss-mask token count (all-reduced over DP unless DCP) and dp_size; with per-token loss also the routed-token count. For the BSHD path with pad_bshd_to_minibatch_max, finds the mini-batch max length. With VPP, micro-batch counts must be divisible by microbatch_group_size_per_vp_stage. Splits into micro-batches with the DCP scheduler (contiguous or zigzag CP layout, min local rows for fused DSv4) or regular balanced splitting. Marks each micro-batch with num_micro_batch, record_r2_routes (routing replay in R2 forward-only without existing routes) and forced max seqlen. Sets global router replay action (replay forward, or record for R2). Runs the Megatron forward_backward_func over a VPP-aware batch generator with dummy seq/micro sizes. On the last PP stage with MTP, collects MTP loss metrics into the first output. For R2 recording, merges recorded per-layer routes (VPP reorder or nested merge), gathers across PP, restores dynamic-batch order, and for DCP attaches routes per micro-batch. On the last stage post-processes outputs (DCP-specific or regular) and attaches routed_experts for non-DCP R2. Clears router replay state.
+        # Inputs: data, loss_function, forward_only.
+        # Outputs: output mapping on the last PP stage, empty mapping on other stages.
+        # Exceptions: AssertionError on VPP divisibility; RuntimeError when R2 recording captured nothing.
+        # Side effects: collectives, gradient accumulation, global router replay state.
         self._distillation_use_topk_active = tu.get_non_tensor_data(data, key="distillation_use_topk", default=False)
         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
 
@@ -1023,6 +1122,8 @@ class MegatronEngine(BaseEngine):
         return output
 
     def _mbridge_export_tasks(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns cached Megatron-Bridge conversion tasks for HF export, building them once; returns None (letting the bridge plan) when the bridge exports FP8 weights.
         """Cache static export tasks while preserving Bridge's specialized FP8 task planning."""
         if getattr(self.bridge, "export_weight_dtype", None) == "fp8":
             return None
@@ -1031,6 +1132,11 @@ class MegatronEngine(BaseEngine):
         return self._hf_export_tasks
 
     def get_per_tensor_param(self, base_sync_done=False, **kwargs):
+        # [FUNCTION DOC]
+        # Exports HF weights for rollout sync.
+        # Behavior: for non-merged LoRA builds a vLLM PEFT config; adapter_only when base_sync_done and non-merged LoRA. Loads model (no grads; frozen params unless adapter_only) to GPU. Vanilla bridge exports all weights; adapter_only exports adapter weights; otherwise exports HF weights with cached tasks (without merging adapters for non-merged LoRA). With QAT wraps the stream with the QAT weight exporter.
+        # Outputs: (generator of (name, tensor), peft_config or None).
+        # KNOWN ISSUE: the model is loaded to GPU but not re-offloaded here even when param offload is enabled; callers must offload.
         peft_config = None
         non_merge_lora_sync = self.peft_cls is not None and not self.model_config.lora.get("merge", False)
         adapter_only = base_sync_done and non_merge_lora_sync
@@ -1063,6 +1169,10 @@ class MegatronEngine(BaseEngine):
         return per_tensor_param, peft_config
 
     def _mcore_export_index(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds (once) and caches the delta export index, a slot cache and a name-to-record mapping.
+        # Exceptions: AssertionError for vanilla mbridge or LoRA.
+        # Side effects: collective slot exchange on first call.
         """Build (once) the per-parameter delta export index: geometry specs and
         form-B probes derived from the bridge's conversion tasks. See
         :mod:`verl.workers.engine.megatron.delta_export`."""
@@ -1082,6 +1192,9 @@ class MegatronEngine(BaseEngine):
         return index
 
     def get_per_tensor_param_shard(self, **kwargs):
+        # [FUNCTION DOC]
+        # Exports local mcore shards: loads the model (no grads) to GPU, builds the export index and returns a generator yielding (name, flat bf16 local tensor, spec), with an empty bf16 tensor for params owned by other PP stages; PEFT config None.
+        # Side effects: loads params to GPU.
         """Yield each rank's *local* mcore shard ``(name, local_flat_bf16,
         ShardSpec)`` -- the spec carries only the wire merge group (the
         comm-stubbed probe owns all shard geometry). Pure export, no side
@@ -1091,6 +1204,8 @@ class MegatronEngine(BaseEngine):
         index = self._mcore_export_index()
 
         def _gen():
+            # [FUNCTION DOC]
+            # HELPER: Generator over export records yielding (name, flattened local param cast to bf16 if floating, spec), or an empty tensor for non-owned params.
             empty = torch.empty(0, dtype=torch.bfloat16, device=get_device_id())
             for rec in index:
                 if rec.param is None:
@@ -1104,6 +1219,8 @@ class MegatronEngine(BaseEngine):
         return _gen(), None
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
+        # [FUNCTION DOC]
+        # HELPER: Builds a per-param HF delta entry by probing the record's comm-stubbed converter via mcore_hf_delta_entry with the shared slot cache.
         """mcore's per-param entry builder: probe the bridge's own converter
         (comm-stubbed copy -- real group sizes, gathers synthesized locally)
         with NaN sentinels -- see
@@ -1114,6 +1231,8 @@ class MegatronEngine(BaseEngine):
         return mcore_hf_delta_entry(rec, place, lidx, lval, self._delta_slot_cache)
 
     def get_per_tensor_param_delta_shard(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns (generator of HF-coordinate delta entries, None) using hf_delta_export over the shard export, the snapshot mapping (created if absent) and _hf_delta_entry. Requires prior prime_delta_snapshots.
         """Yield the delta engine's steady payloads -- FINAL HF-coordinate entries
         per mcore parameter (see the FSDP engine's method of the same name for the
         contract; MegatronEngine extends BaseEngine directly, so the thin wrapper
@@ -1125,20 +1244,32 @@ class MegatronEngine(BaseEngine):
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
     def disable_adapter(self) -> ContextManager:
+        # [FUNCTION DOC]
+        # Returns the PEFT class's adapter-disabling context for the model chunks (requires LoRA).
         return self.peft_cls.disable_adapter(self.module)
 
     def forward_step(self, batch_iter, model, logits_processor_func, postprocess_micro_batch_func):
+        # [FUNCTION DOC]
+        # Abstract per-micro-batch forward step for Megatron schedules; raises NotImplementedError.
         raise NotImplementedError("forward_step must be implemented in subclass")
 
     def postprocess_micro_batch_func(self, output, data: TensorDict, forward_only: bool, loss_function):
+        # [FUNCTION DOC]
+        # Abstract loss/output post-processing for a micro-batch; raises NotImplementedError.
         raise NotImplementedError("postprocess_micro_batch_func must be implemented in subclass")
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
+    # [CLASS DOC]
+    # Eval-mode context for Megatron engines: loads state per offload and sets every model chunk to eval.
     def __init__(self, engine: MegatronEngine, **kwargs):
+        # [FUNCTION DOC]
+        # Creates the context in "eval" mode; kwargs forwarded.
         super().__init__(engine=engine, mode="eval", **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Asserts the engine type, runs base entry and sets each chunk to eval mode.
         assert isinstance(self.engine, MegatronEngine)
         super().__enter__()
         # mcore module is a list of model chunk in each vpp stage
@@ -1146,15 +1277,23 @@ class EngineEvalModeCtx(BaseEngineCtx):
             module.eval()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Asserts the engine type and runs base exit (offload, clear mode).
         assert isinstance(self.engine, MegatronEngine)
         super().__exit__(exc_type, exc_value, traceback)
 
 
 class EngineTrainModeCtx(BaseEngineCtx):
+    # [CLASS DOC]
+    # Train-mode context for Megatron engines: sets chunks to train on entry, optionally zeroes grads on exit.
     def __init__(self, engine: MegatronEngine, **kwargs):
+        # [FUNCTION DOC]
+        # Creates the context in "train" mode; kwargs forwarded.
         super().__init__(engine=engine, mode="train", **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Asserts the engine type, runs base entry and sets each chunk to train mode.
         assert isinstance(self.engine, MegatronEngine)
         super().__enter__()
         # mcore module is a list of model chunk in each vpp stage
@@ -1162,6 +1301,8 @@ class EngineTrainModeCtx(BaseEngineCtx):
             module.train()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Zeroes grads if zero_grad_on_exit or an exception occurred, then runs base exit.
         assert isinstance(self.engine, MegatronEngine)
         if self.zero_grad_on_exit or exc_type is not None:
             self.engine.optimizer_zero_grad()
@@ -1170,7 +1311,11 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend="megatron")
 class MegatronEngineWithLMHead(MegatronEngine):
+    # [CLASS DOC]
+    # Megatron LM-head engine (registered for language_model on the default device) computing per-token log-probs, entropy, sum of squared probabilities and distillation outputs through Megatron forward functions with a logits processor.
     def prepare_model_inputs(self, batch: TensorDict):
+        # [FUNCTION DOC]
+        # Extracts model inputs from a batch: input_ids, optional attention_mask, loss_mask as bool, multi-modal inputs and optional routed_experts. Returns them as a mapping.
         input_ids = batch["input_ids"]
         loss_mask = batch["loss_mask"].to(bool)
         multi_modal_inputs = extract_multi_modal_inputs(batch.get("multi_modal_inputs", []))
@@ -1186,6 +1331,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
         }
 
     def prepare_model_outputs(self, output: dict, data: TensorDict):
+        # [FUNCTION DOC]
+        # Identity: returns the forward output mapping unchanged.
         return output
 
     def _lm_head_logits_processor(
@@ -1202,6 +1349,12 @@ class MegatronEngineWithLMHead(MegatronEngine):
         batch: TensorDict,
         data_format: str,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Logits processor applied inside the Megatron forward to TP-sharded vocab logits.
+        # Behavior: asserts logits and labels share leading dims; replaces non-positive temperatures with 1e-8 (in place) and divides logits in place by temperature. Optionally computes vocab-parallel sum of squared probabilities (before entropy) and entropy (chunked or not) on the scaled logits, using a clone for later steps when entropy is computed since it is destructive. With top-K distillation merges outputs of logits_processor_func; unless distillation_only computes vocab-parallel log-probs of labels.
+        # Inputs: logits, label, temperature tensors; keyword flags; logits_processor_func; batch; data_format ("thd"/"bshd").
+        # Outputs: mapping with any of sum_pi_squared, entropy, distillation keys and log_probs.
+        # Side effects: mutates logits and temperature in place.
         assert logits.shape[:2] == label.shape[:2]
         # avoid non-positive temperature such as padding
         temperature[temperature <= 0] = 1e-8
@@ -1243,6 +1396,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
     def forward_step(
         self, batch_iter: Iterator[TensorDict], model, logits_processor_func, postprocess_micro_batch_func
     ):
+        # [FUNCTION DOC]
+        # Megatron forward step for one micro-batch.
+        # Behavior: takes the next batch from the iterator and moves it to device; requires the per-batch use_fused_kernels flag to match the engine's; reads entropy/sum-pi-squared/distillation flags and pad-to-length bucket (only with remove padding), rejecting pad-to-length with top-K distillation or router replay, and sum-pi-squared with fused kernels. Under DCP requires local_cp_size and a router padding mask. Determines CP layout and VPP stage. For routing replay: switches backward-replay to forward-replay and, when in forward replay, requires routed_experts and installs replay data (R3 aligns routes and builds a response mask). Labels are a clone of input ids (NO_PADDING only). Fused path: resolves a uniform temperature and calls the fused forward with labels, entropy flag, pad id, CP layout and DCP args. Otherwise expands temperature per token as nested, builds the logits processor and args (labels, temperature, loss mask, response attention mask for dense masks), computes the MTP loss normalization factor (routed/batch tokens) when training MTP with per-token loss, and calls the model-specific forward with thd/bshd format and padding options. Records R2 routes when marked, and switches to backward replay afterwards.
+        # Outputs: (forward output, post-process callable bound to the batch and local_cp_size).
+        # Exceptions: RuntimeError / NotImplementedError for the invalid combinations above.
         batch: TensorDict = next(batch_iter)
 
         batch = batch.to(get_device_id())
@@ -1436,6 +1594,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
     def postprocess_micro_batch_func(
         self, output, data: TensorDict, forward_only: bool, loss_function, local_cp_size=None
     ):
+        # [FUNCTION DOC]
+        # Computes loss for one micro-batch for Megatron schedules.
+        # Behavior: prepares outputs; calls loss_function with DP group and scales loss by num_micro_batch (Megatron divides by it), or uses dummy loss 1.0 when forward-only without a loss function. Output mapping has float loss, metrics, detached model_output (only if forward-only or not DCP) and DCP sample ids/leader flag. In the per-token-loss regime with a loss function: requires remove padding; local token count is the DCP-provided count or routed tokens divided by CP size; returns (loss times global routed tokens divided by dp_size, local token count, output) so Megatron's per-token normalization recovers the loss.
+        # Outputs: (scaled_loss, output) or (loss_sum, num_tokens, output).
+        # Exceptions: AssertionError when loss_function is None while training; ValueError for per-token loss without remove padding or missing DCP token count.
         # For memory efficiency
         # We move calculation of entropy to compute_log_probs, forward_only == True
         device = data["input_ids"].device
@@ -1503,8 +1666,12 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
 @EngineRegistry.register(model_type="value_model", backend="megatron")
 class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
+    # [CLASS DOC]
+    # Megatron value-model (critic) engine: forward produces per-token values, which are wrapped under "values".
     # for value head
     def forward_step(self, batch_iter, model, logits_processor_func, postprocess_micro_batch_func):
+        # [FUNCTION DOC]
+        # Value forward step: takes the next batch, moves it to device, runs the model-specific forward with value_model true (thd/bshd format, forced max seqlen, pad-to-length bucket, CP layout) and returns (output, post-process callable bound to the batch).
         batch: TensorDict = next(batch_iter)
         batch = batch.to(get_device_id())
         model_inputs = self.prepare_model_inputs(batch)
@@ -1536,4 +1703,6 @@ class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
         return output, partial(postprocess_micro_batch_func, data=batch)
 
     def prepare_model_outputs(self, output: dict | torch.Tensor, data: TensorDict):
+        # [FUNCTION DOC]
+        # Wraps the forward output as a mapping with key "values".
         return {"values": output}
