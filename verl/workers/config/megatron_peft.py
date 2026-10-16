@@ -11,10 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Builder for Megatron-Bridge PEFT (LoRA) objects from verl model config.
+
 """PEFT configuration of Megatron for verl."""
 
 
 def get_peft_cls(model_config, bridge, provider, dtype=None):
+    # [FUNCTION DOC]
+    # Behavior: returns None if model_config has no lora attribute or its rank (default 0) is not
+    # positive. Otherwise asserts bridge and provider are present, creates the PEFT object from the lora
+    # config mapping (with dtype), prints a summary of type (uppercased, default lora), rank, alpha and
+    # dropout, and returns it.
+    # Inputs: model_config - object with optional lora mapping; bridge; provider; dtype - optional.
+    # Outputs: PEFT object or None.
+    # Exceptions: AssertionError without bridge/provider; ImportError if Megatron-Bridge missing.
+    # Side effects: prints to stdout.
     """Create a Megatron-Bridge PEFT object from ``model_config.lora``."""
     if not hasattr(model_config, "lora"):
         return None

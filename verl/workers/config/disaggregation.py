@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Config for prefill/decode (PD) disaggregated rollout serving. Allowed KV transfer backends: nixl,
+# mooncake, ascend, mori, fake; allowed Mooncake protocols: nvlink, local, rdma, tcp.
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -24,6 +28,10 @@ _ALLOWED_MOONCAKE_PROTOCOLS = ("nvlink", "local", "rdma", "tcp")
 
 @dataclass
 class DisaggregationConfig(BaseConfig):
+    # [CLASS DOC]
+    # PD disaggregation settings: enabled flag, prefill and decode replica counts, optional decode TP
+    # size (defaults to prefill TP), transfer backend, optional bootstrap port, optional IB device, and
+    # Mooncake protocol.
     """Prefill-Decode disaggregation knobs."""
 
     enabled: bool = False
@@ -36,6 +44,10 @@ class DisaggregationConfig(BaseConfig):
     mooncake_protocol: str = "nvlink"
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: skips validation when disabled. Otherwise raises ValueError if the backend is not
+        # allowed, if either replica count is below 1, if a bootstrap port is given outside 1..65535, or if
+        # the backend is mooncake with a disallowed protocol. Outputs: None.
         if not self.enabled:
             return
         if self.transfer_backend not in _ALLOWED_BACKENDS:
@@ -53,6 +65,9 @@ class DisaggregationConfig(BaseConfig):
             )
 
     def effective_decode_tp(self, prefill_tp: int) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns the explicit decode TP size if set, else prefill_tp.
+        # Inputs: prefill_tp - int. Outputs: int.
         """Resolve decode TP (defaults to ``prefill_tp``). Test-only helper; runtime paths
         must inline this because OmegaConf/Ray serialization drops dataclass methods."""
         if self.decode_tensor_model_parallel_size is not None:

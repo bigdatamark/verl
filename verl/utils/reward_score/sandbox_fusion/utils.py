@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Sandbox Fusion client: posts code + stdin to a remote "run_code" endpoint with retries, interprets
+# the API's compile/run status into per-case result codes, and checks all test cases concurrently.
+# Result codes: True (pass), False (wrong answer), -1 (API/sandbox/unknown error), -2 (runtime
+# error), -3 (run timeout), -4 (compile error/timeout). Constants: DEFAULT_TIMEOUT, MAX_RETRIES,
+# INITIAL_RETRY_DELAY (linear backoff base, seconds), API_TIMEOUT (extra HTTP timeout buffer), and
+# SUPPORTED_LANGUAGES (languages accepted by the sandbox).
 import concurrent.futures  # <-- Import concurrent.futures
 import json
 import logging
@@ -73,6 +80,16 @@ def call_sandbox_api(
     memory_limit_mb: int,
     language: str = "python",
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:  # <-- Remove request_id parameter
+    # [FUNCTION DOC]
+    # Executes code via one HTTP POST of a JSON payload (compile_timeout, run_timeout, code, stdin,
+    # memory_limit_MB, language, empty files/fetch_files). Generates a request id for log prefixes.
+    # Behavior: rejects languages not in SUPPORTED_LANGUAGES. HTTP timeout is compile + run + API_TIMEOUT.
+    # Retries up to MAX_RETRIES only on HTTP 504, sleeping INITIAL_RETRY_DELAY * attempt-number between
+    # attempts; other HTTP errors, request exceptions, JSON decode errors or unexpected errors stop
+    # retrying immediately.
+    # Outputs: tuple (response JSON dict, None) on success, or (None, error message) where the internal
+    # request-id prefix is replaced with "API Call Failed: ".
+    # Side effects: network requests, sleeping, logging.
     """
     Calls the remote sandbox API to execute code with retry logic for Gateway Timeout,
     using increasing delay between retries. Logs internal calls with a unique ID.
@@ -183,6 +200,24 @@ def _process_single_case(
     concurrent_semaphore: Optional[threading.Semaphore] = None,
     fn_name: Optional[str] = None,
 ) -> tuple[int, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # HELPER: Runs one test case in the sandbox and classifies the outcome.
+    # Behavior: for python with fn_name, wraps the generation in a script that imports common stdlib
+    # modules, reads stdin lines as JSON arguments, locates fn_name globally or as a method on a
+    # Solution instance, calls it and prints the result (JSON for dict/list/tuple/None/bool, str
+    # otherwise); wrapper errors are written to stderr. stdin is the stringified stdin_data (or None).
+    # Calls call_sandbox_api (inside the semaphore if given) with timeout used for both compile and run.
+    # Builds a metadata dict (case_index, input, expected_output, api error, raw response, status,
+    # stdout, stderr, exit code, durations, compile stderr, api/compile/run statuses) and determines:
+    # API error -> -1 "api_error"; api status "SandboxError" -> -1; "Failed" with compile Error/TLE or
+    # non-zero compile return code -> -4 ("compile_timeout"/"compile_error"); "Failed" with run TLE -> -3
+    # "timeout", run Error or non-zero exit -> -2 "runtime_error", otherwise -1; "Success" with run
+    # Finished -> True if expected_output is None or stdout equals expected ignoring trailing newlines,
+    # else False "wrong_answer"; other states -> -1.
+    # Inputs: case_index, stdin_data, expected_output, sandbox_fusion_url, generation, timeout,
+    # memory_limit_mb, language, concurrent_semaphore, fn_name.
+    # Outputs: tuple (result code, metadata dict). Side effects: network calls, logging.
+    # KNOWN ISSUE: falsy expected outputs (e.g. empty string or 0) are recorded as None in metadata.
     """Helper function to process a single test case."""
     api_response = None
     error_msg = None
@@ -455,6 +490,19 @@ def check_correctness(
     language: str = "python",
     concurrent_semaphore: Optional[threading.Semaphore] = None,
 ) -> tuple[list[Any], list[dict[str, Any]]]:
+    # [FUNCTION DOC]
+    # Runs all test cases concurrently in a thread pool and returns ordered results and metadata.
+    # Behavior: invalid in_outs -> ([-1], [error]); zero cases -> ([], []); inputs/outputs length
+    # mismatch or assert_case length mismatch -> all -1 with error metadata. The code for case i is the
+    # generation plus two newlines plus assert_case[i] (empty by default). Exceptions from a case are
+    # recorded as -1 with "internal_error" metadata. After all complete, if any case had a compile error
+    # (-4), every later-indexed case is also marked -4 with status "compile_error_skipped".
+    # Inputs: sandbox_fusion_url, in_outs (dict with "inputs", "outputs", optional "fn_name",
+    # "assert_case"), generation, timeout, memory_limit_mb, language, concurrent_semaphore.
+    # Outputs: tuple (results list, metadata list), both aligned with inputs.
+    # Side effects: network calls via worker threads, logging.
+    # KNOWN ISSUE: the pool size is max(32, cpu_count * 5), i.e. at least 32 rather than capped as the
+    # comment suggests; real concurrency is only limited by the semaphore if provided.
     """
     Checks the correctness of code generation using the remote sandbox API,
     processing test cases concurrently.

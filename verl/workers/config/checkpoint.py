@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Backend-specific checkpoint config subclasses (currently only Megatron-Core) extending the
+# trainer's CheckpointConfig.
+
 """Backend-specific extensions of :class:`verl.trainer.config.CheckpointConfig`.
 
 The base :class:`CheckpointConfig` lives in ``verl/trainer/config/config.py`` and
@@ -32,6 +36,9 @@ __all__ = ["McoreCheckpointConfig"]
 
 @dataclass
 class McoreCheckpointConfig(CheckpointConfig):
+    # [CLASS DOC]
+    # Megatron-Core checkpoint config adding mbridge_config, a dict of extra keyword arguments forwarded
+    # to the bridge's save_weights (defaults to empty). No validation.
     """Checkpoint config for the Megatron-Core backend.
 
     Adds the mbridge-specific knobs consumed by
