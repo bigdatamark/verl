@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# MoE router record/replay controller for the VeOmni engine (see the module docstring for the
+# lifecycle, layer-indexing contract and handling of positions without recorded routing). Exposes
+# the RouterReplayAction enum and the VeOmniRouterReplay state machine.
+
 """VeOmni-flavored MoE router replay.
 
 Record/replay controller for verl's VeOmni engine. Tapped into VeOmni's
@@ -98,12 +103,20 @@ __all__ = ["RouterReplayAction", "VeOmniRouterReplay"]
 
 
 class RouterReplayAction(Enum):
+    # [CLASS DOC]
+    # Enum of controller modes: DISABLED (pass-through), RECORD (capture router top-k indices),
+    # REPLAY (substitute supplied target indices).
     DISABLED = "disabled"
     RECORD = "record"
     REPLAY = "replay"
 
 
 class VeOmniRouterReplay:
+    # [CLASS DOC]
+    # Stateful controller holding one micro-batch of routing. State: current action; a mapping from
+    # router module identity to layer position (rebuilt per micro-batch); recorded per-layer index
+    # tensors (RECORD); per-layer targets (REPLAY); a debug flag enabled when env var
+    # VERL_ROUTER_REPLAY_DEBUG equals "1"; and whether it is installed into VeOmni's global hook slot.
     """Per-micro-batch router replay controller for VeOmni.
 
     See the module docstring for the lifecycle and for the division of
@@ -111,6 +124,9 @@ class VeOmniRouterReplay:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: initializes action DISABLED, empty position table, recorded and target lists, reads the
+        # debug env flag, and marks not installed. Side effects: reads environment.
         self._action: RouterReplayAction = RouterReplayAction.DISABLED
         # id(router_module) -> position, rebuilt every micro-batch. Absence
         # from this table is what identifies a router's first fire.
@@ -125,19 +141,31 @@ class VeOmniRouterReplay:
 
     @property
     def action(self) -> RouterReplayAction:
+        # [FUNCTION DOC]
+        # Behavior: returns the current action. Outputs: RouterReplayAction.
         return self._action
 
     @property
     def num_fired(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns the number of distinct routers that fired since the last reset.
         """How many distinct routers have fired since ``begin_microbatch``."""
         return len(self._id_to_pos)
 
     @property
     def num_targets(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns the number of REPLAY targets armed for this micro-batch.
         """How many layer targets REPLAY was armed with for this micro-batch."""
         return len(self._targets)
 
     def install(self, model: nn.Module) -> None:
+        # [FUNCTION DOC]
+        # Behavior: imports VeOmni's set_active_replay and validate_model_for_replay, validates the model
+        # is wired for replay, registers self as the active replay controller, and marks installed.
+        # Inputs: model - module containing MoE layers. Outputs: None.
+        # Exceptions: RuntimeError (chained) if VeOmni lacks the hook module; whatever validation raises.
+        # Side effects: mutates VeOmni's global replay slot.
         """Register this controller with VeOmni's global ``set_active_replay`` slot.
 
         After returning, every MoE router forward in ``model`` should reach
@@ -158,6 +186,9 @@ class VeOmniRouterReplay:
         self._installed = True
 
     def uninstall(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: if installed, clears VeOmni's active replay slot (ignoring ImportError) and marks not
+        # installed; otherwise no-op. Side effects: mutates VeOmni global slot.
         """Reverse :meth:`install`. Idempotent."""
         if not self._installed:
             return
@@ -175,6 +206,19 @@ class VeOmniRouterReplay:
         routing_scores: torch.Tensor,
         top_indices: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: DISABLED returns top_indices unchanged. Otherwise assigns the module a position by
+        # identity on first fire in this micro-batch. If debug is on, asserts both tensors are 2-D with
+        # matching row counts. RECORD: on first fire appends a detached int16 copy of top_indices; always
+        # returns top_indices. REPLAY: looks up the target at the module's position, checks it exists and has
+        # the same shape as top_indices, then per row returns the native top_indices where the target row
+        # contains any duplicate expert id (detected by sorting and comparing neighbours), else the target row.
+        # Inputs: module - router module; routing_scores - [rows, experts] scores (debug only);
+        # top_indices - [rows, topk] native choices.
+        # Outputs: [rows, topk] index tensor.
+        # Exceptions: AssertionError on debug shape mismatch; RuntimeError when a REPLAY target is missing
+        # or shape mismatched.
+        # Side effects: mutates position table and recorded list.
         """Called from each MoE router forward via VeOmni's hook surface.
 
         Indices-only: records ``top_indices`` in RECORD mode or returns
@@ -267,26 +311,39 @@ class VeOmniRouterReplay:
         return torch.where(has_duplicate.unsqueeze(-1), top_indices, target)
 
     def begin_record(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: sets action RECORD and resets micro-batch state.
         """Enter RECORD mode for a step."""
         self._action = RouterReplayAction.RECORD
         self._reset_microbatch()
 
     def begin_replay(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: sets action REPLAY and resets micro-batch state.
         """Enter REPLAY mode for a step."""
         self._action = RouterReplayAction.REPLAY
         self._reset_microbatch()
 
     def clear(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: sets action DISABLED and resets micro-batch state.
         """Reset the state machine between steps."""
         self._action = RouterReplayAction.DISABLED
         self._reset_microbatch()
 
     def _reset_microbatch(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Clears the position table, recorded list and targets list.
         self._id_to_pos = {}
         self._recorded = []
         self._targets = []
 
     def begin_microbatch(self, targets: list[torch.Tensor] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: validates arguments against the mode (RECORD forbids targets, REPLAY requires them,
+        # any other mode is an error), resets micro-batch state, and stores a copy of the targets list.
+        # Inputs: targets - optional list of per-layer [nnz, topk] tensors.
+        # Outputs: None. Exceptions: RuntimeError on mode/argument mismatch.
         """Arm the controller for one micro-batch forward.
 
         Must be called from the engine before every forward, once RECORD or
@@ -314,6 +371,10 @@ class VeOmniRouterReplay:
             self._targets = list(targets)
 
     def take_recorded(self) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: requires RECORD mode and at least one recorded layer; stacks per-layer [nnz, topk]
+        # int16 tensors along a new dim 1 to [nnz, layers, topk]. Does not clear state.
+        # Exceptions: RuntimeError if not RECORD or nothing recorded.
         """Return this micro-batch's routing as ``[nnz, L, topk]``.
 
         Layer-major stacking matches the trainer-side ``routed_experts``
