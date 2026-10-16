@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for dynamic dispatch-mode registration in verl.single_controller.base.decorator.
+
 import pytest
 
 import verl.single_controller.base.decorator as decorator_module
@@ -27,6 +30,9 @@ from verl.single_controller.base.decorator import (
 
 @pytest.fixture
 def reset_dispatch_registry():
+    # [FUNCTION DOC]
+    # HELPER: Fixture that shallow-copies DISPATCH_MODE_FN_REGISTRY before the test and restores its contents afterwards.
+    # Side effects: mutates the module-level registry on teardown.
     # Store original state
     original_registry = DISPATCH_MODE_FN_REGISTRY.copy()
     yield
@@ -36,11 +42,18 @@ def reset_dispatch_registry():
 
 
 def test_register_new_dispatch_mode(reset_dispatch_registry):
+    # [FUNCTION DOC]
+    # Behavior: registers "TEST_MODE" with dummy dispatch/collect functions, asserts Dispatch gains the member (validated
+    # by _check_dispatch_mode) and that the predefined dispatch lookup returns both functions, then removes the enum member.
     # Test registration
     def dummy_dispatch(worker_group, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Returns (args, kwargs) unchanged.
         return args, kwargs
 
     def dummy_collect(worker_group, output):
+        # [FUNCTION DOC]
+        # HELPER: Returns output unchanged.
         return output
 
     register_dispatch_mode("TEST_MODE", dummy_dispatch, dummy_collect)
@@ -58,14 +71,21 @@ def test_register_new_dispatch_mode(reset_dispatch_registry):
 
 
 def test_update_existing_dispatch_mode(reset_dispatch_registry):
+    # [FUNCTION DOC]
+    # Behavior: replaces the functions of the existing ONE_TO_ALL mode via update_dispatch_mode and asserts the lookup
+    # returns the new dispatch and collect functions (the fixture restores the registry).
     # Store original implementation
     original_mode = Dispatch.ONE_TO_ALL
 
     # New implementations
     def new_dispatch(worker_group, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Returns (args, kwargs) unchanged.
         return args, kwargs
 
     def new_collect(worker_group, output):
+        # [FUNCTION DOC]
+        # HELPER: Returns output unchanged.
         return output
 
     # Test update=

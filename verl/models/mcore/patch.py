@@ -16,8 +16,20 @@
 # there is some bug in mcore 0.12, so we need to patch it
 # 1. `get_query_key_value_tensors` in `multi_latent_attention.py` works wrong when packed_seq_params is not None
 
+# [MODULE DOC]
+# Runtime monkey patches for Megatron-Core and related packages: a pure-torch fallback for fast_hadamard_transform,
+# MLA attention fixes for older mcore (packed sequences / THD with differing Q and V head dims), a compatibility shim
+# for mbridge on older mcore, a dist-checkpoint writer fix for mcore 0.12.1 with torch 2.8/2.9, an MTP postprocess
+# wrapper, and a memory-leak fix for activation-recompute backward. All imports are done lazily inside the functions.
+
 
 def pure_torch_hadamard_transform(x, scale=1.0):
+    # [FUNCTION DOC]
+    # Behavior: computes the fast Walsh-Hadamard transform along the last dimension using an iterative butterfly in fp32
+    # (pairs at stride h become (a+b, a-b), doubling h until n), multiplies by scale and casts back to the input dtype and shape.
+    # Inputs: x - tensor whose last dimension is a power of two; scale - multiplier.
+    # Outputs: transformed tensor with the same shape and dtype.
+    # Exceptions: ValueError if the last dimension is not a positive power of two.
     """Fast Walsh-Hadamard transform along the last dim (size must be 2**k).
 
     Vectorized butterfly accumulated in fp32, numerically equivalent to
@@ -45,6 +57,11 @@ def pure_torch_hadamard_transform(x, scale=1.0):
 
 
 def apply_fast_hadamard_transform_shim():
+    # [FUNCTION DOC]
+    # Behavior: if fast_hadamard_transform imports successfully (any exception counts as failure), does nothing. Otherwise
+    # registers a stub module of that name exposing pure_torch_hadamard_transform as hadamard_transform, back-fills every
+    # already-loaded module whose namespace holds hadamard_transform bound to None, and logs a warning.
+    # Side effects: mutates sys.modules and other modules' namespaces; logs.
     """Provide a pure-torch ``fast_hadamard_transform`` when the CUDA package is absent.
 
     DeepSeek-V4 / V3.2 sparse-attention (DSA) in Megatron-LM does
@@ -93,6 +110,10 @@ def apply_fast_hadamard_transform_shim():
 
 
 def apply_patch():
+    # [FUNCTION DOC]
+    # Behavior: installs the hadamard shim, then patches Megatron MLA: on mcore < 0.13 replaces
+    # MLASelfAttention.get_query_key_value_tensors; on mcore < 0.16.2 replaces MultiLatentAttention.forward.
+    # Side effects: global class-level monkey patches. Safe to call repeatedly.
     # DeepSeek sparse-attention (DSA) needs ``fast_hadamard_transform``, which
     # cannot be built on ROCm (its setup requires nvcc). Install a pure-torch
     # fallback from the central mcore patch entry so every DSA importer picks it
@@ -129,6 +150,18 @@ def apply_patch():
         *,
         inference_params=None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Replacement MLASelfAttention.get_query_key_value_tensors for mcore 0.12.
+        # Behavior: computes the rotary sequence length and rotary embedding (packed_seq flag for THD when supported; for
+        # non-"rope" types also returns mscale). Down-projects queries (if q_lora_rank, gathering TP-sharded output and
+        # re-scattering for sequence parallel, then q layernorm) and key/values (splitting into compressed kv and the k
+        # positional part, with TP gather / sequence scatter as needed), applies kv layernorm, then runs the up projection and
+        # RoPE (optionally under recompute checkpointing).
+        # Inputs: hidden_states [s, b, h]; key_value_states (unused); position_ids (unused); packed_seq_params;
+        # inference_context / deprecated inference_params.
+        # Outputs: tuple (query, key, value) contiguous tensors.
+        # Exceptions: AssertionError if hidden_states is not 3-D.
+        # Side effects: may set self.qkv_up_checkpoint.
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
@@ -211,6 +244,12 @@ def apply_patch():
         # QKV up projection and RoPE apply
         # =========================================
         def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb):
+            # [FUNCTION DOC]
+            # HELPER: Up-projects q and kv, reshapes to per-head layout, slices rotary embedding (offset for inference; truncated
+            # to q_len unless packed with CP > 1), splits no-PE and PE parts, squeezes the batch dim for packed sequences, applies
+            # RoPE to q and k positional parts using cu_seqlens when packed, broadcasts the shared k positional part to all heads
+            # and concatenates to form query and key.
+            # Outputs: tuple (query, key, value) contiguous.
             if self.config.q_lora_rank is not None:
                 q, _ = self.linear_q_up_proj(q_compressed)
             else:
@@ -328,6 +367,18 @@ def apply_patch():
         inference_params=None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Replacement MultiLatentAttention.forward for mcore < 0.16.2.
+        # Behavior: obtains q/k/v (and the compressed q when returned, for DSA), adjusts them for inference (handling the
+        # different return arity on mcore >= 0.13), makes them contiguous, pads V to Q's head dim for THD packed attention
+        # when they differ and no experimental attention variant is used (updating the core attention's V head size), runs
+        # core attention (checkpointed when configured and training; DSA variant receives the hidden states and compressed
+        # q), un-pads and reshapes THD output to [t, 1, heads*dim], discards the recompute checkpoint output if up-proj
+        # recompute is on, and applies the output projection.
+        # Inputs: standard MLA forward args; attention_bias and rotary cos/sin must be None.
+        # Outputs: tuple (output, bias).
+        # Exceptions: AssertionError for attention_bias or rotary cos/sin, or missing up-proj checkpoint.
+        # Side effects: may mutate core_attention.hidden_size_per_attention_head_v.
         """Forward pass for multi-latent attention"""
         assert attention_bias is None, "Attention bias should not be passed into MLA."
         assert rotary_pos_cos is None and rotary_pos_sin is None, "MLA does not support Flash Decoding"
@@ -444,6 +495,11 @@ def apply_patch():
 
 
 def apply_patch_mbridge():
+    # [FUNCTION DOC]
+    # Behavior: if megatron.core.utils lacks get_tensor_model_parallel_group_if_none (older mcore), installs a fallback
+    # that returns None when torch.distributed is not initialized, otherwise returns tp_group or (with a rank-0
+    # deprecation warning) the default expert-TP or TP group.
+    # Side effects: adds an attribute to megatron.core.utils.
     try:
         from megatron.core.utils import get_tensor_model_parallel_group_if_none
     except ImportError:
@@ -454,6 +510,10 @@ def apply_patch_mbridge():
         from megatron.core import parallel_state
 
         def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
+            # [FUNCTION DOC]
+            # HELPER: Fallback for get_tensor_model_parallel_group_if_none as described in the enclosing function.
+            # Inputs: tp_group; is_expert - choose expert TP group; check_initialized - forwarded to parallel_state.
+            # Outputs: a process group or None.
             """Issue a deprecation warning if tp_group is None and return the default tp group."""
             if not torch.distributed.is_initialized():
                 return None
@@ -474,6 +534,10 @@ def apply_patch_mbridge():
 
 
 def apply_patch_megatron_v012_with_torch_v28_v29() -> None:
+    # [FUNCTION DOC]
+    # Behavior: only for torch 2.8.0/2.9.0 with megatron core 0.12.1, replaces FileSystemWriterAsync.write_preloaded_data
+    # with a version that passes serialization_format (TORCH_SAVE) to torch's _write_item when supported. Otherwise no-op.
+    # Side effects: class-level monkey patch.
     # Error due to missing serialization_format in _write_item of megatron v012;
     # resolved by using megatron v013's implementation.
     import inspect
@@ -508,6 +572,16 @@ def apply_patch_megatron_v012_with_torch_v28_v29() -> None:
         use_fsync: bool,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Replacement write_preloaded_data (static, GC disabled) for async dist checkpointing.
+        # Behavior: opens the bucket file (via multistorageclient when use_msc), writes each byte item then each CPU tensor
+        # item via _write_item, fsyncs if requested, and puts (proc index, results) or (proc index, exception) on
+        # results_queue; then marks its count_queue task done and logs memory usage at debug level.
+        # Inputs: transform_list; local_proc_idx; write_bucket (file name, storage key, (bytes items, tensor items));
+        # results_queue; count_queue; use_fsync; kwargs (use_msc).
+        # Outputs: none.
+        # Exceptions: errors are captured and reported through the queue (AssertionError for non-CPU tensors included).
+        # Side effects: writes files; queue operations.
         """
         Performs actual data saving to storage.
 
@@ -575,11 +649,18 @@ def apply_patch_megatron_v012_with_torch_v28_v29() -> None:
 
 
 def apply_mtp_inference_patch():
+    # [FUNCTION DOC]
+    # Behavior: wraps GPTModel._postprocess so that, during the call, a falsy config.mtp_num_layers (e.g. 0) is set to
+    # None, restoring the original value afterwards.
+    # Side effects: class-level monkey patch; temporarily mutates config.
     from megatron.core.models.gpt.gpt_model import GPTModel
 
     _original_postprocess = GPTModel._postprocess
 
     def _patched(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: The wrapper: normalizes falsy mtp_num_layers to None, calls the original _postprocess, and restores the value
+        # in a finally block. Outputs: original result.
         original_mtp_num_layers = self.config.mtp_num_layers
         if not self.config.mtp_num_layers:
             self.config.mtp_num_layers = None
@@ -595,6 +676,10 @@ def apply_mtp_inference_patch():
 # input tensors and their grads will stay in gpu memory after forward_backward completes.
 # see https://github.com/NVIDIA/Megatron-LM/pull/3267
 def apply_patch_megatron_recomputation_backward():
+    # [FUNCTION DOC]
+    # Behavior: replaces Megatron's CheckpointFunction.backward with patch_backward to release saved inputs and grads
+    # after recompute backward (fixing a MoE memory leak).
+    # Side effects: class-level monkey patch.
     import megatron.core.tensor_parallel.random as rd
     import torch
 
@@ -606,6 +691,18 @@ def apply_patch_megatron_recomputation_backward():
 
     @staticmethod
     def patch_backward(ctx, *args):
+        # [FUNCTION DOC]
+        # HELPER: Replacement CheckpointFunction.backward.
+        # Behavior: validates checkpointing is allowed, restores distributed saved activations if configured, re-runs the
+        # forward under the saved RNG states with grad enabled, back-propagates only outputs that are tensors requiring grad,
+        # and collects cloned input grads. Unless the run function closes over a MultiTokenPredictionLayer (whose inputs alias
+        # decoder outputs), records the current stream on each detached input requiring grad and its grad and frees their
+        # storage.
+        # Inputs: ctx - autograd context; args - output grads.
+        # Outputs: (None, None) followed by per-input grads.
+        # Exceptions: RuntimeError when used with torch.autograd.grad.
+        # KNOWN ISSUE: if no outputs require grad, the zip-of-filter unpacking raises ValueError; also uses torch.cuda.current_stream, which is not device-agnostic (e.g. NPU).
+        # Side effects: frees tensor storage.
         """Backward pass."""
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError("Checkpointing is not compatible with .grad(), please use .backward() if possible")

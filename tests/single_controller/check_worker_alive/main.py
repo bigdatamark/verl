@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Manual script for the worker aliveness checker: starts a 2-worker CPU RayWorkerGroup, enables the aliveness
+# check (1s interval), then calls a non-blocking method that makes each worker exit after WAIT_TIME seconds (env,
+# default 10). The driver sleeps 6 x WAIT_TIME so the checker should detect the dead workers and signal/terminate the
+# driver process before the sleep ends. Driven externally (e.g. a CI shell script checking the exit behavior).
+
 import os
 import sys
 import time
@@ -25,11 +31,20 @@ from verl.single_controller.ray.base import RayClassWithInitArgs, RayResourcePoo
 
 @ray.remote
 class TestActor(Worker):
+    # [CLASS DOC]
+    # Ray remote Worker used to simulate a crash.
     def __init__(self) -> None:
+        # [FUNCTION DOC]
+        # Calls the Worker constructor (sets up rank/env info).
         super().__init__()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def foo(self, wait_time):
+        # [FUNCTION DOC]
+        # Behavior: registered with ONE_TO_ALL dispatch, non-blocking; sleeps wait_time seconds then exits the worker process
+        # with status 1.
+        # Inputs: wait_time - seconds.
+        # Side effects: terminates the worker process.
         time.sleep(wait_time)
         sys.exit(1)
 

@@ -28,6 +28,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Triton implementation of a fused "linear (hidden @ weight^T) + temperature-scaled softmax cross entropy + token entropy" op that never materializes the full (tokens x vocab) logits in the forward pass. Supports vocab-parallel tensor parallelism (each rank holds a vocab shard; labels are global ids, local column j corresponds to global id rank*vocab_size + j) and optional TMA descriptors on Hopper+ (SUPPORT_CUDA_TMA). Defines reduction / backward-strategy enums, a module-level Config (_config) selecting the backward strategy, forward kernels (mainloop over vocab splits + epilogues) and several backward kernels, plus host functions efficient_entropy_forward / efficient_entropy_backward.
+# Math (per token, z = logits / T): max m, accumulate A = sum exp(z - m), entropy_b = sum softmax * z, entropy = log A + m - entropy_b, logprob = z[label] - m - log A. Gradient wrt z: dlogprob * (softmax - onehot) * (-1 sign handled by negating dlogprobs) plus dentropy * (-softmax) * (z - entropy_b), then divided by T.
+# When Triton is missing, triton/tl are replaced with MagicMocks and jit/autotune with a no-op decorator; when TMA is supported a global-memory allocator is registered with Triton (also as a ContextVar default so worker threads inherit it).
+
 """
 Implementations of the linear cross entropy with token entropy kernel.
 """
@@ -59,11 +64,16 @@ if not HAVE_TRITON:
 
     @contextmanager
     def null_decorator(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fallback for triton.jit / triton.autotune when Triton is unavailable: returns the function when used bare, else a decorator returning the function unchanged.
+        # KNOWN ISSUE: it is wrapped with contextmanager, so calling it returns a context-manager object instead of the function/decorator; decorated kernels become non-callable placeholders (only matters when Triton is absent, where the kernels cannot run anyway).
         if len(kwargs) == 0 and len(args) == 1 and callable(args[0]):
             return args[0]
         else:
 
             def inner(func):
+                # [FUNCTION DOC]
+                # HELPER: Identity decorator.
                 return func
 
             return inner
@@ -76,6 +86,8 @@ if not HAVE_TRITON:
 elif SUPPORT_CUDA_TMA:
     # TMA descriptors require a global memory allocation
     def alloc_fn(size: int, alignment: int, stream: typing.Optional[int]):
+        # [FUNCTION DOC]
+        # HELPER: Triton allocator for TMA descriptors: returns an int8 device tensor of size bytes (alignment and stream ignored).
         return torch.empty(size, device=get_device_name(), dtype=torch.int8)
 
     # https://github.com/triton-lang/triton/commit/43625fc968b693ab51884ca95adbcf3e43483fd0
@@ -101,6 +113,8 @@ elif SUPPORT_CUDA_TMA:
 
 @dataclass
 class EntropyReductionEnum:
+    # [CLASS DOC]
+    # Integer constants for log-prob reduction: _None 0 (per-token), _Sum 1, _Mean 2.
     """
     Enum for the reduction method of cross entropy.
     """
@@ -111,6 +125,9 @@ class EntropyReductionEnum:
 
 
 def get_entropy_reduction_enum_number(reduction: str) -> int:
+    # [FUNCTION DOC]
+    # Maps "none"/"sum"/"mean" to the reduction constant.
+    # Exceptions: ValueError for other strings.
     """
     Get the enum number for the reduction method of cross entropy.
     """
@@ -127,6 +144,9 @@ def get_entropy_reduction_enum_number(reduction: str) -> int:
 
 
 def get_entropy_reduction_enum(ce_reduction: int) -> EntropyReductionEnum:
+    # [FUNCTION DOC]
+    # Validates an integer reduction code (0, 1, 2) and returns the matching constant.
+    # Exceptions: ValueError otherwise.
     """
     Get the enum for the reduction method of cross entropy.
     """
@@ -144,6 +164,8 @@ def get_entropy_reduction_enum(ce_reduction: int) -> EntropyReductionEnum:
 
 @dataclass
 class BackwardEnum:
+    # [CLASS DOC]
+    # Backward strategy constants: _Total_Fuse_MN 0 (fully fused, atomics into fp32 grads), _Total_Separate 1 (materialize full d_logits then two matmuls), _Split_Dlogits_N 2 (materialize d_logits per vocab chunk), _Split_Dlogits_M 3 (not implemented).
     """
     Enum for the backward method.
     """
@@ -158,6 +180,8 @@ class BackwardEnum:
 
 @dataclass
 class Config:
+    # [CLASS DOC]
+    # Mutable module configuration: _backward strategy (default _Split_Dlogits_N) and _use_triton flag (default True; False makes host functions raise).
     """Configuration for efficient entropy kernel operations.
 
     Args:
@@ -173,6 +197,9 @@ _config = Config()
 
 
 def set_backward_method(backward_method: BackwardEnum):
+    # [FUNCTION DOC]
+    # Sets the global backward strategy on _config.
+    # Side effects: mutates module global state.
     """
     Set the backward method.
     """
@@ -217,6 +244,8 @@ def efficient_entropy_kernel_general_mainloop(
     BLOCK_SIZE_K: tl.constexpr,
     USE_TMA: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Forward Triton mainloop. 1-D grid over (token blocks x vocab splits); program (pid_m, pid_n) handles BLOCK_M tokens and one vocab split of vocab_per_split columns, iterating over BLOCK_N column tiles; each tile computes logits by a K-loop GEMM (pointer-based with masks or TMA), scales by 1/T, masks out-of-split columns to -inf for the online softmax, and updates running max, accumulate (rescaled sum of exp), entropy_b numerator (sum z*exp) and the label logit. Writes per-(token, split) max/accu/entropy_b partials, and writes the label logit to global_logprobs only for tokens whose global label falls in this split. Program (0,0) zeroes the scalar log-prob output.
     """
     forward mainloop
     """
@@ -375,6 +404,8 @@ def efficient_entropy_triton_kernel_epilogue(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Forward epilogue for non-TP: per token block, combines split partials with a numerically stable log-sum-exp merge (running global max initialized to 0), writes maximum, accumulate, entropy_b (= numerator / accumulate) and entropy, converts the stored label logit to logprob = logit - max - log(accumulate), and stores it per token (reduction 0) or atomically adds the sum (1) or sum / num_tokens (2) into the scalar output.
     """
     foward epilogue
     """
@@ -464,6 +495,8 @@ def efficient_entropy_triton_kernel_epilogue_tp(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: TP forward epilogue (first stage): merges split partials using the all-reduced (global across ranks) per-split max for the merge and the original local max for rescaling each split's accu/entropy_b, writing per-token global max, local accumulate and local entropy_b numerator (later summed across ranks).
     pid_m = tl.program_id(axis=0)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -532,6 +565,8 @@ def efficient_entropy_triton_epilogue_tp_update(
     reduction: int,
     BLOCK_SIZE_M: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: TP forward final stage after cross-rank sums: entropy_b /= accumulate, entropy = log(accumulate) + max - entropy_b, logprob = label logit - max - log(accumulate), stored per token or reduced to the scalar as in the non-TP epilogue.
     pid_m = tl.program_id(axis=0)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -571,6 +606,13 @@ def efficient_entropy_forward(
     temperature: typing.Optional[float] = 1.0,
     dist_process_group: typing.Optional[dist.ProcessGroup] = None,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: validates CUDA, contiguous 2-D hidden (N, H), weight (V_local, H), 1-D labels (N), matching devices/shapes and H divisible by 128. On first TP call creates a dedicated stream and two events (cached on the function). Allocates outputs (logprobs per token or scalar; zero-initialized for TP so the label-logit all-reduce works), entropy, maximum, and a single buffer holding accumulate and entropy_b, plus per-split partial buffers (vocab_per_split 1024). Launches the mainloop. Non-TP: launches the epilogue. TP: keeps a copy of local split maxima, all-reduces maxima (MAX), all-reduces the label logits (SUM) on the dedicated stream overlapped with the TP epilogue, then all-reduces accumulate+entropy_b (SUM) and runs the update kernel.
+    # Inputs: hidden, weight, labels; reduction code; temperature; dist_process_group - vocab-parallel group or None.
+    # Outputs: tuple (logprobs, entropy, maximum, accumulate, entropy_b) - the last three are saved for backward.
+    # Exceptions: AssertionError on invalid inputs or if _use_triton is False; ValueError for invalid reduction.
+    # Side effects: kernel launches, collectives, stream/event creation.
+    # Note: labels outside the local/global vocab range (e.g. ignore indices) leave per-token logprobs uninitialized in the non-TP case.
     """
     forward host function
     """
@@ -636,6 +678,8 @@ def efficient_entropy_forward(
     if _config._use_triton:
         # 1D kernel launch, then split the tile
         def mainloop_grid(meta):
+            # [FUNCTION DOC]
+            # HELPER: Grid of (token blocks * num_splits) programs.
             return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * num_splits,)
 
         efficient_entropy_kernel_general_mainloop[mainloop_grid](
@@ -671,6 +715,8 @@ def efficient_entropy_forward(
 
     # reduction on maximum and maximum_indices
     def epilogue_grid(meta):
+        # [FUNCTION DOC]
+        # HELPER: Grid of one program per token block.
         return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]),)
 
     if dist_process_group is None:
@@ -805,6 +851,8 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
     GROUP_SIZE_M: tl.constexpr,
     USE_TMA: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Fully fused backward kernel (_Total_Fuse_MN). Grouped (GROUP_SIZE_M swizzled) tiles over (tokens x vocab); recomputes the logits tile, forms d_logits from saved max/accu/entropy_b, dlogprobs (per token, or broadcast scalar for sum, divided by N for mean; negated) and dentropy, scales by 1/T, then for each K chunk atomically adds d_logits^T @ hidden into d_weight and d_logits @ weight into d_hidden (both fp32, pre-zeroed).
     """
     backward mainloop, where d_logits & d_hidden & d_weight are fused
     """
@@ -1010,6 +1058,8 @@ def efficient_entropy_backward_kernel_d_hidden(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Standalone backward kernel computing d_hidden directly: program per (token block, hidden chunk) loops over all vocab tiles, recomputing logits and d_logits, and accumulates d_logits @ weight[:, chunk]. Not used by the current host function.
     """
     backward d_hidden
     """
@@ -1137,6 +1187,8 @@ def efficient_entropy_backward_kernel_d_weight(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Standalone backward kernel computing d_weight directly: program per (vocab block, hidden chunk) loops over all token tiles, recomputing d_logits and accumulating d_logits^T @ hidden[:, chunk]. Not used by the current host function.
     pid = tl.program_id(axis=0)
     num_pid_n = tl.cdiv(vocab_size, BLOCK_SIZE_N)
     pid_n = pid % num_pid_n
@@ -1258,6 +1310,8 @@ def efficient_entropy_backward_kernel_general_d_logits(
     GROUP_SIZE_M: tl.constexpr,
     USE_TMA: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Backward kernel (_Total_Separate) that recomputes a (token x vocab) logits tile and stores the corresponding d_logits tile (cast to the output dtype) into a full d_logits matrix.
     """
     backward d_logits
     """
@@ -1421,6 +1475,8 @@ def efficient_entropy_backward_kernel_general_d_logits_split_N(
     GROUP_SIZE_M: tl.constexpr,
     USE_TMA: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Like the d_logits kernel but restricted to vocab chunk split_idx of width vocab_per_split; stores into a (tokens x vocab_per_split) buffer at chunk-local column offsets, masking columns beyond the chunk (weight loads beyond the vocab bound are zero in the non-TMA path).
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(num_tokens, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(vocab_per_split, BLOCK_SIZE_N)
@@ -1526,6 +1582,12 @@ def efficient_entropy_backward(
     temperature: typing.Optional[float] = 1.0,
     dist_process_group: typing.Optional[dist.ProcessGroup] = None,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: validates inputs like the forward plus shapes of dlogprobs (per token or scalar per reduction), dentropy, maximum, acc, entropy_b. Allocates d_hidden/d_weight as fp32 zeros for the fused strategy or when should_return_fp32_grad, else empty in hidden's dtype. Strategy dispatch: _Total_Fuse_MN launches the fused kernel; _Total_Separate materializes full d_logits then d_hidden = d_logits @ weight and d_weight = d_logits^T @ hidden; _Split_Dlogits_N processes vocab chunks of 9504 columns, computing each chunk's d_logits (last chunk trimmed), accumulating d_hidden across chunks and writing each d_weight row slice; _Split_Dlogits_M raises NotImplementedError.
+    # Inputs: dlogprobs, dentropy - upstream grads; hidden, weight, labels; maximum, acc, entropy_b - forward saved stats; reduction; should_return_fp32_grad; temperature; dist_process_group - used only for the rank offset.
+    # Outputs: (d_hidden, d_weight). d_hidden is the local contribution; cross-rank reduction for TP is the caller's job.
+    # Exceptions: AssertionError on invalid inputs or if Triton is disabled in _Total_Separate; NotImplementedError for _Split_Dlogits_M.
+    # KNOWN ISSUE: with should_return_fp32_grad and a non-fused strategy, d_hidden/d_weight are fp32 while d_logits is in hidden's dtype, so the matmuls with out= fp32 buffers will likely fail with a dtype mismatch.
     """
     backward host function
     """
@@ -1579,6 +1641,8 @@ def efficient_entropy_backward(
     if _config._backward == BackwardEnum._Total_Fuse_MN:
         # --- Triton doesn't materialize d_logits at all. Split tiles at the perspective of d_logits.
         def mainloop_grid(meta):
+            # [FUNCTION DOC]
+            # HELPER: Grid of token blocks * vocab blocks for the fused kernel.
             return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]),)
 
         efficient_entropy_backward_kernel_general_mainloop_MN[mainloop_grid](
@@ -1622,6 +1686,8 @@ def efficient_entropy_backward(
         if _config._use_triton:
 
             def d_logits_grid(meta):
+                # [FUNCTION DOC]
+                # HELPER: Grid of token blocks * vocab blocks for the full d_logits kernel.
                 return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]),)
 
             efficient_entropy_backward_kernel_general_d_logits[d_logits_grid](
@@ -1668,6 +1734,8 @@ def efficient_entropy_backward(
         assert _d_logits.is_contiguous()
 
         def d_logits_grid(meta):
+            # [FUNCTION DOC]
+            # HELPER: Grid of token blocks * vocab_per_split blocks for the split-N d_logits kernel.
             return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_per_split, meta["BLOCK_SIZE_N"]),)
 
         for split_idx in range(num_splits):

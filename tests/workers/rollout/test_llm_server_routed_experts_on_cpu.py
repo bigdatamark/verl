@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CPU tests for merging routed_experts (MoE routing records) across partial-rollout resume attempts in
+# FullyAsyncLLMServerClient, across three backend representations: vLLM writable uint8, SGLang detokenized
+# read-only int32 (frombuffer), and SGLang skip-tokenizer-init writable int32. The upstream generate is scripted
+# per attempt. Constants: 2 layers, top-k 4, BACKENDS list.
+
 """Routing-record merging across partial rollout resumes in FullyAsyncLLMServerClient.
 
 Every backend normalizes ``routed_experts`` to numpy, but dtype and writability still
@@ -42,6 +49,10 @@ BACKENDS = ["vllm", "sglang_detokenized", "sglang_skip_tokenizer_init"]
 
 
 def _routing(markers: list[int], backend: str) -> np.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: builds a routing array of shape (len(markers), LAYERS, TOPK) where every entry of row i equals markers[i],
+    # represented as the given backend delivers it (uint8 copy, read-only int32 view over bytes, or int32 via a torch
+    # round-trip). Exceptions: AssertionError for an unknown backend.
     """Build a ``[len(markers), LAYERS, TOPK]`` routing record as ``backend`` delivers it.
 
     Every entry of row ``i`` is ``markers[i]`` so :func:`_markers` can recover which
@@ -59,10 +70,17 @@ def _routing(markers: list[int], backend: str) -> np.ndarray:
 
 
 def _markers(routing: Any) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: returns the marker of each row (element at layer 0, top-k slot 0) as a list of ints.
     return [int(v) for v in routing[:, 0, 0]]
 
 
 def _install_segments(monkeypatch: pytest.MonkeyPatch, segments: list[TokenOutput]) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: patches the base LLMServerClient.generate with a coroutine that records each attempt's prompt ids and
+    # returns the next scripted segment, and replaces llm_server's asyncio.sleep with a zero-delay version.
+    # Inputs: monkeypatch, list of TokenOutput segments. Outputs: list accumulating prompts seen per attempt.
+    # Exceptions: StopIteration if more attempts than segments occur.
     """Script the upstream so each resume attempt returns the next segment.
 
     ``FullyAsyncLLMServerClient.generate`` reaches the upstream through ``super()``, which
@@ -73,6 +91,8 @@ def _install_segments(monkeypatch: pytest.MonkeyPatch, segments: list[TokenOutpu
     prompts_seen: list[list[int]] = []
 
     async def fake_generate(self, request_id, *, prompt_ids, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: records a copy of prompt_ids and returns the next segment.
         prompts_seen.append(list(prompt_ids))
         return next(pending)
 
@@ -81,6 +101,8 @@ def _install_segments(monkeypatch: pytest.MonkeyPatch, segments: list[TokenOutpu
     real_sleep = asyncio.sleep
 
     async def no_wait(_delay, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: sleep replacement ignoring the delay and yielding once.
         return await real_sleep(0, *args, **kwargs)
 
     # The resume loop backs off 1s between attempts; collapse it to keep the test fast.
@@ -90,6 +112,8 @@ def _install_segments(monkeypatch: pytest.MonkeyPatch, segments: list[TokenOutpu
 
 
 def _client() -> FullyAsyncLLMServerClient:
+    # [FUNCTION DOC]
+    # HELPER: builds a client with an empty config stub (partial rollout retry enabled) and no load balancer.
     # A config without ``async_training`` leaves partial rollout enabled, so the client
     # retries on "aborted" instead of returning after the first attempt.
     return FullyAsyncLLMServerClient(config=SimpleNamespace(), load_balancer_handle=None)
@@ -98,6 +122,10 @@ def _client() -> FullyAsyncLLMServerClient:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
 async def test_resume_appends_only_newly_generated_routing(monkeypatch, backend):
+    # [FUNCTION DOC]
+    # Three attempts (aborted, aborted, completed) each returning routing for prompt plus response; asserts each resume
+    # re-sends prompt plus accumulated tokens, the final tokens are the concatenation, and the merged routing keeps all
+    # rows of the first attempt and only the newly generated tail rows of later attempts (shape (8, 2, 4)).
     """Two resumes: each attempt re-sends the accumulated prompt and returns routing for
     prompt + response, so only the tail matching the fresh tokens may be appended."""
     segments = [
@@ -135,6 +163,8 @@ async def test_resume_appends_only_newly_generated_routing(monkeypatch, backend)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
 async def test_merge_yields_numpy_and_preserves_dtype(monkeypatch, backend):
+    # [FUNCTION DOC]
+    # Asserts the merged routing after a resume is a numpy array with the backend's original dtype.
     """Backends agree on numpy, which is what lets the merge be a plain concatenate. Dtype
     still varies, and ``AgentLoopWorker._postprocess`` keys its padded buffer off it."""
     original = _routing([10, 11], backend)
@@ -153,6 +183,8 @@ async def test_merge_yields_numpy_and_preserves_dtype(monkeypatch, backend):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
 async def test_single_attempt_passes_backend_object_through(monkeypatch, backend):
+    # [FUNCTION DOC]
+    # Asserts that with no resume the backend's routing object is returned unchanged (identity).
     """Without a resume there is nothing to concatenate, so the backend object reaches the
     agent loop untouched -- including SGLang's read-only array."""
     original = _routing([10, 11], backend)
@@ -167,6 +199,9 @@ async def test_single_attempt_passes_backend_object_through(monkeypatch, backend
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
 async def test_merged_routing_converts_for_downstream(monkeypatch, backend):
+    # [FUNCTION DOC]
+    # Asserts the merged routing converts to an int64 tensor of shape (3, 2, 4) with markers [10, 11, 22], is writable,
+    # and converts via from_numpy with the same markers.
     """Both downstream sinks normalize to int64 tensors: ``AgentLoopOutput.as_dict`` via
     ``torch.tensor`` and ``AgentLoopWorker._postprocess`` via ``torch.from_numpy``."""
     segments = [

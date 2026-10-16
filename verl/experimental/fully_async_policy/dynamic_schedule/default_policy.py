@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Module default_policy: the built-in "default" dynamic scheduling policy, which always deactivates active hybrid
+# replicas before training, adapts the deactivation wait ratio from observed rollout waiting, and gates re-activation
+# with a cost/benefit estimate. Constants: default switch cost (10 s) used before any measurement, rolling window of 3
+# switch overheads, ratio increase clip bounds [0.02, 0.1], decrease step 0.02, and a pessimistic initial per-sample
+# time of 1000 s. Registering on import adds "default" to the policy registry.
+
 """Built-in "default" dynamic scheduling policy."""
 
 import ray
@@ -35,6 +42,9 @@ INITIAL_PER_SAMPLE_TIME_S = 1000.0
 
 @register_policy("default")
 class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
+    # [CLASS DOC]
+    # Stateful policy holding the current deactivate_ratio, recent switch overheads and the last per-sample time estimate.
+    # An optional _rollouter attribute (Ray actor handle) may be attached externally for request rebalancing.
     """Default policy: deactivate whenever hybrid is active, with adaptive ratio.
 
     Wait threshold: deactivate_ratio × step_required_samples
@@ -66,6 +76,9 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
     """
 
     def __init__(self, deactivate_ratio: float = 0.3, only_hybrid: bool = False):
+        # [FUNCTION DOC]
+        # Behavior: stores the initial ratio and only_hybrid flag, initializes the overhead history and per-sample estimate;
+        # when only_hybrid, prints a notice and forces the ratio to 1.0. Side effects: stdout print.
         self.deactivate_ratio = deactivate_ratio
         self.only_hybrid = only_hybrid
         self._recent_switch_overheads: list[float] = []
@@ -78,18 +91,30 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             self.deactivate_ratio = 1.0
 
     def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: deactivate exactly when hybrid is currently active. Outputs: bool.
         return is_hybrid_active
 
     def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns step_required_samples times deactivate_ratio, truncated to int.
         return int(ctx.step_required_samples * self.deactivate_ratio)
 
     def _switch_cost(self) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: average of the last window of recorded switch overheads, or the default threshold if none. Outputs: seconds.
         if self._recent_switch_overheads:
             recent = self._recent_switch_overheads[-SWITCH_OVERHEAD_WINDOW_SIZE:]
             return sum(recent) / len(recent)
         return DEFAULT_SWITCH_THRESHOLD_S
 
     def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
+        # [FUNCTION DOC]
+        # Behavior: no-op on step <= 0 or only_hybrid. Records activate+deactivate duration if positive. If any samples were
+        # really waited on, increases the ratio by the waited fraction of step_required_samples (max step when that is 0),
+        # clipped to [MIN, MAX], capping the ratio at 1.0; otherwise decreases it by the fixed step. Prints diagnostics.
+        # Side effects: mutates ratio and history; stdout.
+        # KNOWN ISSUE: the decrease branch has no lower bound, so the ratio can become zero or negative despite the documented (0, 1] range.
         if global_steps <= 0 or self.only_hybrid:
             return
 
@@ -130,6 +155,8 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         )
 
     def _deactivate_gap(self, ctx: DynamicScheduleContext) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: threshold (ratio times step_required_samples) minus surplus (generated minus expected). Outputs: float sample gap.
         """How many more samples are needed to reach the deactivate-wait threshold.
 
         Shared by :meth:`should_activate_after_step` and
@@ -140,6 +167,9 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         return deactivate_threshold - surplus
 
     def _estimate_per_sample_time(self, ctx: DynamicScheduleContext) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: if this cycle has positive wait time and waited samples, updates the estimate to their ratio; returns
+        # the (possibly unchanged) estimate. Side effects: mutates the cached estimate.
         """Estimate standalone-only wall-clock time to produce one sample.
 
         Divides this cycle's total wait time by ``step_wait_samples`` — the
@@ -161,6 +191,9 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         return self._last_per_sample_time
 
     def _has_positive_net_benefit(self, global_steps: int, ctx: DynamicScheduleContext) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: computes switch cost and per-sample time, expected benefit = non-negative gap times per-sample time,
+        # prints the comparison, and returns whether benefit exceeds cost. Side effects: may update the per-sample estimate; stdout.
         """Cost/benefit gate: is activating hybrid worth its switch overhead?
 
         Converts the outstanding sample gap into an estimated wall-clock cost
@@ -191,6 +224,9 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
     def should_activate_after_step(
         self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext
     ) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: always True when only_hybrid. Otherwise prints context, returns False if the deactivate gap is not positive,
+        # else the cost/benefit result. Inputs: global_steps; is_hybrid_active unused; ctx. Outputs: bool. Side effects: stdout.
         if self.only_hybrid:
             return True
 
@@ -209,6 +245,10 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         return self._has_positive_net_benefit(global_steps, ctx)
 
     def request_rebalance(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
+        # [FUNCTION DOC]
+        # Behavior: if no _rollouter is attached, prints a skip notice. Otherwise synchronously calls the rollouter's
+        # rebalance_requests remote method and prints cleared sticky entries and server loads; any exception is caught and
+        # printed. Outputs: none. Side effects: blocking Ray call; aborts and retries in-flight requests remotely.
         """Redistribute requests across all active replicas after activation.
 
         Performs a full rebalance via the rollouter:
