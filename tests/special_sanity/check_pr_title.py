@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CI sanity script (all logic at module level, runs on import) validating the PR title from env var PR_TITLE against the
+# format "[1/N] [BREAKING][module, ...] type: description". An optional "[digit/digit-or-N]" progress prefix and an
+# optional "[BREAKING]" prefix are stripped (case-insensitive); the remaining title must start with a bracketed list of
+# modules (letters, underscores, commas, spaces) each of which is in allowed_modules, followed by whitespace, an
+# allowed type (feat, fix, refactor, chore, test), a colon, whitespace and a description. Any failure prints details
+# and raises Exception; success prints the parsed modules, type and breaking flag.
+# KNOWN ISSUE: the progress prefix pattern accepts only single-digit numbers (e.g. "[10/12]" is not stripped and the title fails validation).
+
 import os
 import re
 

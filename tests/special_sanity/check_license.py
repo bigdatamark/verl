@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CI sanity script: for the git-tracked .py files under the given --directories/-d (or given .py files), asserts each
+# file's content contains at least one of the accepted license/copyright header strings in license_headers. Prints
+# every checked path; the first file without a header raises AssertionError. Must be run inside a git work tree.
+
 import subprocess
 from argparse import ArgumentParser
 from pathlib import Path
@@ -54,12 +60,20 @@ license_headers = [
 
 
 def _git_tracked_py_files() -> set[Path]:
+    # [FUNCTION DOC]
+    # HELPER: Runs git ls-files for .py patterns in the current directory and returns the paths as a set of relative Paths.
+    # Exceptions: CalledProcessError if git fails (e.g. not a repository).
+    # Side effects: spawns a subprocess.
     """Return the set of .py files tracked by git (respects .gitignore)."""
     result = subprocess.run(["git", "ls-files", "*.py", "**/*.py"], capture_output=True, text=True, check=True)
     return {Path(line) for line in result.stdout.splitlines() if line}
 
 
 def get_py_files(path_arg: Path, tracked: set[Path]) -> Iterable[Path]:
+    # [FUNCTION DOC]
+    # HELPER: For a directory, returns a lazy iterable of tracked paths equal to it or located under it (comparison is on
+    # relative paths, so the directory argument should be relative to the repository root); for a .py file returns it
+    # directly (even if untracked); otherwise returns an empty list.
     """get py files under a dir. if already py file return it
 
     Args:

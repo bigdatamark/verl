@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CI sanity CLI enforcing the example run-script naming convention described in the module docstring: every .sh under
+# --root (default examples), apart from ignored directories/files, must be named run_<...>_<train-backend>.sh with the
+# full name ending in an allowed backend suffix, and must not contain any forbidden token (inference backend,
+# platform, machine type, quantization) as an underscore-separated word.
+
 """Enforce the canonical naming convention for example run scripts.
 
 The current convention (see ``examples/README.md``) is::
@@ -110,6 +116,8 @@ DEFAULT_IGNORE_FILES = (
 
 
 def _split_tokens(stem: str) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Splits a filename stem on underscores and drops a leading "run" token. Outputs: list of tokens.
     """Split a script stem on underscores, dropping the leading ``run`` token."""
     parts = stem.split("_")
     if parts and parts[0] == "run":
@@ -118,11 +126,16 @@ def _split_tokens(stem: str) -> list[str]:
 
 
 def _has_allowed_backend(stem: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns whether the stem ends with "_" followed by any allowed backend (so multi-word backends such as megatron_lite match).
     """Return whether ``stem`` ends with one of the allowed backend suffixes."""
     return any(stem.endswith(f"_{backend}") for backend in ALLOWED_BACKENDS)
 
 
 def _is_ignored(path: Path, repo_root: Path, ignore_dirs: tuple[str, ...], ignore_files: tuple[str, ...]) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Computes the path relative to repo_root (POSIX form) and returns True if it equals an ignored file or equals /
+    # lies under an ignored directory. Exceptions: ValueError if the path is not under repo_root.
     rel = path.relative_to(repo_root).as_posix()
     if rel in ignore_files:
         return True
@@ -130,6 +143,10 @@ def _is_ignored(path: Path, repo_root: Path, ignore_dirs: tuple[str, ...], ignor
 
 
 def check_filename(path: Path, display: str | None = None) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Validates one script basename. Returns early with a single error if the name does not start with "run_" or does
+    # not end with ".sh"; otherwise may report forbidden tokens and/or a missing allowed backend suffix (both can be reported).
+    # Inputs: path; display - optional text used in messages (defaults to the path). Outputs: list of error strings (empty if valid).
     """Return a list of human-readable violations for one script path.
 
     The path's *basename* is what we validate; the directory layout is
@@ -180,12 +197,20 @@ def collect_scripts(
     ignore_dirs: tuple[str, ...],
     ignore_files: tuple[str, ...],
 ) -> list[Path]:
+    # [FUNCTION DOC]
+    # HELPER: Returns a sorted list of files matching *.sh recursively under root that are not ignored.
     return sorted(
         p for p in root.rglob("*.sh") if p.is_file() and not _is_ignored(p, repo_root, ignore_dirs, ignore_files)
     )
 
 
 def main(argv: list[str] | None = None) -> int:
+    # [FUNCTION DOC]
+    # Behavior: parses --root, --repo-root (default "."), --ignore-dirs and --ignore-files (defaults to the module lists;
+    # passing the flag replaces rather than extends them); resolves paths; returns 2 if root is not a directory. Checks all
+    # collected scripts, displaying them relative to repo_root when possible. On errors prints them plus a convention summary
+    # to stderr and returns 1; otherwise prints a success count and returns 0.
+    # Inputs: argv - optional argument list (defaults to the process arguments). Outputs: exit code.
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--root",

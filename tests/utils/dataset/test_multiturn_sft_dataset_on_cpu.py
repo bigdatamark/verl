@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Tests MultiTurnSFTDataset tokenization of chat conversations into input_ids / attention_mask /
+# position_ids / loss_mask (loss only on assistant turns), right padding vs no-padding modes,
+# forwarding of apply_chat_template_kwargs, and the vision-language path (images, pixel_values,
+# image_grid_thw, 4-row multimodal position ids) through a collated dataloader. Requires local model
+# checkpoints under ~/models (custom_model_prefix). Writes parquet fixtures into a relative
+# "test_data" directory in the current working directory (not cleaned up).
 """
 Test the MultiTurnSFTDataset implementation
 """
@@ -45,6 +53,19 @@ custom_model_prefix = Path("~/models").expanduser().resolve()
     ],
 )
 def test_multiturn_sft_dataset(model_path: str, ignore_input_ids_mismatch: bool):
+    # [FUNCTION DOC]
+    # Behavior: writes two 4-message conversations (user, assistant, tool, assistant) to test_data/test.parquet,
+    # builds the dataset with max_length 512 and truncation "error", and checks: length 2; the four keys are
+    # long tensors of equal shape; decoded loss-masked tokens contain both assistant replies for each
+    # conversation and assistant text never appears in unmasked tokens while user text appears only there;
+    # attention mask is a contiguous prefix of ones; position ids are 0..n-1 then zeros on padding. With
+    # max_length 1024 asserts padding uses pad_token_id with zero attention/loss masks. In "no_padding" mode
+    # asserts input_ids/position_ids/loss_mask exist and the loss-masked text decodes exactly to the two
+    # replies each followed by "<|im_end|>\n".
+    # Inputs: model_path - local tokenizer path; ignore_input_ids_mismatch - dataset config flag (True for Qwen3).
+    # Outputs: none. Exceptions: AssertionError. Side effects: writes a parquet file, loads tokenizer, prints.
+    # KNOWN ISSUE: the exact "<|im_end|>" suffix assertion is template-specific and assumes a ChatML-style
+    # template for every parametrized model; tool-role content is never checked against either mask.
     print(f"Starting test... model_path={model_path}, ignore_input_ids_mismatch={ignore_input_ids_mismatch}")
     # Create a temporary parquet file with test data
     test_data = {
@@ -243,6 +264,12 @@ def test_multiturn_sft_dataset(model_path: str, ignore_input_ids_mismatch: bool)
     ],
 )
 def test_multiturn_sft_dataset_with_chat_template_kwargs(model_path: str, apply_chat_template_kwargs: dict):
+    # [FUNCTION DOC]
+    # Behavior: with a gpt-oss tokenizer and apply_chat_template_kwargs (model_identity), builds a no-padding
+    # dataset from two single-exchange conversations and asserts for every item that assistant content is only
+    # in loss-masked text and user content only in unmasked text (i.e. kwargs are applied when measuring the
+    # system prompt so masks are not shifted).
+    # Inputs: model_path; apply_chat_template_kwargs mapping. Side effects: writes test_data/test_kwargs.parquet.
     """Test that custom apply_chat_template_kwargs are forwarded to system prompt
     measurement so the loss mask is not shifted when kwargs change tokenization.
 
@@ -309,6 +336,9 @@ def test_multiturn_sft_dataset_with_chat_template_kwargs(model_path: str, apply_
 
 
 def generate_image(description: str, size: str = "256x256"):
+    # [FUNCTION DOC]
+    # HELPER: stub tool function whose signature and docstring are converted to a JSON tool schema for the VLM
+    # fixture. Body is a no-op; returns None.
     """Generate a simple image based on description.
 
     Args:
@@ -323,6 +353,11 @@ def generate_image(description: str, size: str = "256x256"):
 
 @pytest.fixture
 def vlm_data_file():
+    # [FUNCTION DOC]
+    # HELPER: fixture writing test_data/test_vlm.parquet with four samples: single image, two images, a
+    # multi-turn tool-call conversation with a tool-produced image and a generate_image tool schema, and a
+    # text-only sample. PIL images are serialized to {"bytes": PNG bytes}. Outputs: the file path.
+    # Side effects: creates directory and file in the working directory.
     test_data = [
         # sample 0: single turn with image input
         {
@@ -399,6 +434,8 @@ def vlm_data_file():
     df = pd.DataFrame(test_data)
 
     def serialize_image(img):
+        # [FUNCTION DOC]
+        # HELPER: converts a PIL image to a mapping {"bytes": PNG-encoded bytes}; returns other values unchanged.
         if isinstance(img, Image.Image):
             img_byte_arr = BytesIO()
             img.save(img_byte_arr, format="PNG")
@@ -418,6 +455,17 @@ def vlm_data_file():
     ],
 )
 def test_multiturn_sft_vlm_dataset_on_cpu(model_path, vlm_data_file):
+    # [FUNCTION DOC]
+    # Behavior: builds a no-padding dataset with a Qwen3-VL tokenizer and processor; for each item asserts
+    # input_ids and loss_mask shapes match, position_ids are (4, seq_len), non-assistant text (with "<image>"
+    # placeholders removed) appears in unmasked tokens, assistant text appears in masked tokens without the
+    # "assistant" role marker, and for samples with images that image_grid_thw is (num_images, 3), pixel_values
+    # is (patches, 3*temporal_patch*patch^2) and the number of image tokens equals patches / merge_size^2;
+    # otherwise both are absent.
+    # Inputs: model_path; vlm_data_file fixture.
+    # KNOWN ISSUE: messages_key is passed at the top level of config rather than under "multiturn"; it only
+    # works if the default key is "messages". The pixel_values error message prints 3*patch^2 rather than the
+    # asserted shape.
     df = pd.read_parquet(vlm_data_file)
     tokenizer = hf_tokenizer(model_path)
     processor = hf_processor(model_path)
@@ -479,6 +527,13 @@ def test_multiturn_sft_vlm_dataset_on_cpu(model_path, vlm_data_file):
     ],
 )
 def test_multiturn_sft_vlm_dataloader_on_cpu(model_path, vlm_data_file):
+    # [FUNCTION DOC]
+    # Behavior: wraps the dataset in a non-shuffled single-replica DistributedSampler and StatefulDataLoader
+    # (batch 2, drop_last) with the no-padding SFTTensorCollator; per batch asserts input_ids, loss_mask and
+    # position_ids are nested tensors of batch size 2, position values are (4, total tokens), and the
+    # extracted multimodal inputs have image_grid_thw rows equal to the batch's image count and pixel_values
+    # rows equal to the total patch count.
+    # Inputs: model_path; vlm_data_file fixture.
     df = pd.read_parquet(vlm_data_file)
     tokenizer = hf_tokenizer(model_path)
     processor = hf_processor(model_path)

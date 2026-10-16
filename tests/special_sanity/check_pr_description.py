@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# GitHub Actions sanity script: fails if the first NUM_LINES (5) lines of the PR body, after stripping, are identical to
+# the first lines of .github/PULL_REQUEST_TEMPLATE.md (under GITHUB_WORKSPACE or "."), meaning the author left the
+# "What does this PR do?" placeholder unchanged. Reads the event payload from GITHUB_EVENT_PATH.
+
 #!/usr/bin/env python3
 import json
 import os
@@ -22,14 +27,20 @@ NUM_LINES = 5
 
 # Custom exception types for clear error handling
 class TemplateFileError(Exception):
+    # [CLASS DOC]
+    # HELPER: Raised when the PR template cannot be read.
     pass
 
 
 class PRBodyLoadError(Exception):
+    # [CLASS DOC]
+    # HELPER: Raised when the GitHub event payload cannot be read or parsed.
     pass
 
 
 class PRDescriptionError(Exception):
+    # [CLASS DOC]
+    # HELPER: Raised when the PR body still starts with the unmodified template.
     pass
 
 
@@ -38,6 +49,10 @@ template_file = os.path.join(os.getenv("GITHUB_WORKSPACE", "."), ".github", "PUL
 
 
 def load_template(path):
+    # [FUNCTION DOC]
+    # HELPER: Reads up to NUM_LINES lines from the template, stripping each, and returns them as a list.
+    # Exceptions: TemplateFileError wrapping any read error.
+    # KNOWN ISSUE: the docstring says lines are kept "without stripping any characters", but each line is stripped.
     """
     Load only the first NUM_LINES of the PR template file as a list of lines,
     without stripping any characters.
@@ -56,6 +71,9 @@ def load_template(path):
 
 
 def load_pr_body(event_path):
+    # [FUNCTION DOC]
+    # HELPER: Loads the event JSON and returns pull_request.body, or "" when missing or null.
+    # Exceptions: PRBodyLoadError wrapping any read/parse error.
     try:
         with open(event_path, encoding="utf-8") as f:
             payload = json.load(f)
@@ -65,6 +83,9 @@ def load_pr_body(event_path):
 
 
 def check_pr_description(body, template_lines):
+    # [FUNCTION DOC]
+    # HELPER: Compares the stripped first NUM_LINES lines of the body with the template lines; raises PRDescriptionError if
+    # equal, otherwise prints both lists for debugging.
     """
     Compare the first NUM_LINES lines of the PR body to the template lines.
     If they match exactly, the placeholder was not modified.
@@ -82,6 +103,8 @@ def check_pr_description(body, template_lines):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: raises OSError if GITHUB_EVENT_PATH is unset; loads template and body, runs the comparison, prints success.
     event_path = os.getenv("GITHUB_EVENT_PATH")
     if not event_path:
         raise OSError("GITHUB_EVENT_PATH is not set.")

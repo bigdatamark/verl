@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CI sanity CLI enforcing that uv is only used on the GPU branch of shell scripts (rules in the module docstring). Scans
+# *.sh under --roots (default examples, recipe, tests) relative to --repo-root, with regex detection of uv subcommand
+# invocations (bare or embedded in strings) and of the VERL_USE_UV + DEVICE=gpu gate.
+
 """Keep the uv launch path GPU-only, so Ascend NPU runs keep using ambient python.
 
 The uv flow (``pyproject.toml`` / ``uv.lock``) resolves only the CUDA backends —
@@ -69,6 +74,9 @@ NPU_NAME_MARKERS = ("_npu", "ascend", "mindspeed")
 
 
 def is_npu_only(rel_path: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if the relative path is inside an NPU-only tree or its lowercased basename contains "_npu",
+    # "ascend" or "mindspeed".
     if any(rel_path == d or rel_path.startswith(d + "/") for d in NPU_DIRS):
         return True
     name = Path(rel_path).name.lower()
@@ -76,6 +84,8 @@ def is_npu_only(rel_path: str) -> bool:
 
 
 def strip_comment(line: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns "" for whole-line comments (first non-space character is "#"), otherwise the line unchanged.
     """Drop a whole-line comment; keep everything else verbatim.
 
     Trailing comments are left in place — quoting makes them ambiguous, and a
@@ -85,10 +95,18 @@ def strip_comment(line: str) -> str:
 
 
 def uv_command_lines(lines: list[str]) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Returns zero-based indices of non-comment lines containing a uv command.
     return [i for i, line in enumerate(lines) if UV_COMMAND.search(strip_comment(line))]
 
 
 def enclosing_ifs(lines: list[str], idx: int) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Scans backwards from the line, tracking "fi" depth, to find the if lines whose then-branch contains it
+    # (innermost first). An else/elif at depth 0 marks that the line is in an else branch so the next if at depth 0 is not
+    # counted (and the flag resets). One-line ifs ending in "fi" are ignored. Text-based: only lines that are exactly "fi",
+    # "else", or start with "elif " / "if " are recognized.
+    # Inputs: lines, idx. Outputs: list of line indices.
     """Indices of the ``if`` lines whose *then* branch contains ``lines[idx]``, innermost first.
 
     An ``if`` whose ``else`` / ``elif`` branch holds the line does not count: a
@@ -114,10 +132,16 @@ def enclosing_ifs(lines: list[str], idx: int) -> list[int]:
 
 
 def is_gpu_gate(line: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if the line contains both the VERL_USE_UV default clause and the DEVICE gpu test clause.
     return bool(USE_UV_CLAUSE.search(line) and GPU_CLAUSE.search(line))
 
 
 def check_script(lines: list[str], display: str) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns error strings for one script: none if it has no uv commands; for NPU-only paths one error per uv line;
+    # otherwise one error for each uv line with no GPU-gating enclosing if (mentioning the innermost non-gating if, if any).
+    # Inputs: lines, display - repo-relative path used for NPU detection and messages.
     uv_lines = uv_command_lines(lines)
     if not uv_lines:
         return []
@@ -147,6 +171,10 @@ def check_script(lines: list[str], display: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # [FUNCTION DOC]
+    # Behavior: parses --roots and --repo-root; returns 2 if a root is not a directory; collects scripts, de-duplicates and
+    # sorts them, counts those using uv and checks them. Prints errors and guidance to stderr and returns 1 on violations,
+    # otherwise prints a success message and returns 0. Inputs: argv - optional arguments. Outputs: exit code.
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--roots",

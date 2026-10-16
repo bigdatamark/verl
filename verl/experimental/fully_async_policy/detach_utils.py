@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module detach_utils: utilities for fully async training: the RolloutSample record passed from rollouter to
+# trainer, per-sample generation data preparation, assembly of a training batch (with timing, staleness and
+# partial-rollout statistics) from many rollout samples, a MetricsAggregator that merges per-micro-step metrics over a
+# weight-sync cycle, and helpers for creating asyncio tasks whose exceptions are reported.
 import asyncio
 import time
 from collections import defaultdict
@@ -26,6 +32,9 @@ from verl.trainer.ppo.ray_trainer import compute_response_mask
 
 @dataclass
 class RolloutSample:
+    # [CLASS DOC]
+    # Dataclass for one generated sample group: full_batch (generated DataProto), sample_id, epoch and a rollout_status
+    # dict of rollouter-side statistics.
     """Enhanced rollout sample containing both original batch info and AgentLoopOutput"""
 
     # Original batch information
@@ -40,6 +49,11 @@ class RolloutSample:
 
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
+    # [FUNCTION DOC]
+    # Behavior: builds a DataProto from the batch dict; the pop lists are currently empty so nothing is removed; if
+    # multi-turn is disabled sets every agent_name to "single_turn_agent"; repeats the batch rollout.n times interleaved.
+    # Inputs: batch_dict - single-sample dataset dict; config - full config. Outputs: repeated DataProto.
+    # KNOWN ISSUE: docstring says it returns a tuple (original batch, gen data) but a single DataProto is returned.
     """
     Similar to the logic of ray_trainer._prepare_generate_batch, but for a single sample.
     Separate the data used for generation from the original data.
@@ -72,6 +86,12 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
 
 
 def addition_process(output: DataProto):
+    # [FUNCTION DOC]
+    # HELPER: Behavior: pops per-sample metrics from meta_info and stores lists of generate_sequences and tool_calls times
+    # in non_tensor_batch under processing_times and tool_calls_times. Outputs: the same (mutated) DataProto.
+    # Exceptions: KeyError if metrics missing.
+    # KNOWN ISSUE: the stored values are plain Python lists rather than numpy arrays, unlike other non-tensor fields, which
+    # may break DataProto operations that expect arrays.
     """collect metirics"""
     metrics = output.meta_info.pop("metrics")  # List[Dict[str, str]]
     processing_times_list = [item["generate_sequences"] for item in metrics]
@@ -84,6 +104,15 @@ def addition_process(output: DataProto):
 def assemble_batch_from_rollout_samples(
     rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
 ) -> DataProto:
+    # [FUNCTION DOC]
+    # Behavior: raises if empty; prefixes the first sample's rollout_status keys with "fully_async/"; post-processes each
+    # sample's batch and concatenates them; computes response_mask if missing; optionally calls balance_batch; records per-row
+    # token counts as global_token_num; computes processing-time stats (avg/max/min/p50/p95/p99, prefixed) and tool-call
+    # time stats (max/min/mean); computes partial-rollout stats from min/max global steps per trajectory (count, ratio and
+    # max span of parameter-version differences); updates meta_info with parameter version diversity, per-trajectory
+    # versions and all stats. Prints progress and elapsed time.
+    # Inputs: rollout_samples; tokenizer (unused); config (unused); balance_batch - optional callable taking (batch, metrics).
+    # Outputs: assembled DataProto. Exceptions: ValueError on empty input; KeyError if required fields are missing.
     """
     Assemble gen_batch_output from RolloutSample objects
     Assembles batches from RolloutSample objects, similar to the _post_generate_batch logic in ray_trainer.
@@ -177,9 +206,15 @@ def assemble_batch_from_rollout_samples(
 
 
 class MetricsAggregator:
+    # [CLASS DOC]
+    # Accumulates numeric metrics across steps and aggregates them per metric using explicit rules or name heuristics;
+    # also derives throughput, idle ratio and resource-utilization metrics. Tracks hybrid/standalone GPU counts.
     """Metrics aggregator, used to combine metrics from multiple training steps"""
 
     def __init__(self, total_gpus: int, hybrid_gpus: int = 0, standalone_gpus: int = 0):
+        # [FUNCTION DOC]
+        # Behavior: initializes empty value lists, sample counts, timestamps, step count, GPU counts and aggregation rules.
+        # Inputs: total_gpus; hybrid_gpus; standalone_gpus.
         # Store all values ​​for each metric
         self.metric_values: dict[str, list[float]] = defaultdict(list)
         # Store the number of samples at each step for weighted averaging
@@ -203,6 +238,8 @@ class MetricsAggregator:
         self.aggregation_rules = self._init_aggregation_rules()
 
     def _init_aggregation_rules(self) -> dict[str, dict[str, list[str]]]:
+        # [FUNCTION DOC]
+        # HELPER: Outputs: mapping aggregation type ("time_sum", "min", "avg", "max", "last", "sum") to explicit metric names.
         """Initialize metrics aggregation rules"""
         return {
             # Time-Based metrics, can add metrics here
@@ -230,6 +267,10 @@ class MetricsAggregator:
         }
 
     def add_step_metrics(self, metrics: dict[str, Any], sample_count: int, timestamp: float = None):
+        # [FUNCTION DOC]
+        # Behavior: records sample count and timestamp (now if None), increments step count, and appends float values of
+        # numeric or tensor metrics (other types ignored). Side effects: mutates state.
+        # Exceptions: tensor values with more than one element raise in item().
         """Adding a single-step metrics"""
         if timestamp is None:
             timestamp = time.time()
@@ -246,6 +287,11 @@ class MetricsAggregator:
                 self.metric_values[key].append(float(value.item()))
 
     def _get_aggregation_type(self, metric_name: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: returns the explicit rule type if listed; else by lowercase name: contains "timing_s/" -> time_sum;
+        # mean/avg/average -> avg; max/maximum -> max; min/minimum -> min; sum/total -> sum; weighted_avg -> weighted_avg;
+        # default avg.
+        # KNOWN ISSUE: the weighted_avg branch is unreachable because any name containing "weighted_avg" already matches "avg".
         """Determine the aggregation type based on the metric name"""
         for agg_type, metric_list in self.aggregation_rules.items():
             if metric_name in metric_list:
@@ -268,6 +314,9 @@ class MetricsAggregator:
         return "avg"
 
     def _aggregate_single_metric(self, metric_name: str, values: list[float]) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: empty -> 0.0; last -> last value; weighted_avg -> sample-count weighted mean (simple mean if lengths
+        # differ or counts sum to 0); sum/time_sum -> sum; avg -> mean; max; min; otherwise mean. Outputs: float.
         """Aggregating a single metric"""
         if not values:
             return 0.0
@@ -307,6 +356,9 @@ class MetricsAggregator:
             return sum(values) / len(values)
 
     def get_aggregated_metrics(self, rollout_resource_utilization: float | None = None) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: returns {} if no steps; aggregates every metric then applies special derived metrics; prints elapsed time.
+        # Inputs: rollout_resource_utilization - optional value from the rollouter. Outputs: dict.
         """aggregated metrics
 
         Args:
@@ -340,6 +392,15 @@ class MetricsAggregator:
     def _special_metrics_aggergate(
         self, aggregated: dict[str, Any], rollout_resource_utilization: float | None = None
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: recomputes global_seqlen/minmax_diff as max minus min when present; recomputes perf/throughput as total
+        # tokens / (time per step * total_gpus) when all keys exist; sets idle ratio = timing_s/gen / timing_s/step; computes
+        # train_resource_utilization from summed compute/allocated times; and, when that, the rollout utilization, a positive GPU
+        # total and positive step time exist, adds rollout utilization and combined resource utilization using the weighted
+        # formula in the comments (x = clipped wait_for_enough_samples / step time).
+        # Inputs: aggregated dict (mutated); rollout_resource_utilization. Outputs: the same dict.
+        # Exceptions: KeyError if global_seqlen/max or min missing when minmax_diff exists; ZeroDivisionError if timing_s/step is 0
+        # while timing_s/gen exists.
         """calculate special metrics"""
 
         # global_seqlen/minmax_diff
@@ -421,6 +482,8 @@ class MetricsAggregator:
         return aggregated
 
     def reset(self):
+        # [FUNCTION DOC]
+        # Behavior: clears all stored values, counts and timestamps and resets the step count.
         """Reset Aggregator"""
         self.metric_values.clear()
         self.sample_counts.clear()
@@ -428,6 +491,8 @@ class MetricsAggregator:
         self.step_count = 0
 
     def get_current_stats(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: returns a debug dict with step count, number of metrics, total samples and metric names.
         """Get statistics about the current aggregation state (for debugging)"""
         return {
             "step_count": self.step_count,
@@ -438,6 +503,9 @@ class MetricsAggregator:
 
 
 def task_exception_handler(task: asyncio.Task):
+    # [FUNCTION DOC]
+    # HELPER: Behavior: done-callback that retrieves the task result; cancellation is ignored; other exceptions are printed
+    # and re-raised (inside the event loop's callback handler, so they surface as loop errors).
     """Handle task exceptions and log them"""
     try:
         task.result()
@@ -449,6 +517,9 @@ def task_exception_handler(task: asyncio.Task):
 
 
 def safe_create_task(coro, name: str, task_set: set = None):
+    # [FUNCTION DOC]
+    # HELPER: Behavior: creates a named asyncio task, attaches task_exception_handler, and adds it to task_set if given (the
+    # task is not removed when done). Outputs: the task. Exceptions: RuntimeError if no running loop.
     """Safely create a task with exception handling
 
     Args:
