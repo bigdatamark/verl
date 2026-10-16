@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU unittest suite for PPO metric utilities (compute_data/timing/throughput metrics, bootstrap_metric,
+# calc_maj_val, process_validation_metrics) and the generic reduce_metrics / Metric aggregation helpers.
+# DataProto inputs are replaced by MagicMock objects carrying plain batch / meta_info mappings.
+
 """
 Tests for the metric utilities in verl.trainer.ppo.metric_utils.
 """
@@ -39,9 +44,13 @@ from verl.utils.metric.utils import (
 
 
 class TestReduceMetrics(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests reduce_metrics on mappings from name to list of floats.
     """Tests for the reduce_metrics function."""
 
     def test_reduce_metrics_basic(self):
+        # [FUNCTION DOC]
+        # Asserts each list reduces to its mean.
         """Test that reduce_metrics correctly computes means."""
         metrics = {
             "loss": [1.0, 2.0, 3.0],
@@ -53,6 +62,8 @@ class TestReduceMetrics(unittest.TestCase):
         self.assertEqual(result["accuracy"], 0.5)
 
     def test_reduce_metrics_empty(self):
+        # [FUNCTION DOC]
+        # Asserts an empty list reduces to NaN.
         """Test that reduce_metrics handles empty lists."""
         metrics = {
             "empty": [],
@@ -62,6 +73,8 @@ class TestReduceMetrics(unittest.TestCase):
         self.assertTrue(np.isnan(result["empty"]))
 
     def test_reduce_metrics_single_value(self):
+        # [FUNCTION DOC]
+        # Asserts a single-element list reduces to that value.
         """Test that reduce_metrics works with single values."""
         metrics = {
             "single": [5.0],
@@ -72,31 +85,43 @@ class TestReduceMetrics(unittest.TestCase):
 
 
 class TestMetric(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests the Metric container: construction, append/extend, aggregation, data-parallel aggregation and factories.
     """Tests for the Metric class."""
 
     def test_init_with_string_aggregation(self):
+        # [FUNCTION DOC]
+        # Asserts a string aggregation name is converted to the AggregationType enum and values start empty.
         """Test Metric initialization with string aggregation type."""
         metric = Metric(aggregation="mean")
         self.assertEqual(metric.aggregation, AggregationType.MEAN)
         self.assertEqual(metric.values, [])
 
     def test_init_with_enum_aggregation(self):
+        # [FUNCTION DOC]
+        # Asserts an enum aggregation is stored as given.
         """Test Metric initialization with AggregationType enum."""
         metric = Metric(aggregation=AggregationType.SUM)
         self.assertEqual(metric.aggregation, AggregationType.SUM)
         self.assertEqual(metric.values, [])
 
     def test_init_with_value(self):
+        # [FUNCTION DOC]
+        # Asserts an initial value becomes the single stored value.
         """Test Metric initialization with an initial value."""
         metric = Metric(aggregation="mean", value=5.0)
         self.assertEqual(metric.values, [5.0])
 
     def test_init_with_invalid_aggregation(self):
+        # [FUNCTION DOC]
+        # Asserts an unknown aggregation name raises ValueError.
         """Test Metric initialization with invalid aggregation type."""
         with self.assertRaises(ValueError):
             Metric(aggregation="invalid")
 
     def test_append_float(self):
+        # [FUNCTION DOC]
+        # Asserts floats are appended in order.
         """Test appending float values."""
         metric = Metric(aggregation="mean")
         metric.append(1.0)
@@ -104,6 +129,8 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(metric.values, [1.0, 2.0])
 
     def test_append_int(self):
+        # [FUNCTION DOC]
+        # Asserts ints are appended unchanged.
         """Test appending int values."""
         metric = Metric(aggregation="mean")
         metric.append(1)
@@ -111,6 +138,8 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(metric.values, [1, 2])
 
     def test_append_tensor(self):
+        # [FUNCTION DOC]
+        # Asserts scalar tensors are stored as equal numeric values.
         """Test appending scalar tensor values."""
         metric = Metric(aggregation="mean")
         metric.append(torch.tensor(3.0))
@@ -118,12 +147,16 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(metric.values, [3.0, 4.0])
 
     def test_append_non_scalar_tensor_raises(self):
+        # [FUNCTION DOC]
+        # Asserts appending a multi-element tensor raises ValueError.
         """Test that appending non-scalar tensor raises ValueError."""
         metric = Metric(aggregation="mean")
         with self.assertRaises(ValueError):
             metric.append(torch.tensor([1.0, 2.0]))
 
     def test_append_metric(self):
+        # [FUNCTION DOC]
+        # Asserts appending another Metric extends with its values.
         """Test appending another Metric extends values."""
         metric1 = Metric(aggregation="mean", value=1.0)
         metric1.append(2.0)
@@ -134,12 +167,16 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(metric2.values, [3.0, 1.0, 2.0])
 
     def test_extend_with_list(self):
+        # [FUNCTION DOC]
+        # Asserts extending with a list appends all items.
         """Test extending with a list of values."""
         metric = Metric(aggregation="mean")
         metric.extend([1.0, 2.0, 3.0])
         self.assertEqual(metric.values, [1.0, 2.0, 3.0])
 
     def test_extend_with_metric(self):
+        # [FUNCTION DOC]
+        # Asserts extending with another Metric appends its values after existing ones.
         """Test extending with another Metric."""
         metric1 = Metric(aggregation="mean")
         metric1.extend([1.0, 2.0])
@@ -151,6 +188,8 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(metric2.values, [3.0, 4.0, 1.0, 2.0])
 
     def test_extend_aggregation_mismatch_raises(self):
+        # [FUNCTION DOC]
+        # Asserts extending with a Metric of different aggregation raises ValueError.
         """Test that extending with mismatched aggregation raises ValueError."""
         metric1 = Metric(aggregation="mean")
         metric2 = Metric(aggregation="sum")
@@ -159,30 +198,41 @@ class TestMetric(unittest.TestCase):
             metric1.extend(metric2)
 
     def test_aggregate_mean(self):
+        # [FUNCTION DOC]
+        # Asserts mean aggregation result.
         """Test aggregation with mean."""
         metric = Metric(aggregation="mean")
         metric.extend([1.0, 2.0, 3.0, 4.0])
         self.assertEqual(metric.aggregate(), 2.5)
 
     def test_aggregate_sum(self):
+        # [FUNCTION DOC]
+        # Asserts sum aggregation result.
         """Test aggregation with sum."""
         metric = Metric(aggregation="sum")
         metric.extend([1.0, 2.0, 3.0, 4.0])
         self.assertEqual(metric.aggregate(), 10.0)
 
     def test_aggregate_min(self):
+        # [FUNCTION DOC]
+        # Asserts min aggregation result.
         """Test aggregation with min."""
         metric = Metric(aggregation="min")
         metric.extend([3.0, 1.0, 4.0, 2.0])
         self.assertEqual(metric.aggregate(), 1.0)
 
     def test_aggregate_max(self):
+        # [FUNCTION DOC]
+        # Asserts max aggregation result.
         """Test aggregation with max."""
         metric = Metric(aggregation="max")
         metric.extend([3.0, 1.0, 4.0, 2.0])
         self.assertEqual(metric.aggregate(), 4.0)
 
     def test_aggregate_dp_sum_mean(self):
+        # [FUNCTION DOC]
+        # Asserts aggregate_dp for sum/mean metrics averages element-wise across ranks then applies the
+        # aggregation (sum -> 5.0, mean -> 2.5 for ranks [1,2] and [3,4]).
         """Test aggregate_dp with SUM and MEAN aggregations."""
         # Test with SUM: mean over DP ranks, then sum
         metric1 = Metric(aggregation="sum")
@@ -213,6 +263,8 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(result, 2.5)
 
     def test_aggregate_dp_min_max(self):
+        # [FUNCTION DOC]
+        # Asserts aggregate_dp for max/min flattens all ranks' values then reduces (4.0 and 1.0).
         """Test aggregate_dp with MIN and MAX aggregations."""
         # Test with MAX: flatten, then max
         metric1 = Metric(aggregation="max")
@@ -243,6 +295,8 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(result, 1.0)
 
     def test_aggregate_dp_mismatched_lengths(self):
+        # [FUNCTION DOC]
+        # Asserts aggregate_dp raises ValueError when ranks hold different numbers of values (sum aggregation).
         """Test aggregate_dp raises error with mismatched value lengths."""
         metric1 = Metric(aggregation="sum")
         metric1.extend([1.0, 2.0])
@@ -254,6 +308,8 @@ class TestMetric(unittest.TestCase):
             Metric.aggregate_dp([metric1, metric2])
 
     def test_from_dict(self):
+        # [FUNCTION DOC]
+        # Asserts from_dict builds one Metric per key holding the scalar, with the given aggregation.
         """Test from_dict creates Metrics from dictionary."""
         data = {"loss": 1.0, "accuracy": 0.9}
         metrics = Metric.from_dict(data, aggregation="mean")
@@ -265,6 +321,8 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(metrics["loss"].aggregation, AggregationType.MEAN)
 
     def test_init_list(self):
+        # [FUNCTION DOC]
+        # Asserts init_list returns a new empty Metric with the same aggregation.
         """Test init_list creates new empty Metric with same aggregation."""
         metric = Metric(aggregation="max")
         metric.extend([1.0, 2.0])
@@ -275,6 +333,8 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(new_metric.values, [])
 
     def test_reduce_metrics_with_metric(self):
+        # [FUNCTION DOC]
+        # Asserts reduce_metrics handles a mix of Metric objects and plain lists (both mean-reduced here).
         """Test reduce_metrics correctly handles Metric objects."""
         metric = Metric(aggregation="mean")
         metric.extend([1.0, 2.0, 3.0])
@@ -290,9 +350,14 @@ class TestMetric(unittest.TestCase):
 
 
 class TestComputeDataMetrics(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests compute_data_metrics on a mocked 2-sample batch (2 prompt + 2 response tokens each).
     """Tests for the compute_data_metrics function."""
 
     def setUp(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds a mock batch whose batch mapping holds token-level scores, rewards, advantages, returns,
+        # prompts, responses, attention_mask, response_mask and values tensors.
         """Set up common test data."""
         # Create a mock DataProto object
         self.batch = MagicMock()
@@ -319,6 +384,9 @@ class TestComputeDataMetrics(unittest.TestCase):
         }
 
     def test_compute_data_metrics_with_critic(self):
+        # [FUNCTION DOC]
+        # Asserts critic score/reward/advantage/return/value/explained-variance and length metric keys exist, and
+        # score/reward means equal the mean of per-sequence sums (5.0 and 2.5).
         """Test compute_data_metrics with critic enabled."""
         metrics = compute_data_metrics(self.batch, use_critic=True)
 
@@ -337,6 +405,8 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertAlmostEqual(metrics["critic/rewards/mean"], 2.5)  # Sum of token_level_rewards
 
     def test_compute_data_metrics_without_critic(self):
+        # [FUNCTION DOC]
+        # Asserts value and explained-variance metrics are absent without a critic while score/reward/length remain.
         """Test compute_data_metrics with critic disabled."""
         metrics = compute_data_metrics(self.batch, use_critic=False)
 
@@ -351,9 +421,14 @@ class TestComputeDataMetrics(unittest.TestCase):
 
 
 class TestComputeTimingMetrics(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests compute_timing_metrics with the internal response-info helper patched.
     """Tests for the compute_timing_metrics function."""
 
     def setUp(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds a mock batch (2 samples, 3 prompt + 3 response tokens) and a canned response-info mapping
+        # (prompt/response lengths 3 each, all-ones response mask).
         """Set up common test data."""
         # Create a mock DataProto object
         self.batch = MagicMock()
@@ -376,6 +451,9 @@ class TestComputeTimingMetrics(unittest.TestCase):
 
     @patch("verl.trainer.ppo.metric_utils._compute_response_info")
     def test_compute_timing_metrics(self, mock_compute_response_info):
+        # [FUNCTION DOC]
+        # Asserts raw timings are reported under timing_s/<name>, gen per-token ms uses response tokens only (6),
+        # and ref/values per-token ms use all tokens (12).
         """Test compute_timing_metrics with various timing data."""
         mock_compute_response_info.return_value = self.response_info
 
@@ -402,6 +480,8 @@ class TestComputeTimingMetrics(unittest.TestCase):
 
     @patch("verl.trainer.ppo.metric_utils._compute_response_info")
     def test_compute_timing_metrics_zero_tokens(self, mock_compute_response_info):
+        # [FUNCTION DOC]
+        # Regression: with zero prompt/response lengths, asserts per-token ms are 0.0 (no division error) and raw timing still reported.
         """Regression test: zero tokens should return 0.0, not crash or report misleading values."""
         zero_response_info = {
             "prompt_length": torch.tensor([0.0, 0.0]),
@@ -428,9 +508,13 @@ class TestComputeTimingMetrics(unittest.TestCase):
 
 
 class TestComputeThroughputMetrics(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests compute_throughout_metrics using a mock batch with meta_info global_token_num [100, 200, 300].
     """Tests for the compute_throughout_metrics function."""
 
     def setUp(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds the mock batch with the token counts in meta_info.
         """Set up common test data."""
         # Create a mock DataProto object
         self.batch = MagicMock()
@@ -439,6 +523,8 @@ class TestComputeThroughputMetrics(unittest.TestCase):
         }
 
     def test_compute_throughout_metrics(self):
+        # [FUNCTION DOC]
+        # Asserts total tokens 600, time per step 2.0 and throughput = tokens / (step time * n_gpus) for 1 and 2 GPUs.
         """Test compute_throughout_metrics with various timing data."""
         timing_raw = {
             "step": 2.0,  # 2 seconds per step
@@ -460,9 +546,14 @@ class TestComputeThroughputMetrics(unittest.TestCase):
 
 
 class TestBootstrapMetric(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests bootstrap_metric resampling.
     """Tests for the bootstrap_metric function."""
 
     def test_bootstrap_metric_basic(self):
+        # [FUNCTION DOC]
+        # With seed 42, 100 bootstraps of size 3, asserts one (mean, std) pair per reducer, mean-of-means near 3.0
+        # and mean-of-maxes between 3.5 and 5.0.
         """Test bootstrap_metric with simple data and functions."""
         data = [1, 2, 3, 4, 5]
         reduce_fns = [np.mean, np.max]
@@ -487,15 +578,21 @@ class TestBootstrapMetric(unittest.TestCase):
         self.assertLess(max_result[0], 5.0)
 
     def test_bootstrap_metric_empty(self):
+        # [FUNCTION DOC]
+        # Asserts empty data raises ValueError.
         """Test bootstrap_metric with empty data."""
         with self.assertRaises(ValueError):
             bootstrap_metric([], subset_size=1, reduce_fns=[np.mean])
 
 
 class TestCalcMajVal(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests calc_maj_val majority voting.
     """Tests for the calc_maj_val function."""
 
     def test_calc_maj_val_basic(self):
+        # [FUNCTION DOC]
+        # Asserts the value of the first entry of the majority prediction ("A" -> 0.9) is returned.
         """Test calc_maj_val with simple data."""
         data = [
             {"pred": "A", "val": 0.9},
@@ -509,6 +606,8 @@ class TestCalcMajVal(unittest.TestCase):
         self.assertEqual(result, 0.9)
 
     def test_calc_maj_val_tie(self):
+        # [FUNCTION DOC]
+        # Asserts that on a tie the result is the first value of one of the tied predictions (0.9 or 0.8).
         """Test calc_maj_val with tied votes."""
         data = [
             {"pred": "A", "val": 0.9},
@@ -526,9 +625,13 @@ class TestCalcMajVal(unittest.TestCase):
 
 
 class TestProcessValidationMetrics(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests process_validation_metrics grouping by data source and prompt.
     """Tests for the process_validation_metrics function."""
 
     def test_process_validation_metrics_basic(self):
+        # [FUNCTION DOC]
+        # Asserts the nested result source -> variable -> metric contains mean@2 for source1/score equal to 0.85.
         """Test process_validation_metrics with simple data."""
         data_sources = ["source1", "source1", "source2"]
         sample_inputs = ["prompt1", "prompt1", "prompt2"]
@@ -552,6 +655,8 @@ class TestProcessValidationMetrics(unittest.TestCase):
         self.assertAlmostEqual(result["source1"]["score"]["mean@2"], 0.85)
 
     def test_process_validation_metrics_with_pred(self):
+        # [FUNCTION DOC]
+        # Asserts that with a "pred" variable, majority-vote metrics (maj@2/mean) are produced for score.
         """Test process_validation_metrics with prediction data."""
         data_sources = ["source1", "source1", "source1"]
         sample_inputs = ["prompt1", "prompt1", "prompt1"]
@@ -569,6 +674,10 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # depending on the random sampling, so we don't check the exact value
 
     def test_process_validation_metrics_counts_missing_sessions_as_incorrect(self):
+        # [FUNCTION DOC]
+        # With expected_acc_counts declaring 4 sessions for each of two prompts but only 2 observed (both correct),
+        # asserts acc mean@4 is 0.25 (missing sessions count as incorrect), acc_success_only mean@2 is 1.0, and
+        # reward mean@2 is 0.5 (unaffected).
         data_sources = ["source1", "source1"]
         sample_uids = ["prompt1", "prompt1"]
         infos_dict = {
@@ -591,6 +700,9 @@ class TestProcessValidationMetrics(unittest.TestCase):
         self.assertAlmostEqual(result["source1"]["reward"]["mean@2"], 0.5)
 
     def test_process_validation_metrics_does_not_add_acc_to_reward_only_source(self):
+        # [FUNCTION DOC]
+        # Asserts a source whose acc entry is None gets no acc or acc_success_only metrics, while the acc source
+        # gets acc mean@2 0.5 (one missing session) and acc_success_only mean@1 1.0.
         result = process_validation_metrics(
             data_sources=["acc_source", "reward_source"],
             sample_uids=["acc_prompt", "reward_prompt"],

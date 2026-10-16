@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for the DataProto protocol (verl.protocol): dict union helpers, construction, iteration,
+# reorder/chunk/concat (including meta_info and metrics merging), pop/select, repeat and padding, batch-dim
+# fold/unfold, disk save/load, length and indexing, subclass-preserving construction, conversion to and from
+# TensorDict (with nested non-tensor data), and tensor / TensorDict / pickle serialization.
+
 import random
 
 import numpy as np
@@ -34,6 +40,8 @@ from verl.utils import tensordict_utils as tu
 
 
 def test_union_tensor_dict():
+    # [FUNCTION DOC]
+    # Asserts union of two TensorDicts sharing the same "obs" tensor object succeeds, while a second dict with an equal-valued clone of "obs" raises AssertionError.
     obs = torch.randn(100, 10)
 
     data1 = TensorDict({"obs": obs, "act": torch.randn(100, 3)}, batch_size=[100])
@@ -49,6 +57,11 @@ def test_union_tensor_dict():
 
 
 def test_union_numpy_dict():
+    # [FUNCTION DOC]
+    # Exercises union_numpy_dict value-equality semantics: equal N-D and object arrays merge; differing values raise
+    # AssertionError (with the "not the same object" message for N-D); nested 2-D/4-D object arrays are compared deeply;
+    # NaNs in the same position compare equal but different values/positions fail; structurally identical self-referencing
+    # object arrays merge without recursion error, while a self-reference versus a None element fails.
     """
     A comprehensive test suite for union_numpy_dict, covering standard use
     cases, N-dimensional arrays, object-dtype arrays, and NaN value handling.
@@ -139,6 +152,8 @@ def test_union_numpy_dict():
 
 
 def test_tensor_dict_constructor():
+    # [FUNCTION DOC]
+    # Asserts from_dict infers batch size 100 by default and raises AssertionError when num_batch_dims 2 or 3 does not match all tensors' shared leading dims.
     obs = torch.randn(100, 10)
     act = torch.randn(100, 10, 3)
     data = DataProto.from_dict(tensors={"obs": obs, "act": act})
@@ -153,6 +168,9 @@ def test_tensor_dict_constructor():
 
 
 def test_tensor_dict_make_iterator():
+    # [FUNCTION DOC]
+    # Asserts two make_iterator runs (mini-batch 10, 2 epochs, seed 1) yield identical DataProto mini-batches for tensor data.
+    # KNOWN ISSUE: a mismatch in non-tensor "labels" is only printed, never raised, so that part of the check cannot fail.
     obs = torch.randn(100, 10)
     labels = [random.choice(["abc", "cde"]) for _ in range(100)]
     dataset = DataProto.from_dict(tensors={"obs": obs}, non_tensors={"labels": labels})
@@ -182,6 +200,8 @@ def test_tensor_dict_make_iterator():
 
 
 def test_reorder():
+    # [FUNCTION DOC]
+    # Asserts reorder permutes tensor and non-tensor data in place by the index tensor and leaves meta_info unchanged.
     obs = torch.tensor([1, 2, 3, 4, 5, 6])
     labels = ["a", "b", "c", "d", "e", "f"]
     data = DataProto.from_dict(tensors={"obs": obs}, non_tensors={"labels": labels}, meta_info={"name": "abdce"})
@@ -193,6 +213,8 @@ def test_reorder():
 
 
 def test_chunk_concat():
+    # [FUNCTION DOC]
+    # Asserts chunk raises AssertionError for a non-divisible count, chunk(2) splits evenly while copying meta_info, and concat restores the original.
     obs = torch.tensor([1, 2, 3, 4, 5, 6])
     labels = ["a", "b", "c", "d", "e", "f"]
     data = DataProto.from_dict(tensors={"obs": obs}, non_tensors={"labels": labels}, meta_info={"name": "abdce"})
@@ -217,6 +239,8 @@ def test_chunk_concat():
 
 
 def test_concat_metrics_from_multiple_workers():
+    # [FUNCTION DOC]
+    # Asserts concat flattens per-worker metrics lists of mappings into a mapping from metric name to list of values in worker order, and keeps other meta keys.
     """Test that concat() properly merges metrics from all workers in distributed training."""
     # Simulate 3 workers each with their own metrics
     obs1 = torch.tensor([1, 2])
@@ -247,6 +271,8 @@ def test_concat_metrics_from_multiple_workers():
 
 
 def test_concat_with_empty_and_non_list_meta_info():
+    # [FUNCTION DOC]
+    # Asserts concat handles a worker lacking metrics (others' metrics still flattened) and preserves identical scalar meta values.
     """Test concat() handles edge cases: empty meta_info, non-list values, and None."""
     obs1 = torch.tensor([1, 2])
     obs2 = torch.tensor([3, 4])
@@ -270,6 +296,8 @@ def test_concat_with_empty_and_non_list_meta_info():
 
 
 def test_concat_first_worker_missing_metrics():
+    # [FUNCTION DOC]
+    # Asserts metrics given as plain mappings on later workers are collected even when the first worker has none.
     """Test that metrics from other workers are preserved even when first worker has no metrics.
 
     This is a critical edge case - the old buggy implementation only checked data[0].meta_info
@@ -293,6 +321,8 @@ def test_concat_first_worker_missing_metrics():
 
 
 def test_concat_non_list_metrics():
+    # [FUNCTION DOC]
+    # Asserts metrics given as a single mapping per worker are flattened into lists.
     """Test that concat() handles non-list metrics (single dict) correctly.
 
     In some cases, metrics might be a single dict instead of a list.
@@ -313,6 +343,8 @@ def test_concat_non_list_metrics():
 
 
 def test_concat_merge_different_non_metric_keys():
+    # [FUNCTION DOC]
+    # Asserts non-metric meta keys unique to any worker are all kept in the result.
     """Test that concat() merges non-metric meta_info keys from all workers.
 
     When different workers have different non-metric keys, all keys should be preserved.
@@ -337,6 +369,8 @@ def test_concat_merge_different_non_metric_keys():
 
 
 def test_concat_conflicting_non_metric_keys():
+    # [FUNCTION DOC]
+    # Asserts differing values for the same non-metric key raise AssertionError "Conflicting values for meta_info key 'config'".
     """Test that concat() raises an assertion error when non-metric keys have conflicting values.
 
     This ensures data integrity by catching cases where workers have different values
@@ -355,6 +389,8 @@ def test_concat_conflicting_non_metric_keys():
 
 
 def test_pop():
+    # [FUNCTION DOC]
+    # Asserts pop moves the requested batch and meta_info keys into the returned DataProto and removes them from the source.
     obs = torch.randn(100, 10)
     act = torch.randn(100, 3)
     dataset = DataProto.from_dict({"obs": obs, "act": act}, meta_info={"2": 2, "1": 1})
@@ -368,6 +404,8 @@ def test_pop():
 
 
 def test_repeat():
+    # [FUNCTION DOC]
+    # Asserts repeat with interleave duplicates each row consecutively and without interleave tiles the whole batch, for tensors and non-tensors, keeping meta_info.
     # Create a DataProto object with some batch and non-tensor data
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
     labels = ["a", "b", "c"]
@@ -393,6 +431,8 @@ def test_repeat():
 
 
 def test_dataproto_pad_unpad():
+    # [FUNCTION DOC]
+    # Asserts pad_dataproto_to_divisor pads by cycling rows from the start (pad sizes 1, 0, 4 for divisors 2, 3, 7) and unpad_dataproto restores the original.
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
     labels = ["a", "b", "c"]
     data = DataProto.from_dict(tensors={"obs": obs}, non_tensors={"labels": labels}, meta_info={"info": "test_info"})
@@ -445,6 +485,9 @@ def test_dataproto_pad_unpad():
 
 
 def test_dataproto_fold_unfold():
+    # [FUNCTION DOC]
+    # Repeats, folds into batch size 3 (adding a dim of 2), reorders the folded rows, unfolds back to 2 batch dims flattened,
+    # and asserts tensor, label and meta_info contents.
     from verl.protocol import DataProto, fold_batch_dim, unfold_batch_dim
 
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
@@ -468,6 +511,9 @@ def test_dataproto_fold_unfold():
 
 
 def test_torch_save_data_proto():
+    # [FUNCTION DOC]
+    # Saves to test_data.pt in the cwd, loads it back, compares contents, then deletes the file.
+    # Side effects: writes and removes a file in the current directory (left behind if an assertion fails).
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
     labels = ["a", "b", "c"]
     data = DataProto.from_dict(tensors={"obs": obs}, non_tensors={"labels": labels}, meta_info={"info": "test_info"})
@@ -484,6 +530,8 @@ def test_torch_save_data_proto():
 
 
 def test_len():
+    # [FUNCTION DOC]
+    # Asserts length comes from the tensor batch, else from non-tensor data, and is 0 for empty or missing non-tensor data with no batch.
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
     labels = np.array(["a", "b", "c"], dtype=object)
     data = DataProto.from_dict(tensors={"obs": obs}, non_tensors={"labels": labels}, meta_info={"info": "test_info"})
@@ -504,6 +552,8 @@ def test_len():
 
 
 def test_dataproto_index():
+    # [FUNCTION DOC]
+    # Asserts indexing by numpy/torch/list integer indices and by numpy/torch/list boolean masks selects matching rows from both tensor and non-tensor data, preserving keys.
     data_len = 100
     idx_num = 10
 
@@ -568,16 +618,25 @@ def test_dataproto_index():
 
 
 def test_old_vs_new_from_single_dict():
+    # [FUNCTION DOC]
+    # Contrasts a subclass emulating the old from_single_dict (always returns base DataProto) with the current one, asserting the current method returns the calling subclass type.
     class CustomProto(DataProto):
+        # [CLASS DOC]
+        # HELPER: Trivial DataProto subclass relying on the inherited (current) from_single_dict.
         """Uses the new, fixed from_single_dict."""
 
         pass
 
     class OriginProto(DataProto):
+        # [CLASS DOC]
+        # HELPER: DataProto subclass overriding from_single_dict with the legacy behaviour.
         """Mimics the *old* from_single_dict (always returns a DataProto)."""
 
         @classmethod
         def from_single_dict(cls, data, meta_info=None, auto_padding=False):
+            # [FUNCTION DOC]
+            # HELPER: Class method splitting a mapping into tensor and non-tensor parts and always building a base DataProto via from_dict (ignores the class).
+            # Inputs: data - mapping; meta_info; auto_padding. Outputs: DataProto.
             tensors, non_tensors = {}, {}
             for k, v in data.items():
                 if torch.is_tensor(v):
@@ -605,6 +664,8 @@ def test_old_vs_new_from_single_dict():
 
 
 def test_dataproto_no_batch():
+    # [FUNCTION DOC]
+    # Asserts select and pop of non-tensor keys work on a DataProto with no tensor batch, and pop empties the source's non-tensor data.
     labels = ["a", "b", "c"]
     data = DataProto.from_dict(non_tensors={"labels": labels}, meta_info={"info": "test_info"})
     selected = data.select(non_tensor_batch_keys=["labels"])
@@ -615,6 +676,8 @@ def test_dataproto_no_batch():
 
 
 def test_sample_level_repeat():
+    # [FUNCTION DOC]
+    # Asserts sample_level_repeat repeats each row by its own count, given either a list or a tensor of counts.
     # Create a DataProto object with some batch and non-tensor data
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
     labels = ["a", "b", "c"]
@@ -640,6 +703,9 @@ def test_sample_level_repeat():
 
 
 def test_dataproto_unfold_column_chunks():
+    # [FUNCTION DOC]
+    # Asserts unfold_column_chunks(2) splits the listed keys along their second dim into 2 rows per sample, while non-listed
+    # keys and non-tensors are duplicated; covers 2-D and 3-D tensors and splitting a non-tensor list column.
     obs1 = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])
     obs2 = torch.tensor([[1, 2], [5, 6], [9, 10]])
 
@@ -706,6 +772,8 @@ def test_dataproto_unfold_column_chunks():
 
 
 def test_dataproto_chunk_after_index():
+    # [FUNCTION DOC]
+    # Asserts that after indexing with any supported index type, the batch size is a torch Size of plain ints.
     data_len = 4
     obs = torch.randn(data_len, 4)
     labels = [f"label_{i}" for i in range(data_len)]
@@ -752,6 +820,8 @@ def test_dataproto_chunk_after_index():
     parse_version(tensordict.__version__) < parse_version("0.10"), reason="requires at least tensordict 0.10"
 )
 def test_to_tensordict():
+    # [FUNCTION DOC]
+    # Requires tensordict >= 0.10. Asserts to_tensordict exposes tensors, non-tensor lists and meta_info entries as keys.
     obs = torch.tensor([1, 2, 3, 4, 5, 6])
     labels = ["a", "b", "c", "d", "e", "f"]
     data = DataProto.from_dict(tensors={"obs": obs}, non_tensors={"labels": labels}, meta_info={"name": "abdce"})
@@ -766,6 +836,8 @@ def test_to_tensordict():
     parse_version(tensordict.__version__) < parse_version("0.10"), reason="requires at least tensordict 0.10"
 )
 def test_from_tensordict():
+    # [FUNCTION DOC]
+    # Requires tensordict >= 0.10. Builds a TensorDict via tensordict_utils.get_tensordict and asserts from_tensordict splits it back into batch, non-tensor data and meta_info.
     tensor_dict = {
         "obs": torch.tensor([1, 2, 3, 4, 5, 6]),
         "labels": ["a", "b", "c", "d", "e", "f"],
@@ -783,6 +855,8 @@ def test_from_tensordict():
     parse_version(tensordict.__version__) < parse_version("0.10"), reason="requires at least tensordict 0.10"
 )
 def test_to_tensordict_with_nested_lists():
+    # [FUNCTION DOC]
+    # Requires tensordict >= 0.10. Asserts ragged lists of floats (including empty) survive to_tensordict.
     """Test converting DataProto with nested lists to TensorDict (lists of lists)."""
     obs = torch.tensor([1, 2, 3])
     # Simulate turn_scores or tool_rewards: array of lists with varying lengths
@@ -808,6 +882,8 @@ def test_to_tensordict_with_nested_lists():
     parse_version(tensordict.__version__) < parse_version("0.10"), reason="requires at least tensordict 0.10"
 )
 def test_to_tensordict_with_nested_dicts():
+    # [FUNCTION DOC]
+    # Requires tensordict >= 0.10. Asserts a column of mappings survives to_tensordict.
     """Test converting DataProto with lists of dicts to TensorDict."""
     obs = torch.tensor([1, 2, 3])
     # Simulate reward_extra_info: array of dicts
@@ -832,6 +908,8 @@ def test_to_tensordict_with_nested_dicts():
     parse_version(tensordict.__version__) < parse_version("0.10"), reason="requires at least tensordict 0.10"
 )
 def test_to_tensordict_with_complex_nested_structures():
+    # [FUNCTION DOC]
+    # Requires tensordict >= 0.10. Asserts lists of chat-message mappings survive to_tensordict.
     """Test converting DataProto with complex nested structures (lists of lists of dicts)."""
     obs = torch.tensor([1, 2, 3])
     # Simulate raw_prompt: array of lists containing dicts
@@ -860,6 +938,8 @@ def test_to_tensordict_with_complex_nested_structures():
     parse_version(tensordict.__version__) < parse_version("0.10"), reason="requires at least tensordict 0.10"
 )
 def test_to_tensordict_and_back_with_nested_data():
+    # [FUNCTION DOC]
+    # Requires tensordict >= 0.10. Asserts a round trip through TensorDict preserves tensors, labels, ragged lists, mappings, message lists and meta_info.
     """Test round-trip conversion: DataProto → TensorDict → DataProto with nested structures."""
     obs = torch.tensor([1, 2, 3, 4])
     labels = ["a", "b", "c", "d"]
@@ -924,6 +1004,9 @@ def test_to_tensordict_and_back_with_nested_data():
     parse_version(tensordict.__version__) < parse_version("0.10"), reason="requires at least tensordict 0.10"
 )
 def test_to_tensordict_agent_loop_scenario():
+    # [FUNCTION DOC]
+    # Requires tensordict >= 0.10. Reproduces agent-loop output (prompts/responses tensors plus mixed numpy, string, ragged and mapping
+    # non-tensors) and asserts conversion succeeds, contents are accessible, and the round trip keeps length, meta_info and tensors.
     """Test the exact scenario from agent loop: DataProto with tool rewards, acc, etc.
 
     This test reproduces the exact error from the agent loop where nested structures
@@ -991,6 +1074,8 @@ def test_to_tensordict_agent_loop_scenario():
 
 
 def test_serialize_deserialize_single_tensor():
+    # [FUNCTION DOC]
+    # Asserts serialize_single_tensor returns (dtype, shape, data) and deserialization reproduces values, shape and dtype.
     """Test serialization and deserialization of a single tensor"""
     # Create test tensor
     original_tensor = torch.randn(3, 4, 5)
@@ -1008,6 +1093,8 @@ def test_serialize_deserialize_single_tensor():
 
 
 def test_serialize_deserialize_tensordict_regular_tensors():
+    # [FUNCTION DOC]
+    # Asserts a TensorDict with 2-D batch size round-trips through (batch_size, device, items) serialization.
     """Test serialization and deserialization of TensorDict with regular tensors"""
     # Create test data
     batch_size = (5, 3)
@@ -1037,6 +1124,8 @@ def test_serialize_deserialize_tensordict_regular_tensors():
 
 
 def test_serialize_deserialize_tensordict_nested_tensors():
+    # [FUNCTION DOC]
+    # Asserts a TensorDict mixing a nested (ragged) tensor and a regular tensor round-trips, comparing nested components after unbinding.
     """Test serialization and deserialization of TensorDict with nested tensors"""
     # Create nested tensor
     tensor_list = [torch.randn(2, 3), torch.randn(3, 4), torch.randn(1, 5)]
@@ -1090,6 +1179,8 @@ def test_serialize_deserialize_tensordict_nested_tensors():
 
 
 def test_serialize_deserialize_tensordict_mixed_types():
+    # [FUNCTION DOC]
+    # Asserts round-trip for float, double, int, long, bool, bfloat16, nested and (when the build supports it) fp8 tensors.
     """Test serialization and deserialization of TensorDict with mixed tensor types"""
     # Create tensors with different data types
     float_tensor = torch.randn(2, 3).float()
@@ -1175,6 +1266,8 @@ def test_serialize_deserialize_tensordict_mixed_types():
 
 
 def test_serialize_deserialize_tensordict_with_device():
+    # [FUNCTION DOC]
+    # Asserts the device (cpu) is preserved along with tensor contents.
     """Test serialization and deserialization of TensorDict with device information"""
     # Create test data
     batch_size = (2, 3)
@@ -1206,6 +1299,9 @@ def test_serialize_deserialize_tensordict_with_device():
 
 
 def test_numpy_dataproto_serialization_skips_tensordict_consolidation(monkeypatch):
+    # [FUNCTION DOC]
+    # Sets VERL_DATAPROTO_SERIALIZATION_METHOD=numpy, patches TensorDict.consolidate to fail, and asserts the getstate/setstate round trip works without consolidation.
+    # Side effects: monkeypatches env and TensorDict (restored by pytest).
     """NumPy serialization should not allocate an unused consolidated TensorDict."""
     monkeypatch.setenv("VERL_DATAPROTO_SERIALIZATION_METHOD", "numpy")
 
@@ -1216,6 +1312,8 @@ def test_numpy_dataproto_serialization_skips_tensordict_consolidation(monkeypatc
     )
 
     def fail_on_consolidate(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Replacement that fails the test if called.
         pytest.fail("TensorDict.consolidate() should not be called in NumPy serialization mode")
 
     monkeypatch.setattr(TensorDict, "consolidate", fail_on_consolidate)
@@ -1230,6 +1328,8 @@ def test_numpy_dataproto_serialization_skips_tensordict_consolidation(monkeypatc
 
 
 def test_serialize_dataproto_with_empty_tensordict():
+    # [FUNCTION DOC]
+    # Skips on tensordict < 0.5. Asserts pickling a DataProto whose TensorDict has no keys but batch size 10 succeeds and unpickles with no keys and the same batch size.
     """Tests that serializing a DataProto with an empty TensorDict does not crash.
 
     This test verifies the fix for the torch.cat error that occurs when calling

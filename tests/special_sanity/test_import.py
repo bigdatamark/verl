@@ -13,13 +13,20 @@
 # limitations under the License.
 
 
+# [MODULE DOC]
+# Smoke tests that the verl package and verl.single_controller import and expose __version__.
+
 def test_import():
+    # [FUNCTION DOC]
+    # Imports verl and prints verl.__version__ (fails on ImportError/AttributeError).
     import verl
 
     print(verl.__version__)
 
 
 def test_single_controller_import():
+    # [FUNCTION DOC]
+    # Imports verl.single_controller and prints its __version__.
     import verl.single_controller
 
     print(verl.single_controller.__version__)

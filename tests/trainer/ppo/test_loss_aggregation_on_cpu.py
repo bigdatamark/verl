@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for agg_loss in "token-sum" mode: masking, data-parallel scaling and micro-batch / FSDP invariance.
+
 """CPU coverage for loss aggregation modes."""
 
 import pytest
@@ -21,6 +24,8 @@ from verl.trainer.ppo.core_algos import agg_loss
 
 
 def test_token_sum_masks_tokens_and_scales_for_dp():
+    # [FUNCTION DOC]
+    # Asserts token-sum with dp_size 4 equals the sum of unmasked entries multiplied by 4.
     loss_mat = torch.tensor([[1.0, 2.0, 30.0], [4.0, 50.0, 6.0]])
     loss_mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 0.0, 1.0]])
 
@@ -31,6 +36,8 @@ def test_token_sum_masks_tokens_and_scales_for_dp():
 
 @pytest.mark.parametrize("num_micro_batches", [1, 2, 4])
 def test_token_sum_is_microbatch_invariant(num_micro_batches):
+    # [FUNCTION DOC]
+    # Parametrized over 1/2/4 micro-batches: summing per-chunk token-sum losses over an 8x3 matrix equals the whole-batch token-sum.
     loss_mat = torch.arange(1, 25, dtype=torch.float32).reshape(8, 3)
     loss_mask = torch.tensor([[1.0, 1.0, 0.0]] * 8)
     step = loss_mat.shape[0] // num_micro_batches
@@ -46,6 +53,9 @@ def test_token_sum_is_microbatch_invariant(num_micro_batches):
 
 @pytest.mark.parametrize("dp_size", [2, 4])
 def test_token_sum_matches_global_sum_after_fsdp_mean_reduction(dp_size):
+    # [FUNCTION DOC]
+    # Parametrized over dp_size 2/4: per-rank token-sum losses (scaled by dp_size) averaged across ranks
+    # equal the global unscaled token-sum, emulating FSDP's mean gradient reduction.
     loss_mat = torch.arange(1, 25, dtype=torch.float32).reshape(8, 3)
     loss_mask = torch.tensor([[1.0, 1.0, 0.0]] * 8)
     rank_step = loss_mat.shape[0] // dp_size

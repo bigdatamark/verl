@@ -12,11 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Sanity test enforcing the documentation layout of the core trainer YAML config files:
+# every key line needs a comment line directly above it, no inline comments, and a blank line after it.
+
 import re
 from pathlib import Path
 
 
 def validate_yaml_format(yaml_lines):
+    # [FUNCTION DOC]
+    # HELPER: Scans YAML lines and collects format violations.
+    # Behavior: iterate line by line, skipping blank lines; for each line matching an (indented) identifier
+    # key followed by a colon: (1) if it is the first line or the previous line is not a comment, record
+    # "Missing comment above line N"; (2) if the line contains '#' after the first colon and the line is not
+    # itself a comment, record "Inline comment found"; (3) if a next line exists and is non-blank, record
+    # "Missing blank line after line N". Line numbers are 1-based.
+    # Inputs: yaml_lines - list of raw lines (with newlines). Outputs: list of error strings.
+    # Exceptions: none. Side effects: none.
+    # KNOWN ISSUE: the comment says the blank-line rule is skipped when the next line is deeper-indented, but the code enforces it for any non-blank next line (nested keys must thus be preceded by blank+comment).
+    # KNOWN ISSUE: '#' inside a quoted value is treated as an inline comment.
     errors = []
     i = 0
 
@@ -58,6 +73,11 @@ def validate_yaml_format(yaml_lines):
 
 
 def test_trainer_config_doc():
+    # [FUNCTION DOC]
+    # Runs validate_yaml_format over a fixed list of trainer YAML paths (ppo_trainer, actor, dp_actor, critic,
+    # dp_critic, ref, dp_ref, rollout, transfer_queue; relative to cwd), printing every error per file.
+    # Exceptions: raises a generic Exception if any file had errors; FileNotFoundError if not run from repo root.
+    # Side effects: reads files, prints to stdout.
     yamls_to_inspect = [
         "verl/trainer/config/ppo_trainer.yaml",
         "verl/trainer/config/actor/actor.yaml",

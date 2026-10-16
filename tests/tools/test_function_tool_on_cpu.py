@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU unit tests for verl.tools.function_tool: the function_tool decorator and its schema inference
+# (delegated to transformers get_json_schema), loading tools from a user file path, normalization of tool
+# return values into (ToolResponse, reward, metrics), the rollout YAML default, and hydra interaction.
+# Nested decorated functions are tool fixtures; their docstrings are part of the test input (Args sections drive schema).
+
 """Unit tests for the function-based tool API."""
 
 from __future__ import annotations
@@ -35,6 +41,8 @@ from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture clearing FUNCTION_TOOL_REGISTRY and the private loaded-path cache before and after each test.
     """Reset both the registry and the per-path cache around every test."""
     FUNCTION_TOOL_REGISTRY.clear()
     function_tool_mod._LOADED_FUNCTION_TOOL_PATHS.clear()
@@ -44,6 +52,8 @@ def _clean_registry():
 
 
 def _write_tool_file(tmp_path: Path, body: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Writes the dedented body to tmp_path/my_tools.py and returns its path as a string. Side effects: writes a file.
     path = tmp_path / "my_tools.py"
     path.write_text(textwrap.dedent(body))
     return str(path)
@@ -55,8 +65,13 @@ def _write_tool_file(tmp_path: Path, body: str) -> str:
 
 
 def test_decorator_registers_with_inferred_schema():
+    # [FUNCTION DOC]
+    # Asserts a decorated function is registered and its inferred schema has name, docstring description,
+    # string/boolean parameter types with per-arg descriptions, and only the non-default arg required.
     @function_tool("greet")
     def greet(name: str, excited: bool = False) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Tool fixture returning "hi <name>" plus "!" when excited.
         """Greet someone.
 
         Args:
@@ -78,6 +93,8 @@ def test_decorator_registers_with_inferred_schema():
 
 
 def test_int_float_union_emits_number_type():
+    # [FUNCTION DOC]
+    # Asserts an int-or-float parameter's schema type includes "number".
     """Numeric unions must let the LLM produce decimals.
 
     transformers ``get_json_schema`` returns the JSON Schema-standard
@@ -88,6 +105,8 @@ def test_int_float_union_emits_number_type():
 
     @function_tool("num")
     def num(x: int | float) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Tool fixture returning the stringified number.
         """Numeric.
 
         Args:
@@ -102,6 +121,8 @@ def test_int_float_union_emits_number_type():
 
 
 def test_int_literal_emits_int_enum():
+    # [FUNCTION DOC]
+    # Asserts an integer Literal parameter yields enum [1, 2, 3].
     """``Literal[1, 2, 3]`` -> JSON ``enum: [1, 2, 3]``.
 
     Pins the verl schema loosening that allows non-string ``enum`` values
@@ -110,6 +131,8 @@ def test_int_literal_emits_int_enum():
 
     @function_tool("pick")
     def pick(x: Literal[1, 2, 3]) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Tool fixture returning the stringified choice.
         """Pick.
 
         Args:
@@ -124,8 +147,12 @@ def test_int_literal_emits_int_enum():
 
 
 def test_decorator_default_name_uses_function_name():
+    # [FUNCTION DOC]
+    # Asserts the decorator called with no name registers under the function's own name.
     @function_tool()
     def my_special_tool(x: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Identity tool fixture.
         """Doc.
 
         Args:
@@ -137,10 +164,14 @@ def test_decorator_default_name_uses_function_name():
 
 
 def test_bare_decorator_without_parentheses():
+    # [FUNCTION DOC]
+    # Asserts the bare decorator form registers under the function name with the same inferred integer schema.
     """``@function_tool`` (no parens) registers under the function name."""
 
     @function_tool
     def bare_tool(x: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Identity tool fixture.
         """Doc.
 
         Args:
@@ -158,6 +189,9 @@ def test_bare_decorator_without_parentheses():
 
 
 def test_explicit_schema_dict_override_skips_inference():
+    # [FUNCTION DOC]
+    # Asserts an explicit schema mapping replaces the inferred schema (custom description, empty properties)
+    # even though the docstring documents a non-existent arg.
     custom = {
         "type": "function",
         "function": {
@@ -169,6 +203,8 @@ def test_explicit_schema_dict_override_skips_inference():
 
     @function_tool("x", schema=custom)
     def x() -> str:
+        # [FUNCTION DOC]
+        # HELPER: Tool fixture returning an empty string.
         """This docstring should be ignored.
 
         Args:
@@ -182,6 +218,8 @@ def test_explicit_schema_dict_override_skips_inference():
 
 
 def test_explicit_schema_object_override():
+    # [FUNCTION DOC]
+    # Asserts an explicit OpenAIFunctionToolSchema object is stored as-is (identity).
     custom = OpenAIFunctionToolSchema.model_validate(
         {
             "type": "function",
@@ -195,14 +233,20 @@ def test_explicit_schema_object_override():
 
     @function_tool("y", schema=custom)
     def y() -> str:
+        # [FUNCTION DOC]
+        # HELPER: Tool fixture returning an empty string (no docstring; schema is supplied).
         return ""
 
     assert FUNCTION_TOOL_REGISTRY["y"].tool_schema is custom
 
 
 def test_duplicate_name_raises():
+    # [FUNCTION DOC]
+    # Asserts registering a second function under an existing name raises ValueError "already registered".
     @function_tool("dup")
     def fn1(x: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Identity tool fixture registered as "dup".
         """Doc.
 
         Args:
@@ -214,6 +258,8 @@ def test_duplicate_name_raises():
 
         @function_tool("dup")
         def fn2(x: str) -> str:
+            # [FUNCTION DOC]
+            # HELPER: Identity tool fixture whose registration must fail.
             """Doc.
 
             Args:
@@ -223,8 +269,12 @@ def test_duplicate_name_raises():
 
 
 def test_async_function_marked_is_async():
+    # [FUNCTION DOC]
+    # Asserts a coroutine function is flagged is_async and that awaiting tool.call with a parameter mapping returns its result.
     @function_tool("aecho")
     async def aecho(text: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Async echo tool fixture.
         """Echo.
 
         Args:
@@ -238,8 +288,12 @@ def test_async_function_marked_is_async():
 
 
 def test_sync_function_runs_in_thread():
+    # [FUNCTION DOC]
+    # Asserts a sync function is flagged non-async and tool.call still works when awaited (returns uppercase text).
     @function_tool("secho")
     def secho(text: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Tool fixture returning the uppercased text.
         """Echo.
 
         Args:
@@ -253,6 +307,8 @@ def test_sync_function_runs_in_thread():
 
 
 def test_missing_docstring_raises_at_registration():
+    # [FUNCTION DOC]
+    # Asserts registering a function without a docstring raises an exception matching "no docstring".
     """Schema inference is delegated to ``transformers.get_json_schema``,
     which raises ``DocstringParsingException`` when the function has no
     docstring at all. We verify the contract surfaces, not the exact
@@ -263,16 +319,22 @@ def test_missing_docstring_raises_at_registration():
 
         @function_tool("nodoc")
         def nodoc(x: str) -> str:
+            # [FUNCTION DOC]
+            # HELPER: Undocumented identity fixture (intentionally invalid).
             return x
 
 
 def test_missing_type_hint_raises_at_registration():
+    # [FUNCTION DOC]
+    # Asserts an unannotated parameter raises an exception matching "missing a type hint".
     """``transformers.get_json_schema`` raises when a parameter is unannotated."""
 
     with pytest.raises(Exception, match=r"missing a type hint"):
 
         @function_tool("untyped")
         def untyped(x) -> str:
+            # [FUNCTION DOC]
+            # HELPER: Identity fixture with an unannotated arg (intentionally invalid).
             """Doc.
 
             Args:
@@ -282,6 +344,8 @@ def test_missing_type_hint_raises_at_registration():
 
 
 def test_missing_arg_description_raises_at_registration():
+    # [FUNCTION DOC]
+    # Asserts an argument absent from the docstring Args block raises "no description for the argument".
     """``transformers.get_json_schema`` requires every parameter to be
     described in the docstring's ``Args:`` block."""
 
@@ -289,6 +353,8 @@ def test_missing_arg_description_raises_at_registration():
 
         @function_tool("partial")
         def partial(x: int, y: int) -> int:
+            # [FUNCTION DOC]
+            # HELPER: Adds x and y; only x is documented (intentionally invalid).
             """Add.
 
             Args:
@@ -298,6 +364,8 @@ def test_missing_arg_description_raises_at_registration():
 
 
 def test_var_args_raises_at_registration():
+    # [FUNCTION DOC]
+    # Asserts both *args and **kwargs parameters raise ValueError matching "variadic parameter".
     """``*args`` / ``**kwargs`` can't be expressed as fixed JSON properties.
 
     We catch this before ``get_json_schema`` so the user gets a verl-specific
@@ -309,6 +377,8 @@ def test_var_args_raises_at_registration():
 
         @function_tool("varargs")
         def varargs(x: int, *args: int) -> int:
+            # [FUNCTION DOC]
+            # HELPER: Sums x and positional extras (intentionally invalid).
             """Sum.
 
             Args:
@@ -320,6 +390,8 @@ def test_var_args_raises_at_registration():
 
         @function_tool("varkw")
         def varkw(x: int, **kwargs: int) -> int:
+            # [FUNCTION DOC]
+            # HELPER: Sums x and keyword extra values (intentionally invalid).
             """Sum.
 
             Args:
@@ -334,6 +406,8 @@ def test_var_args_raises_at_registration():
 
 
 def test_load_basic_returns_registered_tools(tmp_path):
+    # [FUNCTION DOC]
+    # Writes a file defining one tool, loads it, and asserts the returned list holds that tool, identical to the registry entry.
     path = _write_tool_file(
         tmp_path,
         """
@@ -356,6 +430,8 @@ def test_load_basic_returns_registered_tools(tmp_path):
 
 
 def test_load_multiple_tools(tmp_path):
+    # [FUNCTION DOC]
+    # Asserts a file defining two tools returns both (order-insensitive).
     path = _write_tool_file(
         tmp_path,
         """
@@ -385,11 +461,15 @@ def test_load_multiple_tools(tmp_path):
 
 
 def test_missing_path_raises():
+    # [FUNCTION DOC]
+    # Asserts loading a non-existent path raises FileNotFoundError "function_tool_path does not exist".
     with pytest.raises(FileNotFoundError, match="function_tool_path does not exist"):
         load_function_tools_from_path("/nonexistent/path/here.py")
 
 
 def test_no_decorator_logs_warning(tmp_path, caplog):
+    # [FUNCTION DOC]
+    # Asserts loading a file with no tools returns an empty list and logs a WARNING containing "no @function_tool decorators found".
     path = _write_tool_file(tmp_path, "x = 1\n")
     with caplog.at_level("WARNING"):
         tools = load_function_tools_from_path(path)
@@ -398,6 +478,9 @@ def test_no_decorator_logs_warning(tmp_path, caplog):
 
 
 def test_load_is_idempotent_across_calls(tmp_path):
+    # [FUNCTION DOC]
+    # Asserts loading the same path twice returns the same FunctionTool and underlying function objects
+    # (cached; no re-execution that would trip the duplicate guard).
     """Loading the same path twice in one process must be a no-op.
 
     Production calls ``load_function_tools_from_path`` exactly once per
@@ -434,11 +517,15 @@ def test_load_is_idempotent_across_calls(tmp_path):
 
 
 def test_load_returns_only_tools_added_by_this_file(tmp_path):
+    # [FUNCTION DOC]
+    # Asserts a tool registered beforehand stays in the registry but is not included in the loader's return value.
     """Pre-registering a tool from elsewhere must not leak into the loader's
     return value; the loader attributes only what its file added."""
 
     @function_tool("preexisting")
     def preexisting(x: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Identity tool registered before the file is loaded.
         """Pre.
 
         Args:
@@ -468,6 +555,8 @@ def test_load_returns_only_tools_added_by_this_file(tmp_path):
 
 
 def test_relative_path_resolved_against_cwd(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # Changes cwd to tmp_path (monkeypatch) and asserts loading by bare filename finds the tool.
     path_str = _write_tool_file(
         tmp_path,
         """
@@ -494,6 +583,8 @@ def test_relative_path_resolved_against_cwd(tmp_path, monkeypatch):
 
 
 def test_normalize_str():
+    # [FUNCTION DOC]
+    # Asserts a plain string becomes ToolResponse(text), reward 0.0, empty metrics.
     resp, reward, metrics = normalize_function_tool_return("hello")
     assert resp == ToolResponse(text="hello")
     assert reward == 0.0
@@ -501,6 +592,8 @@ def test_normalize_str():
 
 
 def test_normalize_tool_response_passthrough():
+    # [FUNCTION DOC]
+    # Asserts a ToolResponse is returned by identity with default reward and metrics.
     src = ToolResponse(text="x")
     resp, reward, metrics = normalize_function_tool_return(src)
     assert resp is src
@@ -509,11 +602,15 @@ def test_normalize_tool_response_passthrough():
 
 
 def test_normalize_dict_serialized_as_json():
+    # [FUNCTION DOC]
+    # Asserts a mapping is serialized into the response text (keys and values appear).
     resp, _, _ = normalize_function_tool_return({"a": 1, "b": "two"})
     assert "a" in resp.text and "two" in resp.text
 
 
 def test_normalize_2_tuple_carries_reward():
+    # [FUNCTION DOC]
+    # Asserts a (text, reward) tuple carries the reward and empty metrics.
     resp, reward, metrics = normalize_function_tool_return(("text", 1.5))
     assert resp.text == "text"
     assert reward == 1.5
@@ -521,6 +618,8 @@ def test_normalize_2_tuple_carries_reward():
 
 
 def test_normalize_3_tuple_carries_metrics():
+    # [FUNCTION DOC]
+    # Asserts a (text, reward, metrics) tuple carries both reward and metrics.
     resp, reward, metrics = normalize_function_tool_return(("text", 2.0, {"k": "v"}))
     assert resp.text == "text"
     assert reward == 2.0
@@ -528,6 +627,8 @@ def test_normalize_3_tuple_carries_metrics():
 
 
 def test_normalize_tuple_tolerates_none_reward_and_metrics():
+    # [FUNCTION DOC]
+    # Asserts None reward/metrics in 2- and 3-tuples default to 0.0 and empty metrics.
     """Tools may legitimately omit reward/metrics by returning ``None``."""
     resp, reward, metrics = normalize_function_tool_return(("text", None))
     assert resp.text == "text"
@@ -541,6 +642,8 @@ def test_normalize_tuple_tolerates_none_reward_and_metrics():
 
 
 def test_normalize_falsy_reward_is_preserved_not_coerced_to_default():
+    # [FUNCTION DOC]
+    # Asserts integer 0 reward becomes float 0.0 and False becomes 0.0.
     """Regression: detect ``None`` via ``is None``, not truthiness.
 
     The earlier ``ret[1] or 0.0`` form swallowed every falsy reward value
@@ -562,6 +665,8 @@ def test_normalize_falsy_reward_is_preserved_not_coerced_to_default():
 
 
 def test_normalize_tuple_of_invalid_length_raises():
+    # [FUNCTION DOC]
+    # Asserts empty and 4-element tuples raise TypeError mentioning "length 1, 2, or 3".
     """0-length and >=4-length tuples almost always indicate a bug; we
     refuse rather than silently ``str(ret)``-ing the entire tuple, which
     would corrupt the ToolResponse shown to the LLM."""
@@ -573,8 +678,14 @@ def test_normalize_tuple_of_invalid_length_raises():
 
 
 def test_normalize_arbitrary_object_falls_back_to_str():
+    # [FUNCTION DOC]
+    # Asserts an arbitrary object is converted with its string form ("FOO") and default reward/metrics.
     class Foo:
+        # [CLASS DOC]
+        # HELPER: Dummy object with a custom string conversion.
         def __str__(self) -> str:
+            # [FUNCTION DOC]
+            # HELPER: Returns "FOO".
             return "FOO"
 
     resp, reward, metrics = normalize_function_tool_return(Foo())
@@ -589,6 +700,8 @@ def test_normalize_arbitrary_object_falls_back_to_str():
 
 
 def test_rollout_yaml_exposes_function_tool_path():
+    # [FUNCTION DOC]
+    # Loads verl/trainer/config/rollout/rollout.yaml (cwd-relative) and asserts multi_turn.function_tool_path exists and defaults to null.
     """Smoke test the YAML default so ``ToolAgentLoop.__init__`` can read it."""
     from omegaconf import OmegaConf
 
@@ -598,11 +711,19 @@ def test_rollout_yaml_exposes_function_tool_path():
 
 
 class _HydraProbe:
+    # [CLASS DOC]
+    # HELPER: Minimal hydra instantiate target that stores its tools kwarg.
     def __init__(self, tools):
+        # [FUNCTION DOC]
+        # HELPER: Stores tools as an attribute.
         self.tools = tools
 
 
 def test_tool_list_wrap_survives_hydra_instantiate(tmp_path):
+    # [FUNCTION DOC]
+    # Loads a file tool, then instantiates _HydraProbe via hydra twice: with the raw list it asserts hydra
+    # converts FunctionTools (to config objects; guards that ToolListWrap is still needed), and with
+    # ToolListWrap it asserts the wrapper and the real FunctionTool objects with callable fn survive.
     """Without ``ToolListWrap``, ``hydra.utils.instantiate`` demotes each
     ``FunctionTool`` in a kwarg list to ``DictConfig`` and breaks
     ``isinstance(tool, FunctionTool)`` in ``ToolAgentLoop._call_tool``."""

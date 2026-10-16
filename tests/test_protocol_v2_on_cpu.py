@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for the "protocol v2" approach: using raw TensorDicts plus verl.utils.tensordict_utils helpers in
+# place of DataProto. Per-sample lists are stored as NonTensorStack entries, scalar metadata as NonTensorData,
+# and ragged sequences as jagged nested tensors. Mirrors many DataProto tests from test_protocol_on_cpu.py.
+
 """
 Replace DataProto with raw TensorDict
 """
@@ -28,6 +33,9 @@ from verl.utils import tensordict_utils as tu
 
 
 def test_union_tensor_dict():
+    # [FUNCTION DOC]
+    # Asserts union_tensor_dict merges dicts sharing the same tensor object and identical lists, and raises AssertionError on
+    # a cloned tensor, on differing NonTensorData (top_p 0.8 vs 0.9), and on differing per-sample strings.
     obs = torch.randn(100, 10)
 
     meta_info1 = {"top_p": 0.8}
@@ -65,6 +73,8 @@ def test_union_tensor_dict():
 
 
 def test_tensor_dict_constructor():
+    # [FUNCTION DOC]
+    # Asserts get_tensordict infers batch size 100, supports integer and slice indexing over tensors and string lists, and exposes NonTensorData by key.
     obs = torch.ones(100, 10)
     act = torch.zeros(100, 10, 3)
     data_source = ["gsm8k"] * 100
@@ -90,6 +100,8 @@ def test_tensor_dict_constructor():
 
 
 def test_index_select_tensor_dict():
+    # [FUNCTION DOC]
+    # Asserts index_select_tensor_dict on a jagged input_ids tensor plus a padded tensor returns batch size 2 equal to a tensordict built from the selected rows.
     vocab_size = 128
     a = torch.randint(low=0, high=vocab_size, size=(11,))
     b = torch.randint(low=0, high=vocab_size, size=(13,))
@@ -129,6 +141,8 @@ def test_index_select_tensor_dict():
 
 
 def test_index_select_tensor_dict_preserves_3d_nested_tensor_layout_with_equal_seq_len():
+    # [FUNCTION DOC]
+    # Asserts selecting rows from a 3-D nested tensor (ragged along dim 2) keeps ragged index 2, correct values shape, values and offsets.
     position_ids = tu.nested_tensor_from_tensor_list(
         [
             torch.arange(2).expand(4, 2),
@@ -150,6 +164,8 @@ def test_index_select_tensor_dict_preserves_3d_nested_tensor_layout_with_equal_s
 
 
 def test_tensordict_with_images():
+    # [FUNCTION DOC]
+    # Asserts per-sample lists of numpy image arrays of differing sizes are stored and retrievable by sample index alongside jagged ids.
     # each sample contains a sequence with multiple images of different sizes
     vocab_size = 128
     a = torch.randint(low=0, high=vocab_size, size=(11,))
@@ -178,6 +194,8 @@ def test_tensordict_with_images():
 
 
 def test_tensordict_with_packing():
+    # [FUNCTION DOC]
+    # Asserts jagged input_ids offsets equal cumulative sequence lengths, per-row access works at both tensor and tensordict level, and chunk(2) splits rows.
     vocab_size = 128
     a = torch.randint(low=0, high=vocab_size, size=(11,))
     b = torch.randint(low=0, high=vocab_size, size=(13,))
@@ -204,6 +222,9 @@ def test_tensordict_with_packing():
 
 
 def test_tensordict_eq():
+    # [FUNCTION DOC]
+    # Asserts assert_tensordict_eq passes for equal content (including jagged tensors rebuilt from equal lists) and fails when a tensor
+    # value, a per-sample string, a nested NonTensorData mapping value, a jagged row's content, or the jagged row order differs.
     obs = torch.tensor([1, 2, 3, 4, 5, 6])
     data_sources = ["abc", "def", "abc", "def", "pol", "klj"]
     non_tensor_dict = {"train_sample_kwargs": {"top_p": 1.0}, "val_sample_kwargs": {"top_p": 0.7}}
@@ -267,6 +288,8 @@ def test_tensordict_eq():
 
 
 def test_tensor_dict_make_iterator():
+    # [FUNCTION DOC]
+    # Asserts make_iterator without shuffle yields consecutive mini-batches of 2 over two epochs, and with shuffle and the same seed two runs produce identical batches.
     obs = torch.tensor([1, 2, 3, 4, 5, 6])
     input_ids = torch.nested.as_nested_tensor(
         [
@@ -319,6 +342,8 @@ def test_tensor_dict_make_iterator():
 
 
 def test_reorder():
+    # [FUNCTION DOC]
+    # Asserts tensor indexing by a permutation reorders tensors and labels while keeping NonTensorData.
     obs = torch.tensor([1, 2, 3, 4, 5, 6])
     labels = ["a", "b", "c", "d", "e", "f"]
     non_tensor_dict = {"name": "abdce"}
@@ -332,6 +357,9 @@ def test_reorder():
 
 
 def test_chunk_concat():
+    # [FUNCTION DOC]
+    # Asserts tensor_split into 5 parts yields the expected uneven groups, chunk(2) splits evenly with metadata copied, cat restores data, and
+    # concatenating tensordicts with different NonTensorData keeps the first value.
     obs = torch.tensor([1, 2, 3, 4, 5, 6])
     labels = ["a", "b", "c", "d", "e", "f"]
     data = tu.get_tensordict({"obs": obs, "labels": labels}, non_tensor_dict={"name": "abcde"})
@@ -369,6 +397,9 @@ def test_chunk_concat():
 
 
 def test_pop():
+    # [FUNCTION DOC]
+    # Asserts pop_keys returns a tensordict with the requested tensor and metadata keys and removes them, raises KeyError when popping
+    # missing keys, and single-key pop returns raw values for NonTensorData, NonTensorStack (as list) and tensors.
     obs = torch.randn(3, 10)
     act = torch.randn(3, 3)
     labels = ["a", ["b"], []]
@@ -401,6 +432,8 @@ def test_pop():
 
 
 def test_get():
+    # [FUNCTION DOC]
+    # Asserts get_keys returns the requested keys without removal, raises KeyError for a missing key, and get returns raw values or the supplied default.
     obs = torch.randn(3, 10)
     act = torch.randn(3, 3)
     labels = ["a", ["b"], []]
@@ -431,6 +464,8 @@ def test_get():
 
 
 def test_repeat():
+    # [FUNCTION DOC]
+    # Asserts repeat_interleave(2) duplicates rows consecutively and repeat(2) tiles them, for tensors and label lists, keeping metadata.
     # Create a DataProto object with some batch and non-tensor data
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
     labels = ["a", "b", "c"]
@@ -456,6 +491,8 @@ def test_repeat():
 
 
 def test_dataproto_pad_unpad():
+    # [FUNCTION DOC]
+    # Asserts pad_to_divisor cycles rows from the start (pad sizes 1, 0, 4 for divisors 2, 3, 7) and unpad restores the originals.
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
     labels = ["a", "b", "c"]
     data = tu.get_tensordict(tensor_dict={"obs": obs, "labels": labels}, non_tensor_dict={"info": "test_info"})
@@ -507,6 +544,9 @@ def test_dataproto_pad_unpad():
 
 
 def test_torch_save_data_proto():
+    # [FUNCTION DOC]
+    # Saves the tensordict with torch.save to test_data.pt in the cwd, loads it (weights_only False), compares and deletes the file.
+    # Side effects: writes/removes a file in the current directory.
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
     labels = ["a", "b", "c"]
     data = tu.get_tensordict({"obs": obs, "labels": labels}, non_tensor_dict={"info": "test_info"})
@@ -525,6 +565,8 @@ def test_torch_save_data_proto():
 
 
 def test_len():
+    # [FUNCTION DOC]
+    # Asserts length equals the batch size whether from tensors or only labels, a single indexed item has length 0, and an empty tensordict has length 0.
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
     labels = np.array(["a", "b", "c"], dtype=object)
 
@@ -542,6 +584,8 @@ def test_len():
 
 
 def test_dataproto_index():
+    # [FUNCTION DOC]
+    # Asserts indexing by numpy/torch/list integer indices and torch boolean masks selects matching rows; numpy and list boolean masks are commented out (unsupported).
     data_len = 100
     idx_num = 10
 
@@ -602,6 +646,8 @@ def test_dataproto_index():
 
 
 def test_select():
+    # [FUNCTION DOC]
+    # Asserts select keeps only the named tensor and metadata keys.
     obs = torch.randn(100, 10)
     act = torch.randn(100, 3)
     dataset = tu.get_tensordict({"obs": obs, "act": act}, non_tensor_dict={"2": 2, "1": 1})
@@ -615,6 +661,8 @@ def test_select():
 
 
 def test_dataproto_no_batch():
+    # [FUNCTION DOC]
+    # Asserts select and pop_keys work on a tensordict holding only a label list and metadata.
     labels = ["a", "b", "c"]
     data = tu.get_tensordict(tensor_dict={"labels": labels}, non_tensor_dict={"info": "test_info"})
     selected = data.select("labels")
@@ -626,6 +674,8 @@ def test_dataproto_no_batch():
 
 
 def test_sample_level_repeat():
+    # [FUNCTION DOC]
+    # Asserts repeat_interleave with a per-row count tensor repeats each row by its count.
     # Create a DataProto object with some batch and non-tensor data
     obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
     labels = ["a", "b", "c"]
@@ -652,6 +702,8 @@ def test_sample_level_repeat():
 
 
 def test_dataproto_chunk_after_index():
+    # [FUNCTION DOC]
+    # Asserts that after indexing by torch boolean/int tensors or boolean/int lists the batch size is a torch Size of plain ints.
     data_len = 4
     obs = torch.randn(data_len, 4)
     labels = [f"label_{i}" for i in range(data_len)]
@@ -695,6 +747,8 @@ def test_dataproto_chunk_after_index():
 
 
 def test_concat_nested_tensor():
+    # [FUNCTION DOC]
+    # Asserts concat_nested_tensors joins jagged tensors of 2-D, 3-D and 4-D shapes, preserving the order and content of each component.
     # Test 2D nested tensors
     vocab_size = 128
     a = torch.randint(low=0, high=vocab_size, size=(11,))
@@ -750,6 +804,9 @@ def test_concat_nested_tensor():
 
 
 def test_concat_tensordict():
+    # [FUNCTION DOC]
+    # Asserts concat_tensordict joins jagged tensors and label lists while keeping the first NonTensorData value, leaves inputs unchanged,
+    # works with only stacks (batch size 4) and with only metadata (empty batch size).
     vocab_size = 128
     a = torch.randint(low=0, high=vocab_size, size=(11,))
     b = torch.randint(low=0, high=vocab_size, size=(13,))
@@ -800,6 +857,9 @@ def test_concat_tensordict():
 
 
 def test_chunk_tensordict():
+    # [FUNCTION DOC]
+    # Asserts chunk_tensordict(2) on jagged ids, 3-D position ids, attention masks and a stack of optional pixel mappings yields chunks of 2 whose
+    # nested values and non-tensor entries (including None) match the corresponding source rows.
     # Qwen-VL 3d position_ids
     position_ids = torch.nested.as_nested_tensor(
         [
@@ -859,6 +919,8 @@ def test_chunk_tensordict():
 
 
 def test_chunk_tensordict_preserves_3d_nested_tensor_layout_with_equal_seq_len_per_chunk():
+    # [FUNCTION DOC]
+    # Asserts chunking a 3-D nested tensor (ragged dim 2) where rows in a chunk share a length keeps ragged index 2 with matching values and offsets.
     position_ids = tu.nested_tensor_from_tensor_list(
         [
             torch.arange(2).expand(4, 2),
@@ -886,6 +948,8 @@ def test_chunk_tensordict_preserves_3d_nested_tensor_layout_with_equal_seq_len_p
 
 
 def test_chunk_tensordict_preserves_3d_nested_tensor_layout_with_non_last_ragged_idx():
+    # [FUNCTION DOC]
+    # Regression: asserts chunking a nested tensor ragged along dim 1 (topk logprobs) keeps ragged index 1 and the original rows.
     """Regression test: chunk_tensordict must handle nested tensors where the ragged dimension is not the last one."""
     topk = 64
     elements = [torch.randn(5, topk), torch.randn(8, topk), torch.randn(3, topk), torch.randn(7, topk)]
@@ -907,6 +971,8 @@ def test_chunk_tensordict_preserves_3d_nested_tensor_layout_with_non_last_ragged
 
 
 def test_index_select_tensor_dict_preserves_3d_nested_tensor_layout_with_non_last_ragged_idx():
+    # [FUNCTION DOC]
+    # Regression: asserts index selection on a nested tensor ragged along dim 1 keeps ragged index 1 and the selected rows.
     """Regression test: index_select_tensor_dict must handle nested tensors where the ragged dim is not the last."""
     topk = 64
     elements = [torch.randn(5, topk), torch.randn(8, topk), torch.randn(3, topk), torch.randn(7, topk)]
@@ -921,6 +987,8 @@ def test_index_select_tensor_dict_preserves_3d_nested_tensor_layout_with_non_las
 
 
 def test_assign_non_tensor_stack_with_nested_lists():
+    # [FUNCTION DOC]
+    # Asserts assign_non_tensor_stack stores ragged lists (including empty) accessible per row.
     """Test assign_non_tensor_stack with lists of lists."""
     td = tu.get_tensordict({"obs": torch.randn(3, 4)}, non_tensor_dict={})
 
@@ -936,6 +1004,8 @@ def test_assign_non_tensor_stack_with_nested_lists():
 
 
 def test_assign_non_tensor_stack_with_nested_dicts():
+    # [FUNCTION DOC]
+    # Asserts assign_non_tensor_stack stores a list of mappings accessible per row.
     """Test assign_non_tensor_stack with lists of dicts."""
     td = tu.get_tensordict({"obs": torch.randn(3, 4)}, non_tensor_dict={})
 
@@ -951,6 +1021,8 @@ def test_assign_non_tensor_stack_with_nested_dicts():
 
 
 def test_assign_non_tensor_stack_with_complex_nested():
+    # [FUNCTION DOC]
+    # Asserts assign_non_tensor_stack stores lists of chat-message mappings.
     """Test assign_non_tensor_stack with lists of lists of dicts."""
     td = tu.get_tensordict({"obs": torch.randn(2, 4)}, non_tensor_dict={})
 
@@ -970,6 +1042,8 @@ def test_assign_non_tensor_stack_with_complex_nested():
 
 
 def test_assign_non_tensor_handles_wrappers():
+    # [FUNCTION DOC]
+    # Asserts assign_non_tensor accepts plain scalars, pre-wrapped NonTensorData and NonTensorStack values, unwrapping them on read.
     td = tu.get_tensordict({"obs": torch.randn(3, 4)}, non_tensor_dict={})
 
     meta = {"top_p": 0.8}
@@ -985,6 +1059,8 @@ def test_assign_non_tensor_handles_wrappers():
 
 
 def test_assign_non_tensor_stack_batch_size_check():
+    # [FUNCTION DOC]
+    # Asserts assigning a NonTensorStack whose length (2) differs from the batch size (3) raises RuntimeError.
     td = tu.get_tensordict({"obs": torch.randn(3, 4)}, non_tensor_dict={})
     stack = NonTensorStack.from_list([NonTensorData(1.0), NonTensorData(2.0)])
 
@@ -993,6 +1069,8 @@ def test_assign_non_tensor_stack_batch_size_check():
 
 
 def test_assign_non_tensor_with_auto_detection():
+    # [FUNCTION DOC]
+    # Asserts assign_non_tensor stores scalars as metadata and lists (ragged, mappings, plain strings) as per-row stacks.
     """Test assign_non_tensor automatically detects and handles nested structures."""
     td = tu.get_tensordict({"obs": torch.randn(3, 4)}, non_tensor_dict={})
 
@@ -1016,6 +1094,8 @@ def test_assign_non_tensor_with_auto_detection():
 
 
 def test_get_tensordict_with_nested_lists():
+    # [FUNCTION DOC]
+    # Asserts get_tensordict converts ragged list values to per-row stacks alongside tensors.
     """Test get_tensordict automatically handles nested lists."""
     obs = torch.randn(3, 4)
     turn_scores = [[], [0.5, 0.8], [0.9]]
@@ -1031,6 +1111,8 @@ def test_get_tensordict_with_nested_lists():
 
 
 def test_get_tensordict_with_nested_dicts():
+    # [FUNCTION DOC]
+    # Asserts get_tensordict converts lists of mappings to per-row stacks.
     """Test get_tensordict automatically handles lists of dicts."""
     obs = torch.randn(3, 4)
     reward_extra_info = [{"acc": 1.0}, {"acc": 0.0}, {"acc": 1.0}]
@@ -1043,6 +1125,8 @@ def test_get_tensordict_with_nested_dicts():
 
 
 def test_get_tensordict_with_complex_nested_structures():
+    # [FUNCTION DOC]
+    # Asserts get_tensordict converts lists of chat-message lists to per-row stacks.
     """Test get_tensordict with lists of lists of dicts."""
     obs = torch.randn(2, 4)
     raw_prompt = [
@@ -1058,6 +1142,8 @@ def test_get_tensordict_with_complex_nested_structures():
 
 
 def test_get_tensordict_agent_loop_scenario():
+    # [FUNCTION DOC]
+    # Asserts a realistic agent-loop payload (tensors, string lists, ragged lists, mappings, message lists, global_steps metadata) is fully accessible.
     """Test the complete agent loop scenario with all nested types.
 
     This simulates the exact use case from agent loops with:
@@ -1121,6 +1207,9 @@ def test_get_tensordict_agent_loop_scenario():
 
 
 def test_contiguous():
+    # [FUNCTION DOC]
+    # Builds a tensordict with contiguous, non-contiguous and jagged tensors, a stack of mappings holding tensors and tensor metadata; asserts
+    # consolidate raises RuntimeError on the non-contiguous data, and that tensordict_utils.contiguous yields equal content that then consolidates successfully.
     # create a tensordict that contains normal tensor, nested tensor,
     # nontensorstack with numpy, nontensorstack with tensor, NonTensorData with numpy and NonTensorData with tensor
 

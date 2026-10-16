@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for verl.trainer.ppo.core_algos: the advantage-estimator registry, multi-turn GAE masking,
+# equivalence of loop vs vectorized RLOO/GRPO advantage implementations, and the straight-through "+"
+# KL penalty variants. Runnable directly via unittest.
+
 import random
 import unittest
 
@@ -33,11 +38,20 @@ from verl.trainer.ppo.core_algos import (
 
 
 def mock_test_fn():
+    # [FUNCTION DOC]
+    # HELPER: No-op function used as a registration target in duplicate-registration tests.
     pass
 
 
 class TestRegisterAdvEst(unittest.TestCase):
+    # [CLASS DOC]
+    # unittest case for register_adv_est / get_adv_estimator_fn. Each test runs against a fresh registry
+    # containing only two fake estimators: "gae" (doubles input) and "vtrace" (adds one).
     def setUp(self):
+        # [FUNCTION DOC]
+        # HELPER: Clears the real module-level ADV_ESTIMATOR_REGISTRY, then rebinds the module attribute to a new
+        # mapping with the fake "gae"/"vtrace" lambdas and keeps a reference on self.
+        # Side effects: mutates global state of core_algos.
         """Clear the registry before each test"""
         verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.clear()
         verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY = {
@@ -47,34 +61,49 @@ class TestRegisterAdvEst(unittest.TestCase):
         self.ADV_ESTIMATOR_REGISTRY = verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Clears the (test) registry and calls the base tearDown.
+        # KNOWN ISSUE: the original registry contents are never restored, so after this class runs the core_algos registry is empty for any later test in the same process.
         verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.clear()
         return super().tearDown()
 
     def test_register_new_function(self):
+        # [FUNCTION DOC]
+        # Registers a nested function under a string name and asserts the registry maps the name to it.
         """Test registering a new function with a string name"""
 
         @register_adv_est("test_estimator")
         def test_fn():
+            # [FUNCTION DOC]
+            # HELPER: No-op function registered as "test_estimator".
             pass
 
         self.assertIn("test_estimator", self.ADV_ESTIMATOR_REGISTRY)
         self.assertEqual(self.ADV_ESTIMATOR_REGISTRY["test_estimator"], test_fn)
 
     def test_register_with_enum(self):
+        # [FUNCTION DOC]
+        # Registers via a locally defined Enum member and asserts the registry key is the enum's string value.
         """Test registering with an enum value (assuming AdvantageEstimator exists)"""
         from enum import Enum
 
         class AdvantageEstimator(Enum):
+            # [CLASS DOC]
+            # HELPER: Local Enum with a single member TEST = "test_enum_estimator" (shadows, not the real AdvantageEstimator).
             TEST = "test_enum_estimator"
 
         @register_adv_est(AdvantageEstimator.TEST)
         def test_fn():
+            # [FUNCTION DOC]
+            # HELPER: No-op function registered under the enum member.
             pass
 
         self.assertIn("test_enum_estimator", self.ADV_ESTIMATOR_REGISTRY)
         self.assertEqual(self.ADV_ESTIMATOR_REGISTRY["test_enum_estimator"], test_fn)
 
     def test_duplicate_registration_same_function(self):
+        # [FUNCTION DOC]
+        # Registers the same function twice under one name and asserts no error and the mapping is kept.
         """Test that registering the same function twice doesn't raise an error"""
         register_adv_est("duplicate_test")(mock_test_fn)
         register_adv_est("duplicate_test")(mock_test_fn)
@@ -82,37 +111,53 @@ class TestRegisterAdvEst(unittest.TestCase):
         self.assertEqual(self.ADV_ESTIMATOR_REGISTRY["duplicate_test"], mock_test_fn)
 
     def test_duplicate_registration_different_function(self):
+        # [FUNCTION DOC]
+        # Asserts registering a second, different function under an existing name raises ValueError.
         """Test that registering different functions with same name raises ValueError"""
 
         @register_adv_est("conflict_test")
         def test_fn1():
+            # [FUNCTION DOC]
+            # HELPER: No-op function registered first as "conflict_test".
             pass
 
         with self.assertRaises(ValueError):
 
             @register_adv_est("conflict_test")
             def test_fn2():
+                # [FUNCTION DOC]
+                # HELPER: No-op function whose registration under "conflict_test" is expected to fail.
                 pass
 
     def test_decorator_preserves_function(self):
+        # [FUNCTION DOC]
+        # Asserts the decorator returns the original callable (calling it still returns "original").
         """Test that the decorator returns the original function"""
 
         def test_fn():
+            # [FUNCTION DOC]
+            # HELPER: Returns the string "original".
             return "original"
 
         decorated = register_adv_est("preserve_test")(test_fn)
         self.assertEqual(decorated(), "original")
 
     def test_multiple_registrations(self):
+        # [FUNCTION DOC]
+        # Registers two functions and asserts the registry grew by two and maps each name correctly.
         """Test registering multiple different functions"""
         init_adv_count = len(self.ADV_ESTIMATOR_REGISTRY)
 
         @register_adv_est("estimator1")
         def fn1():
+            # [FUNCTION DOC]
+            # HELPER: No-op registered as "estimator1".
             pass
 
         @register_adv_est("estimator2")
         def fn2():
+            # [FUNCTION DOC]
+            # HELPER: No-op registered as "estimator2".
             pass
 
         self.assertEqual(len(self.ADV_ESTIMATOR_REGISTRY), 2 + init_adv_count)
@@ -120,6 +165,8 @@ class TestRegisterAdvEst(unittest.TestCase):
         self.assertEqual(self.ADV_ESTIMATOR_REGISTRY["estimator2"], fn2)
 
     def test_get_adv_estimator_fn_valid_names(self):
+        # [FUNCTION DOC]
+        # Asserts lookup of "gae"/"vtrace" returns the fake lambdas (5 -> 10 and 5 -> 6).
         """Test that valid names return the correct function from registry."""
         # Test GAE
         gae_fn = get_adv_estimator_fn("gae")
@@ -130,18 +177,26 @@ class TestRegisterAdvEst(unittest.TestCase):
         assert vtrace_fn(5) == 6  # 5 + 1 = 6
 
     def test_get_adv_estimator_fn_invalid_name(self):
+        # [FUNCTION DOC]
+        # Asserts an unknown name raises ValueError with message "Unknown advantage estimator simply: invalid_name".
         """Test that invalid names raise ValueError."""
         with pytest.raises(ValueError) as excinfo:
             get_adv_estimator_fn("invalid_name")
         assert "Unknown advantage estimator simply: invalid_name" in str(excinfo.value)
 
     def test_get_adv_estimator_fn_case_sensitive(self):
+        # [FUNCTION DOC]
+        # Asserts lookup is case-sensitive ("GAE" raises ValueError).
         """Test that name lookup is case-sensitive."""
         with pytest.raises(ValueError):
             get_adv_estimator_fn("GAE")  # Different case
 
 
 def test_multi_turn_compute_gae_advantage_return():
+    # [FUNCTION DOC]
+    # With random gamma/lam, computes GAE twice on an 11-token sequence where two value tensors differ only at
+    # masked (response_mask 0) positions; asserts advantages are identical and returns are identical after
+    # masking, i.e. values of observation tokens are ignored. Prints results.
     """Test multi-turn GAE skip observation tokens."""
     gamma = random.uniform(0.0, 1.0)
     lam = random.uniform(0.0, 1.0)
@@ -199,6 +254,10 @@ def test_multi_turn_compute_gae_advantage_return():
 
 
 def _make_group_index(batch_size: int, num_groups: int) -> np.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: Builds a shuffled int64 numpy array of group ids of length batch_size with num_groups groups,
+    # each of size at least 2 (extra samples assigned to random groups). Uses the global random module.
+    # Exceptions: AssertionError if batch_size < 2 * num_groups.
     """Create a numpy index array ensuring each group has at least 2 samples."""
     assert num_groups * 2 <= batch_size, "batch_size must allow >=2 samples per group"
     counts: list[int] = [2] * num_groups
@@ -213,6 +272,8 @@ def _make_group_index(batch_size: int, num_groups: int) -> np.ndarray:
 
 
 def _rand_mask(batch_size: int, seq_len: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns a random 0/1 float mask of shape (batch_size, seq_len), forcing the last column to 1 in any all-zero row.
     mask = torch.randint(0, 2, (batch_size, seq_len), dtype=torch.int64).float()
     rows_without_one = (mask.sum(dim=-1) == 0).nonzero(as_tuple=True)[0]
     if len(rows_without_one) > 0:
@@ -229,6 +290,10 @@ def _rand_mask(batch_size: int, seq_len: int) -> torch.Tensor:
     ],
 )
 def test_rloo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_groups: int, seed: int):
+    # [FUNCTION DOC]
+    # Parametrized over batch size / sequence length / group count / seed: seeds torch, random and numpy,
+    # builds groups, mask and masked random rewards, and asserts the loop and vectorized RLOO implementations
+    # yield identical-shaped advantages and returns within rtol 1e-5 / atol 1e-6. Prints max differences.
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -261,6 +326,8 @@ def test_rloo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
 
 
 def test_grpo_vectorized_matches_original_for_low_variance_rewards():
+    # [FUNCTION DOC]
+    # Asserts loop and vectorized GRPO agree for two groups whose rewards differ by only 1e-5 (near-zero std edge case), with string group ids.
     token_level_rewards = torch.tensor([[1.0], [1.00001], [2.0], [2.00001]], dtype=torch.float32)
     response_mask = torch.ones_like(token_level_rewards)
     index = np.array(["prompt-a", "prompt-a", "prompt-b", "prompt-b"], dtype=object)
@@ -289,6 +356,8 @@ def test_grpo_vectorized_matches_original_for_low_variance_rewards():
     ],
 )
 def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_groups: int, seed: int):
+    # [FUNCTION DOC]
+    # Same randomized equivalence check as the RLOO test, for compute_grpo_outcome_advantage versus its vectorized variant.
     # Set seeds for reproducibility
     torch.manual_seed(seed)
     random.seed(seed)
@@ -345,6 +414,8 @@ def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     ],
 )
 def test_kl_penalty_straight_through_value_matches_base(name, base):
+    # [FUNCTION DOC]
+    # Parametrized over k1+/kl+/abs+/k3+/low_var_kl+: asserts the forward value equals the base estimator's value.
     """The ``+`` suffix is a straight-through trick that swaps in the k2
     gradient while keeping the base estimator's value. Therefore the forward
     value of e.g. ``k3+`` must match the value of plain ``k3``.
@@ -363,6 +434,8 @@ def test_kl_penalty_straight_through_value_matches_base(name, base):
 
 
 def test_kl_penalty_k3_plus_uses_k2_gradient():
+    # [FUNCTION DOC]
+    # Asserts the gradient of the summed "k3+" penalty with respect to logprob equals that of the "k2" penalty.
     """With ``k3+`` the gradient w.r.t. ``logprob`` should equal the gradient
     obtained from the ``k2`` (``0.5 * log_ratio**2``) estimator, since the
     straight-through trick routes the backward pass through ``k2``.

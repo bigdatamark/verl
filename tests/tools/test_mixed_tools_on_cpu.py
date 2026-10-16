@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for load_all_tools combining YAML-configured native BaseTool stubs (search, crawler) with
+# function_tool tools loaded from a Python file (get_weather, calculator). Module constants hold the
+# YAML text and the tool-file source written by the fixtures.
+
 """Coexistence test: yaml-defined native tools + ``@function_tool`` tools.
 
 Pins :func:`verl.tools.tool_registry.load_all_tools`, the loader both
@@ -40,6 +45,8 @@ from verl.tools.tool_registry import load_all_tools
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture clearing the function-tool registry and loaded-path cache before and after each test.
     """Reset the process-global registry + per-path cache around each test."""
     FUNCTION_TOOL_REGISTRY.clear()
     function_tool_mod._LOADED_FUNCTION_TOOL_PATHS.clear()
@@ -111,6 +118,8 @@ def calculator(expression: str) -> str:
 
 @pytest.fixture
 def native_yaml_path(tmp_path: Path) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Fixture writing the native tool YAML to tmp_path/all_tool_config.yaml; returns the path string.
     p = tmp_path / "all_tool_config.yaml"
     p.write_text(_NATIVE_TOOL_YAML)
     return str(p)
@@ -118,23 +127,32 @@ def native_yaml_path(tmp_path: Path) -> str:
 
 @pytest.fixture
 def function_tool_py_path(tmp_path: Path) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Fixture writing the function-tool source to tmp_path/my_function_tools.py; returns the path string.
     p = tmp_path / "my_function_tools.py"
     p.write_text(textwrap.dedent(_FUNCTION_TOOL_BODY))
     return str(p)
 
 
 def _load_as_dict(native_yaml: str | None, function_path: str | None) -> dict[str, BaseTool | FunctionTool]:
+    # [FUNCTION DOC]
+    # HELPER: Calls load_all_tools with the given paths (either may be None) and returns a mapping from tool name to tool.
+    # Exceptions: propagates loader errors (e.g. ValueError on name collision).
     """``load_all_tools`` keyed by tool name."""
     tools = load_all_tools(tool_config_path=native_yaml, function_tool_path=function_path)
     return {tool.name: tool for tool in tools}
 
 
 def test_no_paths_returns_empty():
+    # [FUNCTION DOC]
+    # Asserts both paths None returns an empty list.
     """Both args ``None`` is the "tools disabled" path; must not blow up."""
     assert load_all_tools(tool_config_path=None, function_tool_path=None) == []
 
 
 def test_native_only_loader(native_yaml_path):
+    # [FUNCTION DOC]
+    # Asserts the YAML alone yields the two stub instances and registers no function tools.
     """Sanity: the stub yaml alone yields exactly the two BaseTool instances."""
     tools = _load_as_dict(native_yaml_path, None)
 
@@ -146,6 +164,8 @@ def test_native_only_loader(native_yaml_path):
 
 
 def test_function_only_loader(function_tool_py_path):
+    # [FUNCTION DOC]
+    # Asserts the Python file alone yields two FunctionTool instances.
     """Sanity: the function-tool file alone yields FunctionTool instances."""
     tools = _load_as_dict(None, function_tool_py_path)
 
@@ -155,6 +175,8 @@ def test_function_only_loader(function_tool_py_path):
 
 
 def test_native_and_function_tools_coexist(native_yaml_path, function_tool_py_path):
+    # [FUNCTION DOC]
+    # Asserts all four tools load with correct types and that FunctionTool is not a BaseTool subclass.
     """All four tools land in one mapping with the right concrete types."""
     tools = _load_as_dict(native_yaml_path, function_tool_py_path)
 
@@ -170,6 +192,9 @@ def test_native_and_function_tools_coexist(native_yaml_path, function_tool_py_pa
 
 
 def test_merged_schemas_are_well_formed(native_yaml_path, function_tool_py_path):
+    # [FUNCTION DOC]
+    # Asserts every tool schema is type function with matching name and object parameters; native params
+    # come from YAML and get_weather's city param is an inferred string with its docstring description.
     """Each tool exposes a valid OpenAI function schema."""
     tools = _load_as_dict(native_yaml_path, function_tool_py_path)
 
@@ -191,10 +216,16 @@ def test_merged_schemas_are_well_formed(native_yaml_path, function_tool_py_path)
 
 
 def test_dispatch_branches_match_tool_agent_loop(native_yaml_path, function_tool_py_path):
+    # [FUNCTION DOC]
+    # Runs an async driver exercising the function-tool call path and the BaseTool create/execute/release path.
     """Drive both ``ToolAgentLoop._call_tool`` branches end-to-end."""
     tools = _load_as_dict(native_yaml_path, function_tool_py_path)
 
     async def _drive():
+        # [FUNCTION DOC]
+        # HELPER: Async body: calls get_weather (dict result normalized to JSON text, reward 0, empty metrics) and
+        # calculator ("2 + 3 * 4" -> "14"); then for search and crawler stubs creates an instance, executes, releases,
+        # and asserts text, reward, metrics and the recorded calls.
         # function tool branch -- get_weather returns dict, exercising the
         # dict -> JSON path of normalize_function_tool_return.
         weather_raw = await tools["get_weather"].call({"city": "Tokyo"})
@@ -228,6 +259,9 @@ def test_dispatch_branches_match_tool_agent_loop(native_yaml_path, function_tool
 
 
 def test_loader_is_safe_to_call_repeatedly(native_yaml_path, function_tool_py_path):
+    # [FUNCTION DOC]
+    # Loads three times; asserts consistent names/types, function tools are the same cached objects across
+    # runs, and native tools are fresh instances each run.
     """``load_all_tools`` runs at least twice per process (worker + dataset)."""
     runs = [_load_as_dict(native_yaml_path, function_tool_py_path) for _ in range(3)]
 
@@ -246,6 +280,8 @@ def test_loader_is_safe_to_call_repeatedly(native_yaml_path, function_tool_py_pa
 
 
 def test_function_tool_name_collision_with_native_tool_raises(native_yaml_path, tmp_path):
+    # [FUNCTION DOC]
+    # Writes a function tool named "search" and asserts loading raises ValueError listing ['search'] and "collide".
     """A function tool sharing a name with a native tool must fail loudly."""
     colliding_path = tmp_path / "colliding.py"
     colliding_path.write_text(
@@ -270,6 +306,8 @@ def test_function_tool_name_collision_with_native_tool_raises(native_yaml_path, 
 
 
 def test_function_tool_name_collision_reports_all_offenders(native_yaml_path, tmp_path):
+    # [FUNCTION DOC]
+    # Writes tools crawler, search, ok_unique and asserts the error lists the sorted colliding names ['crawler', 'search'].
     """Multiple collisions are surfaced together, sorted."""
     colliding_path = tmp_path / "many_colliding.py"
     colliding_path.write_text(
@@ -312,6 +350,10 @@ def test_function_tool_name_collision_reports_all_offenders(native_yaml_path, tm
 
 
 def test_dataset_loader_sees_function_tools(native_yaml_path, function_tool_py_path):
+    # [FUNCTION DOC]
+    # Builds an RLHFDataset without running its initializer, sets config and the two path attributes, then
+    # calls load_all_tools with those attributes and asserts the four schema names.
+    # KNOWN ISSUE: no RLHFDataset method is invoked; the test only re-calls load_all_tools directly, so it does not verify the dataset's own loading branch.
     """RLHFDataset and AgentLoopWorker must see the same tool schemas, else
     prompt-length filtering and rollout disagree."""
     from omegaconf import OmegaConf

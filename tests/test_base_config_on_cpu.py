@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for BaseConfig dict-style item access (__getitem__).
+
 import pytest
 
 from verl.base_config import BaseConfig
@@ -19,6 +22,8 @@ from verl.base_config import BaseConfig
 
 @pytest.fixture
 def base_config_mock():
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture returning a default BaseConfig with an extra attribute test_attr = "test_value".
     """Fixture to create a mock BaseConfig instance with test attributes."""
     mock_config = BaseConfig()
     mock_config.test_attr = "test_value"
@@ -26,17 +31,23 @@ def base_config_mock():
 
 
 def test_getitem_success(base_config_mock):
+    # [FUNCTION DOC]
+    # Asserts item access by an existing attribute name returns its value.
     """Test __getitem__ with existing attribute (happy path)."""
     assert base_config_mock["test_attr"] == "test_value"
 
 
 def test_getitem_nonexistent_attribute(base_config_mock):
+    # [FUNCTION DOC]
+    # Asserts item access by an unknown name raises AttributeError.
     """Test __getitem__ with non-existent attribute (exception path 1)."""
     with pytest.raises(AttributeError):
         _ = base_config_mock["nonexistent_attr"]
 
 
 def test_getitem_invalid_key_type(base_config_mock):
+    # [FUNCTION DOC]
+    # Asserts item access with an integer key raises TypeError.
     """Test __getitem__ with invalid key type (exception path 2)."""
     with pytest.raises(TypeError):
         _ = base_config_mock[123]  # type: ignore

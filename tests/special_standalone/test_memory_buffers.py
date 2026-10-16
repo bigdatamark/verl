@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Standalone GPU test (requires CUDA) that two identically-weighted small Llama models stay identical and
+# that GPU allocated memory does not change by 1% or more. Runnable directly as a script.
+
 """
 Test memory buffers
 - We start with two models with the same weights
@@ -24,6 +28,13 @@ from transformers import LlamaConfig, LlamaModel
 
 
 def test_memory_buffers():
+    # [FUNCTION DOC]
+    # Builds a 2-layer LlamaModel (vocab 256, hidden 4096, intermediate 11008, 16 heads) and a copy on GPU 0,
+    # loads the first's state dict into the copy, records total/reserved/allocated memory in GB, records them
+    # again, runs gc and empties the CUDA cache, prints both, asserts relative allocated change < 1%, then
+    # asserts parameter names and values match pairwise.
+    # Side effects: allocates GPU memory, prints to stdout.
+    # KNOWN ISSUE: despite the module docstring, no memory buffer is used; the second measurement is taken immediately after the first (before gc/empty_cache) with nothing in between, so the memory assertion is trivially satisfied.
     llama_config = LlamaConfig(
         vocab_size=256,
         hidden_size=4096,

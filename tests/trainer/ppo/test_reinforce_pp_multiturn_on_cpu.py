@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Regression tests for compute_reinforce_plus_plus_outcome_advantage with multi-turn masks: positions with
+# response_mask 0 (tool observations or padding) are skipped by the reverse discounted-return scan,
+# receive return 0, and do not consume a gamma discount step.
+
 """Tests for REINFORCE++ advantage computation with multi-turn observation spans.
 
 Verifies that masked observation tokens (response_mask=0) are correctly
@@ -28,13 +33,19 @@ from verl.trainer.ppo.core_algos import compute_reinforce_plus_plus_outcome_adva
 
 
 def _config(gamma=1.0):
+    # [FUNCTION DOC]
+    # HELPER: Returns a simple namespace with a gamma attribute (default 1.0) as the algorithm config.
     return SimpleNamespace(gamma=gamma)
 
 
 class TestReinforcePPMultiTurn:
+    # [CLASS DOC]
+    # Groups the multi-turn return-propagation regression tests (issue #7278). Only the returns output is inspected.
     """Regression tests for #7278: observation spans must not block reward propagation."""
 
     def test_observation_span_does_not_block_returns(self):
+        # [FUNCTION DOC]
+        # Asserts the returns at valid tokens of a 6-token sequence with a 2-token masked span equal those of the compact 4-token sequence.
         """Core regression test from the issue: inserting observation tokens
         between assistant tokens should not change valid-token returns."""
         config = _config(gamma=1.0)
@@ -58,6 +69,8 @@ class TestReinforcePPMultiTurn:
         torch.testing.assert_close(compact_valid, expanded_valid)
 
     def test_observation_positions_have_zero_returns(self):
+        # [FUNCTION DOC]
+        # Asserts masked observation positions 2 and 3 get return 0.
         """Observation tokens (mask=0) should have returns=0."""
         config = _config(gamma=1.0)
         mask = torch.tensor([[1.0, 1.0, 0.0, 0.0, 1.0, 1.0]])
@@ -70,6 +83,8 @@ class TestReinforcePPMultiTurn:
         assert returns[0, 3].item() == 0.0
 
     def test_trailing_padding_stays_zero(self):
+        # [FUNCTION DOC]
+        # Asserts all valid tokens before trailing padding receive the final reward 1.0 and padding positions get 0.
         """Trailing padding (mask=0 at the end) should have returns=0 and
         should correctly reset running_return for EOS behavior."""
         config = _config(gamma=1.0)
@@ -87,6 +102,8 @@ class TestReinforcePPMultiTurn:
         assert returns[0, 4].item() == 0.0
 
     def test_gamma_discount_across_observation_span(self):
+        # [FUNCTION DOC]
+        # With gamma 0.5 and reward 2.0 at the last token, asserts returns 2.0, 0, 0, 1.0, 0.5 going backwards (observations not discounted).
         """Gamma discount should only apply across valid tokens, not
         observation tokens — observations are skipped, not discounted."""
         config = _config(gamma=0.5)
@@ -107,6 +124,8 @@ class TestReinforcePPMultiTurn:
         assert returns[0, 0].item() == pytest.approx(0.5)
 
     def test_batch_dimension(self):
+        # [FUNCTION DOC]
+        # Asserts per-row behaviour in a batch of two: an interior observation in row 0 and trailing padding in row 1.
         """Verify correct behavior across a batch of sequences."""
         config = _config(gamma=1.0)
         mask = torch.tensor(
@@ -137,6 +156,8 @@ class TestReinforcePPMultiTurn:
         assert returns[1, 3].item() == 0.0
 
     def test_no_observation_tokens_unchanged(self):
+        # [FUNCTION DOC]
+        # Asserts that with a full mask and gamma 1.0 every position's return equals the final reward 3.0.
         """Without observation tokens, behavior should be identical to before."""
         config = _config(gamma=1.0)
         mask = torch.ones(1, 5)

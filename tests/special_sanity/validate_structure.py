@@ -13,6 +13,10 @@
 # limitations under the License.
 
 #!/usr/bin/env python3
+# [MODULE DOC]
+# CLI tool verifying that test files under the tests root live in a first-level subfolder named after a
+# top-level directory of the implementation package (default verl) or an explicitly allowed extra folder.
+
 """
 Validate that test file subfolders mirror the top-level package layout.
 
@@ -37,6 +41,9 @@ from pathlib import Path
 
 
 def discover_allowed_modules(impl_root: Path, extra: list[str]) -> set[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the set of names of immediate subdirectories of impl_root, plus the extra names.
+    # Exceptions: OSError if impl_root cannot be listed.
     """Return the set of first-level directories that tests may live under."""
     allowed = {p.name for p in impl_root.iterdir() if p.is_dir()}
     allowed.update(extra)
@@ -44,6 +51,11 @@ def discover_allowed_modules(impl_root: Path, extra: list[str]) -> set[str]:
 
 
 def find_violations(tests_root: Path, allowed: set[str], allowed_files: list[str]) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Recursively finds files matching test*.py under tests_root; skips those whose path string is in
+    # allowed_files; reports files directly at tests_root and files whose first subfolder is not allowed.
+    # Outputs: list of error strings.
+    # Note: allowed_files matching is by exact path string, so it only works when tests_root is given in the same form (e.g. relative "tests").
     """Return a list of error strings for test files in the wrong place."""
     errors: list[str] = []
     for test_file in tests_root.rglob("test*.py"):
@@ -64,6 +76,11 @@ def find_violations(tests_root: Path, allowed: set[str], allowed_files: list[str
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # CLI entry: options --impl-root (default verl), --tests-root (default tests), --allow-dirs (special_* folders),
+    # --allow-files (three top-level protocol/base-config tests). Raises if either root is missing; prints
+    # violations plus a guideline to stderr and raises Exception if any; else prints success.
+    # KNOWN ISSUE: --impl-root help says default my_project (actual default verl) and --allow-files help describes folders rather than files.
     parser = argparse.ArgumentParser(description="Check that test files follow tests/<module>/… layout.")
     parser.add_argument(
         "--impl-root",

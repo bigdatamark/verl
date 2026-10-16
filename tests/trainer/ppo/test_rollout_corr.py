@@ -12,6 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Sanity tests for rollout correction (rollout_corr_helper): importance-sampling (IS) weights computed from
+# exp(old_log_prob - rollout_log_prob), rejection sampling (RS) via response_mask, and IS / off-policy
+# diagnostic metrics. All tests use CUDA when available, else CPU, with random or hand-built log probs.
+# Runnable as a script (runs a subset of tests and exits 1 on failure) or under pytest.
+
 """
 Quick Sanity Test for Rollout Correction
 
@@ -40,6 +46,11 @@ from verl.trainer.ppo.rollout_corr_helper import (
 
 
 def test_basic_rollout_correction():
+    # [FUNCTION DOC]
+    # Checks four configurations: token-level IS with threshold 2.0 (shape matches, max weight <= 2.0);
+    # sequence-level IS with threshold 5.0 (every valid token in a sequence shares one weight); RS only with
+    # seq_mean_k1 and threshold "0.5_1.5" (masked-fraction metric exists); and both disabled (weights None,
+    # mask unchanged, off-policy "rollout_corr/kl" metric still present). Prints progress and metrics.
     """Test basic rollout correction functionality."""
     print("Testing basic rollout correction functionality...")
 
@@ -142,6 +153,9 @@ def test_basic_rollout_correction():
     ],
 )
 def test_each_supported_rollout_rs_option(option: str, threshold):
+    # [FUNCTION DOC]
+    # Parametrized over every RS option with an appropriate threshold (lower_upper string or scalar): asserts the
+    # option is in SUPPORTED_ROLLOUT_RS_OPTIONS, the per-option mean metric is produced and the mask shape is preserved.
     """Ensure every supported RS option produces metrics without error."""
     assert option in SUPPORTED_ROLLOUT_RS_OPTIONS
 
@@ -167,6 +181,8 @@ def test_each_supported_rollout_rs_option(option: str, threshold):
 
 
 def test_rollout_rs_multiple_options():
+    # [FUNCTION DOC]
+    # Asserts comma-separated RS options with matching comma-separated thresholds produce a mean metric for each option.
     """Verify multiple RS options with mixed threshold formats."""
     batch_size, seq_length = 2, 6
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -193,6 +209,10 @@ def test_rollout_rs_multiple_options():
 
 
 def test_metrics_completeness():
+    # [FUNCTION DOC]
+    # Runs token-level IS and checks that the expected IS metrics and off-policy metrics (all prefixed rollout_corr/) are present, printing results.
+    # Outputs: returns True when all present, False otherwise.
+    # KNOWN ISSUE: missing metrics only cause a printed message and a False return rather than an assertion, so under pytest this test cannot fail on missing metrics.
     """Test that all expected metrics are returned."""
     print("\nTesting metrics completeness...")
 
@@ -253,6 +273,9 @@ def test_metrics_completeness():
 
 
 def test_offpolicy_metrics():
+    # [FUNCTION DOC]
+    # Asserts compute_offpolicy_metrics returns all thirteen perplexity/KL/chi-square keys with rollout log
+    # probs, and with rollout_log_prob None returns training metrics but no rollout_ppl. Prints values.
     """Test off-policy metrics computation."""
     print("\nTesting off-policy metrics computation...")
 
@@ -310,6 +333,10 @@ def test_offpolicy_metrics():
 
 
 def test_mask_mode():
+    # [FUNCTION DOC]
+    # With constant per-sequence log probs giving ratios about 0.37 and 1.65, token IS (threshold 2.0) plus
+    # token_k1 RS (bounds 0.5..2.0): asserts IS weights keep the raw ratios (not zeroed), the first sequence is
+    # fully masked out and the second kept, and masked fraction is 0.5. Prints results.
     """Test mask mode applies rejection via response_mask, keeps true IS weights."""
     print("\nTesting mask mode behavior...")
 
@@ -367,6 +394,9 @@ def test_mask_mode():
 
 
 def test_exact_icepop_zeroes_weights_without_changing_mask():
+    # [FUNCTION DOC]
+    # With raw weights 0.4, 0.8, 6.0 and a "0.5_5.0" IS threshold: asserts out-of-bound weights are zeroed
+    # (result 0, 0.8, 0), the mask is unchanged, and oob ratio 2/3, std about 0.377 and effective sample size 1/3.
     """IcePop should zero OOB IS weights while preserving response_mask."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -395,6 +425,8 @@ def test_exact_icepop_zeroes_weights_without_changing_mask():
 
 
 def test_bool_rollout_is_threshold_is_rejected():
+    # [FUNCTION DOC]
+    # Asserts a boolean rollout_is_threshold raises TypeError matching "not a boolean".
     """Boolean thresholds should not be silently accepted via bool <: int."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -414,6 +446,9 @@ def test_bool_rollout_is_threshold_is_rejected():
 
 
 def test_seq_fraction_high_uses_raw_weights():
+    # [FUNCTION DOC]
+    # Calls compute_is_metrics with clamped and raw weights where only the raw per-sequence mean of one of two
+    # sequences exceeds the threshold; asserts rollout_is_seq_fraction_high is 0.5.
     """rollout_is_seq_fraction_high must be driven by the raw (pre-truncation) weights.
 
     Truncation clamps every weight to <= rollout_is_threshold, so a per-sequence mean of
