@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for fused-MoE handling in the vLLM quantization utils, loading the
+# real module file under a private name with vLLM and heavy verl dependencies
+# replaced by fake modules. Covers both vLLM layouts: pre-0.24 (FusedMoE is an
+# nn.Module class holding w13/w2 expert weights) and 0.24+ (FusedMoE is a factory
+# returning a MoERunner whose routed_experts submodule holds the weights). Checks
+# the module's resolved expert-holder and traversal-stop class lists, parameter
+# name to owning module resolution for per-expert HF names, and FP8 weight
+# detection (while bf16 router gates are not flagged).
 
 """CPU tests for fused-MoE handling in ``verl/utils/vllm/vllm_quant_utils.py``.
 
@@ -37,10 +46,25 @@ _MODULE_PATH = _VLLM_UTILS_DIR / "vllm_quant_utils.py"
 
 
 def _make_module(name: str) -> types.ModuleType:
+    # [FUNCTION DOC]
+    # HELPER: Creates an empty module object with the given name.
     return types.ModuleType(name)
 
 
 def _load_quant_utils(fused_moe_is_function: bool):
+    # [FUNCTION DOC]
+    # HELPER: Builds fake vLLM layer modules (linear base class and the fused-MoE
+    # package/layer for the requested layout), fake verl kernel and a stub
+    # verl.utils.vllm package pointing at the real directory, temporarily installs
+    # them in the module table, executes vllm_quant_utils.py as a fresh module, then
+    # restores prior module entries and drops any verl.utils.vllm.* submodules
+    # imported during the load.
+    # Inputs: fused_moe_is_function - True for the 0.24+ layout.
+    # Outputs: (loaded module, mapping of fake class names to classes: LinearBase plus
+    # RoutedExperts and MoERunner, or FusedMoE).
+    # Side effects: temporary module-table mutation (restored in a finally block).
+    # KNOWN ISSUE: the spec is passed to module_from_spec before the assert that it is
+    # non-None, so the assert cannot give its intended clearer failure.
     """Load ``vllm_quant_utils`` with vLLM/verl heavyweight deps stubbed.
 
     Args:
@@ -56,7 +80,11 @@ def _load_quant_utils(fused_moe_is_function: bool):
     """
 
     class _FakeLinearBase(torch.nn.Module):
+        # [CLASS DOC]
+        # HELPER: Fake vLLM LinearBase holding a 2x2 weight of the given dtype (default fp8 e4m3).
         def __init__(self, dtype=torch.float8_e4m3fn):
+            # [FUNCTION DOC]
+            # HELPER: Initializes the module and allocates the weight with the given dtype.
             super().__init__()
             self.weight = torch.empty(2, 2, dtype=dtype)
 
@@ -70,17 +98,27 @@ def _load_quant_utils(fused_moe_is_function: bool):
     if fused_moe_is_function:
 
         class _FakeRoutedExperts(torch.nn.Module):
+            # [CLASS DOC]
+            # HELPER: Fake 0.24+ RoutedExperts holding 2x2 w13_weight and w2_weight.
             def __init__(self, dtype=torch.float8_e4m3fn):
+                # [FUNCTION DOC]
+                # HELPER: Allocates both expert weights with the given dtype.
                 super().__init__()
                 self.w13_weight = torch.empty(2, 2, dtype=dtype)
                 self.w2_weight = torch.empty(2, 2, dtype=dtype)
 
         class _FakeMoERunner(torch.nn.Module):
+            # [CLASS DOC]
+            # HELPER: Fake 0.24+ MoERunner owning a routed_experts submodule.
             def __init__(self, dtype=torch.float8_e4m3fn):
+                # [FUNCTION DOC]
+                # HELPER: Creates the routed_experts child with the given dtype.
                 super().__init__()
                 self.routed_experts = _FakeRoutedExperts(dtype)
 
         def _fused_moe_factory(*args, **kwargs):  # noqa: N802 - mirrors vLLM name
+            # [FUNCTION DOC]
+            # HELPER: Fake FusedMoE factory; ignores arguments and returns a new MoERunner.
             return _FakeMoERunner()
 
         fused_moe_layer.FusedMoE = _fused_moe_factory
@@ -91,7 +129,11 @@ def _load_quant_utils(fused_moe_is_function: bool):
     else:
 
         class _FakeFusedMoE(torch.nn.Module):
+            # [CLASS DOC]
+            # HELPER: Fake pre-0.24 FusedMoE module holding 2x2 w13_weight and w2_weight.
             def __init__(self, dtype=torch.float8_e4m3fn):
+                # [FUNCTION DOC]
+                # HELPER: Allocates both expert weights with the given dtype.
                 super().__init__()
                 self.w13_weight = torch.empty(2, 2, dtype=dtype)
                 self.w2_weight = torch.empty(2, 2, dtype=dtype)
@@ -152,6 +194,12 @@ PACKED_MODULES_MAPPING = {
 
 
 def _build_model(ns: dict, moe_dtype=torch.float8_e4m3fn):
+    # [FUNCTION DOC]
+    # HELPER: Builds a toy model with model.layers.0 containing self_attn.qkv_proj
+    # (fp8 linear), mlp.experts (MoERunner if available else FusedMoE, with
+    # moe_dtype) and mlp.gate (bf16 linear router), and sets the packed module mapping
+    # (qkv_proj from q/k/v, gate_up_proj from gate/up).
+    # Inputs: ns - fake class mapping; moe_dtype - default fp8. Outputs: the model.
     """Build ``model.layers.0`` with an attention linear and a fused-MoE block."""
     linear_cls = ns["LinearBase"]
     moe_cls = ns.get("MoERunner") or ns.get("FusedMoE")
@@ -177,6 +225,11 @@ def _build_model(ns: dict, moe_dtype=torch.float8_e4m3fn):
 
 
 def test_new_vllm_resolves_routed_experts_and_does_not_crash():
+    # [FUNCTION DOC]
+    # Behavior: with the 0.24+ layout, the loaded module lists RoutedExperts as an
+    # expert-weight class and MoERunner as a stop class; both a per-expert HF name
+    # (experts.0.gate_proj.weight) and the fused name (experts.w13_weight) resolve to
+    # the routed_experts submodule without raising TypeError.
     """vLLM >= 0.24: per-expert names must resolve to RoutedExperts, no TypeError."""
     mod, ns = _load_quant_utils(fused_moe_is_function=True)
     model = _build_model(ns)
@@ -200,6 +253,10 @@ def test_new_vllm_resolves_routed_experts_and_does_not_crash():
 
 
 def test_new_vllm_is_fp8_weight_detects_moe_and_linear():
+    # [FUNCTION DOC]
+    # Behavior: after clearing the FP8 state caches, fp8 expert and fp8 attention
+    # (q_proj mapped to qkv_proj) weights are detected as fp8 and the bf16 router gate
+    # weight is not.
     mod, ns = _load_quant_utils(fused_moe_is_function=True)
     model = _build_model(ns, moe_dtype=torch.float8_e4m3fn)
 
@@ -215,6 +272,8 @@ def test_new_vllm_is_fp8_weight_detects_moe_and_linear():
 
 
 def test_new_vllm_bf16_experts_not_flagged_fp8():
+    # [FUNCTION DOC]
+    # Behavior: bf16 experts are not detected as fp8.
     mod, ns = _load_quant_utils(fused_moe_is_function=True)
     model = _build_model(ns, moe_dtype=torch.bfloat16)
 
@@ -225,6 +284,10 @@ def test_new_vllm_bf16_experts_not_flagged_fp8():
 
 
 def test_old_vllm_fusedmoe_class_still_supported():
+    # [FUNCTION DOC]
+    # Behavior: with the pre-0.24 layout, FusedMoE is an expert-weight class, the
+    # per-expert name resolves to the experts module itself, and its fp8 weight is
+    # detected as fp8.
     """vLLM < 0.24: FusedMoE is an nn.Module class holding the weights."""
     mod, ns = _load_quant_utils(fused_moe_is_function=False)
     model = _build_model(ns, moe_dtype=torch.float8_e4m3fn)

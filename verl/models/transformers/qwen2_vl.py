@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# verl patches for HF Qwen2-VL / Qwen2.5-VL: padding-free mRoPE position id computation, a
+# flash-attention text attention forward supporting packed sequences (varlen via position ids),
+# sliding windows and Ulysses SP, multimodal embedding merging, version-dependent handling of the
+# 4-row (text + t/h/w) position ids, and forward variants returning logits or fused log_probs/entropy.
+# Module state: flash-attention feature flags from flash_attn or the NPU integration and the
+# FLASH_ATTENTION_DETERMINISTIC env flag.
+
 import inspect
 import logging
 import os
@@ -69,6 +77,21 @@ def get_rope_index(
     second_per_grid_ts: Optional[torch.Tensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: computes [3, seq] mRoPE positions for one unbatched example, mirroring transformers'
+    # Qwen2.5-VL get_rope_index. If grids are given: restrict to valid tokens, count images/videos from
+    # the tokens following vision-start markers, then repeatedly take whichever of the next image or
+    # video pad token comes first: emit a linear text range for the preceding text, then a 3D grid
+    # (t scaled by second_per_grid_t * 2 tokens/s for videos, 0 for images; h and w divided by the merge
+    # size) offset by text length and previous max + 1, and advance past the vision tokens. Trailing text
+    # gets a linear range. Values fill valid positions; others stay 1. Without grids: cumulative mask
+    # positions (masked = 1) or a plain range, expanded to three rows.
+    # Inputs: processor (image_processor.merge_size, tokenizer); input_ids 1-D; image_grid_thw,
+    # video_grid_thw [n, 3]; second_per_grid_ts per video (default 1.0); attention_mask 1-D.
+    # Outputs: [3, seq] position tensor.
+    # Side effects: host syncs.
+    # KNOWN ISSUE: the no-grid, no-mask fallback uses input_ids.shape[1] although input_ids is documented
+    # as 1-D, which would raise an IndexError.
     """
     Gets the position ids for Qwen2-VL, it should be generated before sharding the sequence.
     The batch dim has been removed and the input_ids should be a 1D tensor representing a single example.
@@ -164,6 +187,11 @@ def get_rope_index(
 def prepare_fa2_from_position_ids(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, position_ids: torch.Tensor
 ):
+    # [FUNCTION DOC]
+    # HELPER: Flattens [b, s, h, d] q/k/v to [total, h, d] and derives cu_seqlens from position-id zeros
+    # plus the total length; max length is the largest segment.
+    # Inputs: query, key, value; position_ids [b, s]. Outputs: (q, k, v, (cu, cu), (max, max)).
+    # Exceptions: AssertionError if position_ids is not 2-D.
     assert position_ids.ndim == 2  # (batch_size, seq_length)
     query = query.contiguous().view(-1, query.size(-2), query.size(-1))
     key = key.contiguous().view(-1, key.size(-2), key.size(-1))
@@ -192,6 +220,20 @@ def _custom_flash_attention_forward(
     deterministic: Optional[bool] = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Flash attention wrapper. Enables a symmetric window when supported and the key length
+    # exceeds sliding_window, sets deterministic and softcap flags, casts via PEFT check to bf16, under
+    # Ulysses SP all-to-alls q/k/v and all-gathers position ids. If position ids are non-monotonic
+    # (packed) and not decoding, uses flash_attn_varlen_func with derived cu_seqlens (dropout and
+    # softmax_scale from kwargs); otherwise HF _flash_attention_forward with sliding window. All-to-alls
+    # the output back under SP.
+    # Inputs: query/key/value [b, s_local, h, d]; attention_mask; query_length; is_causal; position_ids
+    # [b, s_local]; sliding_window; use_top_left_mask; deterministic; kwargs.
+    # Outputs: [b, s_local, h, d].
+    # Exceptions: AssertionError for non-2-D position_ids; Ulysses validation errors.
+    # Side effects: SP collectives.
+    # KNOWN ISSUE: docstring mentions 3D position ids but 2-D is asserted; SP path fails if position_ids
+    # is None.
     """
     Patches flash attention forward to handle 3D position ids in mrope. (3, batch_size, seq_length)
     """
@@ -273,6 +315,18 @@ def qwen2_vl_attn_forward(
     position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
     **kwargs,
 ) -> tuple[torch.Tensor, None, None]:
+    # [FUNCTION DOC]
+    # Behavior: replacement for Qwen2-VL / Qwen2.5-VL text attention: projects q/k/v, applies multimodal
+    # rotary embedding with the mrope_section taken from rope_scaling (transformers < 5) or
+    # rope_parameters, repeats KV heads, picks a sliding window per Qwen2 rules, transposes to
+    # [b, s, h, d], reduces 3-D position ids to their first row (text positions), and calls the custom
+    # flash attention; reshapes and applies o_proj.
+    # Inputs: self - Qwen2VLAttention; hidden_states [b, s_local, hidden]; attention_mask; position_ids
+    # (2-D or [rows, b, s]); position_embeddings (cos, sin); kwargs ignored.
+    # Outputs: (attn_output, None) for transformers >= 4.54, else (attn_output, None, None).
+    # Exceptions: AssertionError if neither rope_scaling nor rope_parameters exist.
+    # Side effects: SP collectives.
+    # KNOWN ISSUE: position_ids None would fail on the ndim check.
     from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb, repeat_kv
 
     bsz, q_len, _ = hidden_states.size()  # q_len = seq_length / sp_size
@@ -348,6 +402,18 @@ def _get_input_embeds(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Embeds tokens and masked-scatters vision tower outputs (unpacked via unpack_visual_output)
+    # into image / video token positions. For text-only inputs runs the vision tower on a zero dummy patch
+    # batch (16 x in_channels*temporal_patch*patch^2, grid 1x4x4) and adds zero times its mean to keep
+    # vision parameters in the graph.
+    # Inputs: model; input_ids; attention_mask; pixel_values; pixel_values_videos; image_grid_thw;
+    # video_grid_thw.
+    # Outputs: (inputs_embeds, attention_mask on embeds device or None).
+    # Exceptions: ValueError if token and feature counts differ.
+    # Side effects: vision forward; host sync.
+    # KNOWN ISSUE: the dummy-input path uses the raw visual output without unpack_visual_output, which
+    # may fail if the visual module returns a tuple.
     inputs_embeds = model.get_input_embeddings()(input_ids)
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
@@ -400,6 +466,10 @@ def _get_input_embeds(
 
 
 def process_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Validates [4, b, s] position ids; for transformers <= 4.53.3 drops the text row and returns
+    # only the 3 vision rows.
+    # Inputs: position_ids. Outputs: position ids. Exceptions: ValueError on wrong shape.
     if position_ids.ndim != 3 or position_ids.size(0) != 4:
         # we concat the text position ids with the 3D vision position ids by default
         # see https://github.com/huggingface/transformers/pull/39447
@@ -414,6 +484,8 @@ def process_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class Qwen2VLCausalLMOutputForPPO(Qwen2VLCausalLMOutputWithPast):
+    # [CLASS DOC]
+    # Dataclass extending Qwen2VLCausalLMOutputWithPast with optional per-token log_probs and entropy.
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
 
@@ -429,6 +501,11 @@ def qwen2_vl_base_forward(
     video_grid_thw: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Behavior: replacement Qwen2(.5)VLModel.forward: computes merged embeddings and calls
+    # self.language_model with input_ids None and inputs_embeds / attention_mask in kwargs.
+    # Inputs: self; input_ids; attention_mask; labels (unused); pixel/grid inputs; kwargs.
+    # Outputs: language model output. Side effects: mutates kwargs.
     kwargs["inputs_embeds"], kwargs["attention_mask"] = _get_input_embeds(
         self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
     )  # avoid lora module having multiple keyword arguments
@@ -446,6 +523,11 @@ def qwen2_vl_forward(
     video_grid_thw: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # HELPER: For transformers >= 4.52 calls self.model with processed position ids and multimodal inputs;
+    # for older versions merges embeddings here and calls self.model with inputs_embeds.
+    # Inputs: self; input_ids; attention_mask; position_ids [4, b, s]; pixel/grid inputs; kwargs.
+    # Outputs: base model output. Exceptions: ValueError from process_position_ids.
     if is_transformers_version_in_range(min_version="4.52.0"):
         return self.model(
             input_ids=input_ids,
@@ -477,6 +559,11 @@ def forward_with_normal_backend(
     temperature: float = 1.0,
     **kwargs,
 ) -> "Qwen2VLCausalLMOutputWithPast":
+    # [FUNCTION DOC]
+    # Behavior: runs the base model and applies lm_head to produce full logits.
+    # Inputs: self; input_ids; labels and temperature (unused); kwargs.
+    # Outputs: Qwen2VLCausalLMOutputWithPast with logits and hidden_states.
+    # KNOWN ISSUE: temperature is accepted but not applied.
     outputs = qwen2_vl_forward(self, input_ids, **kwargs)
     hidden_states = outputs[0]
     logits = self.lm_head(hidden_states)
@@ -495,6 +582,12 @@ def forward_with_torch_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple | Qwen2VLCausalLMOutputForPPO:
+    # [FUNCTION DOC]
+    # Behavior: runs the base model, picks targets (shift_labels, else labels or input_ids rolled left by
+    # one), computes log_probs/entropy with FusedLinearForPPO at the given temperature.
+    # Inputs: self; input_ids; labels; temperature; shift_labels; kwargs.
+    # Outputs: Qwen2VLCausalLMOutputForPPO.
+    # Exceptions: RuntimeError when no targets available.
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
     outputs = qwen2_vl_forward(self, input_ids, **kwargs)
@@ -533,6 +626,10 @@ def forward_with_triton_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple | Qwen2VLCausalLMOutputForPPO:
+    # [FUNCTION DOC]
+    # Behavior: same as the torch backend using the triton linear_cross_entropy kernel.
+    # Inputs: same. Outputs: Qwen2VLCausalLMOutputForPPO.
+    # Exceptions: RuntimeError when no targets available.
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
     outputs = qwen2_vl_forward(self, input_ids, **kwargs)

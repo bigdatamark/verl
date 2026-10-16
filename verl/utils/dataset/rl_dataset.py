@@ -14,6 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# RL prompt dataset (RLHFDataset) over parquet/json files via HuggingFace datasets: local caching, optional subsampling,
+# filtering of prompts longer than max_prompt_length (counting tool schemas and multimodal tokens), conversion of
+# <image>/<video>/<audio> placeholders into structured message content, and helpers to extract multimodal inputs used
+# by agent loops. Also a batch collate_fn and get_dataset_class for custom dataset classes.
+
 import asyncio
 import copy
 import logging
@@ -39,6 +45,10 @@ logger = logging.getLogger(__name__)
 
 
 def collate_fn(data_list: list[dict]) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: groups each sample's values by key: tensors are stacked along a new batch dimension; other values become a
+    # 1-D object numpy array. Inputs: data_list - list of dicts. Outputs: merged dict (tensor keys then non-tensor keys).
+    # Exceptions: stacking errors on mismatched tensor shapes.
     """
     Collate a batch of sample dicts into batched tensors and arrays.
 
@@ -70,6 +80,10 @@ def collate_fn(data_list: list[dict]) -> dict:
 
 
 class RLHFDataset(Dataset):
+    # [CLASS DOC]
+    # Prompt dataset for RL. Keeps data_files (local copies) and original_data_files (for resume), tokenizer, processor,
+    # config-derived options, optional tool schemas, and a HuggingFace Dataset "dataframe". Rows are returned with raw chat
+    # messages (raw_prompt); tokenization for rollout happens in the agent loop.
     """
     Load and preprocess RLHF data from Parquet files.
 
@@ -94,6 +108,14 @@ class RLHFDataset(Dataset):
         processor: Optional[ProcessorMixin] = None,
         max_samples: int = -1,
     ):
+        # [FUNCTION DOC]
+        # Behavior: normalizes data_files to a list (deep copies kept for current and original), stores inputs and reads config:
+        # cache_dir (~/.cache/verl/rlhf, user-expanded), prompt/image/video/audio keys, image_patch_size (config or processor
+        # patch size, default 14), max_prompt_length (1024), return_raw_chat, return_full_prompt, truncation, filter flags,
+        # chat template and mm processor kwargs, tool config paths (loading tool schemas, on failure warns and leaves None),
+        # filter worker count (default max(1, cpu/4), capped at cpu count), use_shm, chat_template_func, need_tools_kwargs,
+        # filter_prompts, return_multi_modal_inputs, shuffle, seed; serialize_dataset False. Then downloads and reads files.
+        # Inputs: data_files, tokenizer, config, processor, max_samples (-1 = all). Outputs: none.
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
 
@@ -160,6 +182,9 @@ class RLHFDataset(Dataset):
         self._read_files_and_tokenize()
 
     def _download(self, use_origin_parquet=False):
+        # [FUNCTION DOC]
+        # HELPER: Copies each data file (current list, or original list when use_origin_parquet) to the local cache (optionally
+        # shared memory), writing results into data_files. Side effects: file copies.
         from verl.utils.fs import copy_to_local
 
         data_files = self.data_files if not use_origin_parquet else self.original_data_files
@@ -167,6 +192,10 @@ class RLHFDataset(Dataset):
             self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
 
     def _read_files_and_tokenize(self):
+        # [FUNCTION DOC]
+        # HELPER: Loads each file as a datasets split ("parquet" for .parquet, "json" for .json/.jsonl), concatenates, prints
+        # length, subsamples to max_samples when positive and smaller (random without replacement with seed if shuffle, else
+        # first rows), then filters long prompts. Exceptions: ValueError for unsupported extensions.
         dataframes = []
         for parquet_file in self.data_files:
             # read files and cache
@@ -195,6 +224,10 @@ class RLHFDataset(Dataset):
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
+        # [FUNCTION DOC]
+        # Behavior: if filter_overlong_prompts, keeps only rows whose prompt length (with generation prompt and tool schemas)
+        # is <= max_prompt_length, using num_workers processes; prints the filtered size. Rows that fail length computation are
+        # treated as too long (traceback printed). Inputs: dataframe. Outputs: filtered (or unchanged) dataframe.
         # filter out too long prompts
         if self.filter_overlong_prompts:
             tokenizer = self.tokenizer
@@ -204,6 +237,10 @@ class RLHFDataset(Dataset):
             if processor is not None:
 
                 def doc2len(doc) -> int:
+                    # [FUNCTION DOC]
+                    # HELPER: Processor path: builds multimodal messages, renders the chat template untokenized, extracts images/videos/
+                    # audios; text-only prompts are measured with the processor's tokenizer (no special tokens), multimodal prompts with the
+                    # full processor inputs. Returns token count, or max_prompt_length + 1 on any exception.
                     try:
                         messages = self._build_messages(doc, key=self.prompt_key)
                         # pass tool schemas if available so the processor can format prompts
@@ -246,6 +283,9 @@ class RLHFDataset(Dataset):
             else:
 
                 def doc2len(doc) -> int:
+                    # [FUNCTION DOC]
+                    # HELPER: Tokenizer path: applies the chat template with tokenize forced on (removing tokenize/return_dict/
+                    # return_tensors overrides) and tool schemas; returns normalized token count, or max_prompt_length + 1 on error.
                     try:
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
                         if self.tool_schemas is not None:
@@ -275,6 +315,10 @@ class RLHFDataset(Dataset):
         return dataframe
 
     def resume_dataset_state(self):
+        # [FUNCTION DOC]
+        # Behavior: after loading a dataloader checkpoint: if the object has original_data_files (new-style), re-downloads
+        # original files and re-reads/filters them (serialize_dataset False); otherwise marks serialize_dataset True and prints a
+        # notice that an old checkpoint format is in use. Side effects: file IO.
         self.serialize_dataset = not hasattr(self, "original_data_files")
         # resume dataframe if not it's serialized in data.pt
         if not self.serialize_dataset:
@@ -284,6 +328,9 @@ class RLHFDataset(Dataset):
             print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
 
     def __getstate__(self):
+        # [FUNCTION DOC]
+        # Behavior: pickling state: a copy of the instance dict without "dataframe" unless serialize_dataset is True.
+        # Outputs: dict.
         if not self.serialize_dataset:
             state = self.__dict__.copy()
 
@@ -294,9 +341,19 @@ class RLHFDataset(Dataset):
         return self.__dict__.copy()
 
     def __len__(self):
+        # [FUNCTION DOC]
+        # Behavior: number of rows. Outputs: int.
         return len(self.dataframe)
 
     def _build_messages(self, example: dict, key: str):
+        # [FUNCTION DOC]
+        # HELPER: Takes messages at row[key]; with no images/videos/audios returns them unchanged. Otherwise (processor
+        # required) splits string contents on <image>/<video>/<audio> and builds typed parts in order: images from PIL (RGB),
+        # dicts (decoding "bytes" into a PIL image, merged into the part) or paths; videos from dicts, paths or frame lists;
+        # audios from dicts (kept if they have audio/audio_url, else wrapped) or raw values; text segments as text parts.
+        # Mutates the messages in place. Asserts every media item was consumed exactly.
+        # Inputs: example - row dict; key. Outputs: messages list.
+        # Exceptions: AssertionError (no processor, offset overflow or count mismatch); TypeError for unsupported media types.
         """Replace multimodal placeholders in messages with structured content.
 
         This is required by processor.apply_chat_template.
@@ -384,6 +441,12 @@ class RLHFDataset(Dataset):
         return messages
 
     def __getitem__(self, item):
+        # [FUNCTION DOC]
+        # Behavior: reads row item, sets raw_prompt to the built messages, removes media columns, adds a uint8 dummy_tensor [0],
+        # ensures extra_info is a dict and copies index (default 0), tools_kwargs and interaction_kwargs from it to top level,
+        # warning if tools kwargs are required (extra_info or config need_tools_kwargs) but empty.
+        # Inputs: item - int index. Outputs: row dict.
+        # Exceptions: KeyError in the warning path if the row has no "data_source".
         """For rollout, apply_chat_template has been moved to AgentLoop, so we only return raw_prompt here."""
         row_dict: dict = self.dataframe[item]
         row_dict["raw_prompt"] = self._build_messages(row_dict, key=self.prompt_key)
@@ -417,6 +480,11 @@ class RLHFDataset(Dataset):
         image_patch_size,
         config: DictConfig,
     ) -> tuple[list[Image.Image], list[tuple[torch.Tensor, dict]]]:
+        # [FUNCTION DOC]
+        # Behavior: async; runs qwen_vl_utils.process_vision_info (with video metadata) in the default thread executor to keep
+        # the event loop responsive. Inputs: messages, image_patch_size, config (unused). Outputs: (images, videos) where each
+        # video is (tensor, metadata). Exceptions: ImportError without qwen_vl_utils; requires a running loop.
+        # KNOWN ISSUE: the docstring example calls it synchronously, but it is a coroutine and must be awaited.
         """Extract images and videos from messages.
 
         This method is called by AgentLoop (e.g SingleTurnAgentLoop) before apply_chat_template to
@@ -459,6 +527,9 @@ class RLHFDataset(Dataset):
 
     @classmethod
     def _extract_audio_info(cls, messages: list[dict]) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Collects audio entries from list-type message contents: the "audio" value, else "audio_url", else the part
+        # without its "type" key. Outputs: list, or None if empty.
         audios = []
         for message in messages:
             content = message.get("content")
@@ -482,6 +553,10 @@ class RLHFDataset(Dataset):
         image_patch_size,
         config: DictConfig,
     ) -> tuple[list[Image.Image], list[Any], list[Any]]:
+        # [FUNCTION DOC]
+        # HELPER: If any message has image/video parts, extracts them via qwen_vl_utils.process_vision_info (with video
+        # metadata), else None/None; also extracts audios. Inputs: messages, image_patch_size, config (unused).
+        # Outputs: (images, videos, audios).
         has_visual = any(
             isinstance(message.get("content"), list)
             and any(isinstance(item, dict) and item.get("type") in {"image", "video"} for item in message["content"])
@@ -505,6 +580,8 @@ class RLHFDataset(Dataset):
         image_patch_size,
         config: DictConfig,
     ) -> tuple[list[Image.Image], list[Any], list[Any]]:
+        # [FUNCTION DOC]
+        # Behavior: async wrapper running _process_multi_modal_info in the default thread executor. Outputs: same tuple.
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
@@ -512,6 +589,13 @@ class RLHFDataset(Dataset):
         )
 
     def split(self, num_splits: int):
+        # [FUNCTION DOC]
+        # Behavior: splits rows into num_splits contiguous equal parts (dropping the remainder with a warning). Each split is a
+        # new RLHFDataset built from the same files/config whose dataframe is replaced with the slice, and which inherits
+        # serialize_dataset and original_data_files. Inputs: num_splits - positive int. Outputs: list of datasets.
+        # Exceptions: ValueError (bad num_splits, None or empty dataframe); AttributeError if no dataframe.
+        # KNOWN ISSUE: each split re-runs the full constructor (download, load, filtering) before its dataframe is overwritten,
+        # which is expensive; the docstring does not mention the AttributeError.
         """
         split the dataset into num_splits sub-datasets
         Args:
@@ -568,6 +652,10 @@ class RLHFDataset(Dataset):
 
 
 def get_dataset_class(data_config: DictConfig):
+    # [FUNCTION DOC]
+    # Behavior: if data_config has custom_cls with a path, loads that class externally and requires it to subclass torch
+    # Dataset; otherwise uses RLHFDataset. Prints the chosen class name. Inputs: data_config. Outputs: class.
+    # Exceptions: TypeError if the custom class is not a Dataset subclass.
     """Get RLHF dataset class.
 
     Args:
