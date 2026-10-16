@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Version-compatibility shims for the HuggingFace transformers library: a fallback for
+# flash_attn_supports_top_left_mask, a cached installed-version range check, a resolver for the
+# vision-to-sequence auto model class, normalization of visual-encoder outputs, and removal of tied
+# alias keys from state dicts before saving.
+
 """
 Compatibility utilities for different versions of transformers library.
 """
@@ -30,6 +36,9 @@ except ImportError:
     # For older versions of transformers that don't have this function
     # Default to False as a safe fallback for older versions
     def flash_attn_supports_top_left_mask():
+        # [FUNCTION DOC]
+        # HELPER: Fallback defined only when transformers lacks flash_attn_supports_top_left_mask.
+        # Behavior: always returns False. Inputs: none. Outputs: False. Exceptions/Side effects: none.
         """Fallback implementation for older transformers versions.
         Returns False to disable features that require this function.
         """
@@ -38,6 +47,15 @@ except ImportError:
 
 @lru_cache
 def is_transformers_version_in_range(min_version: Optional[str] = None, max_version: Optional[str] = None) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: reads the installed transformers version from package metadata and checks it lies in
+    # the inclusive range [min_version, max_version]; a None bound is treated as unbounded. Result is
+    # memoized per argument pair (lru_cache).
+    # Inputs: min_version / max_version - optional version strings.
+    # Outputs: True if both bounds are satisfied, else False.
+    # Exceptions: raises ModuleNotFoundError if transformers is not installed; invalid version strings
+    # propagate packaging's InvalidVersion.
+    # Side effects: none (cached).
     try:
         # Get the installed version of the transformers library
         transformers_version_str = importlib.metadata.version("transformers")
@@ -59,6 +77,11 @@ def is_transformers_version_in_range(min_version: Optional[str] = None, max_vers
 
 @lru_cache
 def get_auto_model_for_vision2seq():
+    # [FUNCTION DOC]
+    # Behavior: tries to import AutoModelForImageTextToText (preferred, newer) and returns it; on
+    # ImportError falls back to AutoModelForVision2Seq. Memoized.
+    # Inputs: none. Outputs: the auto model class.
+    # Exceptions: ImportError if neither class exists. Side effects: imports transformers.
     """Return the available VL auto model class across transformers versions."""
 
     try:
@@ -75,6 +98,13 @@ def get_auto_model_for_vision2seq():
 
 
 def unpack_visual_output(visual_output):
+    # [FUNCTION DOC]
+    # Behavior: normalizes visual encoder output into a pair. If the object has pooler_output, returns
+    # (pooler_output, deepstack_features or None). Otherwise, a tuple is returned unchanged (assumed
+    # already a pair); any other object is returned as (object, None).
+    # Inputs: visual_output - encoder output object, tuple, or tensor.
+    # Outputs: a 2-tuple (embeddings, deepstack features or None).
+    # Exceptions/Side effects: none.
     """Unpack the output from the visual encoder, handling both tuple and object return types.
 
     Newer versions of transformers return an object with `pooler_output` and `deepstack_features`
@@ -93,6 +123,16 @@ def unpack_visual_output(visual_output):
 
 
 def drop_tied_target_keys(state_dict, model, model_config) -> None:
+    # [FUNCTION DOC]
+    # Behavior: no-op unless model_config.tie_word_embeddings is truthy. Calls model.tie_weights(), then
+    # iterates named parameters without de-duplication, keeping a mapping from parameter identity to its
+    # first-seen (canonical) name. For each later alias of the same parameter: if the canonical name is in
+    # state_dict, the alias key is removed from state_dict (if present); otherwise the alias becomes the
+    # new canonical name.
+    # Inputs: state_dict - mutable mapping name to tensor; model - nn.Module; model_config - HF config.
+    # Outputs: None.
+    # Exceptions: none expected.
+    # Side effects: mutates state_dict in place; re-ties model weights.
     """Drop tied alias keys (e.g. ``lm_head.weight``) from ``state_dict``.
 
     FSDP gather and the model merger materialise one independent CPU tensor

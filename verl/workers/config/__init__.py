@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Worker configuration package. Imports all config submodules (actor, checkpoint, critic,
+# disaggregation, distillation, engine, model, optimizer, reward, rollout), star-re-exports their
+# public names, and builds the package export list as the concatenation of each submodule's export
+# list.
+
 from . import actor, checkpoint, critic, disaggregation, engine, model, optimizer, reward, rollout
 from .actor import *  # noqa: F401
 from .checkpoint import *  # noqa: F401

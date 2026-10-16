@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+# [PACKAGE DOC]
+# vLLM integration utilities package. Re-exports TensorLoRARequest, VLLMHijack, is_version_ge and
+# resolve_weight_name from the utils module. Side effect on import: applies NPU-specific vLLM
+# patches via apply_npu_vllm_patches. The patch module is intentionally not imported here because it
+# must be imported only after the vLLM LLM instance is created.
+
 from .npu_vllm_patch import apply_npu_vllm_patches
 from .utils import TensorLoRARequest, VLLMHijack, is_version_ge, resolve_weight_name
 

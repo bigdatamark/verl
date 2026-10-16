@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # from . import gsm8k, math, prime_math, prime_code
-# [PACKAGE DOC]
-# Reward scoring package: rule-based reward functions per dataset (GSM8K, MATH variants, DAPO,
-# PRIME math/code, sandbox-fusion code execution, Geometry3K, Search-R1 QA) plus a dispatcher
-# that picks the scorer based on a data_source string. Submodules are imported lazily.
 
 from verl.utils.import_utils import deprecated
 
@@ -30,20 +26,6 @@ def default_compute_score(
     memory_limit_mb=None,
     **kwargs,
 ):
-    # [FUNCTION DOC]
-    # Dispatches to a dataset-specific scorer based on data_source and normalizes the result.
-    # Behavior/routing: "openai/gsm8k" -> gsm8k; lighteval/MATH, DigitalLearningGmbH/MATH-lighteval,
-    # HuggingFaceH4/MATH-500 -> math_reward; "math_dapo", "math", "math_dapo_reasoning" or any id
-    # starting with "aime" -> math_dapo; numina_* listed sources -> prime_math; codecontests, apps,
-    # codeforces, taco -> sandbox_fusion (if sandbox_fusion_url given, continuous=True, passing the
-    # semaphore and memory limit) else prime_code (continuous=True); hiyouga/geometry3k -> geo3k;
-    # searchR1_* listed sources -> search_r1_like_qa_em.
-    # Inputs: data_source, solution_str, ground_truth, extra_info (unused), sandbox_fusion_url,
-    # concurrent_semaphore, memory_limit_mb, extra kwargs (ignored).
-    # Outputs: a dict returned as-is; a number/bool converted to float; otherwise the first element
-    # of a sequence converted to float.
-    # Exceptions: NotImplementedError for an unknown data_source; whatever the scorer raises.
-    # Side effects: lazy submodule imports; code scorers may call remote sandboxes or spawn processes.
     """Compute the score for a given solution based on the data source.
 
     Args:
@@ -131,9 +113,6 @@ def default_compute_score(
     else:
         return float(res[0])
 
-    # [FUNCTION DOC]
-    # HELPER: Deprecated wrapper forwarding all positional arguments to default_compute_score.
-    # The deprecated decorator emits a deprecation warning pointing to default_compute_score.
 
 @deprecated("verl.utils.reward_score.default_compute_score")
 def _default_compute_score(
@@ -142,8 +121,6 @@ def _default_compute_score(
     ground_truth,
     extra_info=None,
     sandbox_fusion_url=None,
-    # [FUNCTION DOC]
-    # Returns default_compute_score regardless of reward_name (argument currently unused).
     concurrent_semaphore=None,
     memory_limit_mb=None,
 ):

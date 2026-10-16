@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for VeOmni MoE parameter export handlers, loading
+# verl/workers/engine/veomni/utils.py directly from its file path under a private
+# module name. Covers GPT-OSS packed expert tensors (gate_up_proj, down_proj and
+# their biases): without expert parallelism the passthrough handler exports them
+# unchanged; with expert parallelism the streaming handler splits the local expert
+# dim into per-expert HF names offset by the global expert id base, and
+# enumerate_hf_slots reports per-expert names with per-expert shapes.
 
 import importlib.util
 from pathlib import Path
@@ -41,6 +49,11 @@ streamed_gpt_oss_moe_param_handler = _UTILS.streamed_gpt_oss_moe_param_handler
     ],
 )
 def test_gpt_oss_non_ep_keeps_packed_expert_params(name, shape):
+    # [FUNCTION DOC]
+    # Behavior: the registered GPT-OSS handler is the passthrough handler; with EP
+    # disabled it yields exactly one (name, tensor) pair with the original name and the
+    # identical tensor object.
+    # Inputs: name, shape - parametrized packed expert params.
     tensor = torch.randn(shape)
     handler = get_moe_param_handler("gpt_oss", ep_enabled=False)
 
@@ -62,6 +75,14 @@ def test_gpt_oss_non_ep_keeps_packed_expert_params(name, shape):
     ],
 )
 def test_gpt_oss_ep_streams_global_experts_in_checkpoint_layout(name, shape, monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: with EP enabled (device lookup patched to the tensor's device) the
+    # handler is the streaming GPT-OSS handler; for 2 local experts with base 4 it
+    # yields names with "mlp.experts.4." and "mlp.experts.5." inserted (no ".weight"
+    # suffix added) and slices equal to the tensor's first-dim entries; slot
+    # enumeration yields names for experts 0 and 1 with the shape minus the expert dim.
+    # Inputs: name, shape; monkeypatch.
+    # Note: slot enumeration uses expert ids starting at 0, not the export base.
     tensor = torch.randn(shape)
     monkeypatch.setattr(_UTILS, "get_device_id", lambda: tensor.device)
     handler = get_moe_param_handler("gpt_oss", ep_enabled=True)

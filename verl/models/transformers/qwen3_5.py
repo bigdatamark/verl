@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# verl patches for HF Qwen3.5 / Qwen3.5-MoE (hybrid linear-attention Gated DeltaNet + full-attention
+# VLM): packed-sequence (cu_seqlens) support for the Gated DeltaNet layers including causal conv1d
+# with per-sequence boundaries, Ulysses SP via FLA context-parallel (conv prefix exchange between
+# ranks and cp_context for the chunked delta rule), a decoder layer that routes cu_seqlens to linear
+# attention, an FSDP2 CPU-offload-safe vision position interpolation, multimodal embedding merging,
+# and forward variants returning logits or fused log_probs/entropy. Optional dependency: fla.
+
 import logging
 import os
 from dataclasses import dataclass
@@ -39,11 +47,19 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def _call_accepts_kwarg(fn, name: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Reports whether a callable accepts the given keyword (explicitly or through **kwargs).
+    # Inputs: fn; name. Outputs: bool.
     params = signature(fn).parameters
     return name in params or any(param.kind == param.VAR_KEYWORD for param in params.values())
 
 
 def _prepare_packed_seq_idx(cu_seqlens: torch.LongTensor, cu_seqlens_cpu: Optional[torch.LongTensor]):
+    # [FUNCTION DOC]
+    # HELPER: Builds a [1, total] int32 sequence-index tensor (index of the packed sequence each token
+    # belongs to), using fla's prepare_sequence_ids if available, otherwise building it from CPU offsets.
+    # Inputs: cu_seqlens; cu_seqlens_cpu optional. Outputs: int32 tensor [1, total].
+    # Side effects: possible host sync.
     try:
         from fla.ops.utils import prepare_sequence_ids
 
@@ -63,6 +79,11 @@ def _split_packed_args(
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     dim: int = 1,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Generator yielding, for each packed sequence, the tuple of slices of every given tensor along
+    # dim (negative dims resolved per tensor).
+    # Inputs: cu_seqlens; tensors tuple; cu_seqlens_cpu; dim (default 1). Outputs: iterator of tuples.
+    # Side effects: host sync if CPU offsets are not provided.
     offsets = (cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens.detach().cpu()).tolist()
     for start, end in zip(offsets[:-1], offsets[1:], strict=True):
         chunks = []
@@ -75,8 +96,14 @@ def _split_packed_args(
 
 
 class _ConvPrefixExchange(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd function exchanging conv1d prefix tails between consecutive SP ranks using fla's CP
+    # send/recv primitives (forward sends tails, backward routes gradients back).
     @staticmethod
     def forward(ctx, tails: torch.Tensor, group: dist.ProcessGroup):
+        # [FUNCTION DOC]
+        # Behavior: stores the group and returns the prefix received from the previous rank for the given
+        # tails. Inputs: ctx; tails [..., prefix_len]; group. Outputs: prefix tensor. Side effects: P2P comm.
         from fla.ops.cp.comm import conv_cp_send_recv_fwd
 
         ctx.group = group
@@ -84,6 +111,9 @@ class _ConvPrefixExchange(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_prefix: torch.Tensor):
+        # [FUNCTION DOC]
+        # Behavior: returns gradients for tails via the backward send/recv, None for group.
+        # Inputs: ctx; grad_prefix. Outputs: (grad_tails, None). Side effects: P2P comm.
         from fla.ops.cp.comm import conv_cp_send_recv_bwd
 
         return conv_cp_send_recv_bwd(grad_prefix.contiguous(), ctx.group), None
@@ -94,6 +124,11 @@ def _build_fla_cp_context(
     cu_seqlens_cpu: Optional[torch.LongTensor],
     conv_kernel_size: int,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Builds an fla CP context for the Ulysses SP group from global cu_seqlens and conv kernel
+    # size; None when no SP group exists.
+    # Inputs: cu_seqlens; cu_seqlens_cpu; conv_kernel_size. Outputs: fla CP context or None.
+    # Exceptions: ImportError if fla CP is unavailable.
     group = get_ulysses_sequence_parallel_group()
     if group is None:
         return None
@@ -108,6 +143,14 @@ def _build_fla_cp_context(
 
 
 def _prepend_cp_conv_prefix(mixed_qkv: torch.Tensor, cp_context) -> tuple[torch.Tensor, int]:
+    # [FUNCTION DOC]
+    # HELPER: Prepends the previous rank's last (kernel_size - 1) conv input channels-time positions to
+    # this rank's mixed_qkv [b, channels, local_len] so the causal conv sees cross-rank history. Tails
+    # are left-padded if the local length is shorter; prefix positions beyond the number of valid
+    # preceding tokens (cp_context.pre_num_conv_tokens) are zeroed.
+    # Inputs: mixed_qkv; cp_context (conv1d_kernel_size, group, pre_num_conv_tokens).
+    # Outputs: (concatenated tensor, prefix_len) or (input, 0) when no prefix is needed.
+    # Side effects: P2P communication.
     prefix_len = max(int(cp_context.conv1d_kernel_size or 0) - 1, 0)
     if prefix_len == 0:
         return mixed_qkv, 0
@@ -126,6 +169,9 @@ def _prepend_cp_conv_prefix(mixed_qkv: torch.Tensor, cp_context) -> tuple[torch.
 
 
 def _as_channel_last_conv1d_input(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns x laid out channel-last in memory (stride 1 on the channel dim) while keeping the
+    # logical [b, c, t] shape, copying only if needed. Inputs: x. Outputs: tensor.
     if x.stride(1) == 1:
         return x
     return x.transpose(1, 2).contiguous().transpose(1, 2)
@@ -136,6 +182,10 @@ def _prepare_cp_conv_seq_idx(
     cu_seqlens_cpu: Optional[torch.LongTensor],
     prefix_len: int,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Builds the conv sequence index for packed inputs and, when a prefix was prepended, extends
+    # it on the left with the first sequence's index for prefix_len positions.
+    # Inputs: cu_seqlens; cu_seqlens_cpu; prefix_len. Outputs: int32 [1, prefix_len + total].
     seq_idx = _prepare_packed_seq_idx(cu_seqlens, cu_seqlens_cpu)
     if prefix_len == 0:
         return seq_idx
@@ -149,6 +199,11 @@ def _packed_causal_conv1d_fallback(
     cu_seqlens: torch.LongTensor,
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Fallback packed causal conv when no fused kernel exists: applies self.conv1d per sequence
+    # segment (split along time), truncates to the segment length, applies SiLU, and concatenates.
+    # Inputs: self - gated delta net; mixed_qkv [b, c, t]; cu_seqlens; cu_seqlens_cpu.
+    # Outputs: tensor [b, c, t].
     outputs = []
     for (segment,) in _split_packed_args(cu_seqlens, (mixed_qkv,), cu_seqlens_cpu=cu_seqlens_cpu, dim=2):
         outputs.append(F.silu(self.conv1d(segment)[:, :, : segment.shape[-1]]))
@@ -156,6 +211,14 @@ def _packed_causal_conv1d_fallback(
 
 
 def _packed_chunk_gated_delta_rule(self, query, key, value, g, beta, cu_seqlens, cu_seqlens_cpu, cp_context=None):
+    # [FUNCTION DOC]
+    # HELPER: Runs the chunked gated delta rule with no initial state and qk L2 norm. Without cu_seqlens
+    # calls it directly; with a CP context passes cp_context (requires kernel support); else passes
+    # cu_seqlens (and cu_seqlens_cpu if accepted); otherwise loops over packed segments and concatenates
+    # outputs along the sequence dim.
+    # Inputs: self; query, key, value, g, beta [b, t, h, ...]; cu_seqlens; cu_seqlens_cpu; cp_context.
+    # Outputs: (core attention output, final state or None).
+    # Exceptions: NotImplementedError when cp_context is needed but unsupported by the kernel.
     kwargs = {
         "g": g,
         "beta": beta,
@@ -198,6 +261,29 @@ def qwen3_5_gated_delta_net_forward(
     cu_seqlens: Optional[torch.LongTensor] = None,
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: replacement Gated DeltaNet forward supporting packed sequences. Rejects packed + cache.
+    # Applies padding mask to states. With cu_seqlens: requires batch 1; if the cu_seqlens total differs
+    # from local length it must equal local length * SP size, in which case an fla CP context is built
+    # and its local cu_seqlens used. Projects qkv (transposed to channels-first), z, b, a. Convolution:
+    # cached single-step update when decoding; otherwise saves conv state if caching, then uses the fused
+    # causal_conv1d_fn (with CP prefix and channel-last input and seq_idx for packed inputs, then strips
+    # the prefix), or the per-segment fallback (shifting offsets by the prefix under CP), or the plain
+    # conv + SiLU. Splits into q, k, v heads, computes beta = sigmoid(b) and
+    # g = -exp(A_log) * softplus(a + dt_bias), repeats q/k heads to match v heads, runs the chunked
+    # (packed / CP aware) or recurrent delta rule, stores recurrent state when caching, applies the gated
+    # norm with z, and projects out.
+    # Inputs: self - Qwen3.5 GatedDeltaNet; hidden_states [b, t, hidden]; cache_params; attention_mask;
+    # cu_seqlens (global packed offsets); cu_seqlens_cpu.
+    # Outputs: tensor [b, t, hidden].
+    # Exceptions: NotImplementedError for packed + cache or missing CP kernel support; ValueError for
+    # batch != 1 or inconsistent lengths.
+    # Side effects: cache mutation; SP communication; host sync.
+    # KNOWN ISSUE: in the chunked path output_final_state is always false, so with cache_params set (non
+    # packed prefill) the stored recurrent state is None.
+    # KNOWN ISSUE: in the fallback CP path model_cu_seqlens is shifted in place after the add creates a
+    # new tensor, which is fine, but cu_seqlens_cpu from the CP context is similarly copied; behavior
+    # depends on the fallback conv seeing the prefix as part of the first sequence.
     if cu_seqlens is not None and cache_params is not None:
         raise NotImplementedError("Packed Qwen3.5 linear attention does not support cached forward.")
 
@@ -344,6 +430,15 @@ def qwen3_5_decoder_layer_forward(
     past_key_values=None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Behavior: replacement decoder layer forward: pops cu_seqlens / cu_seqlens_cpu from kwargs, applies
+    # input layernorm, then linear attention (with cache, mask and packed offsets) or full self-attention
+    # (with positions, cache, rotary embeddings and remaining kwargs), residual add, post-attention
+    # layernorm, MLP (dropping router logits if a tuple is returned), residual add.
+    # Inputs: self - decoder layer (layer_type, norms, linear_attn / self_attn, mlp); hidden_states;
+    # position_embeddings; attention_mask; position_ids; past_key_values; kwargs.
+    # Outputs: hidden states tensor.
+    # Side effects: mutates kwargs.
     cu_seqlens = kwargs.pop("cu_seqlens", None)
     cu_seqlens_cpu = kwargs.pop("cu_seqlens_cpu", None)
     residual = hidden_states
@@ -381,6 +476,16 @@ def qwen3_5_decoder_layer_forward(
 
 
 def fast_pos_embed_interpolate(self, grid_thw):
+    # [FUNCTION DOC]
+    # Behavior: bilinear interpolation of the learned square grid of vision position embeddings to each
+    # image's (h, w) grid: for each image computes floor/ceil indices and weights over the
+    # num_grid_per_side grid, gathers the four neighbor embeddings and blends them, repeats over t frames,
+    # and reorders into spatial-merge block order (t, h/m, w/m, m, m). Tensors are created on grid_thw's
+    # device so it works when FSDP2 offloads pos_embed to CPU.
+    # Inputs: self - vision model (num_grid_per_side, pos_embed, config.spatial_merge_size); grid_thw
+    # [n, 3].
+    # Outputs: [sum(t*h*w), dim] position embeddings.
+    # Side effects: host sync.
     grid_thw_list = grid_thw.tolist()
     grid_ts = [row[0] for row in grid_thw_list]
     grid_hs = [row[1] for row in grid_thw_list]
@@ -454,6 +559,15 @@ def _get_input_embeds(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Embeds tokens and masked-scatters vision pooler outputs into image/video token positions;
+    # for text-only inputs runs the vision tower on a zero dummy patch batch and adds zero times its mean
+    # to keep vision parameters in the graph.
+    # Inputs: model; input_ids; attention_mask; pixel_values; pixel_values_videos; image_grid_thw;
+    # video_grid_thw.
+    # Outputs: dict with inputs_embeds and attention_mask (on embeds device or None).
+    # Exceptions: ValueError on token/feature count mismatch.
+    # KNOWN ISSUE: model is annotated as Qwen3_5CausalLMOutputWithPast, but a model instance is expected.
     inputs_embeds = model.get_input_embeddings()(input_ids)
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
@@ -515,6 +629,11 @@ def qwen3_5_base_forward(
     video_grid_thw: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Behavior: replacement Qwen3.5 model forward: merges embeddings and calls self.language_model with
+    # input_ids None and the remaining kwargs (positions, cu_seqlens, etc.).
+    # Inputs: self; input_ids; attention_mask; pixel/grid inputs; kwargs. Outputs: language model output.
+    # Side effects: mutates kwargs.
     input_kwargs = _get_input_embeds(
         self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
     )  # avoid lora module having multiple keyword arguments
@@ -527,6 +646,8 @@ def qwen3_5_base_forward(
 
 @dataclass
 class Qwen3_5CausalLMOutputForPPO(Qwen3_5CausalLMOutputWithPast):
+    # [CLASS DOC]
+    # Dataclass extending Qwen3_5CausalLMOutputWithPast with optional per-token log_probs and entropy.
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
 
@@ -540,6 +661,12 @@ def forward_with_normal_backend(
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
+    # [FUNCTION DOC]
+    # Behavior: forwards cu_seqlens / cu_seqlens_cpu into kwargs when given, runs self.model and applies
+    # lm_head to get logits.
+    # Inputs: self; input_ids; labels, temperature (unused); cu_seqlens; cu_seqlens_cpu; kwargs.
+    # Outputs: Qwen3_5CausalLMOutputForPPO with logits and hidden_states.
+    # KNOWN ISSUE: temperature is accepted but not applied.
     if cu_seqlens is not None:
         kwargs["cu_seqlens"] = cu_seqlens
     if cu_seqlens_cpu is not None:
@@ -563,6 +690,15 @@ def forward_with_torch_backend(
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
+    # [FUNCTION DOC]
+    # Behavior: runs the model (with packed offsets), picks targets (shift_labels, else labels or
+    # input_ids rolled left), materializes lm_head weight if it is a DTensor, and under Ulysses SP without
+    # shift_labels pads and slices the rolled labels to this rank's shard; casts hidden states to the
+    # weight dtype and computes log_probs/entropy with FusedLinearForPPO.
+    # Inputs: self; input_ids; labels; temperature; shift_labels; cu_seqlens; cu_seqlens_cpu; kwargs.
+    # Outputs: Qwen3_5CausalLMOutputForPPO.
+    # Exceptions: RuntimeError when no targets are available.
+    # Side effects: DTensor all-gather of lm_head weights.
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
     if cu_seqlens is not None:
@@ -617,6 +753,11 @@ def forward_with_triton_backend(
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
+    # [FUNCTION DOC]
+    # Behavior: same as the torch backend but uses the triton linear_cross_entropy kernel.
+    # Inputs: same. Outputs: Qwen3_5CausalLMOutputForPPO.
+    # Exceptions: RuntimeError when no targets are available.
+    # Side effects: DTensor all-gather of lm_head weights.
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
     if cu_seqlens is not None:

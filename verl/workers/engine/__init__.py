@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Training engine package. Always exports BaseEngine, EngineRegistry and the FSDP engines. Optional
+# backends (TorchTitan, VeOmni, Automodel, Mindspeed, Megatron) are imported in individual try blocks;
+# on ImportError a warning is emitted and the corresponding names are set to None, otherwise they are
+# appended to the export list. Mindspeed is imported before Megatron so its monkey patches take effect.
+# Importing the backends registers them with EngineRegistry as a side effect.
+
 import warnings
 
 from .base import BaseEngine, EngineRegistry

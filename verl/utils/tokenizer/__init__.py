@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Tokenizer/processor utilities package. Re-exports the public helpers from the tokenizer submodule:
+# hf_tokenizer and hf_processor (load HuggingFace tokenizers/processors), normalize_token_ids (coerce
+# chat-template outputs to a flat list of ints), build_multimodal_processor_inputs and get_processor_token_id.
+# Side effects: importing loads the tokenizer submodule (and transformers).
 
 from .tokenizer import (
     build_multimodal_processor_inputs,

@@ -13,9 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# FP8 quantization helper specialization for the TensorRT-LLM rollout backend.
+
 from verl.utils.fp8_utils import FP8QuantizerHelper
 
 
 class TRTLLMFP8QuantizerHelper(FP8QuantizerHelper):
+    # [CLASS DOC]
+    # FP8 quantizer helper for TRT-LLM; currently identical to the generic FP8QuantizerHelper and exists
+    # as a backend-specific extension point.
     def __init__(self, quant_config):
+        # [FUNCTION DOC]
+        # Behavior: delegates to the parent constructor with the given quant_config.
+        # Inputs: quant_config - FP8 quantization config. Outputs: none. Side effects: parent init state.
         super().__init__(quant_config)

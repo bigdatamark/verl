@@ -11,9 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# [MODULE DOC]
-# Rule-based GSM8K reward: extracts the final numeric answer from the model output and compares
-# it with the ground truth string. Only the last 300 characters of output are searched for speed.
 
 import re
 
@@ -21,17 +18,6 @@ _SOLUTION_CLIP_CHARS = 300
 
 
 def extract_solution(solution_str, method="strict"):
-    # [FUNCTION DOC]
-    # Extracts the final answer from a solution string.
-    # Behavior: truncates to the last _SOLUTION_CLIP_CHARS characters. "strict": find all
-    # "#### <number>" patterns (number may include minus, digits, dots, commas); take the last and
-    # strip commas and dollar signs; None if none. "flexible": find all number-like tokens and return
-    # the last one that is not empty or ".", None if no tokens.
-    # Inputs: solution_str; method - "strict" or "flexible".
-    # Outputs: answer string or None.
-    # Exceptions: AssertionError for an invalid method.
-    # KNOWN ISSUE: in flexible mode, if every token is invalid ("." only) the loop ends leaving the last
-    # tried token (".") as the answer instead of None; commas are also not stripped in flexible mode.
     assert method in ["strict", "flexible"]
 
     # Optimization: Regular expression matching on very long strings can be slow.
@@ -64,9 +50,6 @@ def extract_solution(solution_str, method="strict"):
 
 
 def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
-    # [FUNCTION DOC]
-    # Scores via exact string equality of the extracted answer with ground_truth.
-    # Outputs: 0 if no answer extracted; score if equal; format_score otherwise.
     """The scoring function for GSM8k.
 
     Reference: Trung, Luong, et al. "Reft: Reasoning with reinforced fine-tuning." Proceedings of the 62nd Annual

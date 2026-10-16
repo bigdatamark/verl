@@ -11,16 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# [MODULE DOC]
-# Example batched reward function built on math_reward.compute_score.
 
 from .math_reward import compute_score
 
 
-    # [FUNCTION DOC]
-    # Scores each (solution, ground_truth) pair sequentially with math_reward.compute_score.
-    # Inputs: parallel lists data_sources (unused), solution_strs, ground_truths, extra_infos (unused).
-    # Outputs: list of scores in order. Exceptions: ValueError if solution and ground-truth lists differ in length.
 def compute_score_batched(data_sources, solution_strs, ground_truths, extra_infos):
     """
     This is a demonstration of how the batched reward function should look like.

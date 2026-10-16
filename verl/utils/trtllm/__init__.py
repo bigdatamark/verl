@@ -12,3 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# TensorRT-LLM utility package (FP8 quantization helpers for the TRT-LLM rollout backend). No code
+# is exported here.

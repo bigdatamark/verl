@@ -1,4 +1,10 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
+# [MODULE DOC]
+# Chat-template probing helpers. Derive, by rendering small synthetic conversations through a tokenizer's or
+# processor's chat template, the token ids of the template's system-prompt prefix, its generation prompt and
+# its inter-turn separator; also provides a wrapper around apply_chat_template that tolerates templates
+# (e.g. Qwen3.5) that refuse conversations without a user message. Configures a module logger whose
+# level comes from the VERL_LOGGING_LEVEL env var (default WARN).
 import logging
 import os
 
@@ -11,6 +17,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def initialize_system_prompt(tokenizer, **apply_chat_template_kwargs) -> list[int]:
+    # [FUNCTION DOC]
+    # Computes the default system-prompt prefix tokens of a chat template.
+    # Behavior: tokenizes a conversation of one empty user message and one of two empty user messages (no
+    # generation prompt); the length difference is the per-turn size, and the system prompt is the one-turn rendering
+    # with that many trailing tokens removed.
+    # Inputs: tokenizer - tokenizer/processor with apply_chat_template; extra kwargs forwarded to apply_chat_template.
+    # Outputs: list of int token ids (empty if the template has no implicit system prompt).
+    # KNOWN ISSUE: if both renderings have equal length, slicing with negative zero yields an empty list, which happens to be correct only by coincidence; any template exception propagates.
+    # Side effects: none.
     """
     Initialize system prompt tokens for chat templates that support them.
 
@@ -40,6 +55,16 @@ def initialize_system_prompt(tokenizer, **apply_chat_template_kwargs) -> list[in
 
 
 def initialize_turn_separator(tokenizer, **apply_chat_template_kwargs) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Computes the turn separator tokens a template emits after a message's closing token.
+    # Behavior: renders a single user turn with empty and with "x" content, first with string content and, on any
+    # exception, with list-of-text-parts content; returns [] if neither form renders. Finds the maximal common trailing
+    # token run of the two renderings. If empty, returns []. Otherwise determines eos id(s) from the tokenizer (or its
+    # wrapped tokenizer attribute), accepting an int or a list/tuple; if any eos id is present in the common suffix,
+    # returns everything after the last occurrence; otherwise drops the first suffix token and returns the rest.
+    # Inputs: tokenizer - tokenizer or processor; extra kwargs forwarded to apply_chat_template.
+    # Outputs: list of int token ids (possibly empty).
+    # Exceptions: swallows rendering exceptions. Side effects: none.
     """Tokens a chat template inserts after a message's closing token, before the next turn.
 
     Multi-turn agent rollouts build the token sequence incrementally. The model stops at the
@@ -112,6 +137,12 @@ def initialize_turn_separator(tokenizer, **apply_chat_template_kwargs) -> list[i
 
 
 def extract_system_prompt_and_generation(tokenizer, **apply_chat_template_kwargs):
+    # [FUNCTION DOC]
+    # Computes both the system-prompt prefix tokens (same method as initialize_system_prompt) and the generation-prompt
+    # tokens, the latter being the tokens appended when rendering one empty user message with add_generation_prompt=True
+    # beyond the rendering without it.
+    # Inputs: tokenizer; extra kwargs forwarded to apply_chat_template.
+    # Outputs: tuple (system_prompt token list, generate_prompt token list). Exceptions: template errors propagate.
     token1 = normalize_token_ids(
         tokenizer.apply_chat_template(
             [{"role": "user", "content": ""}], add_generation_prompt=False, tokenize=True, **apply_chat_template_kwargs
@@ -148,6 +179,20 @@ def apply_chat_template(
     return_dict: bool = False,
     **kwargs,
 ) -> list[int] | str:
+    # [FUNCTION DOC]
+    # Calls processor.apply_chat_template with the given arguments; if that raises any exception, retries by prepending a
+    # dummy user message (list-of-parts with empty text) and stripping the dummy prefix from the result.
+    # Prefix stripping: render the dummy message alone (no generation prompt) as prefix; then
+    # - tokenize false: slice the text output after the prefix string length;
+    # - tokenize true, return_dict false: if output is a nested list (transformers 5 batch form) assert a single row and
+    # unwrap both prefix and output, then slice after the prefix length;
+    # - return_dict true: convert to plain dicts, take the prefix length from input_ids dimension 1 (assumes tensors with
+    # return_tensors="pt") and slice input_ids, attention_mask and, if present, mm_token_type_ids along dimension 1.
+    # Inputs: processor - tokenizer or processor; messages - list of message dicts; tokenize, add_generation_prompt, tools,
+    # return_dict; extra kwargs forwarded.
+    # Outputs: token id list, text string, or dict of tensors.
+    # Exceptions: errors from the retry path propagate; AssertionError if nested output has more than one row.
+    # KNOWN ISSUE: return_dict path assumes tensor outputs; other keys (e.g. pixel values) are left unchanged, and the first exception is silently swallowed regardless of its cause.
     """apply_chat_template to messages with special attention to template requiring
     at least one user message, e.g. Qwen3.5.
 
