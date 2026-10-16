@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Ulysses sequence-parallel replacements for HF Qwen2 attention forward: a legacy flash-attention
+# version for transformers 4.45-4.47 and an attention-interface version for transformers >= 4.48.
+# Same scheme as the Llama patches, plus Qwen2's per-layer sliding window (enabled when
+# use_sliding_window, sliding_window set and layer_idx >= max_window_layers).
+
 from typing import Callable, Optional
 
 import torch
@@ -43,6 +49,21 @@ def qwen2_flash_attn_forward(
     cache_position: Optional[torch.LongTensor] = None,
     position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
 ):
+    # [FUNCTION DOC]
+    # Behavior: projects q/k/v into heads, all-to-alls them (gather sequence, scatter heads) when SP > 1
+    # after validating head divisibility, computes RoPE from position_ids via self.rotary_emb when
+    # position_embeddings is missing (deprecation warning) else uses given cos/sin, updates the KV cache,
+    # repeats KV heads to the query head count, casts float32 states back to autocast / pre-quantization /
+    # weight dtype (warning), transposes to [b, s, h, d], determines the sliding window, and runs HF
+    # _flash_attention_forward over the full length with position ids and train-only dropout; reshapes,
+    # all-to-alls back and applies o_proj.
+    # Inputs: self - Qwen2 attention; hidden_states [b, s_local, hidden]; attention_mask; position_ids;
+    # past_key_value; output_attentions; use_cache (unused); cache_position; position_embeddings.
+    # Outputs: (attn_output [b, s_local, hidden], None, past_key_value).
+    # Exceptions: Ulysses validation errors.
+    # Side effects: SP collectives, cache update, warnings.
+    # KNOWN ISSUE: when output_attentions is true, attn_weights is never assigned and the return raises
+    # NameError.
     """
     Adapted from transformers 4.47.1 to support Ulysses sequence parallelism.
 
@@ -165,6 +186,17 @@ def qwen2_attn_forward(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    # [FUNCTION DOC]
+    # Behavior: transformers >= 4.48 variant: projects q/k/v, all-to-all under SP, applies RoPE with the
+    # given cos/sin, updates cache, determines the sliding window, selects the attention function (eager;
+    # sdpa with output_attentions falls back to eager with warning; else registered implementation), runs
+    # it with scaling, train-only dropout and sliding_window, reshapes, all-to-alls back, applies o_proj.
+    # Inputs: self; hidden_states; position_embeddings; attention_mask; past_key_value; cache_position;
+    # kwargs forwarded to attention.
+    # Outputs: (attn_output, attention weights or None).
+    # Exceptions: Ulysses validation errors.
+    # Side effects: SP collectives, cache update.
+    # KNOWN ISSUE: return annotation lists three elements but two are returned.
     """
     Adapted from transformers 4.49.0 to support Ulysses sequence parallelism for transformers >= 4.48.0.
 

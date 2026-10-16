@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CI sanity script (logic under the main guard): recursively scans all .py files under --directory/-d and asserts none
+# contains ".cuda", the quoted string "cuda" or the quoted string "nccl", directing authors to the helpers in
+# verl/utils/device.py. Files whose absolute path contains any entry of the CUDA or NCCL whitelists (path substrings,
+# separators adapted to the OS) are skipped. Prints a CHECK line per file; the first violation raises AssertionError.
+# Note: the two whitelists are merged, so a file whitelisted for either keyword class is exempt from all keywords.
+
 """
 This CI test is used for checking whether device api usage is irregular, suggest using api in `verl/utils/device.py`.
 Search targets include .py files in verl/recipe and verl/verl.

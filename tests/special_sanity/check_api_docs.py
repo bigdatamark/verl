@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CI sanity CLI: imports the given modules/packages (or every top-level package directory in the current working
+# directory) and all their submodules, and fails if any function or class listed in a module's __all__ lacks a
+# non-empty docstring, except names in _ALLOW_LIST. Exported names not found on the module are also reported.
+# KNOWN ISSUE: the module docstring's usage examples call the script check_docstrings.py, but this file is check_api_docs.py.
+
 """
 Fail CI if any function or class that is publicly exported via
 ``__all__`` lacks a docstring.
@@ -55,10 +61,16 @@ _ALLOW_LIST = [
 
 
 def iter_submodules(root: ModuleType) -> Iterable[ModuleType]:
+    # [FUNCTION DOC]
+    # HELPER: Generator yielding the root module and, if it is a package, every importable submodule found recursively;
+    # walk and import errors are printed to stderr as warnings and skipped.
+    # Side effects: imports modules (executing their top-level code).
     """Yield *root* and every sub-module inside it."""
     yield root
 
     def print_pkg_error(pkg_name):
+        # [FUNCTION DOC]
+        # HELPER: onerror callback for the package walk; prints a skip warning with the package name to stderr.
         print(f"[warn] Skipping {pkg_name!r}", file=sys.stderr)
 
     if getattr(root, "__path__", None):  # only packages have __path__
@@ -70,6 +82,11 @@ def iter_submodules(root: ModuleType) -> Iterable[ModuleType]:
 
 
 def names_missing_doc(mod: ModuleType) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: For each name in the module's __all__ (empty if absent): skips allow-listed fully-qualified names; reports
+    # "<module>.<name>  (not found)" if the attribute is missing or None; for functions and classes reports the qualified
+    # name if the cleaned docstring (inherited docs included via getdoc) is empty or missing. Other object kinds are ignored.
+    # Outputs: list of strings.
     """Return fully-qualified names that need docstrings."""
     missing: list[str] = []
     public = getattr(mod, "__all__", [])
@@ -90,6 +107,9 @@ def names_missing_doc(mod: ModuleType) -> list[str]:
 
 
 def check_module(qualname: str) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Imports qualname; on ModuleNotFoundError prints an error and returns a list with just qualname; otherwise
+    # collects missing-doc names over the module and all submodules. Other import errors propagate.
     """Import *qualname* and check it (and sub-modules)."""
     try:
         module = importlib.import_module(qualname)
@@ -104,6 +124,8 @@ def check_module(qualname: str) -> list[str]:
 
 
 def autodiscover_packages() -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns names of subdirectories of the current working directory that contain an __init__.py.
     """Detect top-level packages under CWD when no argument is given."""
     pkgs: list[str] = []
     for p in Path.cwd().iterdir():
@@ -113,6 +135,9 @@ def autodiscover_packages() -> list[str]:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Behavior: parses positional module names; falls back to autodiscovery; raises ValueError if there are no targets.
+    # Collects all missing names; if any, prints them sorted and raises ValueError; otherwise prints a success message.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "modules",

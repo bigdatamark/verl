@@ -63,7 +63,7 @@ def launch_router_process(
 ):
     # [FUNCTION DOC]
     # Behavior: picks node IP (brackets stripped) and a free port, formats the address (bracketed for IPv6), starts a
-    # non-daemonic-safe daemon process running run_router, waits 3 s and asserts it is alive.
+    # daemon process running run_router, waits 3 s and asserts it is alive.
     # Inputs: worker_urls. Outputs: (router address "host:port", process). Exceptions: AssertionError if it died.
     router_ip = ray.util.get_node_ip_address().strip("[]")
     router_port, _ = get_free_port(router_ip)

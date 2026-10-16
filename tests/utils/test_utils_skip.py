@@ -11,6 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for the rollout skip subsystem (verl.utils.skip): config dataclass
+# validation, the skip registry and BaseSkip action checks, async sample-id step
+# parsing, RolloutSkip dump-directory layout / step lookup / cache and repeat
+# actions, AsyncRolloutSkip step extraction from prompt uids, and SkipManager
+# initialization and its annotate decorator for sync and async functions
+# (including validation bypass and per-config dump isolation). Dumps live under
+# <dump_dir>/<experiment>_<project>/GBS<gbs>_N<n>_in<prompt_len>_out<resp_len>/<step>/
+# as gen_batch.dp plus meta.json. SkipManager class-level state is reset around
+# every test.
 
 """Unit tests for ``verl.utils.skip`` (SkipManager, RolloutSkip, config, registry)."""
 
@@ -37,10 +47,15 @@ from verl.utils.skip.skip_manager import SkipManager
 
 
 def _noop(*_args: Any, **_kwargs: Any) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Accepts any arguments and returns None; used as the wrapped function.
     return None
 
 
 def _reset_skip_manager_class_state() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Resets SkipManager class attributes: config None, step -1, empty
+    # skip_instances mapping.
     SkipManager.config = None  # type: ignore[attr-defined]
     SkipManager.step = -1  # type: ignore[attr-defined]
     SkipManager.skip_instances = {}  # type: ignore[attr-defined]
@@ -48,6 +63,8 @@ def _reset_skip_manager_class_state() -> None:
 
 @pytest.fixture(autouse=True)
 def reset_skip_manager():
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture resetting SkipManager state before and after each test.
     _reset_skip_manager_class_state()
     yield
     _reset_skip_manager_class_state()
@@ -61,6 +78,13 @@ def _minimal_skip_cfg(
     action: str = "cache",
     async_enable: bool = False,
 ) -> OmegaConf:
+    # [FUNCTION DOC]
+    # HELPER: Builds a minimal OmegaConf trainer config with skip.rollout and
+    # skip.async_rollout sections sharing dump_dir, steps (default [1]) and action
+    # (default "cache"), rollout n 2, experiment ut_exp / project ut_proj, sync
+    # trainer mode, train batch 8, gen batch 4, prompt length 8, response length 16.
+    # Inputs: dump_dir; enable - rollout skip; steps; action; async_enable.
+    # Outputs: DictConfig.
     steps = steps if steps is not None else [1]
     return OmegaConf.create(
         {
@@ -95,10 +119,16 @@ def _minimal_skip_cfg(
 
 
 def _local_rollout_config(cfg: OmegaConf) -> RolloutSkipConfig:
+    # [FUNCTION DOC]
+    # HELPER: Converts cfg.skip.rollout to a RolloutSkipConfig dataclass.
     return omega_conf_to_dataclass(cfg.skip.rollout, RolloutSkipConfig)
 
 
 def _project_dump_root(dump_dir: Path, cfg: OmegaConf) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Computes the expected resolved project dump root from the config,
+    # using gen batch size or falling back to train batch size, and rollout n
+    # (default 0). Inputs: dump_dir path; cfg. Outputs: absolute Path.
     exp = cfg.trainer.experiment_name
     proj = cfg.trainer.project_name
     gbs = cfg.data.gen_batch_size or cfg.data.train_batch_size
@@ -110,6 +140,10 @@ def _project_dump_root(dump_dir: Path, cfg: OmegaConf) -> Path:
 
 
 def _write_valid_step_dump(project_root: Path, step: int, proto: DataProto) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Writes a valid step dump: creates <root>/<step>, saves the DataProto to
+    # gen_batch.dp and writes meta.json with global_steps. Outputs: the step dir.
+    # Side effects: filesystem writes.
     step_dir = project_root.joinpath(str(step))
     step_dir.mkdir(parents=True, exist_ok=True)
     proto.save_to_disk(step_dir.joinpath("gen_batch.dp"))
@@ -118,53 +152,84 @@ def _write_valid_step_dump(project_root: Path, step: int, proto: DataProto) -> P
 
 
 class TestRolloutSkipConfig:
+    # [CLASS DOC]
+    # Tests rollout skip config defaults and validation.
     def test_defaults(self):
+        # [FUNCTION DOC]
+        # Behavior: default RolloutSkipConfig is disabled, action cache, no steps.
         c = RolloutSkipConfig()
         assert c.enable is False
         assert c.action == "cache"
         assert c.steps == []
 
     def test_async_rollout_config_defaults(self):
+        # [FUNCTION DOC]
+        # Behavior: default AsyncRolloutSkipConfig is disabled with action cache.
         c = AsyncRolloutSkipConfig()
         assert c.enable is False
         assert c.action == "cache"
 
     def test_invalid_action(self):
+        # [FUNCTION DOC]
+        # Behavior: an unknown action fails an assertion mentioning "action".
         with pytest.raises(AssertionError, match="action"):
             RolloutSkipConfig(action="not_an_action")
 
     def test_steps_must_be_int(self):
+        # [FUNCTION DOC]
+        # Behavior: a non-int entry in steps fails an assertion mentioning "steps".
         with pytest.raises(AssertionError, match="steps"):
             RolloutSkipConfig(steps=[1, "x"])  # type: ignore[list-item]
 
 
 class TestSkipRegistryAndBaseSkip:
+    # [CLASS DOC]
+    # Tests the skip registry and BaseSkip action validation.
     def test_rollout_and_async_rollout_registered(self):
+        # [FUNCTION DOC]
+        # Behavior: "rollout" and "async_rollout" are registered; async maps to AsyncRolloutSkip.
         assert "rollout" in SKIP_REGISTRY
         assert "async_rollout" in SKIP_REGISTRY
         assert SKIP_REGISTRY["async_rollout"] is AsyncRolloutSkip
 
     def test_register_skip_adds_class(self):
+        # [FUNCTION DOC]
+        # Behavior: register_skip with a unique name stores the decorated subclass under
+        # that name; the entry is removed afterwards.
+        # Side effects: temporarily mutates the global registry.
         name = f"ut_dummy_skip_{uuid.uuid4().hex[:8]}"
 
         @register_skip(name)
         class _UtSkip(BaseSkip):
+            # [CLASS DOC]
+            # HELPER: Minimal BaseSkip subclass supporting only the EMPTY action.
             support_actions = [SkipAction.EMPTY]
 
             def meet_precondition(self, step: int, func, *args, **kwargs) -> bool:
+                # [FUNCTION DOC]
+                # HELPER: Always reports the precondition as met.
                 return True
 
             def warp_function(self, step: int, func, *args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Returns the string "warped".
                 return "warped"
 
             def prepare_data(self, step: int, result, *args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: No-op.
                 pass
 
         assert SKIP_REGISTRY[name] is _UtSkip
         del SKIP_REGISTRY[name]
 
     def test_base_skip_rejects_unsupported_action(self):
+        # [FUNCTION DOC]
+        # Behavior: constructing a BaseSkip subclass that supports only CACHE with action
+        # "repeat" raises ValueError containing "Unsupported action".
         class _Bad(BaseSkip):
+            # [CLASS DOC]
+            # HELPER: BaseSkip subclass supporting only the CACHE action.
             support_actions = [SkipAction.CACHE]
 
         with pytest.raises(ValueError, match="Unsupported action"):
@@ -175,21 +240,34 @@ class TestSkipRegistryAndBaseSkip:
 
 
 class TestParseAsyncRolloutSampleStep:
+    # [CLASS DOC]
+    # Tests parse_async_rollout_sample_step.
     def test_valid_sample_id(self):
+        # [FUNCTION DOC]
+        # Behavior: "sample_<i>_<step>" parses to the trailing step integer.
         assert parse_async_rollout_sample_step("sample_0_42") == 42
         assert parse_async_rollout_sample_step("sample_3_1") == 1
 
     def test_valid_uid_prefixed_sample_id(self):
+        # [FUNCTION DOC]
+        # Behavior: a "uid_" prefix is tolerated.
         assert parse_async_rollout_sample_step("uid_sample_0_42") == 42
         assert parse_async_rollout_sample_step("uid_sample_3_1") == 1
 
     def test_invalid_sample_id(self):
+        # [FUNCTION DOC]
+        # Behavior: an unparsable id raises ValueError "Invalid async rollout sample_id".
         with pytest.raises(ValueError, match="Invalid async rollout sample_id"):
             parse_async_rollout_sample_step("bad_id")
 
 
 class TestRolloutSkipPaths:
+    # [CLASS DOC]
+    # Tests RolloutSkip dump path handling.
     def test_check_valid_step_path(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: a nonexistent step dir is invalid; a dir with gen_batch.dp and
+        # meta.json is valid.
         cfg = _minimal_skip_cfg(str(tmp_path), enable=True, steps=[1], action="cache")
         local = _local_rollout_config(cfg)
         rs = RolloutSkip(local, cfg)
@@ -202,6 +280,9 @@ class TestRolloutSkipPaths:
         assert rs._check_valid_step_path(root.joinpath("7")) is True
 
     def test_get_available_steps_filters_invalid_dirs(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: available steps include only integer-named dirs with a valid dump,
+        # sorted ascending ([1, 10]; "not_int" and empty "2" are ignored).
         cfg = _minimal_skip_cfg(str(tmp_path))
         local = _local_rollout_config(cfg)
         rs = RolloutSkip(local, cfg)
@@ -217,6 +298,9 @@ class TestRolloutSkipPaths:
         assert rs._get_available_steps() == [1, 10]
 
     def test_find_latest_step_exact_then_smaller_then_larger(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: with dumps at 5 and 20, lookup returns the exact step if present,
+        # else the largest smaller step, else the smallest larger one; with no dumps -1.
         cfg = _minimal_skip_cfg(str(tmp_path))
         local = _local_rollout_config(cfg)
         rs = RolloutSkip(local, cfg)
@@ -236,7 +320,12 @@ class TestRolloutSkipPaths:
 
 
 class TestRolloutSkipMeetWarpPrepare:
+    # [CLASS DOC]
+    # Tests RolloutSkip precondition, warp (load) and prepare (dump) behavior.
     def test_meet_precondition_cache_miss_and_hit(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: cache action: precondition false without a dump for the step, true
+        # once the step's dump exists.
         cfg = _minimal_skip_cfg(str(tmp_path), action="cache")
         local = _local_rollout_config(cfg)
         rs = RolloutSkip(local, cfg)
@@ -249,6 +338,9 @@ class TestRolloutSkipMeetWarpPrepare:
         assert rs.meet_precondition(1, _noop) is True
 
     def test_meet_precondition_repeat(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: repeat action: precondition false with no dumps, true once any dump
+        # exists (step 1 serving step 2).
         cfg = _minimal_skip_cfg(str(tmp_path), action="repeat")
         local = _local_rollout_config(cfg)
         rs = RolloutSkip(local, cfg)
@@ -261,6 +353,9 @@ class TestRolloutSkipMeetWarpPrepare:
         assert rs.meet_precondition(2, _noop) is True
 
     def test_prepare_data_and_warp_roundtrip(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: prepare_data dumps a batch for step 3 and warp_function for step 3
+        # loads an equal batch.
         cfg = _minimal_skip_cfg(str(tmp_path), action="cache")
         local = _local_rollout_config(cfg)
         rs = RolloutSkip(local, cfg)
@@ -271,6 +366,9 @@ class TestRolloutSkipMeetWarpPrepare:
         assert torch.allclose(loaded.batch["k"], original.batch["k"])
 
     def test_warp_function_repeat_resolves_step_per_call(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: repeat warp resolves its substitute step per call: step 3 loads the
+        # step-1 dump, step 12 loads the step-5 dump.
         """Each repeat warp call must resolve its own substitute step (no shared instance cache)."""
         cfg = _minimal_skip_cfg(str(tmp_path), action="repeat")
         local = _local_rollout_config(cfg)
@@ -286,6 +384,9 @@ class TestRolloutSkipMeetWarpPrepare:
         assert loaded_large.batch["t"].item() == 5.0
 
     def test_warp_function_repeat_without_meet_precondition(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: repeat warp works without a prior precondition call, loading the
+        # only dump (step 7) for step 99.
         cfg = _minimal_skip_cfg(str(tmp_path), action="repeat")
         local = _local_rollout_config(cfg)
         rs = RolloutSkip(local, cfg)
@@ -297,6 +398,8 @@ class TestRolloutSkipMeetWarpPrepare:
         assert loaded.batch["t"].item() == 7.0
 
     def test_warp_function_repeat_raises_when_no_dump(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: repeat warp with no dumps raises RuntimeError "repeat action expected dumped data".
         cfg = _minimal_skip_cfg(str(tmp_path), action="repeat")
         local = _local_rollout_config(cfg)
         rs = RolloutSkip(local, cfg)
@@ -305,7 +408,12 @@ class TestRolloutSkipMeetWarpPrepare:
 
 
 class TestAsyncRolloutSkipExtractStep:
+    # [CLASS DOC]
+    # Tests AsyncRolloutSkip.extract_step.
     def test_extract_step_from_prompts_uid(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: step is parsed from the uid of the DataProto given as the second
+        # positional arg ("uid_sample_1_7" gives 7).
         cfg = _minimal_skip_cfg(str(tmp_path), async_enable=True)
         local = omega_conf_to_dataclass(cfg.skip.async_rollout, AsyncRolloutSkipConfig)
         ars = AsyncRolloutSkip(local, cfg)
@@ -314,6 +422,8 @@ class TestAsyncRolloutSkipExtractStep:
         assert ars.extract_step(object(), prompts) == 7
 
     def test_extract_step_from_kwargs_prompts(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: step is parsed from a prompts keyword argument.
         cfg = _minimal_skip_cfg(str(tmp_path), async_enable=True)
         local = omega_conf_to_dataclass(cfg.skip.async_rollout, AsyncRolloutSkipConfig)
         ars = AsyncRolloutSkip(local, cfg)
@@ -322,6 +432,8 @@ class TestAsyncRolloutSkipExtractStep:
         assert ars.extract_step(prompts=prompts) == 1
 
     def test_extract_step_missing_uid(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: prompts without a uid raise ValueError mentioning "uid".
         cfg = _minimal_skip_cfg(str(tmp_path), async_enable=True)
         local = omega_conf_to_dataclass(cfg.skip.async_rollout, AsyncRolloutSkipConfig)
         ars = AsyncRolloutSkip(local, cfg)
@@ -331,7 +443,11 @@ class TestAsyncRolloutSkipExtractStep:
 
 
 class TestSkipManagerInitAndAnnotate:
+    # [CLASS DOC]
+    # Tests SkipManager.init and annotate.
     def test_init_uses_train_batch_size_when_gen_batch_size_is_null(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: with null gen batch size the rollout instance's gbs is the train batch size.
         cfg = _minimal_skip_cfg(str(tmp_path), enable=False)
         cfg.data.gen_batch_size = None
 
@@ -340,6 +456,9 @@ class TestSkipManagerInitAndAnnotate:
         assert SkipManager.skip_instances["rollout"].gbs == cfg.data.train_batch_size
 
     def test_init_builds_rollout_and_async_instances(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: init stores the config and builds enabled rollout (steps [1, 2]) and
+        # async rollout instances, the latter supporting online step resolution.
         cfg = _minimal_skip_cfg(str(tmp_path), steps=[1, 2], async_enable=True)
         SkipManager.init(cfg)
         assert SkipManager.config is not None
@@ -352,17 +471,25 @@ class TestSkipManagerInitAndAnnotate:
         assert async_inst.support_online_step is True
 
     def test_annotate_sync_bypass_when_step_not_in_steps(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: with skip configured only for step 99, a sync annotated function runs
+        # normally at step 1.
         cfg = _minimal_skip_cfg(str(tmp_path), enable=True, steps=[99])
         SkipManager.init(cfg)
 
         @SkipManager.annotate(role="rollout")
         def work(x: int) -> int:
+            # [FUNCTION DOC]
+            # HELPER: Returns x + 1.
             return x + 1
 
         SkipManager.set_step(1)
         assert work(40) == 41
 
     def test_should_bypass_for_validation(self):
+        # [FUNCTION DOC]
+        # Behavior: bypass-for-validation is true when the batch argument's meta_info has
+        # validate True and false when validate is False.
         batch = DataProto.from_dict(tensors={"x": torch.zeros(1)})
         batch.meta_info = {"validate": True}
         assert SkipManager._should_bypass_for_validation((object(), batch), {}) is True
@@ -370,6 +497,9 @@ class TestSkipManagerInitAndAnnotate:
         assert SkipManager._should_bypass_for_validation((object(), batch), {}) is False
 
     def test_annotate_sync_validation_bypasses_cache_and_dump(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: for a validation batch, the sync annotated rollout runs the real
+        # function (returns 42) and neither loads nor overwrites the cached step-1 dump (99).
         cfg = _minimal_skip_cfg(str(tmp_path), enable=True, steps=[1], action="cache")
         SkipManager.init(cfg)
         root = _project_dump_root(tmp_path, cfg)
@@ -378,6 +508,8 @@ class TestSkipManagerInitAndAnnotate:
 
         @SkipManager.annotate(role="rollout")
         def gen(_self: Any, prompts: DataProto) -> DataProto:
+            # [FUNCTION DOC]
+            # HELPER: Annotated rollout returning a batch with z = 42.
             return DataProto.from_dict(tensors={"z": torch.tensor([42.0])})
 
         SkipManager.set_step(1)
@@ -389,6 +521,8 @@ class TestSkipManagerInitAndAnnotate:
         assert loaded.batch["z"].item() == 99.0
 
     def test_annotate_async_validation_bypasses_cache_and_dump(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: same validation bypass for an async annotated rollout.
         cfg = _minimal_skip_cfg(str(tmp_path), enable=True, steps=[1], action="cache")
         SkipManager.init(cfg)
         root = _project_dump_root(tmp_path, cfg)
@@ -397,9 +531,14 @@ class TestSkipManagerInitAndAnnotate:
 
         @SkipManager.annotate(role="rollout")
         async def gen(_self: Any, prompts: DataProto) -> DataProto:
+            # [FUNCTION DOC]
+            # HELPER: Async annotated rollout returning a batch with z = 42.
             return DataProto.from_dict(tensors={"z": torch.tensor([42.0])})
 
         async def _run():
+            # [FUNCTION DOC]
+            # HELPER: Sets step 1, awaits gen with a validation batch, asserts output 42 and
+            # dump unchanged (99).
             SkipManager.set_step(1)
             val_batch = DataProto.from_dict(tensors={"z": torch.tensor([0.0])})
             val_batch.meta_info = {"validate": True}
@@ -411,12 +550,17 @@ class TestSkipManagerInitAndAnnotate:
         asyncio.run(_run())
 
     def test_annotate_sync_cache_step_one(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: cache action at step 1: first call runs and dumps the output; a second
+        # annotated function at the same step is not executed and returns the cached batch.
         cfg = _minimal_skip_cfg(str(tmp_path), enable=True, steps=[1], action="cache")
         SkipManager.init(cfg)
         root = _project_dump_root(tmp_path, cfg)
 
         @SkipManager.annotate(role="rollout")
         def gen(_: Any = None) -> DataProto:
+            # [FUNCTION DOC]
+            # HELPER: Annotated rollout returning a batch with z = 7.
             return DataProto.from_dict(tensors={"z": torch.tensor([7.0])})
 
         SkipManager.set_step(1)
@@ -428,35 +572,51 @@ class TestSkipManagerInitAndAnnotate:
 
         @SkipManager.annotate(role="rollout")
         def gen_cached(_: Any = None) -> DataProto:
+            # [FUNCTION DOC]
+            # HELPER: Annotated rollout that must not run; raises AssertionError if called.
             raise AssertionError("should not run when cache hit")
 
         loaded = gen_cached()
         assert torch.allclose(loaded.batch["z"], torch.tensor([7.0]))
 
     def test_annotate_async_rollout_online_step(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: async rollout skip derives the step from the prompt uid
+        # ("sample_0_1" gives step 1): the first call runs and dumps under step 1, a
+        # second annotated function with the same uid returns the cached batch without
+        # running.
         cfg = _minimal_skip_cfg(str(tmp_path), enable=False, async_enable=True, steps=[1], action="cache")
         SkipManager.init(cfg)
         root = _project_dump_root(tmp_path, cfg)
 
         def _make_prompts(sample_id: str) -> DataProto:
+            # [FUNCTION DOC]
+            # HELPER: Builds a one-row DataProto whose uid is "uid_" plus the sample id.
             p = DataProto.from_dict(tensors={"x": torch.zeros(1)})
             p.non_tensor_batch["uid"] = np.array([f"uid_{sample_id}"], dtype=object)
             return p
 
         @SkipManager.annotate(role="async_rollout")
         async def gen_single(_self: Any, prompts: DataProto) -> DataProto:
+            # [FUNCTION DOC]
+            # HELPER: Annotated async rollout returning a batch whose value a is the step
+            # parsed from the uid.
             # simulate reading sample_id: strip "uid_" prefix then parse
             raw = str(prompts.non_tensor_batch["uid"][0])
             sample_id = raw[4:] if raw.startswith("uid_") else raw
             return DataProto.from_dict(tensors={"a": torch.tensor([float(sample_id.split("_")[-1])])})
 
         async def _run():
+            # [FUNCTION DOC]
+            # HELPER: Drives both calls and the assertions.
             out = await gen_single(None, _make_prompts("sample_0_1"))
             assert out.batch["a"].item() == 1.0
             assert (root / "1" / "gen_batch.dp").exists()
 
             @SkipManager.annotate(role="async_rollout")
             async def gen_cached(_self: Any, prompts: DataProto) -> DataProto:
+                # [FUNCTION DOC]
+                # HELPER: Async annotated function that must not run (raises AssertionError).
                 raise AssertionError("cached path")
 
             loaded = await gen_cached(None, _make_prompts("sample_0_1"))
@@ -465,16 +625,23 @@ class TestSkipManagerInitAndAnnotate:
         asyncio.run(_run())
 
     def test_annotate_async_bypass_when_step_not_in_list(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: async skip configured for step 99 runs the function once and returns
+        # its output when the uid indicates step 1.
         cfg = _minimal_skip_cfg(str(tmp_path), async_enable=True, steps=[99], action="cache")
         SkipManager.init(cfg)
         calls = {"n": 0}
 
         @SkipManager.annotate(role="async_rollout")
         async def gen(_self: Any, prompts: DataProto) -> DataProto:
+            # [FUNCTION DOC]
+            # HELPER: Counts calls and echoes prompts.
             calls["n"] += 1
             return prompts
 
         async def _run():
+            # [FUNCTION DOC]
+            # HELPER: Calls gen with a step-1 uid and asserts passthrough and one call.
             p = DataProto.from_dict(tensors={"x": torch.zeros(1)})
             p.non_tensor_batch["uid"] = np.array(["uid_sample_0_1"], dtype=object)
             out = await gen(None, p)
@@ -485,7 +652,12 @@ class TestSkipManagerInitAndAnnotate:
 
 
 class TestSkipManagerConfigDataclass:
+    # [CLASS DOC]
+    # Tests SkipManagerConfig defaults.
     def test_skip_manager_config_merge(self):
+        # [FUNCTION DOC]
+        # Behavior: default SkipManagerConfig holds rollout and async_rollout config
+        # dataclasses, with rollout disabled.
         c = SkipManagerConfig()
         assert isinstance(c.rollout, RolloutSkipConfig)
         assert isinstance(c.async_rollout, AsyncRolloutSkipConfig)
@@ -493,20 +665,31 @@ class TestSkipManagerConfigDataclass:
 
 
 class TestSkipManagerRuntimeScenarios:
+    # [CLASS DOC]
+    # Tests SkipManager with unregistered roles.
     def test_annotate_unknown_role_is_noop(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: annotate with an unknown role leaves the function unchanged in effect.
         cfg = _minimal_skip_cfg(str(tmp_path), enable=True, steps=[1])
         SkipManager.init(cfg)
         SkipManager.set_step(1)
 
         @SkipManager.annotate(role="unknown_role")
         def f(x: int) -> int:
+            # [FUNCTION DOC]
+            # HELPER: Returns x * 2.
             return x * 2
 
         assert f(3) == 6
 
 
 class TestSkipDumpDiskScenarios:
+    # [CLASS DOC]
+    # Tests disk-level dump behavior.
     def test_dump_dirs_are_isolated_by_config(self, tmp_path: Path):
+        # [FUNCTION DOC]
+        # Behavior: two RolloutSkip instances with different dump dirs keep separate
+        # step-1 dumps (1.0 vs 2.0).
         dump_a = tmp_path / "disk_a"
         dump_b = tmp_path / "disk_b"
         cfg_a = _minimal_skip_cfg(str(dump_a), enable=True, steps=[1], action="cache")
@@ -525,10 +708,16 @@ class TestSkipDumpDiskScenarios:
     def test_prepare_data_handles_disk_write_error_without_raising(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
+        # [FUNCTION DOC]
+        # Behavior: when saving the DataProto raises OSError, prepare_data swallows it
+        # and no gen_batch.dp exists in the step dir.
+        # Inputs: tmp_path; monkeypatch - replaces DataProto.save_to_disk.
         cfg = _minimal_skip_cfg(str(tmp_path), enable=True, steps=[1], action="cache")
         rs = RolloutSkip(_local_rollout_config(cfg), cfg)
 
         def _raise_save(*args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Replacement save that always raises OSError.
             raise OSError("simulated disk write failure")
 
         monkeypatch.setattr(DataProto, "save_to_disk", _raise_save)

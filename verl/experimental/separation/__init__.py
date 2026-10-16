@@ -11,3 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Separated (non-colocated) trainer/rollout utilities: worker classes, resource pool helpers and a base separated
+# PPO trainer used by the one-step off-policy and fully-async recipes. Exposes engine_workers. No code here.

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CI sanity script: run from the repository root, checks every .md and .rst file under docs/ contains the text
+# "Last updated", except files matching ALLOW_LIST patterns.
+
 """
 Check that every .md and .rst file under docs/ contains the substring "Last updated",
 with an allow-list for exceptions.
@@ -39,6 +43,8 @@ DOCS_DIR = Path("docs")
 
 
 def is_allowed(path: Path) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if the path matches any ALLOW_LIST glob pattern using right-anchored path matching.
     """
     Return True if `path` matches any entry in ALLOW_LIST.
     """
@@ -50,6 +56,9 @@ def is_allowed(path: Path) -> bool:
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: exits with status 1 if docs/ does not exist; collects files lacking "Last updated" (read as UTF-8 ignoring
+    # errors); if any, prints them and the total and raises AssertionError; otherwise prints a success message.
     if not DOCS_DIR.exists():
         print(f"Error: Documentation directory '{DOCS_DIR}' does not exist.", file=sys.stderr)
         sys.exit(1)

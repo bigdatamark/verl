@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Checkpoint-engine package: transports that move trainer weights to rollout replicas. Re-exports the core abstractions
+# from base (CheckpointEngine, registry, TensorMeta, colocated engine, manager, worker) and then tries to import each
+# optional backend (NCCL, HCCL, NIXL, Kimi, Mooncake, delta-sharded). Importing a backend module registers it in
+# CheckpointEngineRegistry and adds its class to __all__; on ImportError the error is recorded in the registry (so later
+# lookups report the missing dependency) and the exported name is set to None.
+
 from .base import (
     CheckpointEngine,
     CheckpointEngineManager,

@@ -12,6 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Core PPO-family algorithm math shared by all trainer backends: KL controllers; a registry of advantage estimators
+# (GAE, GRPO and variants, GDPO, pass@k, REINFORCE++ and baseline, RLOO, OPO, ReMax, GPG, optimal token baseline
+# variants); a registry of policy losses; loss aggregation; entropy, value and KL penalty helpers.
+# Globals: POLICY_LOSS_REGISTRY (name to policy loss fn) and ADV_ESTIMATOR_REGISTRY (name to estimator fn), filled
+# by decorators at import. Tensors are typically (batch, response_length) with a 0/1 response mask.
+
 """
 Core functions to implement PPO algorithms.
 The function implemented in this file should be used by trainer with different distributed strategies to
@@ -51,6 +59,9 @@ POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
 
 
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
+    # [FUNCTION DOC]
+    # Behavior: returns a decorator that stores the decorated function in POLICY_LOSS_REGISTRY under name (silently
+    # overwriting any previous entry) and returns it unchanged. Side effects: mutates registry.
     """Register a policy loss function with the given name.
 
     Args:
@@ -61,6 +72,8 @@ def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
     """
 
     def decorator(func: PolicyLossFn) -> PolicyLossFn:
+        # [FUNCTION DOC]
+        # HELPER: registers func under the enclosing name and returns it.
         POLICY_LOSS_REGISTRY[name] = func
         return func
 
@@ -68,6 +81,8 @@ def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
 
 
 def get_policy_loss_fn(name):
+    # [FUNCTION DOC]
+    # Returns the registered policy loss for name. Exceptions: ValueError listing supported names if unknown.
     """Get the policy loss with a given name.
 
     Args:
@@ -86,6 +101,10 @@ def get_policy_loss_fn(name):
 
 
 class AdvantageEstimator(str, Enum):
+    # [CLASS DOC]
+    # String enum of built-in advantage estimator names (gae, grpo, reinforce_plus_plus, reinforce_plus_plus_baseline,
+    # remax, rloo, opo, grpo_passk, gpg, rloo_vectorized, grpo_vectorized, optimal_token_baseline,
+    # tir_optimal_token_baseline, gdpo). Custom estimators may register by plain string instead.
     """Using an enumeration class to avoid spelling errors in adv_estimator.
 
     Note(haibin.lin): this enum class is immutable after creation. Extending this
@@ -114,6 +133,10 @@ ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
 
 
 def register_adv_est(name_or_enum: str | AdvantageEstimator) -> Any:
+    # [FUNCTION DOC]
+    # Behavior: returns a decorator registering fn under the string name (enum value if an enum is given).
+    # Exceptions: ValueError if a different function is already registered under that name (re-registering the same
+    # function is allowed). Side effects: mutates ADV_ESTIMATOR_REGISTRY.
     """Decorator to register a advantage estimator function with a given name.
 
     Args:
@@ -123,6 +146,8 @@ def register_adv_est(name_or_enum: str | AdvantageEstimator) -> Any:
     """
 
     def decorator(fn):
+        # [FUNCTION DOC]
+        # HELPER: performs the registration described above and returns fn.
         name = name_or_enum.value if isinstance(name_or_enum, Enum) else name_or_enum
         if name in ADV_ESTIMATOR_REGISTRY and ADV_ESTIMATOR_REGISTRY[name] != fn:
             raise ValueError(
@@ -135,6 +160,8 @@ def register_adv_est(name_or_enum: str | AdvantageEstimator) -> Any:
 
 
 def get_adv_estimator_fn(name_or_enum):
+    # [FUNCTION DOC]
+    # Returns the registered estimator for a string or enum name. Exceptions: ValueError if unknown.
     """Get the advantage estimator function with a given name.
 
     Args:
@@ -151,17 +178,24 @@ def get_adv_estimator_fn(name_or_enum):
 
 
 class AdaptiveKLController:
+    # [CLASS DOC]
+    # Adaptive KL coefficient controller (Ziegler et al.): holds value (current coefficient), target KL and horizon.
     """
     Adaptive KL controller described in the paper:
     https://arxiv.org/pdf/1909.08593.pdf
     """
 
     def __init__(self, init_kl_coef, target_kl, horizon):
+        # [FUNCTION DOC]
+        # Stores initial coefficient as value, target_kl as target, and horizon.
         self.value = init_kl_coef
         self.target = target_kl
         self.horizon = horizon
 
     def update(self, current_kl, n_steps):
+        # [FUNCTION DOC]
+        # Behavior: proportional error = current_kl / target - 1 clipped to [-0.2, 0.2]; multiplies value by
+        # 1 + error * n_steps / horizon. Side effects: mutates self.value. Exceptions: division by zero if target is 0.
         """Update the KL coefficient based on current KL divergence.
 
         Args:
@@ -175,12 +209,18 @@ class AdaptiveKLController:
 
 
 class FixedKLController:
+    # [CLASS DOC]
+    # Constant KL coefficient controller exposing value.
     """Fixed KL controller."""
 
     def __init__(self, kl_coef):
+        # [FUNCTION DOC]
+        # Stores kl_coef as value.
         self.value = kl_coef
 
     def update(self, current_kl, n_steps):
+        # [FUNCTION DOC]
+        # No-op update; arguments ignored.
         """Update method for fixed KL controller (no-op).
 
         Args:
@@ -191,6 +231,9 @@ class FixedKLController:
 
 
 def get_kl_controller(kl_ctrl):
+    # [FUNCTION DOC]
+    # Behavior: builds a Fixed controller for type "fixed" or an Adaptive one for "adaptive" (asserting horizon > 0) from
+    # kl_ctrl's kl_coef/target_kl/horizon. Exceptions: AssertionError; NotImplementedError for other types.
     """Factory function to create appropriate KL controller based on configuration.
 
     Args:
@@ -220,6 +263,14 @@ def compute_gae_advantage_return(
     gamma: torch.Tensor,
     lam: torch.Tensor,
 ):
+    # [FUNCTION DOC]
+    # Registered as "gae". Behavior (no grad): iterates time steps backwards computing TD error
+    # delta = reward_t + gamma * next_value - value_t and lastgaelam = delta + gamma * lam * lastgaelam; positions with
+    # mask 0 do not update next_value or lastgaelam (they carry the previous values, so observation tokens are skipped)
+    # but still record the carried advantage. Returns = advantages + values; advantages are then whitened over masked
+    # positions (masked mean/std).
+    # Inputs: token_level_rewards, values, response_mask (bs, T); gamma, lam scalars.
+    # Outputs: (whitened advantages, returns), both (bs, T).
     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py
 
     Args:
@@ -273,6 +324,13 @@ def compute_grpo_outcome_advantage(
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "grpo". Behavior (no grad): per-sample score = sum of token rewards; groups scores by index; for
+    # singleton groups mean 0 and std 1, else group mean and unbiased std; each score becomes (score - mean) /
+    # (std + epsilon), or just score - mean if not normalizing by std; broadcast across tokens times the mask.
+    # Inputs: token_level_rewards, response_mask (bs, T); index - group id per sample; epsilon; flag; config unused.
+    # Outputs: (advantages, returns) identical tensors (bs, T). Exceptions: ValueError for an empty group (unreachable).
+    # Note: does not accept extra keyword arguments, unlike most other estimators.
     """
     Compute advantage for GRPO, operating only on Outcome reward
     (with only one scalar reward for each response).
@@ -340,6 +398,11 @@ def compute_grpo_vectorized_outcome_advantage(
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "grpo_vectorized". Same result as GRPO but vectorized: maps index to integer group ids, computes
+    # per-group mean and std with the group helper (eps 0), then (score - group mean) / (group std + epsilon) or just
+    # centered; broadcast times mask. Outputs: (advantages, advantages).
+    # Note: singleton-group handling depends on the group helper's std definition rather than the explicit std=1 rule.
     """
     Vectorized GRPO（outcome-only）:
       For each group g:
@@ -370,6 +433,16 @@ def compute_gdpo_outcome_advantage(
     batch: Optional[dict] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "gdpo". Behavior: when config, non_tensor_batch and batch are all given, requires
+    # config.gdpo_reward_keys (assert) and, for each key (assert present in non_tensor_batch), places that per-sample
+    # reward as a float at the last valid response token (valid length from attention mask over the response part,
+    # minus 1) of a zero (bs, T) tensor; optional per-key weights from gdpo_reward_weights. Otherwise uses
+    # token_level_rewards as the single component with weight 1. Each component is GRPO-normalized within groups,
+    # weighted and summed, then whitened over the mask and multiplied by the mask.
+    # Inputs: as GRPO plus non_tensor_batch, batch (needs prompts and attention_mask), extra kwargs ignored.
+    # Outputs: (advantages, advantages). Exceptions: AssertionError for missing keys.
+    # Note: a response with zero valid tokens yields index -1, writing the reward at the last position.
     """
     GDPO: Group reward-Decoupled Normalization Policy Optimization.
 
@@ -478,6 +551,13 @@ def compute_grpo_passk_outcome_advantage(
     config: Optional[AlgoConfig] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "grpo_passk". Behavior (no grad): per group (requires at least 2 samples) only the highest-scoring
+    # sample gets advantage max - second max, optionally divided by (group std + epsilon); all others get 0; broadcast
+    # times mask. Inputs: as GRPO; config required. Outputs: (advantages, advantages).
+    # Exceptions: AssertionError if config is None; ValueError for groups smaller than 2.
+    # Note: the norm_adv_by_std_in_grpo argument is ignored; the value is read from config (default True). Ties pick the
+    # first top-k position.
     """
     Compute advantage for Pass@k using a GRPO-style outcome reward formulation.
     Only the best response per group gets a non-zero advantage: r_max - r_second_max.
@@ -541,6 +621,10 @@ def compute_reinforce_plus_plus_baseline_outcome_advantage(
     config: Optional[AlgoConfig] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "reinforce_plus_plus_baseline". Behavior (no grad): subtracts the group mean score (0 for singleton
+    # groups) from each sample score, broadcasts across tokens times mask, then whitens over the mask and re-masks.
+    # Inputs: rewards, mask, index; epsilon/config unused. Outputs: (advantages, advantages).
     """
     Compute advantage for RF++-baseline (https://arxiv.org/abs/2501.03262), operating only on Outcome reward
     (with only one scalar reward for each response).
@@ -593,6 +677,10 @@ def compute_rloo_outcome_advantage(
     config: Optional[AlgoConfig] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "rloo". Behavior (no grad): for groups of size n > 1, advantage = (score - group mean) * n / (n - 1),
+    # i.e. score minus the mean of the other samples; singleton groups keep the raw score. Broadcast times mask.
+    # Outputs: (advantages, advantages).
     """
     Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
 
@@ -645,6 +733,9 @@ def compute_opo_outcome_advantage(
     config: Optional[AlgoConfig] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "opo". Behavior (no grad): baseline per group = response-length-weighted mean of scores (0 for
+    # singleton groups); advantage = score - baseline, broadcast times mask. Outputs: (advantages, advantages).
     """
     Compute advantage for OPO based on https://arxiv.org/pdf/2505.23585
 

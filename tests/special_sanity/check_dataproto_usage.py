@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CI sanity script (logic under the main guard): recursively scans all .py files under --directory/-d and asserts none
+# contains the text "DataProto" (prompting TensorDict usage instead), skipping paths containing any entry of the
+# (currently empty) SEARCH_WHITELIST. Prints a CHECK line per file and stops at the first offending file with an AssertionError.
+# KNOWN ISSUE: the whitelist skip message refers to the "device api usage check whitelist" (copied from check_device_api_usage.py).
+
 """
 This CI test is used for checking whether DataProto is used in the code of some directory
 """

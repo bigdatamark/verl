@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CI sanity script: checks that public (not underscore-prefixed) classes and top-level/method functions in a fixed list
+# of core verl files have docstrings, by static AST inspection. Fails by raising Exception with a per-file report.
+
 """
 Python script to check docstrings for functions and classes in specified files.
 Checks that every public function and class has proper docstring documentation.
@@ -23,15 +27,24 @@ import sys
 
 
 class DocstringChecker(ast.NodeVisitor):
+    # [CLASS DOC]
+    # AST visitor collecting (qualified name, filename, line) for public classes and functions without docstrings.
+    # Functions nested inside other functions are ignored; method names are prefixed with the enclosing class name.
     """AST visitor to check for missing docstrings in functions and classes."""
 
     def __init__(self, filename: str):
+        # [FUNCTION DOC]
+        # HELPER: Stores filename and initializes an empty result list, no current class and nesting level 0.
         self.filename = filename
         self.missing_docstrings: list[tuple[str, str, int]] = []
         self.current_class = None
         self.function_nesting_level = 0
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
+        # [FUNCTION DOC]
+        # HELPER: Records a public function lacking a docstring when not nested inside another function, then visits children
+        # with the nesting level incremented.
+        # KNOWN ISSUE: classes defined inside functions are still checked (only function nesting is tracked for functions), and methods of such classes are skipped because nesting is > 0.
         """Visit function definitions and check for docstrings."""
         if not node.name.startswith("_") and self.function_nesting_level == 0:
             if not self._has_docstring(node):
@@ -43,6 +56,8 @@ class DocstringChecker(ast.NodeVisitor):
         self.function_nesting_level -= 1
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        # [FUNCTION DOC]
+        # HELPER: Same as visit_FunctionDef for async functions.
         """Visit async function definitions and check for docstrings."""
         if not node.name.startswith("_") and self.function_nesting_level == 0:
             if not self._has_docstring(node):
@@ -54,6 +69,9 @@ class DocstringChecker(ast.NodeVisitor):
         self.function_nesting_level -= 1
 
     def visit_ClassDef(self, node: ast.ClassDef):
+        # [FUNCTION DOC]
+        # HELPER: Records a public class lacking a docstring (by bare name), then visits its body with current_class set to it,
+        # restoring the previous value afterwards.
         """Visit class definitions and check for docstrings."""
         if not node.name.startswith("_"):
             if not self._has_docstring(node):
@@ -65,11 +83,16 @@ class DocstringChecker(ast.NodeVisitor):
         self.current_class = old_class
 
     def _has_docstring(self, node) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Returns whether the node has a docstring per the AST helper.
         """Check if a node has a docstring."""
         return ast.get_docstring(node) is not None
 
 
 def check_file_docstrings(filepath: str) -> list[tuple[str, str, int]]:
+    # [FUNCTION DOC]
+    # HELPER: Reads and parses the file, runs the checker and returns its missing list; any error is printed and yields an
+    # empty list (so unreadable/unparsable files silently pass).
     """Check docstrings in a single file."""
     try:
         with open(filepath, encoding="utf-8") as f:
@@ -86,6 +109,11 @@ def check_file_docstrings(filepath: str) -> list[tuple[str, str, int]]:
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: changes the working directory to the repository root (two levels above this script), checks each listed file
+    # (missing files only warn), prints per-file status, and if anything is missing prints a report grouped by file and
+    # sorted by line, then raises Exception; otherwise prints OK. Exits with status 1 if the repo path does not exist.
+    # Side effects: changes the process working directory.
     """Main function to check docstrings in specified files."""
 
     files_to_check = [

@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Top-level verl package. On import it: disables Ray's automatic "uv run" runtime-env hook (env var
+# RAY_ENABLE_UV_RUN_RUNTIME_ENV defaults to "0") before anything imports Ray; exposes DataProto and __version__ (read
+# from the bundled version/version file); sets the basic logging level to WARNING; imports any comma-separated modules
+# listed in VERL_USE_EXTERNAL_MODULES; discovers and loads "verl.plugins" entry points according to
+# VERL_USE_EXTERNAL_PLUGINS ("auto" = all (default), "none" = skip, otherwise a comma list of allowed names), logging
+# load failures at debug level only; when VERL_USE_MODELSCOPE is "true" patches the HF hub to use ModelScope (raises
+# ImportError if modelscope is missing); and on Ascend NPU unwraps torch.nested constructors patched by torch-npu and,
+# for tensordict older than 0.10.0, replaces TensorDictBase._sync_all with a generic device synchronize.
+# Side effects: environment variable defaults, global logging config, plugin imports, monkeypatching of torch/tensordict.
+
 import importlib
 import logging
 import os
@@ -123,6 +134,10 @@ if is_npu_available:
         from tensordict.base import TensorDictBase
 
         def _sync_all_patch(self):
+            # [FUNCTION DOC]
+            # HELPER: Replacement for TensorDictBase._sync_all on NPU: determines the available accelerator device type; if none,
+            # returns; otherwise calls that device module's synchronize so non-blocking device-to-host copies complete.
+            # Inputs: self - the tensordict (unused). Outputs: none.
             from torch._utils import _get_available_device_type, _get_device_module
 
             device_type = _get_available_device_type()
