@@ -12,6 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Pydantic data models for multi-turn (tool-using) async rollout requests. AsyncRolloutRequest keeps
+# a conversation's messages together with incrementally maintained token ids, attention mask,
+# position ids (including Qwen2-VL 3-D rope) and loss mask, appending user/assistant/tool turns via a
+# chat-template delta trick (render the new message after a fixed base chat history and strip the
+# base prefix), handling the generation prompt, optional tokenization sanity checks against a full
+# re-render, and final truncation into prompt/response parts. Also defines finish reason, request
+# state and sanity-check mode enums and the base chat history constant.
 import difflib
 import logging
 import os
@@ -36,6 +44,8 @@ BASE_CHAT_HISTORY = [
 
 
 class FinishReasonTypeEnum(str, Enum):
+    # [CLASS DOC]
+    # String enum of finish reasons: length, stop, tool_calls.
     """The enum for finish reason type."""
 
     LENGTH = "length"
@@ -44,6 +54,9 @@ class FinishReasonTypeEnum(str, Enum):
 
     @classmethod
     def from_str(cls, value: str) -> "FinishReasonTypeEnum":
+        # [FUNCTION DOC]
+        # Behavior: (class method) maps "stop", "length", "tool_calls" to members.
+        # Exceptions: ValueError for other strings.
         if value == "stop":
             return cls.STOP
         elif value == "length":
@@ -55,12 +68,17 @@ class FinishReasonTypeEnum(str, Enum):
 
 
 class Message(BaseModel):
+    # [CLASS DOC]
+    # Pydantic chat message: role, content (string, dict, list of dicts, or tool response), optional tool
+    # calls.
     role: str
     content: str | dict[str, Any] | list[dict[str, Any]] | ToolResponse
     tool_calls: Optional[list[OpenAIFunctionToolCall]] = None
 
 
 class AsyncRolloutRequestStateEnum(str, Enum):
+    # [CLASS DOC]
+    # String enum of request states: pending, running, completed, failed, tool_calling.
     """The enum for async rollout request state."""
 
     PENDING = "pending"
@@ -71,6 +89,8 @@ class AsyncRolloutRequestStateEnum(str, Enum):
 
 
 class TokenizationSanityCheckModeEnum(str, Enum):
+    # [CLASS DOC]
+    # String enum of tokenization sanity check modes: disable, strict, ignore_strippable.
     """The enum for tokenization sanity check mode."""
 
     DISABLE = "disable"
@@ -79,6 +99,13 @@ class TokenizationSanityCheckModeEnum(str, Enum):
 
 
 class AsyncRolloutRequest(BaseModel):
+    # [CLASS DOC]
+    # Request model (arbitrary types allowed for tensors). Holds identifiers, state, messages, multi-modal
+    # keys/data/inputs/processor kwargs, tool schemas and kwargs, full/prompt/response token, mask,
+    # position and loss-mask tensors (shape [1, seq] or [3, seq] for rope positions), reward scores,
+    # length limits (prompt required; response default 8192; model default 32768), per-tool metrics,
+    # output ids/log-probs, chat-template flags, generation prompt ids, and token end positions of the
+    # base chat history without and with generation prompt.
     """The data model for async rollout."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -123,6 +150,21 @@ class AsyncRolloutRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def initialize_request(cls, values):
+        # [FUNCTION DOC]
+        # Behavior: (pre-validation class method) requires non-empty messages, max_prompt_len and a
+        # processing_class (popped from input). Validates messages into Message objects. Defaults
+        # multi_modal_keys to image/video/audio, fills missing multi-modal data lists, empty multi-modal
+        # inputs and processor kwargs. Dumps tool schemas for the template. Tokenizes the messages without
+        # generation prompt. If any of input_ids/attention_mask/position_ids is missing, tokenizes with the
+        # generation prompt (as a dict), sets input ids and mask (warning, not truncating, when longer than
+        # max_prompt_len), stores remaining processor outputs as multi-modal inputs, and computes position ids
+        # (also stored as prompt position ids). Sets prompt ids/mask from input ids/mask, an all-false bool
+        # loss mask (also prompt loss mask), generation prompt ids as the suffix beyond the no-generation-prompt
+        # length, and the token lengths of the base chat history rendered without and with generation prompt.
+        # Inputs: values - raw constructor mapping. Outputs: updated mapping.
+        # Exceptions: ValueError for missing required inputs or unsupported processing class.
+        # KNOWN ISSUE: when the caller supplies input_ids/attention_mask/position_ids, prompt_position_ids is
+        # never set, so truncate_output_ids later fails on None.
         if not (messages := values.get("messages")):
             raise ValueError("messages is required for AsyncRolloutRequest initialization")
         if not (max_prompt_len := values.get("max_prompt_len")):
@@ -243,6 +285,13 @@ class AsyncRolloutRequest(BaseModel):
         tokenize: bool = False,
         return_dict: bool = False,
     ):
+        # [FUNCTION DOC]
+        # HELPER: (static) Renders messages with the chat template as text (with tools and generation prompt
+        # flag). Returns the text if not tokenizing. For tokenizers, warns if multi-modal data is non-empty
+        # and tokenizes to tensors; for processors, passes non-empty image/video/audio lists and processor
+        # kwargs to the multimodal input builder. Converts to tensors when possible and to a plain dict.
+        # Outputs: text, the full input dict (return_dict), or the input_ids tensor [1, seq].
+        # Exceptions: ValueError for unsupported processing classes.
         raw_prompt = processing_class.apply_chat_template(
             messages, tools=tools, add_generation_prompt=add_generation_prompt, tokenize=False
         )
@@ -286,6 +335,11 @@ class AsyncRolloutRequest(BaseModel):
         multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: (static) For Qwen2-VL image processors, asserts batch-size-1 2-D ids/mask and computes 3-D
+        # rope indices from grid sizes in multi-modal inputs; otherwise computes positions from the attention
+        # mask (cumulative, [1, seq]).
+        # Outputs: position ids tensor. Exceptions: AssertionError on bad shapes.
         # special case for qwen2vl
         is_qwen2vl = (
             hasattr(processing_class, "image_processor")
@@ -326,6 +380,12 @@ class AsyncRolloutRequest(BaseModel):
         loss_mask: bool,
         new_multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Appends new ids, an attention mask and a loss mask (all ones times the given booleans),
+        # merges new multi-modal inputs, computes positions for the new chunk, offsets them by the last
+        # existing position + 1, and appends. Asserts all four sequences have equal length.
+        # Inputs: processing_class; new_input_ids [1, n]; attention_mask/loss_mask flags; optional new
+        # multi-modal inputs. Side effects: mutates request tensors.
         """
         Update the input_ids, attention_mask, position_ids, and loss_mask of the request in additive manner.
         """
@@ -360,6 +420,8 @@ class AsyncRolloutRequest(BaseModel):
             {self.attention_mask.shape[-1]=}, {self.position_ids.shape[-1]=}, {self.loss_mask.shape[-1]=}"""
 
     def _update_multi_modal_inputs(self, new_multi_modal_inputs: dict[str, torch.Tensor]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For each key, concatenates the new tensor along dim 0 onto the existing one, or sets it.
         """
         Update the multi_modal_inputs of the request in additive manner.
         """
@@ -374,6 +436,11 @@ class AsyncRolloutRequest(BaseModel):
     def get_generation_prompt_ids(
         self, processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Behavior: appends the generation prompt ids (attention on, loss off) unless the sequence already
+        # ends with them. If use_inference_chat_template, re-renders all messages with generation prompt and
+        # returns those ids as a list; otherwise returns the current input ids as a list.
+        # Side effects: may extend request tensors.
         """
         Get the generation prompt ids for rollout engine.
 
@@ -408,6 +475,9 @@ class AsyncRolloutRequest(BaseModel):
         processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
         content: str,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: appends a user Message, renders base history + that message (no generation prompt, text
+        # only), strips the base prefix, and appends the ids with loss off.
         self.messages.append(Message(role="user", content=content))
         messages = [*BASE_CHAT_HISTORY, self.messages[-1]]
         tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
@@ -432,6 +502,10 @@ class AsyncRolloutRequest(BaseModel):
         content_ids: Optional[torch.Tensor] = None,
         tool_calls: Optional[list[OpenAIFunctionToolCall]] = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: appends an assistant Message with optional tool calls. If content_ids is not given,
+        # renders base history + that message and strips the base-with-generation-prompt prefix. Appends the
+        # ids with attention and loss on.
         self.messages.append(Message(role="assistant", content=content, tool_calls=tool_calls))
         if content_ids is None:
             messages = [*BASE_CHAT_HISTORY, self.messages[-1]]
@@ -455,6 +529,15 @@ class AsyncRolloutRequest(BaseModel):
         processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
         contents: list[ToolResponse],
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: no-op when there are no or only empty tool responses. For each response appends a tool
+        # Message: plain text, or a content list of image/video placeholders and text, collecting new images
+        # and videos. Extends the request's multi-modal data with new items. Renders base history + the new
+        # tool messages with only the new multi-modal data (as a dict), strips the base prefix, extracts new
+        # processor outputs, removes a trailing generation prompt if present, and appends the ids (loss off)
+        # and multi-modal inputs.
+        # Side effects: mutates messages, multi-modal data/inputs and tensors.
+        # KNOWN ISSUE: audio in tool responses is not handled even though "audio" is a default key.
         if not contents or all(content.is_empty() for content in contents):
             return
         # We also handle the case when tool returns image
@@ -514,6 +597,8 @@ class AsyncRolloutRequest(BaseModel):
         )
 
     def update_metrics(self, metrics: Any, tool_id: str) -> None:
+        # [FUNCTION DOC]
+        # Behavior: appends metrics to the list stored under tool_id, creating it if absent.
         """
         metrics: should be a dict of tools_name -> Any
         """
@@ -528,6 +613,11 @@ class AsyncRolloutRequest(BaseModel):
         current_prompt_ids: torch.Tensor,
         diff_surrounding_chars: int = 10,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # HELPER: Decodes both id sequences (special tokens kept), runs a character-level sequence matcher
+        # without autojunk, and for each non-equal opcode returns chunks of both strings widened by
+        # diff_surrounding_chars on each side plus their (start, end) indices.
+        # Outputs: list of dicts with full_prompt_chunk, current_prompt_chunk, indices.
         """Get differences between full prompt and current prompt with surrounding context.
 
         This function helps debug tokenization mismatches by showing the differences between
@@ -579,6 +669,11 @@ class AsyncRolloutRequest(BaseModel):
         return diffs
 
     def _remove_generation_prompt_ids_if_present(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If the sequence ends with the generation prompt ids, trims that many tokens from input ids,
+        # attention mask, position ids and loss mask.
+        # KNOWN ISSUE: with empty generation prompt ids, the slice by negative zero selects/trims everything
+        # (comparison against the whole sequence).
         """
         Remove generation prompt IDs from input tensors if they are present at the end.
         """
@@ -594,6 +689,16 @@ class AsyncRolloutRequest(BaseModel):
         reward_scores: dict[str, list[float]],
         finish_reason_type: FinishReasonTypeEnum = FinishReasonTypeEnum.STOP,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: marks state COMPLETED, stores reward scores, removes a trailing generation prompt, sets
+        # response ids. Unless sanity check is disabled, re-renders the whole conversation (with multi-modal
+        # data), warns on inconsistent or missing multi-modal input keys, and computes text diffs between
+        # full render and incremental ids; warns with details in strict mode, or in ignore_strippable mode
+        # only if any diff chunk has non-whitespace content. Accepts STOP or LENGTH finish reasons, then
+        # truncates outputs and asserts equal sequence lengths.
+        # Inputs: processing_class; reward_scores; finish_reason_type.
+        # Exceptions: ValueError for other finish reasons; AssertionError on length mismatch.
+        # Side effects: mutates state and tensors; logs warnings.
         self.state = AsyncRolloutRequestStateEnum.COMPLETED
         self.reward_scores = reward_scores
 
@@ -699,6 +804,10 @@ class AsyncRolloutRequest(BaseModel):
     def truncate_output_ids(
         self, processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: truncates ids, attention mask, position ids and loss mask to max_model_len, then derives
+        # response ids/mask/positions/loss mask as the part after the corresponding prompt tensor's length,
+        # truncated to max_response_len. processing_class unused.
         self.input_ids = self.input_ids[..., : self.max_model_len]
         self.attention_mask = self.attention_mask[..., : self.max_model_len]
         self.position_ids = self.position_ids[..., : self.max_model_len]

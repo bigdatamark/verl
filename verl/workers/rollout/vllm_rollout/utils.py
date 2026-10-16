@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# vLLM rollout utilities: the worker extension class injected into vLLM workers for
+# colocated weight sync (bucketed IPC receive, LoRA hot-swap, FP8/QAT/ModelOpt reload
+# flows, MTP drafter sync, verl delta transfer), logits masking, LoRA rank rounding,
+# CLI-argument building, MTP speculative config construction, prompt-logprob extraction,
+# and a signal-suppression context manager.
+# Module constants: VLLM_LORA_INT_ID / VLLM_LORA_NAME / VLLM_LORA_PATH (fixed identity of
+# the verl LoRA adapter), VLLM_ASCEND_REQUIRED_ENV_VARS (defaults applied on NPU).
+# Module state: logger (level from VERL_LOGGING_LEVEL, default WARN).
 import ctypes
 import dataclasses
 import functools
@@ -45,6 +54,12 @@ VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", 
 
 
 def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Map a vLLM worker's local rank to the trainer-local rank used for the weight
+    # sync socket. Returns the input unchanged when there is no parallel config, no data
+    # parallelism, or no determinable local DP rank. Otherwise local DP rank (from
+    # data_parallel_rank_local, or data_parallel_rank / data_parallel_index modulo
+    # data_parallel_size_local) times tp_size plus (worker_local_rank mod tp_size).
     worker_local_rank = int(worker_local_rank)
     if parallel_config is None:
         return worker_local_rank
@@ -71,6 +86,10 @@ def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config
 
 
 def set_death_signal():
+    # [FUNCTION DOC]
+    # On Linux, ask the kernel (prctl PR_SET_PDEATHSIG) to SIGKILL this process when its
+    # parent dies, and kill itself immediately if already orphaned (parent pid 1). No-op on
+    # other platforms. Side effects: process signal configuration.
     """Kill the current process when the parent process exits."""
     if platform.system() != "Linux":
         return
@@ -81,6 +100,10 @@ def set_death_signal():
 
 
 def get_vllm_max_lora_rank(lora_rank: int):
+    # [FUNCTION DOC]
+    # Round lora_rank up to the smallest rank allowed by vLLM's MaxLoRARanks literal (or a
+    # hard-coded fallback list 1..512 when unavailable).
+    # Exceptions: AssertionError if lora_rank <= 0; ValueError if above the maximum.
     """
     For vLLM, automatically adjusts the `max_lora_rank` to the nearest allowed value.
     The allowed values are retrieved from vLLM's MaxLoRARanks type definition.
@@ -104,6 +127,11 @@ def get_vllm_max_lora_rank(lora_rank: int):
 
 # https://github.com/vllm-project/vllm/issues/13175
 def monkey_patch_compute_logits(model, vocab_size: int, banned_token_ids: Optional[list[int]] = None):
+    # [FUNCTION DOC]
+    # Replace model.compute_logits with a wrapper that calls the original and then sets
+    # logits for all ids >= vocab_size, and for each banned token id, to negative infinity.
+    # The banned-id index tensor is built once and moved (and cached) to the logits device on
+    # first use. Side effects: mutates the model object; logits modified in place.
     """Mask the tokens the sampler must never pick.
 
     Beyond the out-of-vocabulary tail, `banned_token_ids` covers tokens that live *inside* the
@@ -120,6 +148,9 @@ def monkey_patch_compute_logits(model, vocab_size: int, banned_token_ids: Option
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Patched compute_logits; masks out-of-vocabulary and banned ids in the original
+        # logits and returns them.
         nonlocal banned_index
 
         logits = original_compute_logits(*args, **kwargs)
@@ -134,6 +165,10 @@ def monkey_patch_compute_logits(model, vocab_size: int, banned_token_ids: Option
 
 
 class vLLMColocateWorkerExtension:
+    # [CLASS DOC]
+    # Mixin injected into vLLM GPU workers (via worker_extension_cls). Uses the worker's
+    # model_runner, device, local_rank and LoRA methods (add_lora/remove_lora,
+    # update_weights). Instance flags _is_qat_model / _is_modelopt_qat select reload flows.
     """
     The class for vLLM's worker to inherit from, in the colocate setting.
     By defining an extension class, the code can work no matter what is
@@ -148,6 +183,18 @@ class vLLMColocateWorkerExtension:
     """
 
     def __new__(cls, **kwargs):
+        # [FUNCTION DOC]
+        # Instance construction hook performing per-process patches before the worker object
+        # exists.
+        # Behavior: sets the parent-death signal; with VERL_FULL_DETERMINISM=1 and VERL_SEED set,
+        # enables full determinism with that seed; applies the vLLM LoRA hijack; registers the verl
+        # delta weight-transfer backend when vllm_config.weight_transfer_config.backend is
+        # "verl_delta_ipc"; applies FP8 quant patches when VERL_VLLM_FP8_QUANT_ENABLED=1 or the
+        # model is quantized; applies compressed-tensors NVFP4 QAT patches or ModelOpt NVFP4
+        # patches depending on the quant config; on NPU fills in missing required env vars. Creates
+        # the instance and records the QAT flags.
+        # Inputs: kwargs - worker constructor kwargs (vllm_config used).
+        # Outputs: the new instance. Side effects: global monkey patches, env vars, logging.
         set_death_signal()
 
         if os.environ.get("VERL_FULL_DETERMINISM", "0") == "1":
@@ -206,21 +253,29 @@ class vLLMColocateWorkerExtension:
         return instance
 
     def _get_drafter_model(self):
+        # [FUNCTION DOC]
+        # HELPER: Return the speculative drafter's model, or None if no drafter or it has no model.
         """Return the drafter's model object, or None if unavailable."""
         drafter = getattr(self.model_runner, "drafter", None)
         return drafter.model if drafter is not None and hasattr(drafter, "model") else None
 
     def _get_draft_model_config(self):
+        # [FUNCTION DOC]
+        # HELPER: Return speculative_config.draft_model_config, or None.
         """Return the draft model config from speculative_config, or None."""
         spec = self.model_runner.vllm_config.speculative_config
         return spec.draft_model_config if spec is not None and spec.draft_model_config is not None else None
 
     def _use_mtp_drafter_weight_sync(self):
+        # [FUNCTION DOC]
+        # HELPER: True if the speculative method is "mtp" and a drafter model exists.
         """Return whether the vLLM MTP drafter should receive actor weights."""
         spec = self.model_runner.vllm_config.speculative_config
         return spec is not None and spec.method == "mtp" and self._get_drafter_model() is not None
 
     def _iter_all_models(self):
+        # [FUNCTION DOC]
+        # HELPER: Yield the main model and, when MTP drafter sync is active, the drafter model.
         """Yield models that need weight updates.
 
         Only vLLM MTP drafter sync is supported for now. Independent non-MTP
@@ -231,6 +286,9 @@ class vLLMColocateWorkerExtension:
             yield self._get_drafter_model()
 
     def _iter_all_models_with_config(self):
+        # [FUNCTION DOC]
+        # HELPER: Yield (model, model_config) for the main model and, when MTP sync is active and a
+        # draft config exists, (drafter model, draft config).
         """Yield (model, model_config) for models that need post-processing."""
         yield self.model_runner.model, self.model_runner.vllm_config.model_config
         if self._use_mtp_drafter_weight_sync():
@@ -239,6 +297,9 @@ class vLLMColocateWorkerExtension:
                 yield self._get_drafter_model(), draft_cfg
 
     def monkey_patch_model(self, vocab_size: int, banned_token_ids: Optional[list[int]] = None):
+        # [FUNCTION DOC]
+        # For each synced model, patch compute_logits to mask ids >= vocab_size and banned ids,
+        # and patch the MoE weight loader.
         for model in self._iter_all_models():
             # patch compute_logits to avoid sampling OOV and other illegal tokens
             monkey_patch_compute_logits(model, vocab_size, banned_token_ids)
@@ -246,6 +307,20 @@ class vLLMColocateWorkerExtension:
             patch_vllm_moe_model_weight_loader(model)
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+        # [FUNCTION DOC]
+        # Receive a full weight sync over the bucketed IPC channel and load it.
+        # Behavior: defaults self.device to "<device>:<local_rank>" if unset. Step 1 (prepare): on
+        # ROCm restores MoE expert maps zeroed by dummy init; then exactly one of: QAT prepare,
+        # ModelOpt prepare, LoRA sync (remove the old adapter), quantized-model reload state
+        # capture per model, or MoE weight-loader patching. Step 2: creates a receiver on this
+        # worker's ZMQ handle; for LoRA sync accumulates cloned tensors across buckets and calls
+        # _update_weights once on the last bucket, otherwise loads each bucket as it arrives.
+        # Step 3 (post-process): QAT / ModelOpt post-load processing, nothing for LoRA, quantized
+        # post-load with the saved states, or vLLM's process_weights_after_loading for each model
+        # with its config (run once after all buckets).
+        # Inputs: peft_config - adapter config for LoRA syncs; base_sync_done - whether the base
+        # model was already synced (LoRA-only update); use_shm - shared-memory transport.
+        # Side effects: mutates model weights / LoRA adapters, ZMQ traffic.
         """Update the weights of the rollout model."""
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 
@@ -305,6 +380,9 @@ class vLLMColocateWorkerExtension:
         lora_weights: dict[str, torch.Tensor] | None = {} if (peft_config and base_sync_done) else None
 
         def on_bucket_received(weights: list[tuple[str, torch.Tensor]], is_last: bool) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Bucket callback: in LoRA mode, accumulate clones and apply the full adapter on
+            # the last bucket (then clear); otherwise load the bucket immediately.
             if lora_weights is not None:
                 # Clone: add_lora keeps these past the callback (reused IPC buffer, #6454).
                 lora_weights.update((name, tensor.clone()) for name, tensor in weights)
@@ -353,6 +431,10 @@ class vLLMColocateWorkerExtension:
                 process_weights_after_loading(model, model_config, self.device)
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
+        # [FUNCTION DOC]
+        # HELPER: Apply buffer (non-parameter) updates to the main model using its prebuilt named
+        # buffers map, and to each other synced model with its own map. Returns the main model's
+        # applied-buffer result.
         """Apply buffer updates to the main model and any synced MTP drafter.
 
         The main model (yielded first) reuses the prebuilt ``named_buffers`` map;
@@ -370,6 +452,16 @@ class vLLMColocateWorkerExtension:
         peft_config: dict,
         base_sync_done: bool,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Load one batch of weights.
+        # Behavior: LoRA mode (peft_config and base_sync_done): clones tensors into a mapping and
+        # adds a TensorLoRARequest with the fixed verl LoRA identity. Otherwise splits updates into
+        # parameters and buffers; for quantized models loads parameters through the quantized
+        # loader (and into the MTP drafter when synced); for others loads parameters into every
+        # synced model (resolving names against the model's parameter and buffer names when a
+        # peft_config is present, e.g. base-layer naming); then applies buffer updates. Logs counts.
+        # KNOWN ISSUE: in the LoRA path tensors are cloned here again although the caller already
+        # cloned them, doubling transient memory.
         if peft_config and base_sync_done:
             # Clone out of the receiver's reused IPC bucket buffer: add_lora keeps these tensors
             # past this callback, so views into the freed/overwritten buffer crash later (#6454).
@@ -414,6 +506,11 @@ class vLLMColocateWorkerExtension:
                 )
 
     def _get_zmq_handle(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Build the worker's ZMQ IPC endpoint
+        # "ipc:///tmp/rl-colocate-zmq-{job}-replica-{replica}-rank-{trainer_rank}.sock" from
+        # VERL_RAY_JOB_ID, VERL_REPLICA_RANK, and the resolved local rank plus optional
+        # VERL_ZMQ_BASE_TRAINER_RANK offset (env defaults "0").
         """Get ZMQ handle for communication.
 
         Uses Ray job id + replica_rank + rollout-local rank to match the sender
@@ -431,6 +528,9 @@ class vLLMColocateWorkerExtension:
         return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"
 
     def update_verl_delta_weights(self, update_info: dict) -> None:
+        # [FUNCTION DOC]
+        # Copy update_info, add this worker's ZMQ handle, and forward it to the worker's vLLM
+        # update_weights (the verl delta weight-transfer engine).
         """Add this worker's IPC endpoint and forward the delta update to vLLM."""
         worker_update_info = dict(update_info)
         worker_update_info["zmq_handle"] = self._get_zmq_handle()
@@ -438,10 +538,19 @@ class vLLMColocateWorkerExtension:
 
 
 class SuppressSignalInThread:
+    # [CLASS DOC]
+    # Context manager that, while active, replaces signal.signal so calls from non-main
+    # threads are ignored (printed) instead of raising; main-thread calls pass through.
+    # Restores the original on exit. Side effects: process-global patch of signal.signal.
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Save the original signal.signal, install the thread-aware wrapper and return self.
         self.original_signal = signal.signal
 
         def no_op_signal(sig, action):
+            # [FUNCTION DOC]
+            # HELPER: Wrapper that prints and returns None when called off the main thread, else
+            # delegates to the original signal.signal.
             if threading.current_thread() is not threading.main_thread():
                 print(f"Ignored signal {sig} in thread {threading.current_thread().name}")
                 return
@@ -451,11 +560,17 @@ class SuppressSignalInThread:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC]
+        # Restore the original signal.signal; exceptions are not suppressed.
         signal.signal = self.original_signal
 
 
 @functools.lru_cache(maxsize=1)
 def _optional_bool_vllm_args() -> set[str]:
+    # [FUNCTION DOC]
+    # HELPER: Return (cached) the set of vLLM AsyncEngineArgs field names whose False value
+    # must be passed explicitly as "--no-<flag>": fields typed Optional[bool], and plain bool
+    # fields defaulting to None or True.
     """Return boolean engine fields for which omitting False changes semantics.
 
     For such fields an omitted flag leaves the None default, which vLLM can
@@ -475,6 +590,12 @@ def _optional_bool_vllm_args() -> set[str]:
 
 
 def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
+    # [FUNCTION DOC]
+    # Convert a config mapping to vLLM CLI arguments: None skipped; True -> "--key"; False ->
+    # "--no-key" only for fields in the optional-bool set (key compared with dashes replaced
+    # by underscores), else skipped; non-empty lists -> "--key" followed by each item as a
+    # string; empty lists skipped; dicts -> "--key" plus JSON; other values -> "--key" plus str.
+    # Outputs: list of strings.
     """
     Convert a config dictionary to CLI arguments for vLLM server.
 
@@ -522,6 +643,10 @@ def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
 def build_mtp_speculative_config(
     method: str, num_speculative_tokens: int, engine_speculative_config: Any = None
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Build the MTP speculative config mapping: method and num_speculative_tokens, overlaid
+    # with non-None entries of engine_speculative_config (None, a mapping, or a JSON string).
+    # Exceptions: TypeError if the override is not a mapping after parsing; JSON errors.
     """Build vLLM's MTP speculative config, applying rollout engine overrides."""
     if engine_speculative_config is None:
         engine_speculative_config = {}
@@ -538,6 +663,14 @@ def build_mtp_speculative_config(
 
 
 def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):
+    # [FUNCTION DOC]
+    # Fill result_dict["prompt_ids"] and ["prompt_logprobs"] from a vLLM RequestOutput. No-op
+    # when num_prompt_logprobs is None. Skips the first prompt position (logprob None). For
+    # K == 0, each row holds the single entry's id and logprob; otherwise places each entry by
+    # its rank (1-based) into a K-length row, ignoring an extra sampled token ranked beyond K.
+    # Appends a trailing dummy row of zeros of width max(K, 1).
+    # Exceptions: AssertionError if a position has neither K nor K+1 entries.
+    # Side effects: mutates result_dict.
     """Extract prompt log probabilities from generation output."""
     if num_prompt_logprobs is None:
         return

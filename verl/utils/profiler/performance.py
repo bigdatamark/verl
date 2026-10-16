@@ -280,7 +280,6 @@ def reduce_timing(
 
 
 def topk_reduce_ratio_min_max(timing: float, k: int = 10) -> tuple[float, float, float]:
-    """Calculate topk items take-up ratio, and min/max timing across all ranks."""
     # [FUNCTION DOC]
     # Behavior: returns (-1, -1, -1) when not distributed. Otherwise all_gathers each rank's scalar timing,
     # computes min and max, the (1 - k/100) quantile, and the fraction of ranks strictly above that quantile.
@@ -289,6 +288,7 @@ def topk_reduce_ratio_min_max(timing: float, k: int = 10) -> tuple[float, float,
     # KNOWN ISSUE: the local tensor is 0-dim while gather buffers have shape (1,); all_gather may reject the
     # shape mismatch depending on backend.
     # Side effects: collective communication.
+    """Calculate topk items take-up ratio, and min/max timing across all ranks."""
     if not dist.is_initialized():
         return -1.0, -1.0, -1.0
 

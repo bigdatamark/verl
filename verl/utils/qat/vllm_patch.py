@@ -851,13 +851,6 @@ def apply_qat_patches():
 
 
 def prepare_qat_for_load_weights(model, device=None):
-    """
-    Prepare QAT model for weight loading. Call ONCE before multi-bucket weight loading.
-
-    Args:
-        model: vLLM model
-        device: Device for created parameters
-    """
     # [FUNCTION DOC]
     # Behavior: unwraps model.model, builds a ParamMetaDict, swaps tensor-swap layers to HF-shape params, then
     # for every recorded param in every metadata layer re-creates and registers it unless an existing attribute
@@ -867,6 +860,13 @@ def prepare_qat_for_load_weights(model, device=None):
     # KNOWN ISSUE: the model is unwrapped here and again inside ParamMetaDict, so if the inner model also has a
     # .model attribute only that sub-module is scanned for metadata and parameters.
     # Side effects: replaces/registers params on modules; logging.
+    """
+    Prepare QAT model for weight loading. Call ONCE before multi-bucket weight loading.
+
+    Args:
+        model: vLLM model
+        device: Device for created parameters
+    """
     inner_model = model
     if hasattr(model, "model"):
         inner_model = model.model
@@ -901,12 +901,12 @@ def prepare_qat_for_load_weights(model, device=None):
 
 
 def manual_process_weights_after_loading(model):
-    """Trigger weight post-processing for all quantized layers after load_weights."""
     # [FUNCTION DOC]
     # Behavior: unwraps model.model; for each module with a "scheme" calls scheme.process_weights_after_loading;
     # for modules without a scheme but with a quant_method offering that hook (excluding KV-cache methods)
     # calls it too.
     # Outputs: total number of modules processed. Side effects: runs the (patched) post-processing.
+    """Trigger weight post-processing for all quantized layers after load_weights."""
     dense_count = 0
     moe_count = 0
 

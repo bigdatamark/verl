@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Process-global SkipManager: builds skip instances from config for every registered skip, tracks the
+# current training step, and provides decorators that wrap rollout methods so configured steps are
+# served from cache (or dumped to cache on a miss). Validation calls always bypass skipping.
 
 import functools
 import inspect
@@ -22,6 +26,10 @@ from verl.utils.skip.config import SkipManagerConfig
 
 
 class SkipManager:
+    # [CLASS DOC]
+    # Class-level state only (never instantiated): config (SkipManagerConfig or None), step (current
+    # trainer step shared by skips without online step extraction, default -1) and skip_instances
+    # (role name to skip instance). Decorators are no-ops until init is called.
     """SkipManager is a manager for skip.
 
     Class attributes default here so code paths (e.g. tests or modules that only import
@@ -37,6 +45,10 @@ class SkipManager:
 
     @classmethod
     def init(cls, config):
+        # [FUNCTION DOC]
+        # Converts config.skip to SkipManagerConfig, resets step to -1 and instances, then for each registry
+        # entry whose name is a field of the skip config, instantiates the skip with (sub-config, full config).
+        # Exceptions: config conversion errors; ValueError from skips with unsupported actions.
         cls.config = omega_conf_to_dataclass(config.skip, dataclass_type=SkipManagerConfig)
         cls.step = -1
         cls.skip_instances = {}
@@ -49,10 +61,15 @@ class SkipManager:
 
     @classmethod
     def set_step(cls, step: int):
+        # [FUNCTION DOC]
+        # Sets the shared current step.
         cls.step = step
 
     @staticmethod
     def _get_prompts_batch(args, kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Finds the prompts batch in a decorated call: the "prompts" keyword, else the second
+        # positional argument (after self), else a sole positional argument that has meta_info; else None.
         """Resolve ``DataProto`` from decorated ``generate_sequences(self, prompts, ...)`` calls."""
         prompts = kwargs.get("prompts")
         if prompts is not None:
@@ -65,6 +82,10 @@ class SkipManager:
 
     @classmethod
     def _should_bypass_for_validation(cls, args, kwargs) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if the call is a validation call. Uses the TensorDict check when the prompts object has
+        # non_tensor_data (or when not found but more than one positional arg); otherwise reads
+        # meta_info["validate"] (default False). No prompts -> False.
         prompts = cls._get_prompts_batch(args, kwargs)
         if prompts is None and len(args) > 1:
             return cls._should_bypass_for_validation_tensordict(args, kwargs)
@@ -77,11 +98,22 @@ class SkipManager:
 
     @classmethod
     def annotate(cls, role: str, **kwargs_outer) -> Callable:
+        # [FUNCTION DOC]
+        # Returns a decorator for a rollout method associated with role (extra keyword args ignored). The
+        # wrapper (async for coroutine functions, otherwise sync) calls the original function directly when:
+        # validation call, no enabled skip instance for role, or the step (extracted online if supported,
+        # else the shared step) is not in the skip's configured steps. Otherwise, if meet_precondition holds,
+        # returns warp_function's cached result without calling the function; else calls the function, passes
+        # its result to prepare_data (dump), and returns it.
         def decorator(func: Callable) -> Callable:
+            # [FUNCTION DOC]
+            # HELPER: Wraps func with the async or sync skip wrapper described in annotate.
             if inspect.iscoroutinefunction(func):
 
                 @functools.wraps(func)
                 async def async_wrapper(*args, **kwargs_inner):
+                    # [FUNCTION DOC]
+                    # HELPER: Async skip wrapper; awaits the original function when not skipping.
                     if cls._should_bypass_for_validation(args, kwargs_inner):
                         return await func(*args, **kwargs_inner)
                     skip_instance = cls.skip_instances.get(role)
@@ -103,6 +135,8 @@ class SkipManager:
 
             @functools.wraps(func)
             def sync_wrapper(*args, **kwargs_inner):
+                # [FUNCTION DOC]
+                # HELPER: Synchronous skip wrapper.
                 if cls._should_bypass_for_validation(args, kwargs_inner):
                     return func(*args, **kwargs_inner)
                 skip_instance = cls.skip_instances.get(role)
@@ -126,6 +160,14 @@ class SkipManager:
 
     @classmethod
     def annotate_tq(cls, role: str, phase: str):
+        # [FUNCTION DOC]
+        # Returns a decorator for the V1 TransferQueue trainer methods. If no enabled instance for role or
+        # the shared step is not configured, calls through. phase "submit": ignores the decorated function,
+        # calls self._next_train_batch(); if the skip injects cached data for the batch uids, returns None;
+        # otherwise calls self._submit_batch_to_rollout(batch) and returns None. Any other phase ("sample"):
+        # calls the function, takes the first element if the result is a tuple, and if should_save for its
+        # partition, dumps it via prepare_data(global_steps = step); returns the original result.
+        # Inputs: role - skip registry name; phase - "submit" or "sample".
         """V1 TransferQueue-based skip decorator, unified across both phases.
 
         V1's split architecture separates "submit prompts" (``_add_batch_to_generate``)
@@ -147,8 +189,12 @@ class SkipManager:
         """
 
         def decorator(func: Callable) -> Callable:
+            # [FUNCTION DOC]
+            # HELPER: Wraps a method with the phase-specific TransferQueue skip wrapper.
             @functools.wraps(func)
             def wrapper(self, *args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Method wrapper implementing the submit/sample phase logic described in annotate_tq.
                 skip_instance = cls.skip_instances.get(role)
                 if skip_instance is None or not skip_instance.is_enabled():
                     return func(self, *args, **kwargs)
@@ -178,6 +224,9 @@ class SkipManager:
 
     @staticmethod
     def _should_bypass_for_validation_tensordict(args, kwargs) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Reads non_tensor_data["validate"] from the "prompts" keyword or second positional argument;
+        # False if absent or on any error.
         """Check ``validate`` flag in TensorDict's non_tensor_data for V1 path."""
         prompts = kwargs.get("prompts", None)
         if prompts is None and len(args) > 1:

@@ -13,6 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Patches vLLM's ModelOpt NVFP4 quantization methods (dense linear, fused MoE, KV-cache scales) so that
+# QAT-trained weights in ModelOpt HF format can be reloaded repeatedly at runtime using the FP4 Marlin
+# backend. The approach mirrors verl.utils.qat.vllm_patch: on the first post-processing call, HF param
+# metadata and weight loaders are saved and references to the Marlin-format tensors are kept; later calls
+# convert newly loaded HF data and copy it into those references (stable addresses for CUDA graphs);
+# helper functions rebuild HF-shaped params before a reload and re-run post-processing after it. The
+# patches also force the Marlin backend at method construction time.
 """vLLM ModelOpt NVFP4 patches for dynamic weight updates (Marlin backend)."""
 
 from typing import Optional
@@ -24,6 +32,9 @@ from verl.utils.device import get_device_name
 
 
 def _save_param_meta(layer: torch.nn.Module, param_name: str):
+    # [FUNCTION DOC]
+    # HELPER: Ensures layer._hf_param_meta exists and, if the named param exists, records its shape, dtype,
+    # device string, param class and optional _input_dim/_output_dim. Side effects: mutates layer.
     if not hasattr(layer, "_hf_param_meta"):
         layer._hf_param_meta = {}
 
@@ -52,6 +63,13 @@ def _create_param_from_meta(
     meta: dict,
     device: Optional[torch.device] = None,
 ) -> Parameter:
+    # [FUNCTION DOC]
+    # HELPER: Allocates an empty tensor from metadata (device arg, else recorded device, else default device
+    # name) and wraps it: a vLLM parameter subclass constructed with data, weight_loader and optional
+    # input/output dims when the class is not plain Parameter and a loader was saved; otherwise a non-grad
+    # Parameter with weight_loader attached if available.
+    # Exceptions: errors from the param class constructor propagate (no fallback, unlike the qat variant).
+    # Outputs: new Parameter.
     shape = meta["shape"]
     dtype = meta["dtype"]
     dev = device or meta.get("device", get_device_name())
@@ -78,12 +96,16 @@ def _create_param_from_meta(
 
 
 def _check_first_call(layer: torch.nn.Module) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Increments layer._process_weights_call_count; True if this was the first call.
     count = getattr(layer, "_process_weights_call_count", 0)
     layer._process_weights_call_count = count + 1
     return count == 0
 
 
 def _save_weight_loaders(layer: torch.nn.Module, param_names: list[str]):
+    # [FUNCTION DOC]
+    # HELPER: Stores each named param's weight_loader (when present) into layer._weight_loaders.
     if not hasattr(layer, "_weight_loaders"):
         layer._weight_loaders = {}
     for pname in param_names:
@@ -93,6 +115,10 @@ def _save_weight_loaders(layer: torch.nn.Module, param_names: list[str]):
 
 
 def _update_ref_or_create(layer, ref_name, new_data):
+    # [FUNCTION DOC]
+    # HELPER: If a saved Marlin tensor ref exists for ref_name, copies new_data into it in place and sets the
+    # layer attribute to a Parameter wrapping the ref; otherwise sets a Parameter of a clone (or tensor of a
+    # scalar). Side effects: mutates layer.
     refs = getattr(layer, "_marlin_tensor_refs", {})
     ref = refs.get(ref_name)
     if ref is not None:
@@ -104,17 +130,26 @@ def _update_ref_or_create(layer, ref_name, new_data):
 
 
 def _unwrap_marlin_scale(value):
+    # [FUNCTION DOC]
+    # HELPER: Returns the first element if value is a tuple (newer vLLM returns (scales, factor)), else value.
     return value[0] if isinstance(value, tuple) else value
 
 
 def _split_marlin_scale(value):
+    # [FUNCTION DOC]
+    # HELPER: Normalizes to a (scales, scale_factor) pair, using factor 1.0 when value is not a tuple.
     return value if isinstance(value, tuple) else (value, 1.0)
 
 
 class ModelOptParamMetaDict(dict):
+    # [CLASS DOC]
+    # Name -> Parameter dict for a vLLM model with lazy rebuild of deleted HF-format params from saved
+    # _hf_param_meta and a list of tensor-swap entries: every metadata param that also has a saved Marlin ref.
     """Dict-like parameter store with metadata-based rebuild and tensor swap."""
 
     def __init__(self, model: torch.nn.Module, device: Optional[torch.device] = None):
+        # [FUNCTION DOC]
+        # Behavior: unwraps model.model if present, builds mappings, and fills with current named parameters.
         super().__init__()
         self.device = device
 
@@ -132,6 +167,9 @@ class ModelOptParamMetaDict(dict):
             self[name] = param
 
     def _build_mappings(self):
+        # [FUNCTION DOC]
+        # HELPER: Caches module+meta for every module with _hf_param_meta and registers a swap entry keyed
+        # "<layer>.<param>" for each metadata param present in _marlin_tensor_refs.
         for layer_name, module in self._model.named_modules():
             if not hasattr(module, "_hf_param_meta"):
                 continue
@@ -153,6 +191,9 @@ class ModelOptParamMetaDict(dict):
                     }
 
     def _try_rebuild(self, key: str) -> Optional[Parameter]:
+        # [FUNCTION DOC]
+        # HELPER: For "<layer>.<param>" keys with metadata, returns the existing non-None attribute or creates and
+        # registers a new param from metadata; None otherwise. Side effects: may register a parameter.
         parts = key.rsplit(".", 1)
         if len(parts) != 2:
             return None
@@ -173,6 +214,9 @@ class ModelOptParamMetaDict(dict):
         return new_param
 
     def prepare_for_reload(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: for each swap entry whose module has the param, replaces it with a fresh HF-shape param.
+        # Side effects: replaces module attributes (Marlin refs remain saved).
         """Replace kernel-format tensors with HF-shape tensors for reload."""
         for _key, swap_info in self._tensor_swap_layers.items():
             module = swap_info["module"]
@@ -183,6 +227,8 @@ class ModelOptParamMetaDict(dict):
                 setattr(module, param_name, new_param)
 
     def __getitem__(self, key: str) -> Parameter:
+        # [FUNCTION DOC]
+        # Behavior: stored lookup, else rebuild-and-cache. Exceptions: KeyError if not found.
         if key in dict.keys(self):
             return super().__getitem__(key)
         param = self._try_rebuild(key)
@@ -192,6 +238,8 @@ class ModelOptParamMetaDict(dict):
         raise KeyError(f"Parameter not found: {key}")
 
     def __contains__(self, key: str) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if stored or rebuildable from layer metadata.
         if super().__contains__(key):
             return True
         parts = key.rsplit(".", 1)
@@ -203,6 +251,8 @@ class ModelOptParamMetaDict(dict):
         return False
 
     def get(self, key: str, default=None):
+        # [FUNCTION DOC]
+        # Behavior: self[key] or default on KeyError.
         try:
             return self[key]
         except KeyError:
@@ -213,6 +263,16 @@ _DENSE_HF_PARAMS = ["weight", "weight_scale", "input_scale", "weight_scale_2"]
 
 
 def _modelopt_dense_process_weights(self, layer: torch.nn.Module) -> None:
+    # [FUNCTION DOC]
+    # Behavior: first call saves metadata and loaders for weight, weight_scale, input_scale, weight_scale_2.
+    # Asserts the block scale is FP8 E4M3. Repacks the packed weight (int32 view, transposed) to Marlin;
+    # transposes the scale to params dtype, permutes it for Marlin and processes it (splitting off an optional
+    # scale factor); global scale = processed max(weight_scale_2) divided by that factor. First call registers
+    # weight, weight_scale, weight_global_scale and weight_scale_2 (sharing the global scale tensor) and saves
+    # refs; later calls update refs in place and re-point weight_global_scale to the weight_scale_2 ref. If the
+    # layer has input_scale, sets input_global_scale (max), alpha (input scale * max weight_scale_2) and
+    # input_global_scale_inv, then deletes input_scale.
+    # Exceptions: AssertionError for non-FP8 scales. Side effects: mutates layer.
     """
     Replacement for ModelOptNvFp4LinearMethod.process_weights_after_loading.
 
@@ -305,6 +365,8 @@ def _modelopt_dense_process_weights(self, layer: torch.nn.Module) -> None:
 
 
 def _marlin_repack_experts(packed, perm, size_k, size_n, num_experts):
+    # [FUNCTION DOC]
+    # HELPER: Per-expert Marlin repack of packed weights (int32 view transposed); returns stacked tensor.
     import vllm._custom_ops as ops
 
     result = []
@@ -323,6 +385,9 @@ def _marlin_repack_experts(packed, perm, size_k, size_n, num_experts):
 
 
 def _marlin_process_scales_experts(scale_hf, param_dtype, size_k, size_n, group_size, num_experts):
+    # [FUNCTION DOC]
+    # HELPER: Per-expert Marlin permutation and NVFP4 processing of block scales (cast to params dtype,
+    # transposed), dropping any returned scale factor; returns stacked tensor.
     from vllm.model_executor.layers.quantization.utils.marlin_utils import marlin_permute_scales
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import nvfp4_marlin_process_scales
 
@@ -347,6 +412,11 @@ _MOE_HF_PARAMS = [
 
 
 def _modelopt_moe_marlin_convert(self, layer: torch.nn.Module, is_first_call: bool) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Converts MoE weights to Marlin using vLLM's internal prepare_nvfp4_moe_layer_for_marlin (fetched
+    # from the globals of convert_to_nvfp4_moe_kernel_format, a private dependency). First call registers the
+    # six Marlin params and saves refs; later calls update refs in place. Clears w13/w2 input scales.
+    # Side effects: mutates layer.
     from vllm.model_executor.layers.quantization import modelopt as vllm_modelopt
 
     prepare_for_marlin = vllm_modelopt.convert_to_nvfp4_moe_kernel_format.__globals__[
@@ -404,6 +474,12 @@ def _modelopt_moe_marlin_convert(self, layer: torch.nn.Module, is_first_call: bo
 
 
 def _modelopt_moe_process_weights(self, layer: torch.nn.Module) -> None:
+    # [FUNCTION DOC]
+    # Behavior: first call saves metadata/loaders for the eight MoE HF params. Reduces a 2-D
+    # w13_weight_scale_2 to its first column. Converts to Marlin, rebuilds the fused MoE quant config and
+    # kernel (with shared experts and routing tables if available), and runs the kernel's experts
+    # post-processing on the layer.
+    # Exceptions: AssertionError if experts_cls is unset. Side effects: mutates layer and self.
     """
     Replacement for ModelOptNvFp4FusedMoE.process_weights_after_loading (Marlin).
 
@@ -443,6 +519,15 @@ def _modelopt_moe_process_weights(self, layer: torch.nn.Module) -> None:
 
 
 def _modelopt_kv_process_weights(self, layer) -> None:
+    # [FUNCTION DOC]
+    # Replacement for BaseKVCacheMethod.process_weights_after_loading that keeps the scale params.
+    # Behavior: for non-auto KV dtype without dynamic scale calculation: both k/v scales positive -> use them;
+    # both negative -> 1.0; otherwise duplicate the max into both (asserting k positive). Values doubled on
+    # FP8-FNUZ platforms. Requires float per-tensor values; copies into _k_scale/_v_scale (and _q_scale from k
+    # when q unset) and stores float copies. Then q_scale (doubled on FNUZ; disables calculate_kv_scales) or
+    # 1.0, prob_scale likewise, validated as singleton floats and copied into _q_scale/_prob_scale.
+    # Exceptions: ValueError for non per-tensor scales; AssertionError in the mixed-sign case.
+    # Side effects: mutates layer buffers/attributes.
     """
     Replacement for BaseKVCacheMethod.process_weights_after_loading.
     Doesn't delete k_scale, v_scale, q_scale, prob_scale to allow
@@ -512,6 +597,8 @@ _original_moe_init = None
 
 
 def _require_fp4_marlin_supported() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Raises RuntimeError if vLLM reports FP4 Marlin unsupported on this platform.
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import is_fp4_marlin_supported
 
     if not is_fp4_marlin_supported():
@@ -519,12 +606,19 @@ def _require_fp4_marlin_supported() -> None:
 
 
 def _modelopt_dense_init_marlin(self, quant_config) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Patched ModelOptNvFp4LinearMethod.__init__: runs the original, requires Marlin support, and
+    # forces backend "marlin".
     _original_dense_init(self, quant_config)
     _require_fp4_marlin_supported()
     self.backend = "marlin"
 
 
 def _modelopt_moe_init_marlin(self, quant_config, moe_config) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Patched ModelOptNvFp4FusedMoE.__init__: runs the original, requires Marlin support, and forces
+    # the Marlin MoE backend (disables flashinfer/cutlass, sets nvfp4_backend MARLIN, experts class
+    # MarlinExperts, use_global_sf False).
     _original_moe_init(self, quant_config, moe_config)
     _require_fp4_marlin_supported()
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import MarlinExperts
@@ -541,6 +635,13 @@ def _modelopt_moe_init_marlin(self, quant_config, moe_config) -> None:
 
 
 def prepare_modelopt_for_weight_reload(model, device=None):
+    # [FUNCTION DOC]
+    # Behavior: unwraps model.model, builds ModelOptParamMetaDict, swaps Marlin-format params to HF shape,
+    # then re-creates every recorded param unless an existing one already matches HF shape/dtype and has a
+    # weight_loader. Stores the dict on the inner model as _param_meta_for_restore.
+    # Outputs: the dict.
+    # KNOWN ISSUE: the model is unwrapped here and again inside ModelOptParamMetaDict (double .model unwrap).
+    # Side effects: registers/replaces params.
     """Prepare ModelOpt model for weight reloading. Call ONCE before each reload cycle."""
     inner_model = model
     if hasattr(model, "model"):
@@ -571,6 +672,12 @@ def prepare_modelopt_for_weight_reload(model, device=None):
 
 
 def modelopt_process_weights_after_loading(model):
+    # [FUNCTION DOC]
+    # Behavior: unwraps model.model; calls scheme.process_weights_after_loading for modules with a scheme, and
+    # quant_method.process_weights_after_loading for other modules having one, skipping KV-cache methods.
+    # KNOWN ISSUE: because KV-cache methods are skipped, the patched KV scale processing is not re-run after a
+    # reload, so refitted k/v/q scales are not applied.
+    # Outputs: number of modules processed. Side effects: runs post-processing.
     """Trigger weight post-processing for all quantized layers after load_weights."""
     dense_count = 0
     moe_count = 0
@@ -596,6 +703,11 @@ def modelopt_process_weights_after_loading(model):
 
 
 def apply_modelopt_nvfp4_patches():
+    # [FUNCTION DOC]
+    # Behavior: once per process, saves the original dense/MoE __init__ methods and replaces them with the
+    # Marlin-forcing versions, and replaces process_weights_after_loading on the dense, MoE and KV-cache
+    # method classes. Idempotent via a module flag.
+    # Exceptions: ImportError if vLLM modules are missing. Side effects: process-global monkey-patching.
     """Apply ModelOpt NVFP4 patches to support dynamic weight updates. Call before model loading."""
     global _patched
     global _original_dense_init
