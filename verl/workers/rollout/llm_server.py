@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Client and manager for server-mode LLM rollout. LLMServerClient routes generate requests to
+# server replica actors through a shared global load-balancer actor (acquire/release per request);
+# FullyAsyncLLMServerClient adds transparent resume of aborted (partial) rollouts with a cumulative
+# token budget; LLMServerManager launches replicas (hybrid, colocated TensorRT-LLM, or standalone),
+# registers metrics endpoints, and creates the load balancer. Module logger level from
+# VERL_LOGGING_LEVEL (default WARN).
 """
 Utility classes for manage and request LLM servers:
 - LLMServerManager: manage life-cycle of LLM servers, including launch, tear-down replicas.
@@ -41,6 +48,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class LLMServerClient:
+    # [CLASS DOC]
+    # Request client holding the full config and the load-balancer actor handle; lazily caches which
+    # optional fields the balancer wants on acquire and release.
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
     - Load balance: least in-flight requests load balancing via global coordination
@@ -53,6 +63,9 @@ class LLMServerClient:
         load_balancer_handle: ray.actor.ActorHandle = None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores config and balancer handle; field declarations start unknown.
+        # Inputs: config - whole entrypoint config; load_balancer_handle - Ray actor or None; kwargs ignored.
         """Initialize the LLMServerClient.
 
         Args:
@@ -68,6 +81,12 @@ class LLMServerClient:
         self._lb_require_release_fields: list[str] | None = None
 
     async def _acquire_server(self, request_id: str, **extra) -> tuple[str, ray.actor.ActorHandle]:
+        # [FUNCTION DOC]
+        # HELPER: On first use concurrently queries the balancer's required acquire and release field names
+        # and caches them. Forwards only the declared fields present in extra to the balancer's acquire RPC.
+        # Inputs: request_id; extra - candidate routing fields.
+        # Outputs: (server id, server actor handle).
+        # Exceptions: errors from the balancer (e.g. no available servers) propagate.
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
         # Only the declared fields are serialized.
         if self._lb_require_acquire_fields is None:
@@ -81,6 +100,9 @@ class LLMServerClient:
         return await self._load_balancer.acquire_server.remote(request_id=request_id, **fields)
 
     def _release_server(self, server_id: str, request_id: str | None = None) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Fire-and-forget release RPC with server_id and, if declared, request_id.
+        # KNOWN ISSUE: assumes release fields were already fetched by a prior acquire (iterating None otherwise).
         # Fire-and-forget: release is just a counter decrement, no need to await.
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         pool = {"request_id": request_id}
@@ -88,6 +110,9 @@ class LLMServerClient:
         self._load_balancer.release_server.remote(server_id=server_id, **fields)
 
     def _vllm_request_id(self, request_id: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the caller's request id when rollout full_determinism is set, else a new random hex
+        # uuid for each call.
         # request_id passed to vLLM. Default: a fresh uuid per turn so each turn
         # is an independent vLLM request. Under full_determinism the caller's
         # request_id is passed straight through so vLLM sees a stable id across runs.
@@ -108,6 +133,16 @@ class LLMServerClient:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> TokenOutput:
+        # [FUNCTION DOC]
+        # Behavior: (traced) acquires a server using the request id and all request fields, then calls the
+        # server's generate RPC. Builds optional kwargs: audio data when given, processor kwargs when
+        # non-empty; pops "mm_processor_output" and, for sglang, substitutes it for video_data; pops
+        # "priority" and forwards it only for vllm when non-zero. Uses a per-turn request id (see helper).
+        # Sets min/max global steps in the output's extra fields to its global_steps when absent. Always
+        # releases the server afterwards.
+        # Inputs: request_id; prompt_ids; sampling_params; optional image/video/audio data and processor
+        # kwargs; extra kwargs forwarded to the server.
+        # Outputs: TokenOutput from the server.
         """Generate tokens from prompt ids.
 
         Args:
@@ -169,6 +204,8 @@ class LLMServerClient:
 
 
 class FullyAsyncLLMServerClient(LLMServerClient):
+    # [CLASS DOC]
+    # Client that loops generate calls to resume aborted requests, merging partial outputs.
     """FullyLLMServerClient supports resume generation on partial rollout, making rollout interruption
     invisible to the AgentLoop.
     """
@@ -180,6 +217,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         only_hybrid: bool = False,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: initializes the base client and records only_hybrid (retry acquisition when the balancer
+        # is temporarily empty).
         """Initialize the FullyAsyncLLMServerClient.
 
         Args:
@@ -195,6 +235,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         self._only_hybrid = only_hybrid
 
     async def _acquire_server(self, request_id: str, **extra) -> tuple[str, ray.actor.ActorHandle]:
+        # [FUNCTION DOC]
+        # HELPER: Repeatedly calls the base acquire; on a RuntimeError mentioning no available servers while
+        # only_hybrid, sleeps 1 s and retries; other errors re-raise.
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
         # When only_hybrid is True, hybrid replicas are the sole rollout resource and
         # the LB may be temporarily empty during weight sync / scaling transitions.
@@ -210,6 +253,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     raise
 
     def _configured_response_length(self) -> Optional[int]:
+        # [FUNCTION DOC]
+        # HELPER: Returns rollout response_length from config when it is a positive int; otherwise None
+        # (also when the config lacks the section).
         """Per-response token budget from the rollout config, or ``None`` when unavailable.
 
         Tests and lightweight callers may pass a config stub without the rollout section; in that
@@ -234,6 +280,18 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> TokenOutput:
+        # [FUNCTION DOC]
+        # Behavior: normalizes prompt ids; finds the token limit key ("max_tokens" or "max_new_tokens") and
+        # its value; copies sampling params. If no limit was given and a configured response length exists,
+        # pins "max_tokens" to it. Loops: calls base generate with prompt plus tokens so far; appends tokens
+        # and log-probs; appends routed experts only for new tokens (first output kept whole); sums preemption
+        # counts; records stop reason, first num_cached_tokens, and min/max global steps. If a limit exists,
+        # reduces the remaining budget and stops with reason "length" once reached. Stops unless stop reason
+        # is "aborted"/"abort" and retry is allowed (disallowed when config has async_training with
+        # partial_rollout false); sleeps 1 s between attempts. Writes global steps (last), min/max steps and
+        # cached token count to extra fields.
+        # Inputs: same as the base generate. Outputs: merged TokenOutput.
+        # Side effects: none on the caller's sampling_params.
         """Generate tokens from prompt ids.
 
         Args:
@@ -352,6 +410,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
 
 class LLMServerManager:
+    # [CLASS DOC]
+    # Manager owning rollout replicas, their server handles/addresses, and the global load balancer.
     """LLMServerManager is responsible for:
     - Launch server replicas
     - Launch global load balancer
@@ -378,6 +438,11 @@ class LLMServerManager:
         start_rank: int = 0,
         load_balancer_cls: type | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores config sections, worker group, resource pool, start rank and optional balancer
+        # class; asserts nnodes > 0 when standalone; resolves the replica class from rollout name and
+        # disaggregation flag unless a subclass already defines one.
+        # Exceptions: AssertionError in standalone mode with no nodes.
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
         self.model_config = config.actor_rollout_ref.model
@@ -398,6 +463,9 @@ class LLMServerManager:
     @classmethod
     @auto_await
     async def create(cls, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: (class method, auto-awaitable) constructs, launches replicas, creates the balancer,
+        # returns the instance.
         """Create the LLMServerManager."""
         instance = cls(*args, **kwargs)
         await instance._initialize_llm_servers()
@@ -407,6 +475,9 @@ class LLMServerManager:
     @classmethod
     @auto_await
     async def create_empty(cls, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: (class method, auto-awaitable) constructs with empty replica/handle/address lists and
+        # creates an empty balancer.
         """Create an empty LLMServerManager: no replicas are launched and the
         load balancer starts empty.
 
@@ -422,6 +493,17 @@ class LLMServerManager:
         return instance
 
     async def _initialize_llm_servers(self, start_rank: int = None):
+        # [FUNCTION DOC]
+        # HELPER: Computes per-replica world size tp*dp*pp, or with disaggregation
+        # (prefill_tp*prefill_replicas + decode_tp*decode_replicas)*dp*pp (decode tp defaults to prefill tp).
+        # Total world size is the worker group's or gpus-per-node*nnodes; replica count is the integer
+        # quotient. Creates replicas with consecutive ranks from start_rank and initializes them
+        # concurrently: hybrid on the worker group (non-trtllm), hybrid colocated with the resource pool
+        # (trtllm), or standalone. Records handles and addresses and prints addresses. If log stats are
+        # disabled while Prometheus or RL-insight metrics are wanted, raises; otherwise updates Prometheus
+        # config and/or registers RL-insight metrics with per-replica labels.
+        # Exceptions: ValueError on metrics/log-stats conflict.
+        # Side effects: launches Ray actors and servers; writes Prometheus config.
         """Initialize the LLM server replicas.
 
         Args:
@@ -504,6 +586,9 @@ class LLMServerManager:
                 )
 
     async def _init_global_load_balancer(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Creates the router/load-balancer actor over address-to-handle mapping using the optional
+        # router config path, determinism flag and custom balancer class; stores it.
         from verl.workers.rollout.router import get_router_handle
 
         self.global_load_balancer = get_router_handle(
@@ -514,6 +599,9 @@ class LLMServerManager:
         )
 
     def get_client(self, client_cls: type[LLMServerClient] | None = None, **kwargs) -> LLMServerClient:
+        # [FUNCTION DOC]
+        # Behavior: instantiates client_cls (default LLMServerClient) with config and balancer handle plus
+        # kwargs. Outputs: client.
         """Get the LLMServerClient to request LLM server replicas.
 
         Args:
@@ -532,19 +620,27 @@ class LLMServerManager:
         )
 
     def get_addresses(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Behavior: returns the server addresses list.
         """Get the OpenAI chat completion API http addresses of the LLM server replicas."""
         return self.server_addresses
 
     def get_replicas(self) -> list[RolloutReplica]:
+        # [FUNCTION DOC]
+        # Behavior: returns the replica list.
         """Get the LLM server replicas."""
         return self.rollout_replicas
 
     @auto_await
     async def start_profile(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: (auto-awaitable) starts profiling on all replicas concurrently with kwargs.
         """Start profiling on all rollout replicas."""
         await asyncio.gather(*[replica.start_profile(**kwargs) for replica in self.rollout_replicas])
 
     @auto_await
     async def stop_profile(self):
+        # [FUNCTION DOC]
+        # Behavior: (auto-awaitable) stops profiling on all replicas concurrently.
         """Stop profiling on all rollout replicas."""
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])

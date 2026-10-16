@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Skip framework: lets selected training steps (currently rollout generation) be replaced by cached
+# results dumped from earlier runs, for faster debugging/reproduction. Exposes the base class, the
+# manager and its config, and imports the rollout skip implementations so they register themselves.
 
 from .base_skip import BaseSkip
 from .config import SkipManagerConfig

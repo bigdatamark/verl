@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Rollout using HuggingFace generate on an in-process (optionally FSDP-wrapped) module, splitting the
+# batch into micro-batches and padding outputs to a fixed response length.
 """
 Rollout with huggingface models.
 TODO: refactor this class. Currently, it will hang when using FSDP HybridShard. We should actually create a single
@@ -37,12 +40,23 @@ __all__ = ["HFRollout"]
 
 
 class HFRollout(BaseRollout):
+    # [CLASS DOC]
+    # Rollout bound to a module and a config (do_sample, temperature, response_length, optional top_p,
+    # top_k, micro_batch_size, and val_kwargs for validation sampling).
     def __init__(self, module: nn.Module, config):
+        # [FUNCTION DOC]
+        # Behavior: calls the base initializer and stores config and module.
+        # KNOWN ISSUE: the base initializer requires config, model_config and device_mesh, so this
+        # argument-less parent call raises TypeError.
         super().__init__()
         self.config = config
         self.module = module
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # Behavior: splits prompts into max(batch / micro_batch_size, 1) chunks (micro batch defaults to the
+        # whole batch), generates each chunk, and concatenates the results.
+        # Outputs: DataProto.
         batch_size = prompts.batch.batch_size[0]
         num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
         batch_prompts = prompts.chunk(chunks=num_chunks)
@@ -52,6 +66,22 @@ class HFRollout(BaseRollout):
 
     @torch.no_grad()
     def _generate_minibatch(self, prompts: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: (no-grad) generates for one chunk.
+        # Behavior: sampling options come from meta_info overriding config (do_sample, validate, temperature,
+        # response_length, top_p default 1.0, top_k default 0 clamped non-negative). Builds a generation
+        # config: greedy when not sampling; validation sampling from val_kwargs; otherwise rollout sampling;
+        # always one beam and one return sequence. Sets eval mode; for FSDP modules summons full params
+        # (no writeback, non-recursive); runs generate under bf16 autocast with max_new_tokens, eos and pad
+        # ids, caching enabled. Right-pads sequences with pad id to prompt length + configured response
+        # length and asserts the length. Repeats mask/position ids if more than one return sequence. Splits
+        # prompt/response, extends position ids by 1..response_length after the last prompt position, builds
+        # the response mask from eos, and concatenates masks. Empties device cache and restores train mode.
+        # Inputs: prompts - DataProto with input_ids, attention_mask, position_ids and meta eos_token_id,
+        # pad_token_id. Outputs: DataProto with prompts, responses, input_ids, attention_mask, position_ids.
+        # Exceptions: AssertionError if the generated length exceeds the target.
+        # KNOWN ISSUE: padding target uses the config response_length even when meta_info overrides it, so a
+        # larger override fails the assertion; 1-D position ids assumed (no mRoPE).
         # make sampling args can be overridden by inputs
         do_sample = prompts.meta_info.get("do_sample", self.config.do_sample)
         is_validate = prompts.meta_info.get("validate", False)

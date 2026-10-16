@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Dataclass configs for training engines: router replay, a base EngineConfig with common batching,
+# offload, dtype and determinism fields, a QAT sub-config, and per-backend configs (Megatron-Core,
+# FSDP, VeOmni, TorchTitan, Automodel) with their own validation in post-init, plus a
+# TrainingWorkerConfig bundling model/engine/optimizer/checkpoint/profiler configs. Logger level from
+# VERL_LOGGING_LEVEL (default INFO).
+
 import logging
 import math
 import os
@@ -46,6 +53,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 # TODO: rename to RouterReplayConfig after removing the legacy implementation
 @dataclass
 class EngineRouterReplayConfig(BaseConfig):
+    # [CLASS DOC]
+    # Engine-side router replay settings: mode ("disabled", "R2", "R3") and optional record / replay
+    # file paths. KNOWN ISSUE: docstring mentions 'record'/'replay' modes that validation rejects.
     """Configuration for router replay in MoE models.
 
     This configuration controls the routing behavior for Mixture of Experts (MoE) models,
@@ -67,6 +77,8 @@ class EngineRouterReplayConfig(BaseConfig):
     replay_file: Optional[str] = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: raises ValueError if mode is not disabled / R2 / R3.
         """Validate router replay configuration."""
         valid_modes = ["disabled", "R2", "R3"]
         if self.mode not in valid_modes:
@@ -75,6 +87,11 @@ class EngineRouterReplayConfig(BaseConfig):
 
 @dataclass
 class EngineConfig(BaseConfig):
+    # [CLASS DOC]
+    # Base engine config: param / optimizer offload, forward_only, strategy (None by default), dtype,
+    # dynamic batch size (default True), training and inference token / micro batch limits, fused
+    # kernels, remove padding, seed, full determinism and router replay. Batch-size, offload, padding,
+    # fused-kernel and forward_only fields are mutable.
     _mutable_fields = BaseConfig._mutable_fields | {
         "use_dynamic_bsz",
         "max_token_len_per_gpu",
@@ -115,6 +132,8 @@ class EngineConfig(BaseConfig):
     router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: no-op (batch-size validation is intentionally disabled pending config reorg).
         pass
         # TODO: turn on this check after we reorg config
         # if self.use_dynamic_bsz:
@@ -125,6 +144,10 @@ class EngineConfig(BaseConfig):
 
 @dataclass
 class QATEngineConfig(BaseConfig):
+    # [CLASS DOC]
+    # QAT settings: enable flag, mode ("w4a16" default), group size 16, ignore patterns (lm_head,
+    # embed_tokens, regex for MoE gate), activation observer strategy, optional vLLM quantization config
+    # path. No validation.
     """Configuration for QAT (Quantization-Aware Training) within an engine.
 
     Args:
@@ -146,6 +169,11 @@ class QATEngineConfig(BaseConfig):
 
 @dataclass
 class McoreEngineConfig(EngineConfig):
+    # [CLASS DOC]
+    # Megatron-Core engine config: TP/EP/ETP/PP/VPP/CP sizes, dynamic context parallel with max seqlen
+    # per DP-CP rank, entropy chunking, sequence parallel (mutable for auto-correction), distributed
+    # optimizer, padding options, distributed checkpointing options, override dicts for DDP /
+    # transformer / mcore model configs, mbridge selection, Megatron-FSDP, strategy "megatron" and QAT.
     """Configuration for Megatron parallelism.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -212,6 +240,12 @@ class McoreEngineConfig(EngineConfig):
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: runs base post-init; asserts strategy is "megatron" and dtype is bfloat16 or float16;
+        # emits a FutureWarning when vanilla_mbridge is set; with dynamic context parallel requires
+        # max_seqlen_per_dp_cp_rank to be a positive non-bool int (ValueError otherwise); when TP size is 1
+        # warns and forces sequence_parallel to False.
+        # Exceptions: AssertionError, ValueError. Side effects: warnings; mutates sequence_parallel.
         super().__post_init__()
         """config validation logics go here"""
         assert self.strategy == "megatron"
@@ -238,6 +272,11 @@ class McoreEngineConfig(EngineConfig):
 
 @dataclass
 class FSDPEngineConfig(EngineConfig):
+    # [CLASS DOC]
+    # FSDP engine config: wrap policy, offload policy, reshard after forward, FSDP size (-1 all), forward
+    # prefetch, model dtype, orig params, mixed precision, Ulysses SP size (mutable), entropy options,
+    # torch compile, no-sync gradient accumulation, strategy "fsdp", pad_to_length and bucket, QAT and a
+    # turbo config dict.
     """Configuration for FSDP (Fully Sharded Data Parallel).
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -302,12 +341,19 @@ class FSDPEngineConfig(EngineConfig):
     turbo_config: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base post-init and asserts strategy is fsdp, fsdp2 or fsdp_turbo.
         super().__post_init__()
         assert self.strategy in ["fsdp", "fsdp2", "fsdp_turbo"], f"strategy {self.strategy} not supported"
 
 
 @dataclass
 class VeOmniEngineConfig(EngineConfig):
+    # [CLASS DOC]
+    # VeOmni engine config (see docstring): parallel sizes, init device, sharding / offload flags,
+    # checkpoint manager ("dcp"), attention / MoE and many kernel implementation selectors, async
+    # activation offload options, basic modules, and padding options. attn_implementation is mutable.
+    # KNOWN ISSUE: mixed_precision is typed and defaulted as a bool although documented as an optional dict.
     """Configuration for VeOmni.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -458,6 +504,11 @@ class VeOmniEngineConfig(EngineConfig):
     pad_to_length_bucket: int = 1024
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base post-init; asserts strategy is "veomni"; raises ValueError if the activation
+        # offload host cache limit is not finite or negative; maps flash_attention_2/3/4 to VeOmni's SP-aware
+        # variants, logging the replacement.
+        # Side effects: mutates attn_implementation; logs.
         super().__post_init__()
         assert self.strategy in ["veomni"], f"strategy {self.strategy} not supported"
 
@@ -482,6 +533,10 @@ class VeOmniEngineConfig(EngineConfig):
 
 @dataclass
 class TorchtitanEngineConfig(EngineConfig):
+    # [CLASS DOC]
+    # TorchTitan engine config: wrap / reshard / prefetch / precision / offload options, entropy and
+    # compile options, DP (replicate/shard), TP, EP, ETP, PP, CP sizes, attention type, SPMD backend,
+    # activation checkpoint mode, optional max sequence length, strategy, seed and determinism.
     """Configuration for Torchtitan.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -546,6 +601,11 @@ class TorchtitanEngineConfig(EngineConfig):
     full_determinism: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base post-init; asserts attn_type in flex / flex_flash / varlen, spmd_backend in
+        # default / full_dtensor / spmd_types, activation_checkpoint in selective / full / none, and strategy
+        # "torchtitan". Exceptions: AssertionError.
+        # KNOWN ISSUE: the docstring lists "sdpa" as an example attention type, which is rejected here.
         super().__post_init__()
         assert self.attn_type in ["flex", "flex_flash", "varlen"], (
             f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
@@ -561,6 +621,11 @@ class TorchtitanEngineConfig(EngineConfig):
 
 @dataclass
 class AutomodelEngineConfig(EngineConfig):
+    # [CLASS DOC]
+    # Automodel (NeMo) engine config: distributed strategy, TP/PP/CP/EP/DP-replicate sizes, sequence
+    # parallel, deferred grad sync, activation checkpointing, FP8, compile, model dtype, attention
+    # implementation, pass-through backend and MoE config dicts, FSDP2 mixed-precision dtypes and
+    # entropy options.
     """Configuration for Automodel (nemo_automodel) backend.
 
     The Automodel backend uses NeMoAutoModelForCausalLM for model loading and
@@ -673,6 +738,9 @@ class AutomodelEngineConfig(EngineConfig):
     entropy_checkpointing: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base post-init; asserts strategy is "automodel", distributed strategy in fsdp2 /
+        # megatron_fsdp / ddp, and pp_size is 1. Exceptions: AssertionError.
         super().__post_init__()
         assert self.strategy == "automodel", f"strategy must be 'automodel', got {self.strategy}"
         assert self.distributed_strategy in ["fsdp2", "megatron_fsdp", "ddp"], (
@@ -683,6 +751,10 @@ class AutomodelEngineConfig(EngineConfig):
 
 @dataclass
 class TrainingWorkerConfig(BaseConfig):
+    # [CLASS DOC]
+    # Bundle passed to a training worker: model type (language_model / value_model), model, engine,
+    # optimizer, checkpoint and profiler configs (all default None), an optional callable that picks
+    # engine and optimizer configs from model config and device name, and an extra context dict.
     model_type: str = None  # model type (language_model/value_model)
     model_config: HFModelConfig = None
     engine_config: EngineConfig = None

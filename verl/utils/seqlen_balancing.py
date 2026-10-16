@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Sequence-length balancing utilities: workload estimation, balanced k-way partitioning
+# (Karmarkar-Karp and greedy), imbalance metrics, and dynamic micro-batching that splits a batch into
+# token-budgeted, workload-balanced micro-batches (optionally synchronized across data-parallel
+# ranks) plus helpers to restore the original order afterwards.
 
 import copy
 import heapq
@@ -25,6 +30,9 @@ from verl.utils.device import get_device_name
 
 
 def calculate_workload(seqlen_list: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Returns the elementwise relative attention/MLP workload 24576 * L + L^2 for a tensor of lengths L.
+    # No side effects; callers upcast to int64 to avoid overflow.
     """Calculate approximate computational workload for transformer attention.
 
     Estimates FLOPs for dense transformer blocks based on sequence length using
@@ -47,6 +55,16 @@ def calculate_workload(seqlen_list: torch.Tensor) -> torch.Tensor:
 
 
 def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # Largest Differencing Method partitioning into k_partitions sets, returning lists of original indices.
+    # Behavior: sort (value, index) ascending. With equal_size, each consecutive chunk of k sorted items
+    # forms one initial state (one item per set); otherwise each item forms a state with a single
+    # non-empty set. States sit in a heap ordered so the largest spread (max set sum - min set sum) pops
+    # first (ties: larger top set). Repeatedly pop two states and merge them by pairing the i-th largest
+    # set of one with the i-th smallest set of the other, then push back. The final state's sets give
+    # the partitions (indices in insertion order, not sorted).
+    # Exceptions: AssertionError if equal_size and the count is not divisible by k, or a resulting
+    # partition does not have count/k items.
     """Partition items into k groups using the Karmarkar-Karp differencing method.
 
     Implements the Largest Differencing Method (LDM) algorithm for balanced
@@ -71,20 +89,30 @@ def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool) 
 
     # see: https://en.wikipedia.org/wiki/Largest_differencing_method
     class Set:
+        # [CLASS DOC]
+        # HELPER: A partition under construction: running sum and list of (index, value) items.
         def __init__(self) -> None:
+            # [FUNCTION DOC]
+            # Creates an empty set with sum 0.
             self.sum = 0
             self.items = []
 
         def add(self, idx: int, val: int):
+            # [FUNCTION DOC]
+            # Appends (idx, val) and adds val to the sum.
             self.items.append((idx, val))
             self.sum += val
 
         def merge(self, other):
+            # [FUNCTION DOC]
+            # Appends all items of other and adds their values to the sum (other is not modified).
             for idx, val in other.items:
                 self.items.append((idx, val))
                 self.sum += val
 
         def __lt__(self, other):
+            # [FUNCTION DOC]
+            # Orders by sum, then by item count, then lexicographically by items.
             if self.sum != other.sum:
                 return self.sum < other.sum
             if len(self.items) != len(other.items):
@@ -92,7 +120,12 @@ def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool) 
             return self.items < other.items
 
     class State:
+        # [CLASS DOC]
+        # HELPER: A k-set partial partition; sets are kept sorted in decreasing order.
         def __init__(self, items: list[tuple[int, int]], k: int) -> None:
+            # [FUNCTION DOC]
+            # Creates k empty sets, puts item i into set i, then sorts sets descending.
+            # Exceptions: AssertionError unless the number of items is 1 or k.
             self.k = k
             # sets should always be decreasing order
             self.sets = [Set() for _ in range(k)]
@@ -102,6 +135,8 @@ def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool) 
             self.sets = sorted(self.sets, reverse=True)
 
         def get_partitions(self):
+            # [FUNCTION DOC]
+            # Returns a list of index lists, one per set, in current set order.
             partitions = []
             for i in range(len(self.sets)):
                 cur_partition = []
@@ -111,15 +146,23 @@ def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool) 
             return partitions
 
         def merge(self, other):
+            # [FUNCTION DOC]
+            # Merges other into self by combining self's i-th set with other's (k-1-i)-th set, then re-sorts
+            # descending. Mutates self.
             for i in range(self.k):
                 self.sets[i].merge(other.sets[self.k - 1 - i])
             self.sets = sorted(self.sets, reverse=True)
 
         @property
         def spread(self) -> int:
+            # [FUNCTION DOC]
+            # Property: difference between the largest and smallest set sums.
             return self.sets[0].sum - self.sets[-1].sum
 
         def __lt__(self, other):
+            # [FUNCTION DOC]
+            # Inverted ordering for a min-heap: a state is "less" if it has a larger spread, or with equal
+            # spread a larger top set, so it pops first.
             # least heap, let the state with largest spread to be popped first,
             # if the spread is the same, let the state who has the largest set
             # to be popped first.
@@ -128,6 +171,8 @@ def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool) 
             return self.sets[0] > other.sets[0]
 
         def __repr__(self) -> str:
+            # [FUNCTION DOC]
+            # Returns sets as "[{v,v},{v}]" listing the values of each set.
             repr_str = "["
             for i in range(self.k):
                 if i > 0:
@@ -173,6 +218,11 @@ def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool) 
 
 
 def greedy_partition(seqlen_list: list[int], k_partitions: int, equal_size: bool) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # Assigns items in original order to the partition with the smallest current sum (first on ties).
+    # With equal_size, a bias of (total + 1) is added to every value so item counts dominate, giving
+    # equal-size partitions. Outputs: list of k index lists.
+    # Exceptions: AssertionError if equal_size and partitions end up unequal (count not divisible by k).
     """Partition items into k groups using a greedy assignment strategy.
 
     Assigns each item to the partition with the smallest current sum, iterating
@@ -211,6 +261,10 @@ def greedy_partition(seqlen_list: list[int], k_partitions: int, equal_size: bool
 
 
 def get_seqlen_balanced_partitions(seqlen_list: list[int], k_partitions: int, equal_size: bool):
+    # [FUNCTION DOC]
+    # Runs karmarkar_karp and validates/sorts the result: exactly k partitions, none empty, covering all
+    # indices; each partition's indices are sorted.
+    # Exceptions: AssertionError if fewer items than partitions or any validation fails.
     """
     Calculates partitions of indices from seqlen_list such that the sum of sequence lengths
     in each partition is balanced. Uses the Karmarkar-Karp differencing method.
@@ -239,6 +293,8 @@ def get_seqlen_balanced_partitions(seqlen_list: list[int], k_partitions: int, eq
     assert len(seqlen_list) >= k_partitions, f"number of items:[{len(seqlen_list)}] < k_partitions:[{k_partitions}]"
 
     def _check_and_sort_partitions(partitions):
+        # [FUNCTION DOC]
+        # HELPER: Validates partition count, non-emptiness and full index coverage, returning sorted copies.
         assert len(partitions) == k_partitions, f"{len(partitions)} != {k_partitions}"
         seen_idx = set()
         sorted_partitions = [None] * k_partitions
@@ -255,6 +311,13 @@ def get_seqlen_balanced_partitions(seqlen_list: list[int], k_partitions: int, eq
 
 
 def log_seqlen_unbalance(seqlen_list: list[int], partitions: list[list[int]], prefix):
+    # [FUNCTION DOC]
+    # Computes imbalance metrics. "Before" sums use contiguous chunks of size len // k of seqlen_list;
+    # "after" sums use the given partitions.
+    # Outputs: dict with keys prefix + "/min", "/max", "/minmax_diff" (chunk sums), "/balanced_min",
+    # "/balanced_max" (partition sums), "/mean" (total over chunks divided by number of partitions).
+    # KNOWN ISSUE: if the length is not divisible by k the chunking yields an extra short chunk that
+    # distorts min; if length < k, chunk size is 0 and the range step raises ValueError.
     """
     Calculate and log metrics related to sequence length imbalance before and after partitioning.
 
@@ -303,6 +366,8 @@ def log_seqlen_unbalance(seqlen_list: list[int], partitions: list[list[int]], pr
 
 
 def ceildiv(a: int, b: int) -> int:
+    # [FUNCTION DOC]
+    # Returns ceiling of a / b using negated floor division.
     """Compute ceiling division of a by b.
 
     Returns the smallest integer greater than or equal to a/b.
@@ -325,6 +390,8 @@ def ceildiv(a: int, b: int) -> int:
 
 
 def roundup_divisible(a: int, b: int) -> int:
+    # [FUNCTION DOC]
+    # Returns the smallest multiple of b that is >= a.
     """Round up a to the nearest multiple of b.
 
     Returns the smallest multiple of b that is >= a.
@@ -355,6 +422,31 @@ def rearrange_micro_batches(
     use_dynamic_bsz_balance=True,
     force_group_size=1,
 ):
+    # [FUNCTION DOC]
+    # Splits a TensorDict batch into micro-batches whose token counts fit max_token_len and whose
+    # workloads are balanced.
+    # Behavior:
+    # - Effective lengths: offsets differences for nested input_ids, else attention_mask row sums; the
+    #   padded length (or max nested length) must not exceed max_token_len.
+    # - Works on groups of force_group_size consecutive samples (batch size must be divisible).
+    # - Initial micro-batch count = min(num groups, ceil(total tokens / max_token_len)), raised to
+    #   min_num_micro_batch; if a DP group is given, initialized, and same_micro_num_in_dp, take the max
+    #   over ranks; then round up to a multiple of num_batches_divided_by.
+    # - Workloads per group = sum of calculate_workload of members; also group token lengths.
+    # - With DP sync, all-reduce the max group token length and the min group count across ranks so all
+    #   ranks raise consistently. ValueError if any group exceeds max_token_len.
+    # - Loop: ValueError if the count exceeds the (min) number of groups; partition groups by workload
+    #   with Karmarkar-Karp (unequal sizes); check every partition's tokens <= max_token_len (all-reduced
+    #   MIN across ranks when syncing); if not, increase the count by num_batches_divided_by (or 1).
+    # - Convert group indices to sample indices. If use_dynamic_bsz_balance, sort micro-batches by
+    #   workload descending (tie: first index) and reorder so the smaller ones are at both ends
+    #   (even positions reversed followed by odd positions) to reduce pipeline bubbles.
+    # - Select each partition from the batch with tensordict index selection.
+    # Inputs: batch, max_token_len, dp_group, num_batches_divided_by, same_micro_num_in_dp,
+    # min_num_micro_batch, use_dynamic_bsz_balance, force_group_size.
+    # Outputs: tuple (list of micro-batch TensorDicts, list of index lists into the original batch).
+    # Exceptions: AssertionError on length/divisibility checks; ValueError as described.
+    # Side effects: collective all-reduce calls on dp_group when syncing; device-host transfers.
     """
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
 
@@ -505,6 +597,9 @@ def rearrange_micro_batches(
 
 
 def get_reverse_idx(idx_map):
+    # [FUNCTION DOC]
+    # Returns the inverse permutation: output[idx_map[i]] = i (built on a deep copy of idx_map, so the
+    # input must be a permutation of 0..n-1 and supports item assignment).
     """
     Build the inverse of an index mapping.
 
@@ -531,6 +626,10 @@ def prepare_dynamic_batch(
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
 ) -> tuple[list[DataProto], list[list[int]]]:
+    # [FUNCTION DOC]
+    # Applies rearrange_micro_batches to data.batch and builds a DataProto per micro-batch with the
+    # selected tensors, non-tensor arrays indexed by the same indices, and a deep copy of meta_info.
+    # Outputs: tuple (list of DataProto, list of index lists). Exceptions/side effects as rearrange_micro_batches.
     """
     Prepare a batch for dynamic batching.
 
@@ -562,6 +661,10 @@ def prepare_dynamic_batch(
 
 
 def restore_dynamic_batch(data: torch.Tensor, batch_idx_list: list[list[int]]) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Concatenates the micro-batch index lists, inverts the permutation and reorders data (rows of a
+    # dense tensor, or components of a jagged nested tensor rebuilt as a new nested tensor) back to the
+    # original order. Exceptions: AssertionError if index count differs from data's first dimension.
     """
     Restore a batch from dynamic batching.
 
@@ -592,6 +695,14 @@ def get_group_balanced_partitions(
     uid_list: list,
     k_partitions: int,
 ) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # Partitions samples into k_partitions while keeping samples with the same uid together.
+    # Behavior: forms groups from runs of consecutive equal uids (non-contiguous repeats become separate
+    # groups); each group's workload is the sum of member calculate_workload values; groups are
+    # partitioned with Karmarkar-Karp using equal_size=True (same number of groups per partition);
+    # returns each partition's sample indices sorted.
+    # Exceptions: AssertionError if list lengths differ, there are fewer groups than partitions, or the
+    # group count is not divisible by k_partitions.
     """
     Partition samples into k groups while keeping samples with the same uid together.
 

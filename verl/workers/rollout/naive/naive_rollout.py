@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Naive token-by-token sampling rollout for a single GPU: repeatedly runs the full model on the
+# growing sequence (no KV cache), samples the next token, and returns prompts, responses, sequences,
+# log-probs, attention mask and position ids.
 """
 In single GPU rollout, the sequences are generated directly by sampling from the model.
 The output will contain
@@ -34,7 +38,15 @@ __all__ = ["NaiveRollout"]
 
 
 class NaiveRollout(BaseRollout):
+    # [CLASS DOC]
+    # Rollout bound to an in-process HF-compatible module and a config with response_length,
+    # temperature, top_k and do_sample.
     def __init__(self, module: nn.Module, config):
+        # [FUNCTION DOC]
+        # Behavior: calls the base initializer and stores config and module.
+        # Inputs: module - model returning an object with logits; config - DictConfig.
+        # KNOWN ISSUE: the base initializer requires config, model_config and device_mesh, so the
+        # argument-less parent call raises TypeError; this class is effectively unusable as written.
         """A naive rollout. It requires the module to be compatible with huggingface APIs. That is:
         The module should define __call__ to receive input_ids, attention_mask and position_ids.
         It outputs a structure that contains logits field.
@@ -49,6 +61,22 @@ class NaiveRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # Behavior: (no-grad) puts the module in eval mode. For response_length steps: runs the module on the
+        # full current ids/mask/position ids; takes last-step logits divided by temperature; if top_k set,
+        # masks logits below the k-th largest to negative infinity; softmaxes; samples (multinomial) or
+        # argmax. Appends the previous step's "still alive" mask column to the attention mask, then updates
+        # the alive mask using the eos ids, extends position ids by one, appends the token and stores the
+        # logits. Computes log-probs of the response tokens from the stacked logits, builds a TensorDict
+        # (input_ids = prompt part, responses, sequences, old_log_probs, attention_mask, position_ids),
+        # restores train mode.
+        # Inputs: prompts - DataProto with input_ids, attention_mask, position_ids and meta eos_token_id
+        # (iterable of ids). Outputs: DataProto with the batch above.
+        # Side effects: toggles module eval/train mode.
+        # KNOWN ISSUE: with multiple eos ids each loop iteration overwrites the alive mask, so only the last
+        # eos id effectively counts and earlier ones are ignored; the dtype conversion result is discarded;
+        # the attention mask ends one step behind (the final token's mask column is never appended), and
+        # the mask for a token is set from the previous step only.
         """Generate sequences"""
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         attention_mask = prompts.batch["attention_mask"]  # left-padded attention_mask

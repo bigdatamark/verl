@@ -14,6 +14,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Megatron-Core training utilities for verl: building (virtual-)pipelined model chunks with
+# Float16 and DDP (incl. Muon layer-wise layouts) directly or via Megatron-Bridge / mbridge,
+# unwrapping wrappers, nested HF config attribute lookup, CPU offload/reload of model buffers and
+# optimizer state, checkpoint directory layout helpers (v2 layout: model/, optimizer/, extra/,
+# manifest), Megatron->HF parameter name/tensor conversion and per-tensor streaming across PP/TP/EP
+# for weight sync, layer offset computation, training hook registration, MTP helpers, and
+# non-destructive CPU snapshots of model weights.
+# ALL_MODULE_WRAPPER_CLASSNAMES is the tuple of wrapper classes stripped by unwrap_model (DDP,
+# Float16Module, and Megatron FSDP classes when importable). Module logger level from
+# VERL_LOGGING_LEVEL (default WARN).
+
 """Pretrain utilities."""
 
 import inspect
@@ -49,10 +62,16 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def get_model_config(model):
+    # [FUNCTION DOC]
+    # Returns the "config" attribute found through Megatron wrapper layers (must exist).
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
 def _assert_muon_layer_wise_ddp_supported() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Verifies Megatron-Core has layer_wise_optimizer (LayerWiseDistributedOptimizer,
+    # tag_params_for_buffer_routing) and that DistributedDataParallelConfig accepts
+    # use_layer_wise_param_layout. Exceptions: ValueError (chained) when either is missing.
     """Fail closed when Megatron-Core cannot build LayerWise DDP layouts."""
     try:
         from megatron.core.optimizer.layer_wise_optimizer import (  # noqa: F401
@@ -83,6 +102,18 @@ def wrap_model_chunks_with_layerwise_aware_ddp(
     use_layer_wise_distributed_optimizer: bool = False,
     override_ddp_config: dict | None = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: builds DistributedDataParallelConfig from defaults (use_distributed_optimizer as given,
+    # grad_reduce_in_fp32 True, overlap_grad_reduce False) updated by overrides. For layer-wise mode:
+    # tags params for buffer routing, forces use_distributed_optimizer True, sets
+    # use_layer_wise_param_layout True unless overridden, and computes a full param layout per chunk
+    # (trainable params, bucket size, DP-CP size, expert DP size). Wraps each chunk in DDP (bucketing
+    # disabled for chunks after the first, passing the layout when present) and broadcasts params.
+    # Inputs: model_chunks - list of modules; tfconfig - TransformerConfig; keyword-only flags and
+    # override_ddp_config dict.
+    # Outputs: list of DDP-wrapped chunks.
+    # Exceptions: ImportError if layer-wise modules are missing; AssertionError without dp_cp group.
+    # Side effects: parameter broadcast collectives; tags params.
     """Wrap model chunks in Megatron DDP, with optional LayerWise (Muon) param layouts.
 
     Mirrors ``megatron.training.training.wrap_model_chunks_with_ddp`` so Muon gets
@@ -157,6 +188,22 @@ def get_model(
     transformer_config=None,
     override_ddp_config=None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: with PP > 1 and VPP set, builds one chunk per virtual stage via the provider (setting
+    # the virtual rank, computing pre/post_process per stage, passing vp_stage) then resets virtual
+    # rank to 0; otherwise builds a single chunk with first/last stage flags. Sets model_type on each
+    # chunk, ensures default TP attributes on all params, prints the parameter count on DP rank 0,
+    # moves chunks to the current device unless transformer_config requests CPU init, sets
+    # config.fp8 = None, wraps in Float16Module when fp16/bf16, and optionally wraps with
+    # layer-wise-aware DDP.
+    # Inputs: model_provider_func(pre_process, post_process[, vp_stage]); model_type; wrap_with_ddp;
+    # use_distributed_optimizer; use_layer_wise_distributed_optimizer; transformer_config;
+    # override_ddp_config.
+    # Outputs: list of model chunks.
+    # Exceptions: AssertionError for encoder_and_decoder model types.
+    # Side effects: mutates parallel_state virtual rank; device moves; prints.
+    # KNOWN ISSUE: the encoder_and_decoder branch is unreachable because it is asserted against
+    # just before; fp8 is unconditionally cleared on the model config.
     """Build the model."""
     # Build model.
     if (
@@ -254,6 +301,9 @@ _HF_CONFIG_CHILD_NAMES = ("text_config", "language_config", "thinker_config", "m
 
 
 def _get_hf_text_config(hf_config: PretrainedConfig):
+    # [FUNCTION DOC]
+    # HELPER: Returns hf_config.get_text_config() if callable and non-None, else the text_config
+    # attribute (or None).
     get_text_config = getattr(hf_config, "get_text_config", None)
     if callable(get_text_config):
         text_config = get_text_config()
@@ -263,9 +313,15 @@ def _get_hf_text_config(hf_config: PretrainedConfig):
 
 
 def _iter_hf_config_tree(hf_config: PretrainedConfig):
+    # [FUNCTION DOC]
+    # HELPER: Generator over a nested HF config in priority order: depth-first, each config's text
+    # config and the known wrapper children (text_config, language_config, thinker_config,
+    # model_config) are visited before the config itself; each object visited once (by identity).
     seen = set()
 
     def _visit(config):
+        # [FUNCTION DOC]
+        # HELPER: Recursive visitor implementing the ordering and de-duplication above.
         if id(config) in seen:
             return
         seen.add(id(config))
@@ -287,6 +343,11 @@ def _iter_hf_config_tree(hf_config: PretrainedConfig):
 
 
 def get_hf_config_attr(hf_config: PretrainedConfig, attr_name: str) -> Any:
+    # [FUNCTION DOC]
+    # Behavior: returns the first non-None attribute value found on the text config, then over the
+    # config tree order.
+    # Inputs: hf_config; attr_name. Outputs: value.
+    # Exceptions: AttributeError if not found anywhere.
     """Find an attribute in a nested Hugging Face model configuration."""
     text_config = _get_hf_text_config(hf_config)
     if text_config is not None:
@@ -302,6 +363,10 @@ def get_hf_config_attr(hf_config: PretrainedConfig, attr_name: str) -> Any:
 
 
 def get_hf_rope_theta(hf_config: PretrainedConfig) -> float:
+    # [FUNCTION DOC]
+    # Behavior: walks the config tree; for each config returns rope_theta if set, else
+    # rope_parameters["rope_theta"], else the first nested dict value of rope_parameters containing
+    # rope_theta. Outputs: theta. Exceptions: AttributeError if none found.
     """Return RoPE base frequency theta.
 
     Most configs expose ``rope_theta`` on the root. Newer models (e.g. Qwen3 in transformers>=5) store it under
@@ -310,6 +375,8 @@ def get_hf_rope_theta(hf_config: PretrainedConfig) -> float:
     """
 
     def _maybe_get_theta(config: Any) -> float | None:
+        # [FUNCTION DOC]
+        # HELPER: Theta lookup on a single config as described; None if absent.
         theta = getattr(config, "rope_theta", None)
         if theta is not None:
             return theta
@@ -336,6 +403,9 @@ def get_hf_rope_theta(hf_config: PretrainedConfig) -> float:
 
 @dataclass
 class McoreModuleWrapperConfig:
+    # [CLASS DOC]
+    # Dataclass of model wrapping options: is_value_model, share_embeddings_and_output_weights,
+    # wrap_with_ddp, use_distributed_optimizer, use_layer_wise_distributed_optimizer, use_megatron_fsdp.
     """Configuration for Mcore module wrapper."""
 
     is_value_model: bool = False
@@ -357,6 +427,28 @@ def make_megatron_module(
     peft_cls: Any = None,
     peft_config: Any = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: best-effort sets hf_config.rope_theta (ignored if absent, e.g. NoPE models). With a
+    # bridge: choose value-model and freeze-router hooks (mbridge versions when provider is None,
+    # Megatron-Bridge versions otherwise, value hook built from hidden_size and sequence parallel).
+    # Provider path (Megatron-Bridge): register pre-wrap hooks in order — PEFT transformation (if
+    # peft_cls), optional adapter checkpoint loading (peft_config adapter_path), adapter info printing
+    # on rank 0, then value-model / freeze-router callbacks. If DDP wrapping with layer-wise Muon is
+    # requested, rejects FSDP and validates support. Builds the DDP config via create_ddp_config when
+    # available, else manually (FSDP defaults: distributed optimizer, nan check, megatron FSDP,
+    # optim_grads_params sharding, overlap grad reduce; then overrides; finalize). Calls
+    # provide_distributed_model (DDP disabled in layer-wise mode, which instead wraps with
+    # wrap_model_chunks_with_layerwise_aware_ddp), and takes tf_config from the created model.
+    # mbridge path: calls bridge.get_model with callbacks, DDP config dict and fp16/bf16 from
+    # tf_config, then layer-wise wrapping if requested. For MLA configs applies the MLA patch.
+    # Without bridge: uses get_model with a provider building init_mcore_model per stage.
+    # Inputs: wrap_config; tf_config; hf_config; bridge; provider; override_model_config (may contain
+    # moe_config.freeze_moe_router); override_ddp_config; peft_cls; peft_config (mapping with
+    # adapter_path).
+    # Outputs: (model chunks, TransformerConfig).
+    # Exceptions: ValueError for layer-wise + FSDP or unsupported layer-wise; AttributeError if
+    # peft_cls is set but peft_config is None.
+    # Side effects: mutates hf_config; registers hooks on provider; global patches; prints.
     from verl.models.mcore.config_converter import get_hf_rope_theta
 
     try:
@@ -406,6 +498,9 @@ def make_megatron_module(
                 if adapter_path:
 
                     def adapter_checkpoint_hook(model):
+                        # [FUNCTION DOC]
+                        # HELPER: Pre-wrap hook that prints and loads PEFT adapter weights from adapter_path non-strictly;
+                        # returns the model.
                         print(f"Loading adapter weights from: {adapter_path}")
                         load_peft_adapter_checkpoint(
                             model,
@@ -418,6 +513,8 @@ def make_megatron_module(
                     provider.register_pre_wrap_hook(adapter_checkpoint_hook)
 
                 def peft_info_hook(model):
+                    # [FUNCTION DOC]
+                    # HELPER: Pre-wrap hook printing adapter parameter info on global rank 0; returns the model.
                     if torch.distributed.get_rank() == 0:
                         print_adapter_info(model)
                     return model
@@ -531,6 +628,9 @@ def make_megatron_module(
     else:
 
         def megatron_model_provider(pre_process, post_process, vp_stage=None):
+            # [FUNCTION DOC]
+            # HELPER: Builds one mcore model chunk with init_mcore_model (sharing/value/freeze-router/vp_stage
+            # options) and moves it to the device.
             from verl.models.mcore import init_mcore_model
 
             parallel_model = init_mcore_model(
@@ -566,6 +666,11 @@ except ImportError:
 
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
+    # [FUNCTION DOC]
+    # Behavior: repeatedly takes .module while the object is one of the wrapper classes, for a single
+    # model or each element of a list.
+    # Inputs: model - module or list; module_instances - tuple of wrapper classes.
+    # Outputs: unwrapped module or list (matching input form).
     return_list = True
     if not isinstance(model, list):
         model = [model]
@@ -581,6 +686,14 @@ def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
 
 
 def convert_config(hf_config: PretrainedConfig, megatron_config) -> TransformerConfig:
+    # [FUNCTION DOC]
+    # Behavior: deprecated; warns and builds a llama-style TransformerConfig from an HF config: layer /
+    # hidden / heads / KV groups / FFN sizes, SiLU gated MLP, RMSNorm, CPU init, no linear bias,
+    # parallel sizes from parallel_state, overlap P2P when VPP > 1, dtypes from params_dtype, sequence
+    # parallel when TP > 1, variable seq lengths, alltoall MoE dispatcher, dropouts, QKV bias for
+    # Qwen2 or attention_bias, bf16 when dtype is bfloat16.
+    # Inputs: hf_config; megatron_config with params_dtype. Outputs: TransformerConfig.
+    # Side effects: warning and prints.
     """[Deprecated] convert config
 
     Args:
@@ -640,6 +753,9 @@ def mcore_model_parallel_config(
     sequence_parallel: bool,
     params_dtype: torch.dtype,
 ) -> ModelParallelConfig:
+    # [FUNCTION DOC]
+    # Behavior: deprecated (DeprecationWarning); returns a ModelParallelConfig with current parallel
+    # sizes, given sequence_parallel and dtype, bf16 True, fp16 False, timers None.
     # WARNING: Code should not reach this point. This function is deprecated and will be removed.
     # Please use hf_to_mcore_config_dense() from verl.models.mcore.config_converter instead.
     warnings.warn(
@@ -663,6 +779,9 @@ def mcore_model_parallel_config(
 
 
 def _can_safely_resize_storage(tensor: torch.Tensor) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True only when the tensor exclusively owns its storage: storage size equals numel,
+    # offset 0 and contiguous.
     """Check whether it is safe to call ``storage().resize_(0)`` on *tensor*.
 
     Resizing the underlying storage to zero immediately frees the GPU memory
@@ -685,6 +804,9 @@ def _can_safely_resize_storage(tensor: torch.Tensor) -> bool:
 
 
 def _clear_te_fp8_weight_workspaces(model_chunk):
+    # [FUNCTION DOC]
+    # HELPER: Clears every non-empty _fp8_workspaces dict on submodules of the chunk (TE FP8 cached
+    # quantized weights) and returns how many entries were cleared. Side effects: frees GPU caches.
     """Clear cached Transformer-Engine FP8 weight workspaces on a model chunk.
 
     When training with an FP8 param dtype (or loading a native-FP8 checkpoint),
@@ -711,6 +833,17 @@ def _clear_te_fp8_weight_workspaces(model_chunk):
 
 @torch.no_grad()
 def offload_megatron_model_to_cpu(models):
+    # [FUNCTION DOC]
+    # Behavior (no grad): for DDP chunks, for each dense and expert-parallel buffer: if param storage is
+    # non-empty, allocate (once) a pinned CPU tensor cpu_data on param_data (recording original storage
+    # size) or assert shape/dtype match an existing one, synchronously copy to it and free GPU storage
+    # (resize to 0); assert recorded size matches; free grad storage (recording its size). Also moves
+    # frozen (non-trainable) params not in DDP buffers to CPU. For non-DDP chunks (ref model) moves
+    # each param and grad to CPU, freeing old storage when exclusively owned. Clears TE FP8 workspaces
+    # per chunk and empties the device cache.
+    # Inputs: models - list of chunks. Outputs: none.
+    # Exceptions: AssertionError on cpu_data shape/dtype/size mismatch.
+    # Side effects: GPU memory freed; attributes cpu_data, param_data_size, grad_data_size set.
     """
     In megatron, the model and optimizer storage are:
     - bf16 parameter data chunked in model parallel group
@@ -800,6 +933,12 @@ def offload_megatron_model_to_cpu(models):
 
 @torch.no_grad()
 def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
+    # [FUNCTION DOC]
+    # Behavior (no grad): for DDP chunks: if load_grad and a grad size was recorded, restore grad storage
+    # when it is empty or the recorded size and zero it (otherwise just zero in place); if param storage
+    # is empty, restore it and copy from cpu_data (non-blocking). Optionally moves frozen CPU params back
+    # to the device. For non-DDP chunks moves params and grads to the device. Empties cache.
+    # Inputs: models; load_grad; load_frozen_params. Outputs: none. Side effects: GPU allocation.
     """
     Load megatron model to GPU.
     Args:
@@ -847,6 +986,10 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
 
 @torch.no_grad()
 def offload_megatron_copy_params(optimizers):
+    # [FUNCTION DOC]
+    # Behavior (no grad): for each underlying optimizer (expanding ChainedOptimizer) that has
+    # shard_fp32_from_float16_groups, moves each tensor of those (possibly nested list) groups to CPU
+    # non-blocking. Inputs: optimizers. Side effects: mutates tensor .data.
     """
     Offload optimizer parameters to CPU. Supports both Megatron optimizers
     and `ChainedOptimizer`, which wraps a list of underlying optimizers.
@@ -856,16 +999,22 @@ def offload_megatron_copy_params(optimizers):
     """
 
     def _iter_opts(opt):
+        # [FUNCTION DOC]
+        # HELPER: Returns chained_optimizers for a ChainedOptimizer, else a single-element list.
         if isinstance(opt, ChainedOptimizer):
             return opt.chained_optimizers
         return [opt]
 
     def offload_tensor_to_cpu(tensor):
+        # [FUNCTION DOC]
+        # HELPER: Moves tensor data to CPU non-blocking; no-op for None.
         if tensor is None:
             return
         tensor.data = tensor.data.to("cpu", non_blocking=True)
 
     def offload_group_to_cpu(group):
+        # [FUNCTION DOC]
+        # HELPER: Applies offload to a tensor, a list of tensors, or a list of lists; no-op for None.
         if group is None:
             return
 
@@ -888,6 +1037,9 @@ def offload_megatron_copy_params(optimizers):
 
 @torch.no_grad()
 def load_megatron_copy_params(optimizers):
+    # [FUNCTION DOC]
+    # Behavior (no grad): inverse of offload_megatron_copy_params, moving fp32 master shard groups to
+    # the current device non-blocking.
     """
     Load optimizer parameters back to GPU. Handles ChainedOptimizer.
 
@@ -896,17 +1048,23 @@ def load_megatron_copy_params(optimizers):
     """
 
     def _iter_opts(opt):
+        # [FUNCTION DOC]
+        # HELPER: Expands ChainedOptimizer into its sub-optimizers, else a single-element list.
         if isinstance(opt, ChainedOptimizer):
             return opt.chained_optimizers
         return [opt]
 
     def load_tensor_to_gpu(tensor):
+        # [FUNCTION DOC]
+        # HELPER: Moves tensor data to the current device non-blocking; no-op for None.
         if tensor is None:
             return
         device_id = get_device_id()
         tensor.data = tensor.data.to(device_id, non_blocking=True)
 
     def load_group_to_gpu(group):
+        # [FUNCTION DOC]
+        # HELPER: Applies load to a tensor, list, or list of lists; no-op for None.
         if group is None:
             return
 
@@ -929,7 +1087,17 @@ def load_megatron_copy_params(optimizers):
 
 @torch.no_grad()
 def offload_megatron_optimizer(optimizers):
+    # [FUNCTION DOC]
+    # Behavior (no grad): per sub-optimizer: offloads fp32 master copies; if the inner optimizer
+    # exists: for a HybridDeviceOptimizer-like object (sub_optimizers, inner_param_to_orig_param,
+    # state) moves every tensor state of each sub-optimizer to CPU and mirrors it into the hybrid
+    # state under the original param; otherwise moves exp_avg, exp_avg_sq and master_param state
+    # entries to CPU non-blocking. Then clears TE's dummy wgrad cache (if TE importable), Megatron's
+    # global memory buffer, and empties device cache.
+    # Inputs: optimizers - Megatron optimizer or ChainedOptimizer. Side effects: memory movement.
     def _iter_opts(opt):
+        # [FUNCTION DOC]
+        # HELPER: Expands ChainedOptimizer into its sub-optimizers, else a single-element list.
         if isinstance(opt, ChainedOptimizer):
             return opt.chained_optimizers
         return [opt]
@@ -978,7 +1146,13 @@ def offload_megatron_optimizer(optimizers):
 
 @torch.no_grad()
 def load_megatron_optimizer(optimizers):
+    # [FUNCTION DOC]
+    # Behavior (no grad): per sub-optimizer: reloads fp32 master copies; for hybrid optimizers calls
+    # _move_new_state_to_right_device, else moves exp_avg / exp_avg_sq / master_param state to the
+    # device non-blocking; empties cache.
     def _iter_opts(opt):
+        # [FUNCTION DOC]
+        # HELPER: Expands ChainedOptimizer into its sub-optimizers, else a single-element list.
         if isinstance(opt, ChainedOptimizer):
             return opt.chained_optimizers
         return [opt]
@@ -1034,6 +1208,9 @@ _HUGGINGFACE_SUBDIR = "huggingface"
 
 
 def get_model_checkpoint_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # Behavior: ensures checkpoint_path and checkpoint_path/model exist; returns the latter.
+    # Side effects: directory creation.
     """Directory holding model-weight artifacts (HF and/or Megatron shards)."""
     local_mkdir_safe(checkpoint_path)
     p = os.path.join(checkpoint_path, _MODEL_SUBDIR)
@@ -1042,6 +1219,8 @@ def get_model_checkpoint_path(checkpoint_path):
 
 
 def get_optimizer_checkpoint_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # Behavior: ensures and returns checkpoint_path/optimizer. Side effects: mkdir.
     """Directory holding optimizer + lr_scheduler dist_checkpointing shards."""
     local_mkdir_safe(checkpoint_path)
     p = os.path.join(checkpoint_path, _OPTIMIZER_SUBDIR)
@@ -1050,6 +1229,8 @@ def get_optimizer_checkpoint_path(checkpoint_path):
 
 
 def get_extra_checkpoint_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # Behavior: ensures and returns checkpoint_path/extra. Side effects: mkdir.
     """Directory holding 'extra' artifacts (rng_state)."""
     local_mkdir_safe(checkpoint_path)
     p = os.path.join(checkpoint_path, _EXTRA_SUBDIR)
@@ -1058,6 +1239,8 @@ def get_extra_checkpoint_path(checkpoint_path):
 
 
 def get_model_dist_checkpoint_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # Behavior: ensures and returns checkpoint_path/model/dist_ckpt. Side effects: mkdir.
     """``model/dist_ckpt/`` — used when mbridge is disabled or for PEFT adapter shards."""
     p = os.path.join(get_model_checkpoint_path(checkpoint_path), _DIST_CKPT_SUBDIR)
     local_mkdir_safe(p)
@@ -1065,6 +1248,8 @@ def get_model_dist_checkpoint_path(checkpoint_path):
 
 
 def get_optimizer_dist_checkpoint_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # Behavior: ensures and returns checkpoint_path/optimizer/dist_ckpt. Side effects: mkdir.
     """``optimizer/dist_ckpt/`` — optimizer + lr_scheduler dist_checkpointing directory."""
     p = os.path.join(get_optimizer_checkpoint_path(checkpoint_path), _DIST_CKPT_SUBDIR)
     local_mkdir_safe(p)
@@ -1072,6 +1257,8 @@ def get_optimizer_dist_checkpoint_path(checkpoint_path):
 
 
 def get_extra_dist_checkpoint_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # Behavior: ensures and returns checkpoint_path/extra/dist_ckpt. Side effects: mkdir.
     """``extra/dist_ckpt/`` — rng_state dist_checkpointing directory."""
     p = os.path.join(get_extra_checkpoint_path(checkpoint_path), _DIST_CKPT_SUBDIR)
     local_mkdir_safe(p)
@@ -1079,6 +1266,8 @@ def get_extra_dist_checkpoint_path(checkpoint_path):
 
 
 def get_hf_model_checkpoint_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # Behavior: ensures and returns checkpoint_path/model/huggingface. Side effects: mkdir.
     """``model/huggingface/`` — HuggingFace-format weights, config, and tokenizer.
 
     Historically this lived at ``<checkpoint>/huggingface``; as of layout
@@ -1092,12 +1281,16 @@ def get_hf_model_checkpoint_path(checkpoint_path):
 
 
 def get_transformer_config_checkpoint_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # Behavior: ensures checkpoint_path exists; returns checkpoint_path/transformer_config.json.
     """``transformer_config.json`` at the checkpoint root (written by rank 0)."""
     os.makedirs(checkpoint_path, exist_ok=True)
     return os.path.join(checkpoint_path, "transformer_config.json")
 
 
 def get_checkpoint_contents_manifest_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # Behavior: ensures checkpoint_path exists; returns checkpoint_path/ckpt_contents.json.
     """Path to the ``ckpt_contents.json`` manifest describing saved contents.
 
     The manifest is a human- and tool-readable mapping from logical content
@@ -1123,14 +1316,20 @@ def get_checkpoint_contents_manifest_path(checkpoint_path):
 
 
 def get_legacy_dist_checkpoint_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # HELPER: Returns checkpoint_path/dist_ckpt (pre-v2 layout; no directory creation).
     return os.path.join(checkpoint_path, _DIST_CKPT_SUBDIR)
 
 
 def get_legacy_hf_model_checkpoint_path(checkpoint_path):
+    # [FUNCTION DOC]
+    # HELPER: Returns checkpoint_path/huggingface (pre-v2 layout; no directory creation).
     return os.path.join(checkpoint_path, _HUGGINGFACE_SUBDIR)
 
 
 def get_dist_checkpoint_path(checkpoint_path):  # pragma: no cover - back-compat shim
+    # [FUNCTION DOC]
+    # Behavior: deprecated shim; always raises RuntimeError explaining the v2 layout helpers.
     """Deprecated — kept only so stale imports fail loudly via the layout detector.
 
     In the v2 layout there is no longer a single ``dist_ckpt/`` directory;
@@ -1155,10 +1354,29 @@ def convert_megatron_model_to_transformers_model(
     num_query_groups: int,
     convert_qkv_gate_up_by_trunk_concat=False,
 ):
+    # [FUNCTION DOC]
+    # Behavior: maps one Megatron (GPT/llama-style) parameter to HF names: word embeddings ->
+    # model.embed_tokens.weight; self_attention linear_proj -> o_proj; linear_qkv layer_norm_weight ->
+    # input_layernorm; linear_qkv tensor -> fused qkv_proj, or (when splitting by TP trunk) split into
+    # q/k/v by iterating TP shards and query-group chunks (with replicated-KV handling when KV heads <
+    # TP size, keeping one KV copy per group of ranks); q/k_layernorm -> q_norm/k_norm; list of three
+    # tensors -> q/k/v. mlp linear_fc1 layer_norm_weight -> post_attention_layernorm; linear_fc1 weight
+    # -> fused gate_up_proj or split per TP shard into gate/up; list of two -> gate/up; linear_fc2 ->
+    # down_proj; final_layernorm -> model.norm; output_layer -> lm_head. Layer number and component
+    # are taken from fixed positions of the dotted name (index 2 and 4, param type index 5).
+    # Inputs: name; param - tensor or list of tensors; config - HF config; tp_size; num_query_groups;
+    # convert_qkv_gate_up_by_trunk_concat.
+    # Outputs: (keys view, values view) of the produced name->tensor mapping.
+    # Exceptions: ValueError for unknown names; AssertionError for malformed list params.
+    # KNOWN ISSUE: for list-valued linear_fc1 with param_type "bias", outputs are still named
+    # ".weight".
     """Convert megatron model to transformers model."""
     new_params = {}
 
     def convert_qkv_shard(full_tensor, q_name, k_name, v_name):
+        # [FUNCTION DOC]
+        # HELPER: Splits a TP-concatenated fused QKV tensor into per-head-group q, k, v pieces and stores
+        # concatenated q/k/v under the given names in new_params.
         nonlocal config
         nonlocal tp_size
         nonlocal num_query_groups
@@ -1207,6 +1425,9 @@ def convert_megatron_model_to_transformers_model(
         new_params[v_name] = torch.cat(v_shard_list, dim=0)
 
     def convert_gate_up_shard(full_tensor, gate_name, up_name):
+        # [FUNCTION DOC]
+        # HELPER: Splits a TP-concatenated fused gate/up tensor (each shard = [gate; up]) into concatenated
+        # gate and up tensors stored under the given names.
         nonlocal config
         nonlocal tp_size
 
@@ -1288,6 +1509,13 @@ def convert_megatron_model_to_transformers_model(
 
 
 def broadcast_from_megatron_pp(tensor: torch.Tensor):
+    # [FUNCTION DOC]
+    # Behavior: exactly one PP rank holds the tensor. All-gathers (shape, dtype, tensor_model_parallel,
+    # partition_dim) specs over the PP group, finds the source rank, allocates an empty tensor with TP
+    # attributes on other ranks, and broadcasts from the source's global rank.
+    # Inputs: tensor or None. Outputs: the tensor on every PP rank.
+    # Exceptions: ValueError if more than one rank holds it; AssertionError if none.
+    # Side effects: PP collectives.
     # tensor is not None only in one of the pp ranks
     if tensor is not None:
         shape = tensor.shape
@@ -1325,6 +1553,10 @@ def broadcast_from_megatron_pp(tensor: torch.Tensor):
 
 
 def broadcast_str_from_megatron_pp(obj: Any):
+    # [FUNCTION DOC]
+    # Behavior: all-gathers the object over the PP group, identifies the single non-None source,
+    # then broadcast_object_list from it; returns the object.
+    # Exceptions: ValueError if two ranks hold one; AssertionError if none.
     obj_output = [None] * mpu.get_pipeline_model_parallel_world_size()
     torch.distributed.all_gather_object(object_list=obj_output, obj=obj, group=mpu.get_pipeline_model_parallel_group())
 
@@ -1359,6 +1591,19 @@ def default_tp_concat_fn(
     hf_config=None,
     convert_qkv_gate_up_by_simple_split=False,
 ):
+    # [FUNCTION DOC]
+    # Behavior: merges TP-sharded tensors gathered for one parameter into the full inference tensor.
+    # QKV (name contains qkv_layer_name, not layer_norm): uses attention/KV heads (vision config heads
+    # for vision_model names), splits each shard per query group into q, k, v sized by q-per-kv ratio,
+    # concatenates q, k, v across shards and returns fused [q;k;v] or list [q,k,v]. Gate/up (name
+    # contains gate_proj_layer_name, not layer_norm or vision projection): splits each shard in half
+    # and returns fused [gate;up] or list. MoE experts linear_fc2 weight: concatenation along dim 1.
+    # Otherwise concatenates along the parameter's TP partition dim.
+    # Inputs: layer_name_mapping - dict with qkv_layer_name/gate_proj_layer_name; name; train_params -
+    # the local shard (for partition dim); infer_params - list of gathered shards; model_config;
+    # hf_config; convert_qkv_gate_up_by_simple_split.
+    # Outputs: tensor or list of tensors.
+    # Exceptions: AssertionError on head divisibility.
     """
     name: name of the parameter
     train_params: training parameters
@@ -1440,6 +1685,23 @@ def per_tensor_generator(
     layer_name_mapping,
     convert_qkv_gate_up_by_simple_split=True,
 ):
+    # [FUNCTION DOC]
+    # Behavior: generator that streams full (un-sharded) HF-named weights from Megatron chunks on all
+    # ranks. First gathers metadata (pp_rank, vpp idx, index, name) of all parameters plus extra
+    # state-dict keys (e.g. router expert_bias) across PP. Then for each entry in global order: skips
+    # output layer names when embeddings are tied; the owning PP rank pulls the next local tensor and
+    # normalizes its name with the layer offset; name and tensor are broadcast across PP; leading
+    # "module." prefixes are stripped. For expert linear_fc weights with EP > 1: all-gathers over EP,
+    # maps local expert ids to global ids, optionally all-gathers over expert-TP, merges via
+    # default_tp_concat_fn and converts each expert. Otherwise TP-gathers TP params and merges them.
+    # Converts names/tensors via weight_converter.convert_param and yields detached (name, tensor).
+    # Inputs: actor_module - list of chunks; model_config - HF config; weight_converter (with
+    # mcore_config, hf_config, convert_param); transformer_config; layer_name_mapping;
+    # convert_qkv_gate_up_by_simple_split.
+    # Outputs: iterator of (hf_name, tensor).
+    # Side effects: many PP/TP/EP collectives; all ranks must iterate in lockstep.
+    # KNOWN ISSUE: the tied-embedding skip checks for "output_layers" while Megatron names the head
+    # "output_layer", so it likely never matches; extra-key metadata reuses the last parameter index.
     from megatron.core import parallel_state as mpu
 
     pp_rank = mpu.get_pipeline_model_parallel_rank()
@@ -1452,6 +1714,9 @@ def per_tensor_generator(
     all_gather_group_size = torch.distributed.get_world_size(group=all_gather_group)
 
     def tensor_generator():
+        # [FUNCTION DOC]
+        # HELPER: Yields (name, param) for named parameters of each unwrapped chunk, followed by extra
+        # state-dict entries (excluding _extra_state) moved to the device.
         for scan_vpp_idx in range(vpp_size):
             existing_keys = set()
             model = unwrap_model(actor_module[scan_vpp_idx])
@@ -1578,6 +1843,19 @@ def per_tensor_generator(
 
 
 def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerConfig):
+    # [FUNCTION DOC]
+    # Behavior: global index of the first decoder layer for an arbitrary (pipeline_rank, vp_stage).
+    # PP size 1 -> 0. With a custom pipeline layout, delegate to it. With uneven first/last stages:
+    # compute middle layers and stages; with VPP, offset = vp_stage * layers-per-virtual-chunk-sum plus
+    # first-stage chunk size and middle chunk share for ranks > 0; without VPP, middle rank times
+    # per-rank layers plus first-stage layers (rank 0 -> 0). Even split: count embedding/loss as extra
+    # layers when configured; with VPP offset = vp_stage * (num_layers / vp) + rank * per-virtual-rank;
+    # otherwise rank * per-rank; minus one when embedding is counted and the CURRENT process is not
+    # first stage.
+    # Inputs: pipeline_rank; vp_stage; config. Outputs: int.
+    # Exceptions: AssertionError if VPP set without vp_stage.
+    # KNOWN ISSUE: the embedding adjustment queries the current process's stage instead of
+    # pipeline_rank, so offsets for other ranks can be off by one.
     """
     Get the index offset of any pipeline stage, given the level of pipelining.
 
@@ -1723,6 +2001,13 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
 
 
 def register_megatron_training_hooks(model: list[torch.nn.Module], optimizer):
+    # [FUNCTION DOC]
+    # Behavior: for each chunk's config sets grad_scale_func to optimizer.scale_loss and
+    # finalize_model_grads_func. When the first chunk is DDP/FSDP and overlap_grad_reduce is on: sets
+    # no_sync_func (list over chunks or single) and grad_sync_func (start_grad_sync). When overlap
+    # param gather and align_param_gather are on: sets param_sync_func (start_param_sync).
+    # Inputs: model - list of chunks; optimizer - Megatron optimizer.
+    # Exceptions: AssertionError if a custom no_sync_func already exists. Side effects: mutates configs.
     from megatron.core.distributed import finalize_model_grads
     from megatron.core.utils import get_model_config
 
@@ -1761,6 +2046,9 @@ def register_megatron_training_hooks(model: list[torch.nn.Module], optimizer):
 
 
 def mapping_string_to_attn_backend(args: dict) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: converts a string "attention_backend" entry to the AttnBackend enum member in place.
+    # Inputs/Outputs: args dict (returned).
     if "attention_backend" in args and isinstance(args["attention_backend"], str):
         from megatron.core.transformer.enums import AttnBackend
 
@@ -1769,6 +2057,11 @@ def mapping_string_to_attn_backend(args: dict) -> dict:
 
 
 def get_megatron_mtp_loss(n_micro_batch):
+    # [FUNCTION DOC]
+    # Behavior: loss scale 1.0 if the MTP tracker uses global token means (has loss_sums and per-token
+    # loss), else 1/n_micro_batch; calls MTPLossLoggingHelper.track_mtp_metrics into a dict and returns
+    # {"mtp_losses/<key with spaces as underscores>": float}.
+    # Inputs: n_micro_batch. Outputs: dict. Side effects: the tracker may reset its state.
     # Newer MCore tracks raw loss sums and token counts across all microbatches,
     # then computes the weighted mean in track_mtp_metrics. Older versions
     # accumulate one normalized loss per microbatch and still need averaging.
@@ -1796,6 +2089,11 @@ def get_megatron_mtp_loss(n_micro_batch):
 
 
 def get_megatron_module_device(models: list[Any]) -> str:
+    # [FUNCTION DOC]
+    # Behavior: "cpu" for empty input. If the first chunk has no buffers list, returns the device type
+    # of its (inner) first parameter ("cpu" if none). If the first buffer has no param_data, uses the
+    # module params' device. Else "cpu" when param storage is freed, otherwise the accelerator name.
+    # Inputs: models. Outputs: device type string.
     if not models:
         return "cpu"
 
@@ -1821,6 +2119,9 @@ def get_megatron_module_device(models: list[Any]) -> str:
 
 
 def _get_mtp_num_layers(hf_config):
+    # [FUNCTION DOC]
+    # HELPER: Returns the first positive of num_nextn_predict_layers, mtp_num_hidden_layers, or
+    # text_config.mtp_num_hidden_layers; else 0.
     """Get MTP layer count from various config formats.
 
     Supports:
@@ -1838,6 +2139,8 @@ def _get_mtp_num_layers(hf_config):
 
 
 def _set_mtp_num_layers(hf_config, value: int):
+    # [FUNCTION DOC]
+    # HELPER: Sets each of those three fields that exists to value. Side effects: mutates hf_config.
     """Set MTP layer count in the appropriate config field."""
     if hasattr(hf_config, "num_nextn_predict_layers"):
         hf_config.num_nextn_predict_layers = value
@@ -1848,6 +2151,12 @@ def _set_mtp_num_layers(hf_config, value: int):
 
 
 def check_mtp_config(model_config: HFModelConfig, engine_config: McoreEngineConfig):
+    # [FUNCTION DOC]
+    # Behavior: if MTP disabled: zero the HF MTP fields, force override_transformer_config
+    # mtp_num_layers None and remove mtp_loss_scaling_factor. If enabled without MTP layers: raise.
+    # If enabled with layers: set mtp_loss_scaling_factor from model_config.mtp unless already overridden.
+    # Inputs: model_config (hf_config, mtp.enable, mtp.mtp_loss_scaling_factor); engine_config
+    # (override_transformer_config dict). Exceptions: ValueError. Side effects: mutates both configs.
     """
     Check and configure MTP (Multi-Token Prediction) settings.
 
@@ -1882,6 +2191,10 @@ def check_mtp_config(model_config: HFModelConfig, engine_config: McoreEngineConf
 
 
 def patch_engine_mtp(module, model_config):
+    # [FUNCTION DOC]
+    # Behavior: logs a warning, prints the module, and for each module applies postprocess and
+    # checkpointed-forward MTP patches, plus the embedding-detach patch when mtp.detach_encoder.
+    # Inputs: module or list; model_config. Side effects: monkey patches modules; stdout.
     """
     Apply MTP patches to the model module.
 
@@ -1908,6 +2221,11 @@ def patch_engine_mtp(module, model_config):
 
 @torch.no_grad()
 def copy_megatron_model_to_cpu(models):
+    # [FUNCTION DOC]
+    # Behavior (no grad): for DDP chunks stores pinned CPU clones of each buffer's param_data (from GPU,
+    # or from cpu_data if offloaded); for others stores pinned clones per named parameter.
+    # Inputs: models. Outputs: dict "model_chunk_<i>" -> {"buffer_states": nested lists, "is_ddp": True}
+    # or {"model_state": name -> {"data"}, "is_ddp": False}.
     """
     Copy Megatron model parameters to CPU memory (non-destructive copy).
     Unlike offload_megatron_model_to_cpu which moves data, this function creates
@@ -1956,6 +2274,11 @@ def copy_megatron_model_to_cpu(models):
 
 @torch.no_grad()
 def restore_megatron_model_from_cpu(models, cpu_state):
+    # [FUNCTION DOC]
+    # Behavior (no grad): for chunks present in cpu_state with matching DDP-ness, copies saved buffer
+    # data back into GPU param_data (or into cpu_data if currently offloaded), or copies named params.
+    # Mismatched or missing chunks are skipped silently.
+    # Inputs: models; cpu_state from copy_megatron_model_to_cpu. Outputs: none.
     """
     Restore Megatron model parameters from CPU memory back to GPU.
 

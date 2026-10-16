@@ -11,6 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Model construction and loading utilities spanning HuggingFace Transformers and Megatron: config
+# loading/overrides, actor/critic/value-head model creation, parameter counting, random masks and
+# position ids for tests, PEFT target/exclude module matching, Megatron layer-name normalization,
+# Megatron weight loading from HF or dist checkpoints, packed-input padding, auto-class selection,
+# multi-modal input batching, LoRA rank discovery, and a PPO output dataclass.
+# At import, AutoModelForVision2Seq is resolved through transformers_compat (and
+# AutoModelForImageTextToText falls back to the Vision2Seq class when missing).
+# _VARLEN_MULTI_MODAL_KEYS lists multi-modal keys whose last dim varies and must be padded.
+
 """
 Utilities to create common models from huggingface
 """
@@ -60,19 +71,32 @@ _VARLEN_MULTI_MODAL_KEYS = {"input_features", "feature_attention_mask", "mm_toke
 
 
 class LambdaLayer(nn.Module):
+    # [CLASS DOC]
+    # nn.Module wrapping an arbitrary callable so it can be placed inside nn.Sequential.
     def __init__(self, fn):
+        # [FUNCTION DOC]
+        # Inputs: fn - callable. Side effects: stores it.
         super().__init__()
         self.fn = fn
 
     def forward(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Returns fn applied to all positional and keyword args.
         return self.fn(*args, **kwargs)
 
 
 def squeeze(x):
+    # [FUNCTION DOC]
+    # HELPER: Removes the trailing dimension (size 1) of a tensor.
     return torch.squeeze(x, dim=-1)
 
 
 def update_model_config(module_config, override_config_kwargs):
+    # [FUNCTION DOC]
+    # Behavior: recursively applies overrides: dict values recurse into the attribute of the same name,
+    # other values are set as attributes.
+    # Inputs: module_config - HF config; override_config_kwargs - nested mapping.
+    # Exceptions: AttributeError when recursing into a missing attribute. Side effects: mutates config.
     """Update the module config with the override_config_kwargs.
     Args:
         module_config: The module config from Huggingface Transformers.
@@ -86,6 +110,11 @@ def update_model_config(module_config, override_config_kwargs):
 
 
 def get_huggingface_actor_config(model_name: str, override_config_kwargs=None, trust_remote_code=False) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: loads AutoConfig for model_name (optionally trusting remote code) and applies overrides.
+    # Inputs: model_name; override_config_kwargs - dict or None; trust_remote_code.
+    # Outputs: the HF PretrainedConfig (annotated as dict).
+    # Exceptions: AssertionError if overrides are not a dict.
     if override_config_kwargs is None:
         override_config_kwargs = {}
     assert isinstance(override_config_kwargs, dict), (
@@ -101,6 +130,11 @@ def get_generation_config(
     model: str,
     trust_remote_code: bool = False,
 ) -> Optional[GenerationConfig]:
+    # [FUNCTION DOC]
+    # Behavior: tries GenerationConfig.from_pretrained(model); on OSError derives one from the model
+    # config; returns None if that also raises OSError.
+    # Inputs: model - path/name; trust_remote_code (used only for the fallback config).
+    # Outputs: GenerationConfig or None.
     try:
         return GenerationConfig.from_pretrained(model)
     except OSError:  # Not found
@@ -115,6 +149,11 @@ def get_generation_config(
 
 
 def create_huggingface_actor(model_name: str, override_config_kwargs=None, automodel_kwargs=None) -> nn.Module:
+    # [FUNCTION DOC]
+    # Behavior: builds the overridden HF config (trust_remote_code taken from automodel_kwargs) and
+    # instantiates AutoModelForCausalLM from config (random init, no weights) with automodel_kwargs.
+    # Inputs: model_name; override_config_kwargs; automodel_kwargs. Outputs: nn.Module.
+    # Exceptions: AssertionError for non-dict overrides.
     """
 
     Args:
@@ -139,6 +178,11 @@ def create_huggingface_actor(model_name: str, override_config_kwargs=None, autom
 
 
 def create_huggingface_critic(model_name: str, override_config_kwargs=None, automodel_kwargs=None) -> nn.Module:
+    # [FUNCTION DOC]
+    # Behavior: creates an actor model and replaces lm_head with Linear(hidden_size -> 1) in
+    # automodel_kwargs torch_dtype (default fp32) followed by squeezing the last dim, producing
+    # per-token scalar values.
+    # Inputs: same as create_huggingface_actor. Outputs: nn.Module.
     """
 
     Args:
@@ -161,6 +205,11 @@ def create_huggingface_critic(model_name: str, override_config_kwargs=None, auto
 
 
 def get_model_size(model: nn.Module, scale="auto"):
+    # [FUNCTION DOC]
+    # Behavior: counts parameters; with scale "auto" picks "B" (>1e9), "M" (>1e6), "K" (>1e3) or "";
+    # divides accordingly.
+    # Inputs: model; scale in {"auto","B","M","K",""}. Outputs: (scaled count, scale string).
+    # Exceptions: NotImplementedError for other scales.
     n_params = sum(p.numel() for p in model.parameters())
 
     if scale == "auto":
@@ -188,6 +237,8 @@ def get_model_size(model: nn.Module, scale="auto"):
 
 
 def print_model_size(model: nn.Module, name: str = None):
+    # [FUNCTION DOC]
+    # Behavior: prints "<name> contains <n>.<2 decimals><scale> parameters"; name defaults to the class name.
     n_params, scale = get_model_size(model, scale="auto")
     if name is None:
         name = model.__class__.__name__
@@ -200,6 +251,16 @@ def create_random_mask(
     max_ratio_of_left_padding: float,
     min_ratio_of_valid_token: float = 0,
 ):
+    # [FUNCTION DOC]
+    # Behavior: for each row, samples a left-padding length uniformly in [0, max_left_padding] and a
+    # valid length in [max(1, min_ratio*seq), max_ratio*seq], and zeroes positions before the
+    # left padding end and after the valid span (right padding). Uses numpy's global RNG.
+    # Inputs: input_ids (batch, seq); max_ratio_of_valid_token in (0,1]; max_ratio_of_left_padding in
+    # [0,1); min_ratio_of_valid_token.
+    # Outputs: int64 mask shaped like input_ids.
+    # Exceptions: AssertionError on invalid ratios or when max valid + max left padding exceed seq.
+    # KNOWN ISSUE: one assertion compares max_ratio_of_valid_token (a ratio) with sequence_length,
+    # which is always true; it presumably meant max_num_valid_tokens.
     """Create a random mask given input_ids. Support left padding and right padding.
     Process:
     - Sample valid token length
@@ -238,10 +299,19 @@ def create_random_mask(
 
 
 def compute_position_id_with_mask(mask):
+    # [FUNCTION DOC]
+    # Behavior: position ids = cumulative sum of the mask along the last dim minus 1, clipped at 0
+    # (left padding gets 0). Inputs: mask (batch, seq). Outputs: tensor same shape.
     return torch.clip(torch.cumsum(mask, dim=-1) - 1, min=0, max=None)
 
 
 def convert_weight_keys(state_dict: dict[str, torch.Tensor], model: PreTrainedModel):
+    # [FUNCTION DOC]
+    # Behavior: if the model has _checkpoint_conversion_mapping (transformers' key renaming), invert
+    # it and for each state dict key apply the first reverse regex substitution that matches (with
+    # leading "^" and parenthesized groups stripped from replacements); returns a new dict. Otherwise
+    # returns the input dict.
+    # Inputs: state_dict - name to tensor; model - PreTrainedModel. Outputs: dict with original HF keys.
     # convert state dict keys: https://github.com/huggingface/transformers/pull/38385
     if not hasattr(model, "_checkpoint_conversion_mapping"):
         return state_dict
@@ -263,6 +333,10 @@ def convert_weight_keys(state_dict: dict[str, torch.Tensor], model: PreTrainedMo
 
 
 def check_exclude_modules(config, key: str) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: if the config has non-empty exclude_modules: a string is treated as a full-match regex;
+    # otherwise a list matches on exact key or key ending with "." plus an entry.
+    # Inputs: config - PEFT-like config; key - module name. Outputs: bool.
     """
     A helper method to check if the passed module's key name matches any of the exclude modules in the adapter_config.
     Adapted from https://github.com/huggingface/peft/blob/main/src/peft/tuners/tuners_utils.py
@@ -286,6 +360,12 @@ def check_exclude_modules(config, key: str) -> bool:
 
 
 def check_target_modules(config, key: str) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: target_modules string -> full regex match (returns a match object or None); exact key
+    # in list -> True; otherwise suffix match ".<target>" and, when layers_to_transform is set
+    # (non-empty), extracts a layer index after the layers_pattern (any segment if pattern empty) and
+    # requires it to equal / be in layers_to_transform.
+    # Inputs: config; key. Outputs: truthy match / bool.
     """
     A helper method to check if the passed module's key name matches any of the target modules in the adapter_config.
     Adapted from https://github.com/huggingface/peft/blob/main/src/peft/tuners/tuners_utils.py
@@ -337,6 +417,14 @@ def check_target_modules(config, key: str) -> bool:
 
 
 def normalize_model_name(name, pp_rank, vpp_rank, transformer_config, layer_name="layers"):
+    # [FUNCTION DOC]
+    # Behavior: computes the global layer offset for (pp_rank, vpp_rank) via megatron_utils'
+    # get_transformer_layer_offset; if the name contains layer_name, finds the segment equal to
+    # layer_name and adds the offset to the following numeric segment.
+    # Inputs: name; pp_rank; vpp_rank; transformer_config; layer_name. Outputs: normalized name.
+    # Exceptions: AssertionError if the segment after layer_name is missing or not numeric.
+    # KNOWN ISSUE: the substring check may match names where no segment equals layer_name exactly,
+    # in which case the last segment index is used.
     """
     Transform the model name in each model_chunk in each pp stage into the name in inference engine
     """
@@ -361,6 +449,14 @@ def normalize_model_name(name, pp_rank, vpp_rank, transformer_config, layer_name
 
 
 def normalize_pp_vpp_params(params, num_hidden_layers, layer_name="layers"):
+    # [FUNCTION DOC]
+    # Behavior: generator intended to yield (global_name, param) for nested per-PP, per-VPP named
+    # parameter dicts.
+    # Inputs: params - list (pp) of lists (vpp) of name->param dicts; num_hidden_layers; layer_name.
+    # Outputs: iterator of (name, param).
+    # KNOWN ISSUE: calls normalize_model_name with seven positional arguments (pp_size, vpp_size,
+    # num_hidden_layers) while it accepts (name, pp_rank, vpp_rank, transformer_config), so it raises
+    # TypeError when iterated.
     """
     Normalize the pp vpp params into a complete named parameters.
     This is useful when gather parameters from pp ranks and passed to a model without pp
@@ -384,6 +480,12 @@ def normalize_pp_vpp_params(params, num_hidden_layers, layer_name="layers"):
 def get_parallel_model_from_config(
     config, megatron_config, pre_process=None, post_process=None, share_embeddings_and_output_weights=False, value=False
 ):
+    # [FUNCTION DOC]
+    # Behavior: resolves a verl Megatron model class for the HF config's architectures (actor or
+    # value variant) and instantiates it with config, megatron_config and pipeline flags.
+    # Inputs: config - HF config; megatron_config - ModelParallelConfig; pre_process; post_process;
+    # share_embeddings_and_output_weights; value. Outputs: model instance.
+    # Exceptions: AssertionError for wrong megatron_config type; ValueError for unsupported archs.
     from megatron.core import ModelParallelConfig
 
     assert isinstance(megatron_config, ModelParallelConfig)
@@ -400,6 +502,9 @@ def get_parallel_model_from_config(
 
 
 def _get_parallel_model_architecture_from_config(config: PretrainedConfig, value=False) -> type[nn.Module]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the first ModelRegistry class found for config.architectures (prints a debug line
+    # each attempt). Exceptions: ValueError listing supported architectures if none match.
     architectures = getattr(config, "architectures", [])
     for arch in architectures:
         model_cls = ModelRegistry.load_model_cls(arch, value)
@@ -413,6 +518,17 @@ def _get_parallel_model_architecture_from_config(config: PretrainedConfig, value
 
 
 def _load_hf_model(config, model_config, is_value_model):
+    # [FUNCTION DOC]
+    # HELPER: Loads the HF checkpoint for Megatron weight conversion. Resolves the auto class, copies
+    # an hdfs: path locally (optionally via shm), and on the global rank of (tp0, dp0, pp0, current cp)
+    # loads real weights on CPU while other ranks build under init_empty_weights (meta tensors), with
+    # warnings suppressed. A path containing "mistral7b-rm" loads MistralForSequenceClassification,
+    # maps score.weight to lm_head.weight, truncates embeddings to 32000 rows, and forces
+    # is_value_model True.
+    # Inputs: config - with model.path (and optional use_shm); model_config - HF config with
+    # architectures; is_value_model.
+    # Outputs: (architectures, model, state_dict, is_value_model).
+    # Exceptions: AssertionError without architectures. Side effects: downloads, prints.
     """Helper function containing the loading hf model logic"""
     from accelerate import init_empty_weights
     from megatron.core import parallel_state as mpu
@@ -467,6 +583,9 @@ def _load_hf_model(config, model_config, is_value_model):
 
 
 def get_hf_model_path(config):
+    # [FUNCTION DOC]
+    # Behavior: returns a local copy path for hdfs: model paths (copy_to_local, optional shm), else
+    # config.model.path. Side effects: may download.
     if config.model.path.startswith("hdfs:"):
         from verl.utils.fs import copy_to_local
 
@@ -477,6 +596,11 @@ def get_hf_model_path(config):
 
 
 def load_megatron_model_weights(config, model_config, parallel_model, params_dtype, is_value_model=False):
+    # [FUNCTION DOC]
+    # Behavior: loads HF weights via _load_hf_model and, for each architecture, calls the registered
+    # verl weight loader to distribute state_dict into the wrapped parallel models.
+    # Inputs: config; model_config; parallel_model - wrapped Megatron models; params_dtype;
+    # is_value_model. Outputs: the HF model config. Side effects: prints; mutates model params.
     """Load weights for verl customized model."""
     architectures, model, state_dict, is_value_model = _load_hf_model(config, model_config, is_value_model)
 
@@ -498,6 +622,10 @@ def load_megatron_model_weights(config, model_config, parallel_model, params_dty
 
 
 def load_megatron_gptmodel_weights(config, model_config, parallel_model, params_dtype, is_value_model=False):
+    # [FUNCTION DOC]
+    # Behavior: loads HF weights and calls load_state_dict_to_megatron_gptmodel for mcore GPTModel,
+    # then deletes the state dict and HF model.
+    # Inputs: as load_megatron_model_weights. Outputs: none. Side effects: mutates model params.
     """Load weights for mcore GPT model."""
     _, model, state_dict, is_value_model = _load_hf_model(config, model_config, is_value_model)
 
@@ -515,6 +643,14 @@ def load_megatron_gptmodel_weights(config, model_config, parallel_model, params_
 
 # pad input_ids_rmpad, cu_seqlens and max_seqlen_in_batch to be divisible by tp
 def pad_packed_inputs(unpad_tokens: torch.Tensor, cu_seqlens, max_seqlen_in_batch, size):
+    # [FUNCTION DOC]
+    # Behavior: pads packed tokens along dim 0 to a multiple of size (1-D or 2-D); when padding,
+    # appends a fake sequence of length pad_size to cu_seqlens and raises max_seqlen_in_batch to at
+    # least pad_size.
+    # Inputs: unpad_tokens (total_nnz, ...); cu_seqlens (num_seqs + 1,); max_seqlen_in_batch; size.
+    # Outputs: (tokens, cu_seqlens, max_seqlen_in_batch).
+    # Exceptions: NotImplementedError intended for ndim > 2.
+    # KNOWN ISSUE: the error message calls ndim() on an int, raising TypeError instead.
     """pad the tokens such that the total length is a multiple of size.
     This function is useful when applying sequence parallel and context parallel
 
@@ -548,6 +684,11 @@ def pad_packed_inputs(unpad_tokens: torch.Tensor, cu_seqlens, max_seqlen_in_batc
 
 
 def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=False, prefix=""):
+    # [FUNCTION DOC]
+    # Behavior: for each model chunk, builds its sharded state dict with prefix, drops output_layer
+    # keys for value models, and loads from the dist checkpoint with ASSUME_OK_UNEXPECTED strictness.
+    # Inputs: parallel_model - list of chunks; dist_weight_path; is_value_model; prefix.
+    # Outputs: none. Side effects: loads weights into the models in place.
     from megatron.core import dist_checkpointing
     from megatron.core.dist_checkpointing.serialization import StrictHandling
 
@@ -569,6 +710,14 @@ def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=Fal
 def get_parallel_gptmodel_from_config(
     tfconfig, hf_config, pre_process=None, post_process=None, share_embeddings_and_output_weights=False, value=False
 ):
+    # [FUNCTION DOC]
+    # Behavior: builds an mcore GPTModel with Transformer Engine decoder block spec, RoPE (base from
+    # HF config), vocab and max positions from the HF config, and linear rope scaling factor if
+    # present. For value models on the last stage, replaces output_layer with a 1-output
+    # LinearForLastLayer.
+    # Inputs: tfconfig - TransformerConfig; hf_config; pre_process; post_process;
+    # share_embeddings_and_output_weights; value. Outputs: GPTModel.
+    # Exceptions: AssertionError if normalization is not RMSNorm or rope scaling type is not linear.
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -605,6 +754,12 @@ def get_parallel_gptmodel_from_config(
 
 
 def patch_valuehead_model(model) -> None:
+    # [FUNCTION DOC]
+    # Behavior: patches a TRL AutoModelForCausalLMWithValueHead so it behaves like a PreTrainedModel:
+    # marks pretrained_model params to ignore on save, binds tie_weights / get_input_embeddings /
+    # get_output_embeddings delegating to the wrapped model, can_generate returning False, and copies
+    # _no_split_modules.
+    # Inputs: model. Side effects: mutates the model. Exceptions: ImportError without trl.
     from types import MethodType
 
     from transformers import PreTrainedModel
@@ -615,18 +770,26 @@ def patch_valuehead_model(model) -> None:
         from trl import AutoModelForCausalLMWithValueHead  # type: ignore
 
     def tie_weights(self: "AutoModelForCausalLMWithValueHead") -> None:
+        # [FUNCTION DOC]
+        # HELPER: Ties weights of the wrapped pretrained model if it is a PreTrainedModel.
         if isinstance(self.pretrained_model, PreTrainedModel):
             self.pretrained_model.tie_weights()
 
     def get_input_embeddings(self: "AutoModelForCausalLMWithValueHead") -> torch.nn.Module:
+        # [FUNCTION DOC]
+        # HELPER: Returns the wrapped model's input embeddings (None if not a PreTrainedModel).
         if isinstance(self.pretrained_model, PreTrainedModel):
             return self.pretrained_model.get_input_embeddings()
 
     def get_output_embeddings(self: "AutoModelForCausalLMWithValueHead") -> torch.nn.Module:
+        # [FUNCTION DOC]
+        # HELPER: Returns the wrapped model's output embeddings (None if not a PreTrainedModel).
         if isinstance(self.pretrained_model, PreTrainedModel):
             return self.pretrained_model.get_output_embeddings()
 
     def can_generate(self):
+        # [FUNCTION DOC]
+        # HELPER: Always returns False.
         return False
 
     ignore_modules = [name for name, _ in model.named_parameters() if "pretrained_model" in name]
@@ -639,6 +802,14 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
+    # [FUNCTION DOC]
+    # Behavior: first tries AutoModelForTokenClassification (flash-attention-2) as a value model.
+    # On any failure (BaseException) requires trl; loads the base model as Vision2Seq (if the config
+    # type is mapped) or CausalLM, sets config.hidden_size from text_config for VLMs, wraps with TRL
+    # AutoModelForCausalLMWithValueHead and patches it.
+    # Inputs: local_path; torch_dtype; model_config; trust_remote_code. Outputs: model.
+    # Exceptions: RuntimeError (chained) if loading fails and trl is unavailable.
+    # KNOWN ISSUE: catching BaseException also swallows KeyboardInterrupt/SystemExit from the first load.
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification
 
     try:
@@ -691,6 +862,13 @@ _architecture_to_auto_class = {
 
 
 def get_hf_auto_model_class(hf_config):
+    # [FUNCTION DOC]
+    # Behavior: if config.auto_map references architectures[0] (remote code), pick the auto class by
+    # its key (Vision2Seq, CausalLM, ImageTextToText, else AutoModel). Otherwise AutoModel by default,
+    # AutoModelForImageTextToText if the config type is mapped there, else the first auto class whose
+    # suffix key (ForCausalLM, ForVision2Seq, ForTokenClassification, ForSequenceClassification) is
+    # contained in architectures[0].
+    # Inputs: hf_config. Outputs: auto model class.
     has_remote_code = hasattr(hf_config, "auto_map") and any(
         hf_config.architectures[0] in val for val in hf_config.auto_map.values()
     )
@@ -720,10 +898,17 @@ def get_hf_auto_model_class(hf_config):
 
 
 def _pad_last_dim_and_cat(values: list[torch.Tensor], key: str) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Concatenates tensors along dim 0 after right-padding their last dim with zeros to the
+    # max length. Requires rank >= 2 and identical middle dims.
+    # Inputs: values - list of tensors; key - name for errors. Outputs: concatenated tensor.
+    # Exceptions: ValueError for empty input; RuntimeError for low rank or mismatched shapes.
     if not values:
         raise ValueError(f"Cannot merge empty multi-modal input list for key {key!r}.")
 
     def _format_tensor_shapes(values: list[torch.Tensor]) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Comma-joined string of tensor shape tuples for error messages.
         return ", ".join(str(tuple(value.shape)) for value in values)
 
     rank = values[0].dim()
@@ -760,6 +945,14 @@ def extract_multi_modal_inputs(
     batch_data: list[dict[str, torch.Tensor]],
     indices: Optional[list[int]] = None,
 ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+    # [FUNCTION DOC]
+    # Behavior: optionally selects entries by indices (ignoring out-of-range ones); unwraps
+    # NonTensorData; skips None entries; collects non-None values per key. If any entry had
+    # "image_bound" (MiniCPM-o), every key keeps its raw list; variable-length keys are padded on the
+    # last dim and concatenated; other keys are concatenated along dim 0.
+    # Inputs: batch_data - list of mappings (or NonTensorData); indices - optional list.
+    # Outputs: dict key -> tensor (or list for image_bound batches).
+    # Exceptions: RuntimeError with shapes on concatenation failure; errors from padding helper.
     """
     Extract and process multi-modal inputs from a batch.
 
@@ -810,6 +1003,11 @@ def extract_multi_modal_inputs(
 
 
 def get_lora_rank_from_adapter(adapter_path: str | os.PathLike) -> int:
+    # [FUNCTION DOC]
+    # Behavior: resolves user/absolute path, reads adapter_config.json and returns int(r).
+    # Inputs: adapter_path. Outputs: int.
+    # Exceptions: FileNotFoundError for missing dir/file; ValueError for invalid JSON, missing "r" or
+    # non-integer rank.
     """
     Extract LoRA rank from adapter configuration file.
 
@@ -846,5 +1044,8 @@ def get_lora_rank_from_adapter(adapter_path: str | os.PathLike) -> int:
 
 @dataclass
 class CausalLMOutputForPPO(CausalLMOutputWithPast):
+    # [CLASS DOC]
+    # Dataclass extending CausalLMOutputWithPast with optional log_probs and entropy tensors returned by
+    # fused PPO forward paths.
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None

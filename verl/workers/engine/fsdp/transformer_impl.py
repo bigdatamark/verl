@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Concrete FSDP engines: FSDPEngine (model build with HF/value-head models, LoRA, QAT, FSDP1 or FSDP2 wrapping, Ulysses sequence parallelism, offload, checkpointing, weight export incl. sharded/delta export) plus its train/eval contexts, and the registered FSDPEngineWithLMHead / value-head variants that implement micro-batch forward with remove-padding, temperature scaling, log-prob and entropy computation.
+# Module state: device_name is resolved once at import.
 """
 The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
@@ -90,12 +94,16 @@ device_name = get_device_name()
 
 
 def _is_scalar_unit_temperature(temperature) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns true only when temperature is a host (non-tensor) value equal to 1.0.
     """Return whether a host scalar temperature makes scaling a no-op."""
 
     return not isinstance(temperature, torch.Tensor) and float(temperature) == 1.0
 
 
 def _scale_logits_by_temperature(logits, temperature, *, is_unit_temperature: bool):
+    # [FUNCTION DOC]
+    # HELPER: Returns logits unchanged when is_unit_temperature, else logits divided by temperature clamped to at least 1e-8 (cast to logits dtype).
     """Scale logits without copying the full vocabulary tensor for temperature 1."""
 
     if is_unit_temperature:
@@ -104,6 +112,8 @@ def _scale_logits_by_temperature(logits, temperature, *, is_unit_temperature: bo
 
 
 class FSDPEngine(BaseEngine):
+    # [CLASS DOC]
+    # FSDP-based engine. Key attributes: configs, mode, rank, use_remove_padding, device_mesh, ulysses_device_mesh/parallel group/size, use_ulysses_sp, offload flags, _is_lora, _uses_fsdp2_cpu_offload_policy, _autocast_dtype, scaler, QAT config/flag, compute_entropy_from_logits, pad_to_length(_bucket); after initialize: module, optimizer, lr_scheduler, checkpoint_manager.
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
 
@@ -117,6 +127,10 @@ class FSDPEngine(BaseEngine):
         optimizer_config: FSDPOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
+        # [FUNCTION DOC]
+        # Stores configs, applies NPU patches, validates Ulysses requires remove-padding, initializes device meshes, optional full determinism, offload/LoRA/QAT flags, mixed-precision defaults (bf16 autocast, no scaler), entropy function (chunked or not, optionally torch.compiled) and pad-to-length settings.
+        # Exceptions: ValueError when ulysses_sequence_parallel_size above 1 without use_remove_padding.
+        # Side effects: global patches, process groups, logging.
         """
         Initialize the FSDPEngine.
 
@@ -191,13 +205,19 @@ class FSDPEngine(BaseEngine):
 
     @property
     def is_param_offload_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns the param offload flag (may be forced false when FSDP CPU offload is used).
         return self._is_offload_param
 
     @property
     def is_optimizer_offload_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns the optimizer offload flag (may be forced false when FSDP CPU offload is used).
         return self._is_offload_optimizer
 
     def is_mp_src_rank_with_outputs(self):
+        # [FUNCTION DOC]
+        # Returns true for Ulysses SP local rank 0 when SP is enabled, otherwise true.
         if self.ulysses_device_mesh is not None:
             is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
         else:
@@ -205,6 +225,8 @@ class FSDPEngine(BaseEngine):
         return is_collect
 
     def initialize(self):
+        # [FUNCTION DOC]
+        # Builds model/optimizer/scheduler, creates the FSDPCheckpointManager (with the model processor), then offloads model/optimizer/grad to CPU per offload flags.
         """
         Build the model, optimizer, and learning rate scheduler under FSDP.
 
@@ -233,6 +255,9 @@ class FSDPEngine(BaseEngine):
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
     def _init_device_mesh(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates the FSDP device mesh (via fsdp_size) and, if Ulysses size above 1, a 2D (dp, sp) mesh with dp = data-parallel size, storing the sp process group; sets use_ulysses_sp.
+        # Side effects: process group creation.
         world_size = torch.distributed.get_world_size()
         from torch.distributed.device_mesh import init_device_mesh
 
@@ -252,6 +277,12 @@ class FSDPEngine(BaseEngine):
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
     def _build_module(self):
+        # [FUNCTION DOC]
+        # HELPER: Loads the unwrapped HF module.
+        # Behavior: dtype is model_dtype, or fp32 when training and bf16 when forward_only if unset. Under the init-weight context (meta tensors unless word embeddings are tied) with warnings suppressed: for language models loads with the HF auto class and deletes sub-modules listed in _verl_strip_modules; for value models sets num_labels 1 and zero dropouts on the HF config and loads a value-head model. Applies Liger kernels (no fused linear CE, swiglu on) if configured, applies verl's monkey patch (remove-padding, Ulysses, fused kernels backend), casts to dtype and enables non-reentrant gradient checkpointing if configured.
+        # Outputs: module.
+        # Exceptions: AssertionError for unsupported model_type.
+        # Side effects: mutates hf_config; reads weights from disk.
         from verl.utils.model import get_hf_auto_model_class
         from verl.utils.torch_dtypes import PrecisionType
 
@@ -337,6 +368,11 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _build_lora_module(self, module):
+        # [FUNCTION DOC]
+        # HELPER: Wraps the module with LoRA.
+        # Behavior: enables input grads; if lora_adapter_path is set, copies it locally and loads a trainable PeftModel, coercing a string task_type to CAUSAL_LM; otherwise builds a LoraConfig (causal LM, rank, alpha, target modules/parameters, exclude modules, no bias), applies it, and casts trainable params to the frozen base dtype when they differ.
+        # Outputs: the PEFT-wrapped module.
+        # Side effects: prints/logs; may copy files.
         module.enable_input_require_grads()
 
         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
@@ -383,6 +419,11 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _build_fsdp_module(self, module):
+        # [FUNCTION DOC]
+        # HELPER: Wraps the module with FSDP1 or FSDP2.
+        # Behavior: mixed-precision dtypes from config (defaults bf16 params, fp32 reduce/buffers); sets _autocast_dtype to param dtype and creates a ShardedGradScaler (growth interval 400) only for fp16. Strategy "fsdp": FSDP1 with wrap policy, sharding strategy per mesh and reshard_after_forward, sync_module_states, forward_prefetch, use_orig_params; forward_only uses CPUOffload of params and disables manual offload flags. Strategy "fsdp2": MixedPrecisionPolicy with cast_forward_inputs; pinned CPUOffloadPolicy when offload_policy or forward_only (disables manual offload, sets fsdp2-policy flag); applies fully_shard and loads the full state dict captured before sharding. Optionally enables activation offloading. For FSDP1 sets FULL state-dict type with one process, SHARDED otherwise.
+        # Outputs: wrapped module.
+        # Exceptions: NotImplementedError for unknown strategy; AssertionError if FSDP2 is unavailable.
         # TODO(ziheng): need to improve
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
 
@@ -494,6 +535,8 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _build_optimizer(self, module):
+        # [FUNCTION DOC]
+        # HELPER: Builds the optimizer over module parameters using verl's build_optimizer and the optimizer config.
         from verl.workers.config.optimizer import build_optimizer
 
         optimizer = build_optimizer(module.parameters(), self.optimizer_config)
@@ -501,6 +544,9 @@ class FSDPEngine(BaseEngine):
         return optimizer
 
     def _build_lr_scheduler(self, optimizer):
+        # [FUNCTION DOC]
+        # HELPER: Builds a constant or cosine LR schedule with warmup (warmup steps from ratio when lr_warmup_steps non-positive; cosine uses min_lr_ratio, num_cycles, zero_indexed_step). Prints totals on rank 0.
+        # Exceptions: NotImplementedError for other scheduler types.
         from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
         optim_config = self.optimizer_config
@@ -534,6 +580,8 @@ class FSDPEngine(BaseEngine):
         return lr_scheduler
 
     def _apply_qat(self, module):
+        # [FUNCTION DOC]
+        # HELPER: Applies QAT fake-quantization to the module (enable, mode, group_size, ignore patterns, activation observer), enables QAT fusion, and for mode "w4a4" restores input scales from the checkpoint. Returns the module.
         """Apply QAT transformations to the model before FSDP wrapping."""
         from verl.utils.qat.core import apply_qat, enable_qat_fuse
 
@@ -555,6 +603,12 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _restore_w4a4_input_scales(self, model, model_path):
+        # [FUNCTION DOC]
+        # HELPER: Restores W4A4 activation quantization scales from safetensors files.
+        # Behavior: scans model_path for model*.safetensors; for each key containing "input_global_scale", resolves the owning submodule by walking dotted path parts (integer parts index containers), fills its input_global_scale with the scalar (or max) of the stored tensor, and fills input_amax likewise from the matching "<module>.input_amax" key; logs the count.
+        # Inputs: model - module tree; model_path - local directory.
+        # Exceptions: propagates errors if a module path or the amax key is missing.
+        # Side effects: in-place buffer fills; file reads.
         """Restore input_global_scale and input_amax from checkpoint for W4A4 mode."""
         import glob
 
@@ -586,6 +640,10 @@ class FSDPEngine(BaseEngine):
         logger.info(f"[QAT W4A4] Restored {loaded_count} input_global_scale/input_amax from {model_path}")
 
     def _build_model_optimizer(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds module, optimizer and scheduler.
+        # Behavior: builds the HF module; records pass_packed_cu_seqlens = whether the module's forward accepts a cu_seqlens parameter (false if signature inspection fails); applies LoRA if enabled; applies QAT when enabled and training; barriers; prints model size on rank 0; wraps with FSDP; builds optimizer and scheduler unless forward_only (then both None). Stores module, optimizer, lr_scheduler on self.
+        # Side effects: barrier collective, logging.
         from verl.utils.model import print_model_size
 
         # Load base model with specified configuration and dtype
@@ -627,6 +685,8 @@ class FSDPEngine(BaseEngine):
         self.lr_scheduler = lr_scheduler
 
     def train_mode(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns an EngineTrainModeCtx for this engine (kwargs forwarded).
         """
         Return a context manager that switches to training mode with FSDP-specific handling.
 
@@ -635,6 +695,8 @@ class FSDPEngine(BaseEngine):
         return EngineTrainModeCtx(self, **kwargs)
 
     def eval_mode(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns an EngineEvalModeCtx for this engine (kwargs forwarded).
         """
         Return a context manager that switches to evaluation mode with FSDP-specific handling.
 
@@ -643,27 +705,39 @@ class FSDPEngine(BaseEngine):
         return EngineEvalModeCtx(self, **kwargs)
 
     def get_data_parallel_rank(self):
+        # [FUNCTION DOC]
+        # Returns the "dp" local rank of the Ulysses mesh when SP is enabled, else the global rank.
         if self.ulysses_device_mesh is not None:
             return self.ulysses_device_mesh["dp"].get_local_rank()
         else:
             return torch.distributed.get_rank()
 
     def get_data_parallel_size(self):
+        # [FUNCTION DOC]
+        # Returns world size divided by the Ulysses SP size.
         return torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
 
     def get_data_parallel_group(self):
+        # [FUNCTION DOC]
+        # Returns the Ulysses mesh "dp" group when SP is enabled, else WORLD.
         if self.ulysses_device_mesh is not None:
             return self.ulysses_device_mesh.get_group(mesh_dim="dp")
         else:
             return torch.distributed.group.WORLD
 
     def get_model_parallel_group(self):
+        # [FUNCTION DOC]
+        # Not supported for FSDP; raises NotImplementedError.
         raise NotImplementedError
 
     def get_context_parallel_group(self):
+        # [FUNCTION DOC]
+        # Not supported for FSDP; raises NotImplementedError.
         raise NotImplementedError
 
     def _get_packed_pad_size(self, packed_length: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Returns how many tokens of right padding bring packed_length up to the next multiple of pad_to_length_bucket; 0 when pad_to_length is disabled.
         """Right-padding that rounds a packed micro-batch up to the next bucket boundary.
 
         ``rearrange_micro_batches`` derives the *number* of micro-batches from the token budget but
@@ -678,6 +752,8 @@ class FSDPEngine(BaseEngine):
         return ceildiv(packed_length, bucket) * bucket - packed_length
 
     def _gather_and_unpad_packed(self, tensor: torch.Tensor, pad_size: int) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Under Ulysses SP all-gathers dim-0 shards and removes pad_size tail elements; otherwise slices off the last pad_size elements (no-op when 0). Returns the unpadded tensor.
         """Strip what ``prepare_model_inputs`` appended to the packed sequence.
 
         Under Ulysses SP the per-rank shards are all-gathered back into the global packed
@@ -690,6 +766,11 @@ class FSDPEngine(BaseEngine):
 
     @contextmanager
     def _gradient_sync_context(self, *, is_last_micro_batch: bool):
+        # [FUNCTION DOC]
+        # HELPER: Context manager that suppresses FSDP gradient synchronization on non-final micro-batches.
+        # Behavior: if the micro-batch is last or use_no_sync_for_gradient_accumulation (default true) is false, does nothing. Otherwise uses no_sync for FSDP1, or disables requires-gradient-sync for FSDP2 and re-enables it on exit (even on error); other modules do nothing.
+        # Inputs: is_last_micro_batch - keyword bool.
+        # Side effects: toggles module sync state; retains unsharded grads.
         """Skip FSDP gradient communication on non-final accumulation steps.
 
         During gradient accumulation the optimizer only steps after the final
@@ -722,6 +803,12 @@ class FSDPEngine(BaseEngine):
             yield
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
+        # [FUNCTION DOC]
+        # Runs forward (and backward) over all micro-batches of a batch.
+        # Behavior: records sp_size; reads return_model_output (default false); all-reduces loss-mask token count across DP and stores it and dp_size as non-tensor data; splits into micro-batches (same count across DP); for each micro-batch, under no-grad (forward_only), the gradient-sync context (training) and a profiler range named "micro_batch<i>", calls forward_step; when training backpropagates (scaled by the grad scaler if present) and drops model_output from the meta info unless return_model_output. Collects outputs and post-processes them back to original order.
+        # Inputs: data - TensorDict with loss_mask; loss_function; forward_only.
+        # Outputs: post-processed output dict.
+        # Side effects: collectives, gradient accumulation, mutation of data.
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
         return_model_output = tu.get_non_tensor_data(data=data, key="return_model_output", default=False)
@@ -777,15 +864,24 @@ class FSDPEngine(BaseEngine):
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        # [FUNCTION DOC]
+        # Abstract per-micro-batch forward; raises NotImplementedError.
         raise NotImplementedError("forward_step must be implemented in subclass")
 
     def optimizer_zero_grad(self):
+        # [FUNCTION DOC]
+        # Zeroes optimizer gradients.
         """
         Zero gradients and enforce FSDP grad-clipping logic.
         """
         self.optimizer.zero_grad()
 
     def optimizer_step(self):
+        # [FUNCTION DOC]
+        # Clips gradients and steps the optimizer.
+        # Behavior: unscales with the grad scaler if present; clips via FSDP1 clip_grad_norm_, FSDP2 clip helper, or plain torch clipping; materializes DTensor norms; with a scaler steps/updates through it, otherwise skips the step and zeroes grads (with a printed warning) when the norm is non-finite; invalidates QAT scales when QAT is on.
+        # Outputs: grad norm as float.
+        # Exceptions: AssertionError if clip_grad is None.
         """
         Clip gradients, skip update if non-finite, and step optimizer.
 
@@ -834,6 +930,8 @@ class FSDPEngine(BaseEngine):
         return grad_norm.item()
 
     def lr_scheduler_step(self):
+        # [FUNCTION DOC]
+        # Steps the LR scheduler and returns the first group's last LR.
         """
         Advance FSDP scheduler and return updated learning rate.
         """
@@ -842,6 +940,10 @@ class FSDPEngine(BaseEngine):
         return lr
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+        # [FUNCTION DOC]
+        # Moves FSDP model and/or optimizer between CPU and accelerator regardless of offload config.
+        # Behavior: base validation; no-op when forward_only; for the accelerator loads model and optimizer state; for "cpu" offloads them. grad has no separate effect.
+        # Exceptions: AssertionError for other devices.
         """
         Move FSDP model and/or optimizer to CPU or GPU with offload support.
         Note that this function executes irrespective of offload config. It serves as manual control
@@ -876,6 +978,9 @@ class FSDPEngine(BaseEngine):
         max_ckpt_to_keep: Optional[int] = None,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC]
+        # Saves a checkpoint through FSDPCheckpointManager.
+        # Behavior: loads params to GPU first if param offload is on or they are on CPU, unless the FSDP2 CPU offload policy manages placement; saves (with hdfs upload, step and retention passed through); barriers; offloads again if param offload is on.
         """
         Save FSDP checkpoint, handling parameter offload as needed.
         """
@@ -896,6 +1001,9 @@ class FSDPEngine(BaseEngine):
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
     ) -> None:
+        # [FUNCTION DOC]
+        # Loads a checkpoint through FSDPCheckpointManager (loading params to GPU first when offloaded), barriers, then re-offloads params and optimizer per offload flags.
+        # Inputs: local_path, hdfs_path, del_local_after_load passed to the manager.
         """
         Load FSDP checkpoint, restoring parameters and optimizer state.
         """
@@ -916,6 +1024,10 @@ class FSDPEngine(BaseEngine):
             offload_fsdp_optimizer(self.optimizer)
 
     def get_per_tensor_param_shard(self, **kwargs):
+        # [FUNCTION DOC]
+        # Exports local shards for sharded/delta weight sync.
+        # Behavior: for FSDP1 (unless the FSDP2 policy flag is set) loads params to GPU before the state dict and re-offloads after; takes the state dict with HF key conversion; returns a generator that for each param builds a ShardSpec from the (DTensor) param, moves it to the device, casts floating tensors to bf16, takes the local shard and yields (name, flattened local shard, spec); PEFT config None.
+        # KNOWN ISSUE: docstring says non-LoRA only but nothing enforces that.
         """Like :meth:`get_per_tensor_param`, but yields each rank's *local* FSDP shard
         ``(name, local_flat_shard_bf16, ShardSpec)`` instead of all-gathering the full
         tensor. Pure DTensor export, no side effects -- delta bookkeeping lives in
@@ -937,6 +1049,8 @@ class FSDPEngine(BaseEngine):
         from ..spec import ShardSpec
 
         def _gen():
+            # [FUNCTION DOC]
+            # HELPER: Generator yielding (name, flat bf16 local shard on device, ShardSpec) for each state-dict entry.
             for name, param in params.items():
                 spec = ShardSpec.from_param(param)
                 p = param.to(device, non_blocking=True)
@@ -948,6 +1062,9 @@ class FSDPEngine(BaseEngine):
         return _gen(), None
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
+        # [FUNCTION DOC]
+        # HELPER: Builds a per-param HF delta entry for identity (non-converter) params via the shared identity helper.
+        # Exceptions: NotImplementedError if the spec carries a to_hf_chunk converter.
         """Per-param HF delta entry builder: this engine handles DTensor identity
         params only (weight name == HF name, coordinates translate). EP/converter
         specs are the veomni engine's business -- it overrides this hook."""
@@ -961,6 +1078,9 @@ class FSDPEngine(BaseEngine):
         return _hf_entry_identity(name, spec, place, lidx, lval)
 
     def get_per_tensor_param_delta_shard(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns (generator of HF-coordinate delta entries, None) by feeding the shard export, the snapshot mapping (created if absent) and _hf_delta_entry into the shared hf_delta_export helper. Requires prior prime_delta_snapshots.
+        # Side effects: the export updates snapshots as it diffs.
         """Yield the delta engine's steady payloads -- FINAL HF-coordinate entries
         ``(slots, dtype_str, counts, hf_idx, hf_val, gather_group)`` per parameter.
         Weight->HF naming, to-HF conversion, diff and snapshot are all backend
@@ -975,6 +1095,11 @@ class FSDPEngine(BaseEngine):
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+        # [FUNCTION DOC]
+        # Exports full (HF-named) weights for rollout synchronization.
+        # Behavior: loads params to GPU unless the FSDP2 CPU offload policy is active or staging is skippable (FSDP2 without PEFT). For LoRA models: without merging, collects LoRA params (optionally layered summon / adapters only when base_sync_done) and, if base not yet synced, renames LoRA wrapper keys; peft_config is the "default" config; with merge enabled, returns the merged-LoRA generator immediately. Non-LoRA uses the state dict. Converts keys to HF naming, offloads if param offload is on and staging was done. If LoRA with base_sync_done, yields entries as-is; otherwise lazily moves DTensors to device and gathers full tensors, then unfuses packed MoE params. With QAT, wraps the stream with a QATQuantizer (mode, group size, param dtype, ignore patterns) that quantizes weights for rollout.
+        # Inputs: layered_summon, base_sync_done - LoRA export controls.
+        # Outputs: (generator of (name, tensor), peft_config or None).
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
@@ -1061,6 +1186,10 @@ class FSDPEngine(BaseEngine):
         return per_tensor_param, peft_config_dict
 
     def _merged_lora_per_tensor_param(self):
+        # [FUNCTION DOC]
+        # HELPER: Generator streaming merged base-plus-LoRA weights for rollout sync.
+        # Behavior: inside a merged-LoRA context (adapters backed up), normalizes PEFT param names in the state dict, converts keys to HF naming and, for each entry, yields the name with either the gathered full DTensor cast to bf16 on device, or a detached clone of a plain tensor. The context stays open until the consumer finishes, so yielded tensors carry the merge. On completion or abandonment (finally) offloads params to CPU if param offload is on.
+        # Side effects: temporarily mutates module weights (restored on context exit); collectives during full_tensor.
         """Stream merged (base + LoRA) weights for rollout weight sync.
 
         ``state_dict()`` returns tensors that alias the live FSDP parameter
@@ -1092,14 +1221,22 @@ class FSDPEngine(BaseEngine):
             log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
     def disable_adapter(self) -> ContextManager:
+        # [FUNCTION DOC]
+        # Returns the wrapped module's disable_adapter context (requires a PEFT model).
         return self.module.disable_adapter()
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
+    # [CLASS DOC]
+    # Eval-mode context for FSDP engines: installs the engine's Ulysses SP group globally and calls module.eval() on entry; restores the previous SP group and reshards the root FSDP module on exit.
     def __init__(self, engine: FSDPEngine, **kwargs):
+        # [FUNCTION DOC]
+        # Creates the context in "eval" mode; kwargs forwarded to BaseEngineCtx.
         super().__init__(engine=engine, mode="eval", **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Asserts the engine type, runs base entry (loads offloaded state), saves the current Ulysses SP group and sets the engine's group, then puts the module in eval mode.
         assert isinstance(self.engine, FSDPEngine)
         super().__enter__()
         self.prev_sp_group = get_ulysses_sequence_parallel_group()
@@ -1107,6 +1244,9 @@ class EngineEvalModeCtx(BaseEngineCtx):
         self.engine.module.eval()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Restores the previous Ulysses SP group; if fsdp_size is above 1, reshards the root module (FSDP1 handle reshard or FSDP2 reshard); then runs base exit (offload, clear mode).
+        # KNOWN ISSUE: the reshard is skipped for the default fsdp_size of -1 (full-world sharding), so the root module may stay unsharded after eval in that configuration.
         assert isinstance(self.engine, FSDPEngine)
         set_ulysses_sequence_parallel_group(self.prev_sp_group)
 
@@ -1122,10 +1262,16 @@ class EngineEvalModeCtx(BaseEngineCtx):
 
 
 class EngineTrainModeCtx(BaseEngineCtx):
+    # [CLASS DOC]
+    # Train-mode context for FSDP engines: installs the Ulysses SP group and module.train() on entry; restores the SP group and optionally zeroes grads on exit.
     def __init__(self, engine: FSDPEngine, **kwargs):
+        # [FUNCTION DOC]
+        # Creates the context in "train" mode; kwargs forwarded to BaseEngineCtx.
         super().__init__(engine=engine, mode="train", **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Asserts the engine type, runs base entry, saves/sets the Ulysses SP group and switches the module to train mode.
         assert isinstance(self.engine, FSDPEngine)
         super().__enter__()
         self.prev_sp_group = get_ulysses_sequence_parallel_group()
@@ -1133,6 +1279,8 @@ class EngineTrainModeCtx(BaseEngineCtx):
         self.engine.module.train()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Restores the previous SP group, zeroes grads if zero_grad_on_exit or an exception occurred, then runs base exit.
         assert isinstance(self.engine, FSDPEngine)
         set_ulysses_sequence_parallel_group(self.prev_sp_group)
         if self.zero_grad_on_exit or exc_type is not None:
@@ -1142,7 +1290,17 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
+    # [CLASS DOC]
+    # Causal-LM FSDP engine (registered for language_model, backends fsdp/fsdp2, cuda/npu) computing per-token log-probs and optional entropy, sum of squared probabilities, and top-K distillation outputs, as nested tensors aligned with input ids.
     def prepare_model_inputs(self, micro_batch: TensorDict):
+        # [FUNCTION DOC]
+        # Builds model inputs from a micro-batch of nested (jagged) tensors.
+        # Behavior: rejects pad_to_length combined with top-K distillation. Reads use_remove_padding (default true), pad_mode (must be NO_PADDING), use_fused_kernels (requires scalar temperature). Records whether temperature is scalar 1, broadcasts scalar temperature to a float32 per-sample tensor.
+        # Remove-padding path: packs input ids to (1, total) and position ids to (1, total) or (k, 1, total) for 3D; keeps int64 cu_seqlens offsets; computes labels by rolling the packed ids left by one over the global sequence; optionally right-pads ids, positions, labels and temperatures (pad value 1) to the next bucket; under Ulysses SP pads (VLMs: pad only, slicing after embedding) or pads and slices ids/positions, and pads/slices labels and temperatures; records total pad size (static plus SP), squeezed labels and per-token temperature. Model inputs are ids, no attention mask, positions; when the model forward accepts cu_seqlens, passes cu_seqlens (with an extra boundary covering the padding) and a CPU copy.
+        # Padded path: right-pads ids (pad_token_id) and positions (0, 3D transposed to (k, batch, len)) to the max length, builds an attention mask from the nested ids, records packed rolled labels and per-sample temperature.
+        # Fused kernels add scalar temperature, return_dict and, with remove padding, shift_labels set to the precomputed labels. Multi-modal inputs are merged.
+        # Outputs: (model_inputs mapping, output_args mapping).
+        # Exceptions: RuntimeError for pad_to_length with top-K distillation; AssertionError for invalid temperature or pad mode.
         if self.pad_to_length and tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False):
             # Every top-K path re-derives the teacher tensors' layout from the *unpadded* packed
             # length and slices them with the Ulysses rule only, which does not know about the
@@ -1330,6 +1488,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return model_inputs, output_args
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
+        # [FUNCTION DOC]
+        # Converts raw model output to the model_output mapping.
+        # Behavior: reads flags calculate_entropy, calculate_sum_pi_squared, distillation_use_topk, distillation_only. Remove-padding path: with fused kernels takes log_probs (unless distillation_only) and entropy from the output and, for top-K distillation, extracts distillation_losses, student_mass and teacher_mass from fused auxiliary outputs (gathered, unpadded, nested). Otherwise gathers DTensor logits, scales by temperature, optionally computes sum of squared probabilities and entropy (chunked/plain/checkpointed), runs logits_processor_func for top-K distillation (each output must have one value per local token; gathered and nested), and computes log-probs of rolled labels (in-place backward unless entropy needed). Then gathers across SP and strips padding for log-probs, entropy and sum-pi-squared, and nests them by input offsets.
+        # Padded path: fused kernels - masks valid positions and nests log-probs/entropy; otherwise scales logits, optionally computes entropy/sum-pi-squared, narrows to valid lengths, concatenates, runs distillation processing, log-probs and nests everything.
+        # Inputs: output - model output; output_args - from prepare_model_inputs (temperature_is_one optional); micro_batch; logits_processor_func - loss callable used for distillation.
+        # Outputs: mapping with log_probs (unless distillation_only), entropy, sum_pi_squared and distillation keys as requested.
+        # Exceptions: NotImplementedError for sum-pi-squared with fused kernels or unsupported pad modes; AssertionError on distillation output shape mismatch.
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
@@ -1547,6 +1712,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return model_output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        # [FUNCTION DOC]
+        # Runs one micro-batch forward and loss.
+        # Behavior: moves micro-batch to device, prepares inputs, runs the module (use_cache false) under autocast with the resolved param dtype (no autocast for fp32), prepares outputs (passing loss_function as logits processor), and computes loss/metrics with the DP group; without a loss function (forward-only only) uses a dummy loss 1.0.
+        # Outputs: (loss tensor, mapping with detached model_output, float loss, metrics).
+        # Exceptions: AssertionError if loss_function is None while training.
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
@@ -1593,11 +1763,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
 @EngineRegistry.register(model_type="value_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
+    # [CLASS DOC]
+    # Value-model (critic) FSDP engine registered for value_model; reuses LM-head input preparation and forward but turns outputs into per-token values.
     """
     The only difference between critic and actor is how the raw model output is processed
     """
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
+        # [FUNCTION DOC]
+        # Extracts per-token values from the model output.
+        # Behavior: TRL value-head models use the third output element, token-classification models use logits with the last dim squeezed. Remove-padding path gathers across SP, strips padding and nests by input offsets; padded path narrows each row to its valid length, concatenates and nests.
+        # Inputs: output, output_args (pad_size required for remove padding), micro_batch; logits_processor_func unused.
+        # Outputs: mapping with "values" nested tensor.
+        # Exceptions: NotImplementedError for unsupported pad modes.
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
 

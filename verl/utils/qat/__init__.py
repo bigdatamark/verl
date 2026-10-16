@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Quantization-aware training (NVFP4) support for FSDP training and vLLM rollout weight sync. Re-exports
+# the training-side API from core (QATConfig, apply_qat, load_quantization_config, enable_qat_fuse,
+# invalidate_all_scales) and the vLLM-side patch API from vllm_patch (apply_qat_patches,
+# prepare_qat_for_load_weights, manual_process_weights_after_loading). Importing the package imports
+# vllm_patch eagerly.
 """
 QAT (Quantization-Aware Training) module for verl.
 

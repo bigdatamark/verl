@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# HuggingFace model configuration dataclasses: MTP (multi-token prediction) options and
+# HFModelConfig, whose post-init copies model/tokenizer/config to local storage, loads tokenizer,
+# processor, generation config and HF config, and applies overrides and per-model patches.
+
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -28,6 +33,10 @@ __all__ = ["HFModelConfig", "MtpConfig"]
 
 @dataclass
 class MtpConfig(BaseConfig):
+    # [CLASS DOC]
+    # MTP settings: enable (load/save MTP params), enable_train, enable_rollout, training options
+    # (detach encoder, loss scaling factor), SGLang speculative options and vLLM method / speculative
+    # token count. No validation.
     """
     Configuration for MTP model.
 
@@ -69,6 +78,13 @@ class MtpConfig(BaseConfig):
 
 @dataclass
 class HFModelConfig(BaseConfig):
+    # [CLASS DOC]
+    # HF model config: paths (model, HF config, tokenizer and their local copies), model type, tokenizer
+    # loading flag, runtime-loaded objects (hf_config, generation_config, tokenizer, processor), shm and
+    # remote-code flags, custom chat template, external libs, override config, checkpointing / offload /
+    # remove-padding flags, FSDP LoRA and Megatron LoRA settings, adapter path, Liger and fused kernel
+    # options, TiledMLP options, architectures and an MtpConfig. Mutable fields are the runtime-derived
+    # ones. path is required.
     # note that we separate model_path, model_config_path and tokenizer_path in case they are different
     _mutable_fields = {
         "model_type",
@@ -146,6 +162,23 @@ class HFModelConfig(BaseConfig):
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior, in order: imports external libs; defaults HF config and tokenizer paths to path; copies
+        # the model path locally; if load_tokenizer, copies the tokenizer path locally and loads tokenizer
+        # and processor; copies tokenizer chat template to a processor lacking one; applies a custom chat
+        # template to the processor if any, else the tokenizer; copies the HF config path locally and loads
+        # the generation config; loads the HF config with attn_implementation from override_config (default
+        # flash_attention_2), falling back to vLLM's config loader only when transformers fails with a
+        # KeyError for "deepseek_v4"; builds overrides from tokenizer bos/eos/pad ids plus override_config
+        # (or its "model_config" sub-dict) and applies them; records tied-embedding flag; requires exactly one
+        # architecture; for kimi_vl sets greedy topk; when MTP is disabled zeroes MTP layer counts
+        # (num_nextn_predict_layers, mtp_num_hidden_layers, also under text_config); validates target_modules
+        # is a string or list of strings.
+        # Exceptions: AssertionError on architecture count; TypeError on bad target_modules; ValueError and
+        # IO errors from loading.
+        # Side effects: filesystem copies (possibly to shared memory), imports, network/model hub access.
+        # KNOWN ISSUE: with load_tokenizer False and a custom chat template, the tokenizer is None and setting
+        # its chat_template raises AttributeError.
         import_external_libs(self.external_lib)
 
         if self.hf_config_path is None:
@@ -258,4 +291,6 @@ class HFModelConfig(BaseConfig):
                         )
 
     def get_processor(self):
+        # [FUNCTION DOC]
+        # Behavior: returns the processor if present, else the tokenizer.
         return self.processor if self.processor is not None else self.tokenizer

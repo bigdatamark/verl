@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Rollout replica abstraction for server-mode inference: the token output model, rollout deployment
+# modes, the abstract RolloutReplica (one possibly multi-node server instance with lifecycle and
+# control fan-out to its server actors), a lazy name-to-class registry for built-in backends
+# (vllm, sglang, trtllm), and resolution including prefill/decode disaggregated variants.
+# Constant: extra concurrency reserved for control-method calls (16).
 import asyncio
 import logging
 import os
@@ -37,6 +43,9 @@ CONTROL_METHOD_CONCURRENCY = 16
 
 
 class TokenOutput(BaseModel):
+    # [CLASS DOC]
+    # Pydantic model of one generation result: response token ids, optional log-probs, optional routed
+    # experts, stop reason, preemption count, and a free-form extra fields mapping.
     token_ids: list[int]
     """response token ids"""
     log_probs: Optional[list[float]] = None
@@ -52,6 +61,9 @@ class TokenOutput(BaseModel):
 
 
 class RolloutMode(Enum):
+    # [CLASS DOC]
+    # Deployment modes: HYBRID (rollout fused with trainer process, weight sync), COLOCATED (same
+    # placement group, separate process), STANDALONE (dedicated GPUs).
     # Rollout engine and training engine(fsdp/megatron) fused in same process
     # Rollout and trainer share GPUs, switch context with weight synchronization.
     # Usage scenarios: on-policy training.
@@ -68,6 +80,10 @@ class RolloutMode(Enum):
 
 
 class RolloutReplica(ABC):
+    # [CLASS DOC]
+    # Abstract replica: tracks rank, config, model config, world size (tp*dp*pp), nodes, role flags,
+    # mode, worker actors, resource pool, bundle indices, server actors, and the main server's address
+    # and handle. Subclasses implement launch_servers and set those fields.
     """Rollout replica is an individual server instance, which may be deployed on single or multiple nodes.
     It is equivalent to launch server in each node with command line:
 
@@ -100,6 +116,11 @@ class RolloutReplica(ABC):
         is_teacher_model: bool = False,
         name_suffix: str = "",
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: stores rank, converts config to dataclass, stores model config; computes world size,
+        # GPUs per replica node = min(gpus_per_node, world size) (must divide world size), node count, role
+        # flags, and name suffix ("_" + suffix when non-empty); initializes empty state.
+        # Exceptions: AssertionError when world size is not divisible.
         self.replica_rank = replica_rank
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = model_config
@@ -129,6 +150,9 @@ class RolloutReplica(ABC):
         self._server_handle: ActorHandle = None
 
     async def init_hybrid(self, worker_group: RayWorkerGroup):
+        # [FUNCTION DOC]
+        # Behavior: sets HYBRID mode, takes this replica's contiguous slice of the worker group's workers
+        # (world_size workers starting at rank*world_size), and launches servers.
         """Init hybrid rollout server, rollout engine and training engine(fsdp/megatron) fused in same process.
 
         Args:
@@ -141,6 +165,11 @@ class RolloutReplica(ABC):
         await self.launch_servers()
 
     async def init_hybrid_colocated(self, worker_group: RayWorkerGroup, resource_pool: RayResourcePool):
+        # [FUNCTION DOC]
+        # Behavior: like init_hybrid, but also records the resource pool and bundle indices
+        # rank*world_size + 0..world_size-1, then launches servers.
+        # KNOWN ISSUE: docstring lists a bundle_indices argument that does not exist (computed internally),
+        # and it sets HYBRID rather than COLOCATED mode.
         """Init hybrid rollout server, rollout engine and training engine(fsdp/megatron) fused in same process.
 
         Args:
@@ -158,6 +187,11 @@ class RolloutReplica(ABC):
 
     # TODO(sgm): this should be the default solution, but need to make the RolloutMode more clear.
     async def init_colocated(self, resource_pool: RayResourcePool):
+        # [FUNCTION DOC]
+        # Behavior: sets COLOCATED mode, records the pool, builds a worker group on it with a role-specific
+        # name prefix (reward/teacher/default) using the checkpoint-engine worker actor class, without bin
+        # packing, with GPU use per rollout_worker_use_gpu; stores its workers and launches servers.
+        # Side effects: spawns Ray actors.
         """Init colocated rollout server, rollout engine and hybrid engine colocated in same ray placement group
         but in separate processes.
 
@@ -187,6 +221,11 @@ class RolloutReplica(ABC):
         await self.launch_servers()
 
     async def init_standalone(self):
+        # [FUNCTION DOC]
+        # Behavior: sets STANDALONE mode; creates a dedicated resource pool named by role and rank with
+        # gpus_per_replica_node per node across nnodes (max colocate 2); builds a GPU worker group on it with
+        # a role-specific prefix; stores workers and launches servers.
+        # Side effects: creates placement groups and Ray actors.
         """Init standalone rollout server, create new resource pool for this rollout."""
         # create resource pool for this rollout
         self.rollout_mode = RolloutMode.STANDALONE
@@ -226,6 +265,9 @@ class RolloutReplica(ABC):
         await self.launch_servers()
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
+        # [FUNCTION DOC]
+        # Behavior: wraps the checkpoint-engine worker class as a Ray actor class and returns it with init
+        # args (rollout config, model config, replica rank).
         """Get rollout worker actor class for colocated and standalone mode."""
         from verl.checkpoint_engine.base import CheckpointEngineWorker
 
@@ -240,37 +282,54 @@ class RolloutReplica(ABC):
 
     @abstractmethod
     async def launch_servers(self):
+        # [FUNCTION DOC]
+        # Behavior: abstract; launch the HTTP server(s) and set servers/address/handle.
+        # Exceptions: NotImplementedError if called on the base.
         """Launch http server in each node."""
         raise NotImplementedError
 
     @property
     def server_address(self) -> str:
+        # [FUNCTION DOC]
+        # Behavior: returns the OpenAI-compatible server address.
         """Get rollout server address for OpenAI chat completion."""
         return self._server_address
 
     @property
     def server_handle(self) -> ActorHandle:
+        # [FUNCTION DOC]
+        # Behavior: returns the main server actor handle.
         """Get rollout server handle for Token-in-token-out generation."""
         return self._server_handle
 
     @property
     def max_concurrency(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns max(1000, max_num_seqs + control concurrency) for Ray actor concurrency.
         # 1000 is Ray's default max_concurrency for async execution.
         # Add some margin to account for control method call.
         return max(1000, self.config.max_num_seqs + CONTROL_METHOD_CONCURRENCY)
 
     def rollout_worker_use_gpu(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: whether colocated rollout workers request GPUs; base returns true.
         return True
 
     async def wake_up(self):
+        # [FUNCTION DOC]
+        # Behavior: concurrently calls wake_up on all server actors.
         """Wake up each rollout server."""
         await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
 
     async def sleep(self):
+        # [FUNCTION DOC]
+        # Behavior: concurrently calls sleep on all server actors.
         """Sleep each rollout server."""
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
     async def abort_all_requests(self, reject_request: bool = False):
+        # [FUNCTION DOC]
+        # Behavior: concurrently calls abort_all_requests(reject_request) on all server actors.
         """Partial rollout: abort and save all unfinished requests in each rollout server.
 
         Args:
@@ -285,42 +344,61 @@ class RolloutReplica(ABC):
         )
 
     async def resume_generation(self):
+        # [FUNCTION DOC]
+        # Behavior: concurrently calls resume_generation on all server actors.
         """Resume generation on all servers after abort_all_requests."""
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
 
     async def clear_kv_cache(self):
+        # [FUNCTION DOC]
+        # Behavior: concurrently calls clear_kv_cache on all server actors.
         """reset kv cache in each rollout server."""
         await asyncio.gather(*[server.clear_kv_cache.remote() for server in self.servers])
 
     async def release_kv_cache(self):
+        # [FUNCTION DOC]
+        # Behavior: concurrently calls release_kv_cache on all server actors.
         """Release only the kv_cache GPU memory, keeping model weights in place."""
         await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
 
     async def resume_kv_cache(self):
+        # [FUNCTION DOC]
+        # Behavior: concurrently calls resume_kv_cache on all server actors.
         """Restore the kv_cache GPU memory after a weight sync."""
         await asyncio.gather(*[server.resume_kv_cache.remote() for server in self.servers])
 
     async def start_profile(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: concurrently calls start_profile(kwargs) on all server actors.
         """Start profiling on the replica."""
         await asyncio.gather(*[server.start_profile.remote(**kwargs) for server in self.servers])
 
     async def stop_profile(self):
+        # [FUNCTION DOC]
+        # Behavior: concurrently calls stop_profile on all server actors.
         """Stop profiling on the replica."""
         await asyncio.gather(*[server.stop_profile.remote() for server in self.servers])
 
 
 class RolloutReplicaRegistry:
+    # [CLASS DOC]
+    # Class-level registry mapping backend name to a zero-argument loader returning the replica class.
     """Factory for managing rollout replica implementations."""
 
     _registry: dict[str, Callable[[], type[RolloutReplica]]] = {}
 
     @classmethod
     def register(cls, name: str, loader: Callable[[], type[RolloutReplica]]) -> None:
+        # [FUNCTION DOC]
+        # Behavior: (class method) stores/overwrites the loader under name.
         """Register a new rollout replica type."""
         cls._registry[name] = loader
 
     @classmethod
     def get(cls, name: str) -> type[RolloutReplica]:
+        # [FUNCTION DOC]
+        # Behavior: (class method) calls the loader for name and returns the class.
+        # Exceptions: ValueError for unknown names (lists available).
         """Get a rollout replica class by name."""
         if name not in cls._registry:
             raise ValueError(f"Unknown rollout mode: {name}. Available: {list(cls._registry.keys())}")
@@ -329,12 +407,22 @@ class RolloutReplicaRegistry:
 
 # Loader functions for built-in types
 def _load_vllm():
+    # [FUNCTION DOC]
+    # HELPER: Lazily imports and returns the vLLM replica class.
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
     return vLLMReplica
 
 
 def _load_sglang():
+    # [FUNCTION DOC]
+    # HELPER: Sets SGLANG_USE_CPU_ENGINE=1 during import. If vllm is not importable, installs stub
+    # modules for vllm, its custom ops (mock fp8 quant) and model executor activation layers (empty
+    # GeluAndMul/SiluAndMul classes) into the module table so SGLang's transitive imports succeed.
+    # Imports and returns the SGLang replica class, deleting the env var afterwards.
+    # Side effects: mutates process environment and global module table.
+    # KNOWN ISSUE: the env var is deleted rather than restored (a pre-existing value is lost) and stays
+    # set if the import raises.
     os.environ["SGLANG_USE_CPU_ENGINE"] = "1"
 
     try:
@@ -355,9 +443,13 @@ def _load_sglang():
         mock_activation = types.ModuleType("vllm.model_executor.layers.activation")
 
         class GeluAndMul:  # noqa: N801
+            # [CLASS DOC]
+            # HELPER: Empty stub activation class for the mock vllm module.
             pass
 
         class SiluAndMul:  # noqa: N801
+            # [CLASS DOC]
+            # HELPER: Empty stub activation class for the mock vllm module.
             pass
 
         mock_activation.GeluAndMul = GeluAndMul
@@ -379,6 +471,8 @@ def _load_sglang():
 
 
 def _load_trtllm():
+    # [FUNCTION DOC]
+    # HELPER: Lazily imports and returns the TensorRT-LLM replica class.
     from verl.workers.rollout.trtllm_rollout.trtllm_async_server import TRTLLMReplica
 
     return TRTLLMReplica
@@ -391,6 +485,11 @@ RolloutReplicaRegistry.register("trtllm", _load_trtllm)
 
 
 def get_rollout_replica_class(rollout: str, disaggregation_enabled: bool = False) -> type[RolloutReplica]:
+    # [FUNCTION DOC]
+    # Behavior: with disaggregation enabled, returns the SGLang PD replica (after loading the sglang
+    # entry for its import side effects) or the vLLM PD replica; other backends raise. Otherwise
+    # returns the registry class for the name.
+    # Exceptions: NotImplementedError for unsupported PD backends; ValueError for unknown names.
     """Resolve a replica class by backend name.
 
     PD-disaggregated rollouts reuse the base backend name (``sglang`` /

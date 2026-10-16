@@ -11,12 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Core abstractions for the skip framework: the SkipAction enum, the BaseSkip interface that concrete
+# skips implement, and a name-to-class registry populated by the register_skip decorator.
 
 from enum import Enum
 from typing import Callable
 
 
 class SkipAction(Enum):
+    # [CLASS DOC]
+    # Supported skip behaviors: CACHE (replay the cached result for each step, matching a previous run),
+    # REPEAT (reuse the latest available cached result), RANDOM (random result) and EMPTY (do nothing
+    # and return empty). Each concrete skip declares which it supports.
     CACHE = "cache"
     # Replace the result with cached data
     # ensuring that the output of each step is consistent with the non-skip version from the previous run,
@@ -29,6 +36,9 @@ class SkipAction(Enum):
 
 
 class BaseSkip:
+    # [CLASS DOC]
+    # Abstract skip. Class attributes: support_actions (allowed SkipAction values) and
+    # support_online_step (whether the step can be extracted from call arguments at runtime).
     """Base class for skip.
 
     Implementations are shared per role via ``SkipManager.skip_instances`` and may receive
@@ -43,6 +53,10 @@ class BaseSkip:
     support_online_step = False
 
     def __init__(self, local_config, global_config):
+        # [FUNCTION DOC]
+        # Reads action (converted to SkipAction), enable, dump_dir and steps from local_config and stores
+        # global_config. Exceptions: ValueError if the action is invalid for SkipAction or not in
+        # support_actions.
         self.action = SkipAction(local_config.action)
         self.enable = local_config.enable
         self.dump_dir = local_config.dump_dir
@@ -52,18 +66,28 @@ class BaseSkip:
             raise ValueError(f"Unsupported action: {self.action}. Supported actions are: {self.support_actions}")
 
     def is_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns the enable flag.
         return self.enable
 
     def meet_precondition(self, step: int, func: Callable, *args, **kwargs) -> bool:
+        # [FUNCTION DOC]
+        # Abstract: whether skipping should apply for this step/call. Raises NotImplementedError.
         raise NotImplementedError("meet_precondition is not implemented")
 
     def warp_function(self, step: int, func: Callable, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Abstract: produce the skipped (replacement) result for a call. Raises NotImplementedError.
         raise NotImplementedError("warp_function is not implemented")
 
     def prepare_data(self, step: int, result, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Abstract: handle/persist the real result of a call (e.g. dump to cache). Raises NotImplementedError.
         raise NotImplementedError("prepare_data is not implemented")
 
     def extract_step(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Abstract: derive the current step from call arguments. Raises NotImplementedError.
         raise NotImplementedError("extract_step is not implemented")
 
 
@@ -73,7 +97,12 @@ SKIP_REGISTRY: dict[str, type[BaseSkip]] = {}
 def register_skip(
     name: str,
 ) -> Callable[[type[BaseSkip]], type[BaseSkip]]:
+    # [FUNCTION DOC]
+    # Returns a class decorator that stores the class in SKIP_REGISTRY under name (overwriting any
+    # existing entry) and returns the class unchanged.
     def decorator(cls: type[BaseSkip]) -> type[BaseSkip]:
+        # [FUNCTION DOC]
+        # HELPER: Registers cls under the enclosing name and returns cls.
         SKIP_REGISTRY[name] = cls
         return cls
 

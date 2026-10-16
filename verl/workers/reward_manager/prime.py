@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# PRIME reward manager (registered as "prime"): scores a whole batch in parallel worker processes
+# with per-sample timeouts, forcibly terminating worker processes afterwards to avoid hangs.
 
 import asyncio
 from concurrent.futures import ProcessPoolExecutor
@@ -29,6 +32,10 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 
 async def single_compute_score(evaluation_func, completion, reference, task, task_extra_info, executor, timeout=300.0):
+    # [FUNCTION DOC]
+    # HELPER: Runs evaluation_func(task, completion, reference, task_extra_info) in the given process
+    # executor on the current event loop and awaits it with a timeout.
+    # Outputs: the function's result, or None on timeout or any exception (both printed).
     loop = get_event_loop()
     try:
         # Ensure process_completion is called properly
@@ -45,6 +52,17 @@ async def single_compute_score(evaluation_func, completion, reference, task, tas
 async def parallel_compute_score_async(
     evaluation_func, completions, references, tasks, extra_info=None, num_processes=64
 ):
+    # [FUNCTION DOC]
+    # HELPER: Scores all rows concurrently in a process pool.
+    # Behavior: defaults extra info to a list of None. Creates a process pool with num_processes workers,
+    # schedules one scoring task per row (300 s timeout each; lengths must match), and gathers results.
+    # On gather failure prints and re-raises. Always terminates every pool process (kill if not exited
+    # within 5 s), printing how many were terminated. Converts results: None/exception gives 0.0,
+    # numbers/bools converted to float, otherwise the first element is converted to float.
+    # Inputs: evaluation_func; completions; references; tasks; extra_info; num_processes.
+    # Outputs: list of float scores.
+    # Exceptions: ValueError for length mismatch; gather exceptions re-raised.
+    # Side effects: spawns and kills processes; accesses executor's private process table; prints.
     if extra_info is None:
         extra_info = [None] * len(tasks)
     scores = []
@@ -89,6 +107,10 @@ async def parallel_compute_score_async(
 
 
 def run_reward_scoring(evaluation_func, completions, references, tasks, extra_info=None, num_processes=64):
+    # [FUNCTION DOC]
+    # HELPER: Creates and installs a fresh event loop, runs the async parallel scoring to completion,
+    # and closes the loop. Outputs: list of scores.
+    # Side effects: replaces the current thread's event loop (left set to a closed loop).
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -101,6 +123,8 @@ def run_reward_scoring(evaluation_func, completions, references, tasks, extra_in
 
 @register("prime")
 class PrimeRewardManager(AbstractRewardManager):
+    # [CLASS DOC]
+    # Batch reward manager from PRIME storing tokenizer, examine count, scorer and data source key.
     """
     The Reward Manager used in https://github.com/PRIME-RL/PRIME
     """
@@ -112,12 +136,20 @@ class PrimeRewardManager(AbstractRewardManager):
         compute_score: Optional[Callable] = None,
         reward_fn_key: str = "data_source",
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: stores arguments; scorer falls back to the default.
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key
 
     def verify(self, data):
+        # [FUNCTION DOC]
+        # Behavior: decodes all full response rows (special tokens skipped), collects ground truths, data
+        # sources and optional extra info, asserts equal lengths, and runs parallel scoring with 64
+        # processes; on timeout or any other exception prints and uses all zeros. Stores scores as batch
+        # field "acc".
+        # Outputs: list of float scores. Side effects: writes data.batch["acc"]; prints; spawns processes.
         """
         verify the batch and save as ``acc`` tensor
         """
@@ -150,6 +182,13 @@ class PrimeRewardManager(AbstractRewardManager):
         return scores
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: returns precomputed rm_scores if present. Otherwise computes valid response lengths,
+        # decodes responses, scores via verify, writes each score at the sample's last valid response token,
+        # and for up to num_examine samples per data source prints the decoded sequences.
+        # Outputs: reward tensor, or dict with only reward_tensor.
+        # KNOWN ISSUE: uses the hardcoded "data_source" key instead of reward_fn_key; prints the entire
+        # batch's decoded list rather than the single sample; the dict result omits reward_extra_info.
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn

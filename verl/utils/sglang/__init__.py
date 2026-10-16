@@ -12,3 +12,5 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# SGLang-specific utilities (currently FP8 quantization config and ignored-layer handling). No code here.

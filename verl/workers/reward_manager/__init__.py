@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Reward manager package: turns rollout batches into token-level reward tensors using rule-based
+# or custom scoring functions. Exposes the name registry (register, get_reward_manager_cls) and the
+# built-in managers (batch, dapo, naive, prime); importing registers them. Also tries to import the
+# experimental rate-limited reward manager so it registers too, silently skipping it on ImportError.
 
 from .registry import get_reward_manager_cls, register  # noqa: I001
 from .batch import BatchRewardManager

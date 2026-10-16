@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Dataclass configs for the rollout (inference) side: sampling parameters, multi-turn / tool
+# settings, agent loop and custom async server, tracing, SGLang server mode, Prometheus monitoring,
+# the trainer-to-rollout checkpoint (weight sync) engine, and the main RolloutConfig with
+# engine/parallelism/memory options and post-init validation.
+
 import warnings
 from dataclasses import dataclass, field
 from typing import Optional
@@ -37,6 +43,8 @@ __all__ = [
 
 @dataclass
 class SamplingConfig(BaseConfig):
+    # [CLASS DOC]
+    # Sampling parameters (temperature, top_k, top_p, do_sample, n), used e.g. for validation sampling.
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0
@@ -46,6 +54,10 @@ class SamplingConfig(BaseConfig):
 
 @dataclass
 class MultiTurnConfig(BaseConfig):
+    # [CLASS DOC]
+    # Multi-turn settings: enable flag, assistant / user turn limits (mutable), tool config and function
+    # tool paths, parallel tool call limit, tool response length and truncation side, chat-template and
+    # tokenization sanity-check modes, tool-call format, and optional repeat count.
     _mutable_fields = {"max_assistant_turns", "max_user_turns"}
 
     enable: bool = False
@@ -64,12 +76,18 @@ class MultiTurnConfig(BaseConfig):
 
 @dataclass
 class CustomAsyncServerConfig(BaseConfig):
+    # [CLASS DOC]
+    # Custom async server class location: module path and class name (both optional).
     path: Optional[str] = None
     name: Optional[str] = None
 
 
 @dataclass
 class AgentLoopConfig(BaseConfig):
+    # [CLASS DOC]
+    # Agent loop settings: worker count, default agent loop name, optional agent loop config path,
+    # custom async server, and optional fully qualified custom AgentLoopManager class (imported
+    # dynamically).
     num_workers: int = 8
     default_agent_loop: str = "single_turn_agent"
     agent_loop_config_path: Optional[str] = None
@@ -81,6 +99,9 @@ class AgentLoopConfig(BaseConfig):
 
 @dataclass
 class TraceConfig(BaseConfig):
+    # [CLASS DOC]
+    # Rollout trace settings: project / experiment names, backend, token-to-text flag and optional
+    # per-worker per-step sample cap.
     project_name: Optional[str] = None
     experiment_name: Optional[str] = None
     backend: Optional[str] = None
@@ -88,12 +109,17 @@ class TraceConfig(BaseConfig):
     max_samples_per_step_per_worker: Optional[int] = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: raises ValueError if the sample cap is set and negative.
         if self.max_samples_per_step_per_worker is not None and self.max_samples_per_step_per_worker < 0:
             raise ValueError("`max_samples_per_step_per_worker` must be a non-negative integer or null.")
 
 
 @dataclass
 class ServerConfig(BaseConfig):
+    # [CLASS DOC]
+    # SGLang server-mode HTTP settings: request timeout, retry attempts and delay, connection limit and
+    # maximum startup wait (seconds).
     """
     Configuration for SGLang server when running in server mode
     """
@@ -107,6 +133,8 @@ class ServerConfig(BaseConfig):
 
 @dataclass
 class PrometheusConfig(BaseConfig):
+    # [CLASS DOC]
+    # Prometheus settings: enable flag, port, config file path and optional served model name.
     """
     Configuration for Prometheus server
     """
@@ -123,6 +151,9 @@ class PrometheusConfig(BaseConfig):
 
 @dataclass
 class CheckpointEngineConfig(BaseConfig):
+    # [CLASS DOC]
+    # Weight-sync engine settings: backend (mutable; naive, nccl, nixl, hccl), bucket size in MB, extra
+    # engine kwargs, and an optional module imported on each worker to register custom backends.
     """
     Configuration for checkpoint engine to update weights from trainer to rollout
     """
@@ -143,6 +174,13 @@ class CheckpointEngineConfig(BaseConfig):
 
 @dataclass
 class RolloutConfig(BaseConfig):
+    # [CLASS DOC]
+    # Main rollout config: engine name (required), mode, resources, sampling, determinism and seed,
+    # lengths, dtype and memory utilization, cudagraph / eager options, DP/EP/TP/PP/MoE-TP sizes,
+    # batching limits, logprob options, validation sampling, log-prob micro batching, engine kwargs,
+    # nested agent / trace / multi-turn / server / prometheus / checkpoint engine / profiler / MTP /
+    # disaggregation configs, load format, quantization, routing replay and sleep-mode flags, and more.
+    # Several length / parallelism / engine fields are mutable.
     _mutable_fields = {
         "max_model_len",
         "load_format",
@@ -276,6 +314,16 @@ class RolloutConfig(BaseConfig):
     router_config_path: Optional[str] = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: raises ValueError for mode "sync" and emits a DeprecationWarning for any other
+        # non-"async" mode. For non-trtllm engines with EP size greater than 1, asserts EP equals TP times DP.
+        # Asserts MoE-TP greater than 1 is only used with trtllm. For trtllm, converts EP and MoE-TP values of
+        # 1 to None (unspecified) and, if both remain set, asserts their product equals TP. Raises
+        # NotImplementedError for PP greater than 1 on vllm / sglang / trtllm. Coerces disaggregation given as
+        # a dict or DictConfig into a DisaggregationConfig (bypassing freezing), raising TypeError for other
+        # types. Raises ValueError if disaggregation is enabled for an engine other than sglang / vllm.
+        # Exceptions: ValueError, AssertionError, NotImplementedError, TypeError.
+        # Side effects: warnings; mutates expert / MoE-TP sizes and disaggregation.
         """Validate the rollout config"""
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":

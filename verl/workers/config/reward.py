@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Dataclass configs for rewards: reward manager selection, sandbox fusion execution service, the
+# generative/discriminative reward model (served via a rollout config), and the top-level RewardConfig.
+# Logger level from VERL_LOGGING_LEVEL (default WARN).
+
 import logging
 import os
 from dataclasses import dataclass, field
@@ -30,6 +35,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @dataclass
 class RewardManagerConfig(BaseConfig):
+    # [CLASS DOC]
+    # Reward manager selection: source ("register" or "importlib"), name, and optional external module
+    # config. Not exported in the module export list.
     """Configuration for reward manager.
 
         A reward manager defines the mechanism of computing rule-based reward and handling different reward sources.
@@ -49,6 +57,13 @@ class RewardManagerConfig(BaseConfig):
     module: Optional[ModuleConfig] = field(default_factory=ModuleConfig)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base post-init. For "register", asserts the name is present in the reward-loop
+        # reward manager registry. For "importlib", asserts a module with a path is configured. Other source
+        # values are not rejected.
+        # Exceptions: AssertionError. Side effects: imports the registry.
+        # KNOWN ISSUE: the docstring points to verl/experimental/reward/reward_manager.py, but the registry
+        # consulted lives under verl.experimental.reward_loop.reward_manager.
         super().__post_init__()
         if self.source == "register":
             from verl.experimental.reward_loop.reward_manager.registry import REWARD_MANAGER
@@ -65,6 +80,9 @@ class RewardManagerConfig(BaseConfig):
 
 @dataclass
 class SandboxFusionConfig(BaseConfig):
+    # [CLASS DOC]
+    # Sandbox fusion settings: optional service URL, max concurrent requests (64) and per-process memory
+    # limit in MB (1024). No validation.
     """Configuration for cloud/local sandbox fusion.
 
     Args:
@@ -80,6 +98,9 @@ class SandboxFusionConfig(BaseConfig):
 
 @dataclass
 class RewardModelConfig(BaseConfig):
+    # [CLASS DOC]
+    # Reward model settings: enable flag, dedicated resource pool flag and size (GPUs per node, nodes),
+    # model path, and the RolloutConfig used to serve it. No validation.
     _mutable_fields = BaseConfig._mutable_fields
 
     enable: bool = False
@@ -92,6 +113,9 @@ class RewardModelConfig(BaseConfig):
 
 @dataclass
 class RewardConfig(BaseConfig):
+    # [CLASS DOC]
+    # Top-level reward config: number of reward workers, reward manager, reward model and sandbox
+    # fusion sub-configs. No validation.
     _mutable_fields = BaseConfig._mutable_fields
 
     # reward manager args

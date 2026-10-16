@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Dataclass configs for the skip framework: one per skip implementation (sync rollout, async
+# rollout, TransferQueue rollout) and a top-level SkipManagerConfig grouping them.
 
 from dataclasses import dataclass, field
 
@@ -19,6 +22,9 @@ from verl.base_config import BaseConfig
 
 @dataclass
 class RolloutSkipConfig(BaseConfig):
+    # [CLASS DOC]
+    # Settings for the synchronous rollout skip: enable, dump_dir (cache directory, may contain "~"),
+    # steps (training steps to which skipping applies), action ("cache" or "repeat").
     """Config for rollout skip behavior."""
 
     enable: bool = False
@@ -27,6 +33,9 @@ class RolloutSkipConfig(BaseConfig):
     action: str = "cache"  # cache | repeat | random | empty, refer to SkipAction in base_skip.py
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Validates field types and that action is "cache" or "repeat". Exceptions: AssertionError.
+        # KNOWN ISSUE: the inline comment on action lists random/empty too, but validation rejects them.
         assert isinstance(self.enable, bool), f"`enable` must be bool, got {type(self.enable)}"
         assert isinstance(self.dump_dir, str), f"`dump_dir` must be str, got {type(self.dump_dir)}"
         assert isinstance(self.steps, list), f"`steps` must be list[int], got {type(self.steps)}"
@@ -36,6 +45,8 @@ class RolloutSkipConfig(BaseConfig):
 
 @dataclass
 class AsyncRolloutSkipConfig(BaseConfig):
+    # [CLASS DOC]
+    # Same fields and defaults as RolloutSkipConfig, for the async (agent loop) rollout skip.
     """Config for rollout skip behavior."""
 
     enable: bool = False
@@ -44,6 +55,8 @@ class AsyncRolloutSkipConfig(BaseConfig):
     action: str = "cache"  # cache | repeat | random | empty, refer to SkipAction in base_skip.py
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Same validation as RolloutSkipConfig. Exceptions: AssertionError.
         assert isinstance(self.enable, bool), f"`enable` must be bool, got {type(self.enable)}"
         assert isinstance(self.dump_dir, str), f"`dump_dir` must be str, got {type(self.dump_dir)}"
         assert isinstance(self.steps, list), f"`steps` must be list[int], got {type(self.steps)}"
@@ -53,6 +66,8 @@ class AsyncRolloutSkipConfig(BaseConfig):
 
 @dataclass
 class RolloutTqSkipConfig(BaseConfig):
+    # [CLASS DOC]
+    # Same fields and defaults, for the TransferQueue-based rollout skip.
     """Config for V1 TransferQueue-based rollout skip behavior."""
 
     enable: bool = False
@@ -61,6 +76,8 @@ class RolloutTqSkipConfig(BaseConfig):
     action: str = "cache"  # cache | repeat, refer to SkipAction in base_skip.py
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Same validation as RolloutSkipConfig. Exceptions: AssertionError.
         assert isinstance(self.enable, bool), f"`enable` must be bool, got {type(self.enable)}"
         assert isinstance(self.dump_dir, str), f"`dump_dir` must be str, got {type(self.dump_dir)}"
         assert isinstance(self.steps, list), f"`steps` must be list[int], got {type(self.steps)}"
@@ -70,6 +87,8 @@ class RolloutTqSkipConfig(BaseConfig):
 
 @dataclass
 class SkipManagerConfig(BaseConfig):
+    # [CLASS DOC]
+    # Top-level skip config with sub-configs rollout, async_rollout and rollout_tq (default instances).
     """Top-level config for skip modules."""
 
     rollout: RolloutSkipConfig = field(default_factory=RolloutSkipConfig)

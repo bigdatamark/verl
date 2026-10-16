@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Dataclass configs for the critic (value model) worker: a strategy-agnostic CriticConfig with batch
+# size validation, strategy-specific subclasses (Megatron, FSDP, TorchTitan, VeOmni) that bind the
+# generic engine slot to their backend engine config, and an FSDP critic model config.
+
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -43,6 +48,11 @@ __all__ = [
 
 @dataclass
 class CriticConfig(BaseConfig):
+    # [CLASS DOC]
+    # Base critic config: required strategy, micro/mini batch sizes (deprecated global micro batch size
+    # too), dynamic batch and token limits, PPO epochs, shuffling, value clip range, loss aggregation,
+    # generic engine slot, optimizer, model (default None), checkpoint and profiler sub-configs. Mutable
+    # fields add the batch sizes, engine and model.
     """Configuration for critic model training.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -101,6 +111,10 @@ class CriticConfig(BaseConfig):
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts strategy was set. Without dynamic batch size, requires exactly one of the global
+        # and per-GPU micro batch sizes, and if the global one is set requires it to divide the mini batch
+        # size. Exceptions: AssertionError, ValueError. Note: loss_agg_mode is not validated here.
         """Validate critic configuration parameters."""
         assert self.strategy != MISSING
 
@@ -115,6 +129,9 @@ class CriticConfig(BaseConfig):
                     )
 
     def validate(self, n_gpus: int, train_batch_size: int):
+        # [FUNCTION DOC]
+        # Behavior: without dynamic batch size, raises ValueError if train_batch_size is below the mini
+        # batch size. n_gpus is unused at this level.
         """Validate critic configuration with runtime parameters.
 
         Args:
@@ -130,6 +147,10 @@ class CriticConfig(BaseConfig):
 
     @staticmethod
     def _check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
+        # [FUNCTION DOC]
+        # HELPER: Raises ValueError if neither or both of mbs and mbs_per_gpu are set.
+        # KNOWN ISSUE: messages name the options "micro_batch_size" / "micro_batch_size_per_gpu" rather than
+        # the actual ppo_micro_batch_size field names.
         """Validate mutually exclusive micro batch size configuration options.
 
         Ensures that users don't set both deprecated micro_batch_size and
@@ -158,6 +179,9 @@ class CriticConfig(BaseConfig):
 
 @dataclass
 class McoreCriticConfig(CriticConfig):
+    # [CLASS DOC]
+    # Megatron critic: strategy "megatron", NCCL timeout (seconds), Megatron engine config and Megatron
+    # checkpoint config.
     """Configuration for Megatron-based critic model training.
 
     The inheritance from CriticConfig provides all base critic configuration plus Megatron-specific settings.
@@ -175,10 +199,14 @@ class McoreCriticConfig(CriticConfig):
     checkpoint: McoreCheckpointConfig = field(default_factory=McoreCheckpointConfig)
 
     def validate(self, n_gpus: int, train_batch_size: int):
+        # [FUNCTION DOC]
+        # Behavior: delegates to base validation.
         """Validate Megatron critic configuration with runtime parameters."""
         super().validate(n_gpus, train_batch_size)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base post-init then binds engine to the megatron config.
         """Validate Megatron critic configuration parameters."""
         super().__post_init__()
         self.engine = self.megatron
@@ -186,6 +214,9 @@ class McoreCriticConfig(CriticConfig):
 
 @dataclass
 class FSDPCriticConfig(CriticConfig):
+    # [CLASS DOC]
+    # FSDP critic: strategy "fsdp", FSDP engine config, forward micro batch sizes (mutable), deprecated
+    # Ulysses SP size and gradient clip.
     """Configuration for FSDP-based critic model training.
 
     The inheritance from CriticConfig provides all base critic configuration plus FSDP-specific settings.
@@ -210,6 +241,9 @@ class FSDPCriticConfig(CriticConfig):
     grad_clip: float = 1.0
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base post-init, binds engine to the fsdp config and force-writes strategy onto it.
+        # Side effects: mutates nested engine config.
         """Validate FSDP critic configuration parameters."""
         super().__post_init__()
         self.engine = self.fsdp
@@ -219,6 +253,9 @@ class FSDPCriticConfig(CriticConfig):
         object.__setattr__(self.engine, "strategy", self.strategy)
 
     def validate(self, n_gpus: int, train_batch_size: int):
+        # [FUNCTION DOC]
+        # Behavior: base validation; then without dynamic batch size, if the global micro batch size is set,
+        # requires it times the SP size to be at least n_gpus. Exceptions: ValueError.
         """Validate FSDP critic configuration with runtime parameters."""
         super().validate(n_gpus, train_batch_size)
 
@@ -234,6 +271,8 @@ class FSDPCriticConfig(CriticConfig):
 
 @dataclass
 class TorchTitanCriticConfig(CriticConfig):
+    # [CLASS DOC]
+    # TorchTitan critic: strategy "torchtitan" and a TorchTitan engine config.
     """Configuration for TorchTitan-based critic model training.
 
     The inheritance from CriticConfig provides all base critic configuration plus TorchTitan-specific settings.
@@ -247,6 +286,8 @@ class TorchTitanCriticConfig(CriticConfig):
     torchtitan: TorchtitanEngineConfig = field(default_factory=TorchtitanEngineConfig)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base post-init then binds engine to the torchtitan config.
         """Validate TorchTitan critic configuration parameters."""
         super().__post_init__()
         self.engine = self.torchtitan
@@ -254,6 +295,10 @@ class TorchTitanCriticConfig(CriticConfig):
 
 @dataclass
 class FSDPCriticModelCfg(BaseModelConfig):
+    # [CLASS DOC]
+    # FSDP critic model config extending the base model config with shared-memory loading, activation
+    # offload, remove-padding, gradient checkpointing, an FSDP config, LoRA rank/alpha/target modules,
+    # and a TiledMLP options mapping (disabled, 4 shards by default). No validation.
     """FSDP-enabled critic model configuration.
     Inherits base critic settings and adds distributed-memory and LoRA options.
 
@@ -282,6 +327,8 @@ class FSDPCriticModelCfg(BaseModelConfig):
 
 @dataclass
 class VeOmniCriticConfig(CriticConfig):
+    # [CLASS DOC]
+    # VeOmni critic: strategy "veomni", a VeOmni engine config and gradient clip.
     """Configuration for VeOmni-based critic model training.
 
     Uses VeOmni's FSDP2 + sequence parallelism engine for the value model,
@@ -297,11 +344,16 @@ class VeOmniCriticConfig(CriticConfig):
     grad_clip: float = 1.0
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base post-init then binds engine to the veomni config.
         """Set engine to VeOmni config."""
         super().__post_init__()
         self.engine = self.veomni
 
     def validate(self, n_gpus: int, train_batch_size: int):
+        # [FUNCTION DOC]
+        # Behavior: base validation; then without dynamic batch size, if the global micro batch size is set,
+        # requires it times the VeOmni Ulysses parallel size to be at least n_gpus. Exceptions: ValueError.
         """Validate VeOmni critic configuration with runtime parameters."""
         super().validate(n_gpus, train_batch_size)
 

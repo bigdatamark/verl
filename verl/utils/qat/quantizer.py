@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Real (non-fake) NVFP4 quantization of trained weights for export to vLLM in compressed-tensors format.
+# Streams parameters decoder-layer by decoder-layer, computes per-tensor global scales (fused by min across
+# q/k/v and gate/up groups, matching vLLM's fused layers), FP8 E4M3 per-group block scales, and packed FP4
+# weights via compressed_tensors' NVFP4PackedCompressor. Logging level comes from VERL_LOGGING_LEVEL.
 """
 Fast NVFP4 Quantizer for verl FSDP training.
 
@@ -48,6 +53,13 @@ def compute_blockwise_scale(
     global_scale: torch.Tensor,
     group_size: int = 16,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: splits each row into in_features/group_size groups, takes per-group abs-max (fp32), divides by
+    # FP4 max (6) and multiplies by global_scale, clamps to +-FP8 max, casts to float8_e4m3fn, and replaces
+    # zeros with the FP8 epsilon.
+    # Inputs: weight - 2-D tensor (in_features divisible by group_size); global_scale - scalar/1-elem tensor;
+    # group_size. Outputs: FP8 tensor of shape (out_features, num_groups).
+    # Exceptions: RuntimeError from view if not divisible / non-contiguous. Side effects: none.
     """Compute blockwise scale using pre-computed global_scale (for fusion).
     Returns FP8 E4M3 blockwise scale tensor.
     """
@@ -85,6 +97,13 @@ def fuse_global_scales(
     layer_global_scales: dict[str, torch.Tensor],
     strategy: str = "min",
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: groups names by parent path (text before the last "."); for each parent and each fusion
+    # pattern, if all pattern children are present, sets each member's scale to a clone of the minimum of the
+    # group's scales (shape [1]). Names not in a complete group keep their original scale.
+    # Inputs: layer_global_scales - mapping module name -> 1-elem tensor; strategy - only "min".
+    # Outputs: new mapping. Exceptions: ValueError for other strategies (only raised when a group matches).
+    # Side effects: none.
     """Fuse global scales for QKV/GateUp groups (take min across group)."""
     if not layer_global_scales:
         return {}
@@ -119,6 +138,10 @@ def fuse_global_scales(
 
 
 class QATQuantizer:
+    # [CLASS DOC]
+    # Streaming NVFP4 quantizer. Holds mode (w4a16/w4a4), group size, ignore patterns (substring or "re:"
+    # regex on module name), compute device, optional compute dtype, the compressor, and TENSOR_GROUP FP4
+    # QuantizationArgs with FP8 scales.
     """Quantizer for QAT-trained weights using compressed_tensors APIs."""
 
     def __init__(
@@ -129,6 +152,10 @@ class QATQuantizer:
         device: Optional[torch.device] = None,
         param_dtype: Optional[torch.dtype] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores settings (defaults: ignore lm_head, embed_tokens, router gate; device from
+        # get_device_name), creates the compressor and quantization args.
+        # Side effects: none.
         self.mode = mode.lower()
         self._is_w4a4 = self.mode == "w4a4"  # W4A4 needs input_global_scale
         self.group_size = group_size
@@ -147,6 +174,9 @@ class QATQuantizer:
         )
 
     def _should_quantize(self, name: str, tensor: torch.Tensor) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True for 2-D ".weight" tensors whose column count is divisible by group_size and whose module
+        # name matches no ignore pattern.
         """Check if parameter should be quantized."""
         if not name.endswith(".weight"):
             return False
@@ -170,6 +200,8 @@ class QATQuantizer:
 
     @staticmethod
     def _extract_layer_idx(name: str) -> Optional[int]:
+        # [FUNCTION DOC]
+        # HELPER: Returns the integer after "layers." in the name, or None.
         """Extract decoder layer index from parameter name."""
         match = _LAYER_IDX_RE.search(name)
         return int(match.group(1)) if match else None
@@ -181,6 +213,17 @@ class QATQuantizer:
         input_global_scales: dict[str, torch.Tensor],
         output_device: torch.device,
     ) -> list[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Quantizes one buffered layer.
+        # Behavior: drops input_global_scale/input_amax entries; splits remaining into quantizable weights and
+        # passthrough tensors. Quantizable weights outside a decoder layer (layer_idx None) are an error. With no
+        # quantizable weights, returns passthrough moved to output_device. Otherwise moves each weight to the
+        # compute device/dtype, computes its global scale via generate_gparam from +-amax, fuses scales, and for
+        # each weight emits <layer>.weight_packed, <layer>.weight_scale (FP8) and <layer>.weight_global_scale; in
+        # W4A4 also <layer>.input_global_scale (fp32). Passthrough tensors are appended last.
+        # Outputs: list of (name, tensor) on output_device.
+        # Exceptions: RuntimeError for quantizable weights outside layers; ValueError if W4A4 scale missing.
+        # Side effects: device memory use.
         """Quantize one decoder layer's buffered params. Returns list of (name, tensor)."""
         layer_weights = {}
         layer_passthrough = {}
@@ -264,6 +307,17 @@ class QATQuantizer:
         params: dict[str, torch.Tensor] | Iterable[tuple[str, torch.Tensor]],
         target_device: Optional[torch.device] = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # [FUNCTION DOC]
+        # Behavior: accepts a dict or iterable of (name, tensor); moves CUDA tensors to CPU; in W4A4 records
+        # initialized input_global_scale tensors (warning for the -1.0 sentinel); buffers tensors until the layer
+        # index changes, then yields the processed previous group; flushes the final buffer and empties the device
+        # cache.
+        # Inputs: params; target_device - output device (default CPU).
+        # Outputs: generator of (name, tensor).
+        # KNOWN ISSUE: the layer flush happens on any index change, so non-layer params (index None) interleaved
+        # between layers form separate groups; params of one layer must be contiguous in the input order, or a
+        # layer is processed in pieces (breaking scale fusion).
+        # Side effects: device transfers, cache clearing, logging.
         """Streaming quantize: consume input layer by layer, yield (name, tensor) pairs."""
         if isinstance(params, dict):
             params = params.items()

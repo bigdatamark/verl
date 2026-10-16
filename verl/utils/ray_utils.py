@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Ray helpers: detecting whether Ray was told not to set accelerator visibility env vars, parallel
+# ray.put of many objects, getting/creating an asyncio event loop, and a decorator that lets async
+# functions be called from both sync and async contexts.
 """
 Contains commonly used utilities for ray
 """
@@ -26,6 +30,11 @@ import ray
 
 
 def ray_noset_visible_devices(env_vars=os.environ):
+    # [FUNCTION DOC]
+    # Behavior: returns True if any RAY_EXPERIMENTAL_NOSET_*_VISIBLE_* variable (CUDA, ROCR, HIP, Ascend,
+    # Habana, Neuron, TPU, oneAPI) is set to a non-empty value in env_vars.
+    # Inputs: env_vars - mapping (default os.environ, bound at definition time). Outputs: bool.
+    # Side effects: none.
     # Refer to
     # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/nvidia_gpu.py#L95-L96
     # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/amd_gpu.py#L102-L103
@@ -49,6 +58,11 @@ def ray_noset_visible_devices(env_vars=os.environ):
 
 
 def parallel_put(data_list: list[Any], max_workers: Optional[int] = None):
+    # [FUNCTION DOC]
+    # Behavior: submits ray.put for each item to a thread pool (default min(len, 16) workers), collects
+    # (index, ref) pairs as they complete, and returns refs ordered by input index.
+    # Inputs: data_list - non-empty list; max_workers. Outputs: list of ObjectRefs.
+    # Exceptions: AssertionError on empty list; ray.put errors propagate. Side effects: object store writes.
     """
     Puts a list of data into the Ray object store in parallel using a thread pool.
 
@@ -64,6 +78,8 @@ def parallel_put(data_list: list[Any], max_workers: Optional[int] = None):
     assert len(data_list) > 0, "data_list must not be empty"
 
     def put_data(index, data):
+        # [FUNCTION DOC]
+        # HELPER: Returns (index, ray.put(data)).
         return index, ray.put(data)
 
     if max_workers is None:
@@ -85,6 +101,10 @@ def parallel_put(data_list: list[Any], max_workers: Optional[int] = None):
 
 
 def get_event_loop():
+    # [FUNCTION DOC]
+    # Behavior: returns asyncio.get_event_loop(); if that raises RuntimeError (no loop in this thread), creates
+    # a new loop and sets it as current.
+    # Outputs: event loop. Side effects: may set the thread's event loop.
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
@@ -95,6 +115,9 @@ def get_event_loop():
 
 
 def auto_await(func):
+    # [FUNCTION DOC]
+    # Behavior: returns a wrapper (see docstring; note the code's case numbering differs from the docstring's).
+    # Outputs: decorated function.
     """Auto await a coroutine function.
 
     Handles three cases:
@@ -108,6 +131,14 @@ def auto_await(func):
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Calls func; non-coroutine results are returned as-is. With no running loop, runs the coroutine
+        # via asyncio.run. With a running loop, returns the coroutine unawaited if the immediate caller frame is a
+        # coroutine function; otherwise runs it with asyncio.run in a single worker thread and blocks for the result.
+        # KNOWN ISSUE: in the last case the running loop's thread is blocked until completion, and the coroutine
+        # runs on a different loop, so it must not depend on objects bound to the original loop. An async caller
+        # that does not await gets an unawaited coroutine.
+        # Exceptions: exceptions of the coroutine propagate. Side effects: may create threads/loops.
         coro = func(*args, **kwargs)
 
         if not inspect.iscoroutine(coro):

@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Training-side QAT setup: config dataclass, loading of the compressed-tensors style quantization JSON,
+# replacement of eligible nn.Linear modules with fake-quantizing QATLinear, setup of sibling links between
+# projections that vLLM fuses (q/k/v, gate/up) so they can share a global scale, and invalidation of
+# cached weight scales after optimizer steps.
 """QAT (Quantization-Aware Training) utilities for verl FSDP training."""
 
 import json
@@ -29,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class QATConfig(BaseConfig):
+    # [CLASS DOC]
+    # QAT settings: enable flag, mode ("w4a16" or "w4a4"), quantization group size (16), ignore patterns
+    # (substring match, or regex when prefixed "re:"; defaults skip lm_head, embed_tokens and MoE router
+    # gates), activation observer name for W4A4, and path to the quantization config JSON.
     """Unified configuration for QAT (Quantization-Aware Training)."""
 
     enable: bool = False
@@ -40,6 +49,12 @@ class QATConfig(BaseConfig):
 
 
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Behavior: reads the JSON at quantization_config_path; if the config has ignore_patterns, replaces the
+    # JSON "ignore" field with them (logging when they differ).
+    # Inputs: qat_config. Outputs: parsed dict.
+    # Exceptions: ValueError if the path is empty; OSError / JSON decode errors propagate.
+    # Side effects: file read, logging.
     """Load quantization config JSON file from QATConfig."""
     if not qat_config.quantization_config_path:
         raise ValueError("quantization_config_path is required when QAT is enabled")
@@ -60,6 +75,10 @@ def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
 
 
 def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True only for nn.Linear modules whose qualified name matches no ignore pattern
+    # ("re:" patterns via regex match from the start of the name, others via substring) and whose
+    # in_features is divisible by group_size (warning logged otherwise). Side effects: debug/warning logs.
     """Check if a module should be quantized."""
     if not isinstance(module, nn.Linear):
         return False
@@ -88,6 +107,13 @@ def apply_qat(
     model: nn.Module,
     config: QATConfig | dict[str, Any],
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # Behavior: converts dict config to QATConfig; returns the model unchanged if disabled. Parses mode into
+    # QATMode (lower-cased), collects eligible modules first, then replaces each non-QATLinear one in its
+    # parent with QATLinear.from_linear (mode, group_size, activation_observer).
+    # Inputs: model; config - QATConfig or dict of its fields. Outputs: the same model (mutated).
+    # Exceptions: ValueError for invalid mode; TypeError for unknown dict keys.
+    # Side effects: mutates module tree; logging.
     """Apply QAT to a model by replacing nn.Linear with QATLinear."""
     from verl.utils.qat.linear import QATLinear, QATMode
 
@@ -129,6 +155,9 @@ def apply_qat(
 
 
 def _set_module(model: nn.Module, name: str, new_module: nn.Module):
+    # [FUNCTION DOC]
+    # HELPER: Walks the dotted name through getattr from model to the parent and sets the last component to
+    # new_module. Exceptions: AttributeError for invalid paths. Side effects: mutates model.
     """Set a module in the model by its full name."""
     parts = name.split(".")
     parent = model
@@ -144,6 +173,11 @@ FUSION_PATTERNS = {
 
 
 def setup_fusion_siblings(model: nn.Module):
+    # [FUNCTION DOC]
+    # Behavior: for each fusion pattern (qkv: q/k/v_proj; gate_up: gate/up_proj), groups QATLinear modules
+    # whose names end with a pattern suffix by parent path; for groups with at least two members, sets on
+    # each module a list of weak references to its siblings (_fusion_siblings_ref).
+    # Outputs: dict pattern name -> number of groups linked. Side effects: sets attributes; logs.
     """Setup fusion siblings for QKV and GateUp layers."""
     import weakref
 
@@ -175,6 +209,9 @@ def setup_fusion_siblings(model: nn.Module):
 
 
 def enable_qat_fuse(model: nn.Module):
+    # [FUNCTION DOC]
+    # Behavior: sets up fusion siblings and marks the model with _qat_fuse_enabled = True.
+    # Outputs: None. Side effects: mutates modules/model; logs.
     """Enable QAT fuse mode: sets up fusion siblings for weight scale fusion."""
     setup_fusion_siblings(model)
     model._qat_fuse_enabled = True
@@ -182,6 +219,9 @@ def enable_qat_fuse(model: nn.Module):
 
 
 def invalidate_all_scales(model: nn.Module):
+    # [FUNCTION DOC]
+    # Behavior: for every QATLinear in the model, clears cached blockwise scale, global scale and cached weight
+    # amax so they are recomputed on the next forward. Side effects: mutates modules; debug log.
     """Clear all cached weight scales after optimizer.step()."""
     from verl.utils.qat.linear import QATLinear
 

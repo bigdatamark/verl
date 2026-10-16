@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Abstract rollout interface used by hybrid workers plus a lazy registry mapping (backend name, mode)
+# to the fully qualified class path of each server adapter (vllm, sglang, trtllm in async mode).
 
 import importlib
 from abc import ABC, abstractmethod
@@ -27,6 +30,9 @@ __all__ = ["BaseRollout"]
 
 
 class BaseRollout(ABC):
+    # [CLASS DOC]
+    # Abstract rollout: holds rollout config, model config (both converted to dataclasses) and device
+    # mesh; subclasses implement async resume, weight update and release, and optionally sync generation.
     """Base class for rollout."""
 
     def __init__(
@@ -37,12 +43,17 @@ class BaseRollout(ABC):
         *args,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: converts config and model_config to dataclasses and stores them with device_mesh.
+        # Inputs: config; model_config; device_mesh; extra args/kwargs ignored.
         self.config = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
         self.device_mesh = device_mesh
 
     @abstractmethod
     async def resume(self, tags: list[str]):
+        # [FUNCTION DOC]
+        # Behavior: abstract; resume GPU memory for the given tags ("weights" and/or "kv_cache").
         """Resume rollout weights or kv cache in GPU memory.
 
         Args:
@@ -57,6 +68,9 @@ class BaseRollout(ABC):
         wire_format: str = "named_tensors",
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: abstract; load new weights. Inputs: weights - generator of (name, tensor) for
+        # "named_tensors", or of (named tensors, is_last) flushes for "delta_flush"; wire_format; kwargs.
         """Update the weights of the rollout model.
 
         Args:
@@ -71,10 +85,14 @@ class BaseRollout(ABC):
 
     @abstractmethod
     async def release(self):
+        # [FUNCTION DOC]
+        # Behavior: abstract; release weights and KV cache from GPU memory.
         """Release weights and kv cache in GPU memory."""
         pass
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # Behavior: synchronous batch generation; default raises NotImplementedError.
         """Batch generate sequences in sync mode.
 
         Args:
@@ -94,6 +112,11 @@ _ROLLOUT_REGISTRY = {
 
 
 def get_rollout_class(rollout_name: str, mode: str = "async") -> type[BaseRollout]:
+    # [FUNCTION DOC]
+    # Behavior: looks up the class path for (rollout_name, mode), imports its module and returns the class.
+    # Inputs: rollout_name - backend; mode - default "async".
+    # Outputs: rollout class. Exceptions: AssertionError for unknown pairs; ImportError/AttributeError.
+    # Side effects: imports the backend module.
     """Get the rollout class by name.
 
     Args:

@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Batch reward manager (registered as "batch"): calls the scoring function once for the whole batch
+# with lists of decoded responses, ground truths, data sources and extra infos.
 
 from collections import defaultdict
 from typing import Any
@@ -24,6 +27,9 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager, RawRewar
 
 @register("batch")
 class BatchRewardManager(AbstractRewardManager):
+    # [CLASS DOC]
+    # Stores the tokenizer, examine count, batch scoring function, data source key and extra keyword
+    # arguments forwarded to the scoring function.
     """
     A batch reward manager that computes rewards for a batch of data.
 
@@ -38,6 +44,8 @@ class BatchRewardManager(AbstractRewardManager):
     def __init__(
         self, tokenizer, num_examine, compute_score: RawRewardFn, reward_fn_key="data_source", **reward_kwargs
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores the arguments as attributes. Inputs: see class. Outputs: none.
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.compute_score = compute_score
@@ -45,6 +53,16 @@ class BatchRewardManager(AbstractRewardManager):
         self.reward_kwargs = reward_kwargs
 
     def verify(self, data):
+        # [FUNCTION DOC]
+        # Behavior: decodes each response truncated to its valid length (sum of the attention mask over the
+        # response region, i.e. columns after the prompt length) with special tokens skipped. Gathers
+        # ground truths from each item's reward_model mapping (None if absent), data sources, rollout
+        # reward scores (default empty dicts) and extra infos (default empty dicts); stores each item's
+        # rollout reward scores into its extra info under "rollout_reward_scores". Calls the scoring
+        # function with keyword lists plus stored kwargs.
+        # Inputs: data - DataProto with prompts, responses, attention_mask, reward_model, data source.
+        # Outputs: whatever the scoring function returns (expected one score or dict per sample).
+        # Side effects: mutates the extra_info entries in place.
         prompt_ids = data.batch["prompts"]
         response_ids = data.batch["responses"]
         attention_mask = data.batch["attention_mask"]
@@ -78,6 +96,17 @@ class BatchRewardManager(AbstractRewardManager):
         return scores
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: returns precomputed rm_scores when present. Otherwise zero float tensor shaped like
+        # responses; computes valid response lengths; scores via verify. For each sample, a dict score
+        # contributes its "score" as reward and every key/value is appended to extra info lists; otherwise
+        # the score is the reward. Places the reward at the last valid response token. For up to
+        # num_examine samples per data source prints prompt, response, ground truth and score. Stores the
+        # per-sample rewards as batch field "acc".
+        # Inputs: data; return_dict. Outputs: reward tensor or dict with reward_tensor and extra info.
+        # Side effects: prints; writes data.batch["acc"].
+        # KNOWN ISSUE: a zero valid length writes the reward at index -1 (last position); mixing dict and
+        # non-dict scores leaves extra info lists with mismatched lengths.
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         reward_from_rm_scores = self._extract_reward_from_rm_scores(data, return_dict)
         if reward_from_rm_scores is not None:

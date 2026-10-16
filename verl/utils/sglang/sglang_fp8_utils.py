@@ -12,6 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Helpers for SGLang block-wise FP8 quantization: builds the FP8 quant config passed to the SGLang
+# server and weight sync, and decides which parameters to skip quantizing. Ignored layers are merged
+# from a quant config's "ignored_layers" and "modules_to_not_convert", the comma-separated env var
+# SGLANG_FP8_IGNORED_LAYERS, and explicit arguments, de-duplicated case-insensitively.
 
 import os
 import re
@@ -22,6 +27,9 @@ from verl.utils.fp8_utils import FP8QuantizerHelper
 
 
 def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Reads key from config using its get method if callable (dict-like), else attribute access;
+    # returns default if config is None or key is absent.
     if config is None:
         return default
     get_value = getattr(config, "get", None)
@@ -31,6 +39,9 @@ def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
 
 
 def _normalize_ignored_layers(ignored_layers: Any) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Converts None to [], a string to its comma-split parts, a non-iterable scalar to a
+    # one-element list; then stringifies, strips and drops empty entries. Outputs: list of names.
     if ignored_layers is None:
         return []
     if isinstance(ignored_layers, str):
@@ -47,6 +58,8 @@ def _normalize_ignored_layers(ignored_layers: Any) -> list[str]:
 
 
 def _dedupe_layers(ignored_layers: Iterable[str]) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Removes case-insensitive duplicates, keeping first occurrence and order.
     seen = set()
     deduped = []
     for layer in ignored_layers:
@@ -59,10 +72,15 @@ def _dedupe_layers(ignored_layers: Iterable[str]) -> list[str]:
 
 
 def _get_ignored_layers_from_env() -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns normalized ignored layers from the SGLANG_FP8_IGNORED_LAYERS environment variable.
     return _normalize_ignored_layers(os.getenv("SGLANG_FP8_IGNORED_LAYERS"))
 
 
 def get_sglang_fp8_ignored_layers(quant_config: Any = None) -> list[str]:
+    # [FUNCTION DOC]
+    # Returns the de-duplicated union of quant_config "ignored_layers", "modules_to_not_convert" and the
+    # env-var layers, in that order.
     ignored_layers = []
     ignored_layers.extend(_normalize_ignored_layers(_get_config_value(quant_config, "ignored_layers")))
     ignored_layers.extend(_normalize_ignored_layers(_get_config_value(quant_config, "modules_to_not_convert")))
@@ -71,6 +89,12 @@ def get_sglang_fp8_ignored_layers(quant_config: Any = None) -> list[str]:
 
 
 def _matches_ignored_layer(param_name: str, ignored_layer: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Decides whether param_name is covered by an ignore rule. Candidates are the name with
+    # surrounding dots stripped and that name without a trailing ".weight". A rule prefixed "re:" is a
+    # regex matched (from the start) against either candidate, case-sensitive. Otherwise, case-insensitive:
+    # match if a candidate equals the rule, starts with "rule.", ends with ".rule", or contains the rule
+    # as a dot-delimited component sequence. Empty rules never match.
     ignored_layer = ignored_layer.strip()
     if not ignored_layer:
         return False
@@ -97,6 +121,10 @@ def _matches_ignored_layer(param_name: str, ignored_layer: str) -> bool:
 
 
 def build_sglang_fp8_quant_config(hf_config: Any = None, ignored_layers: Any = None) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Returns the FP8 config dict: dynamic activation scheme, e4m3 format, quant_method "fp8", weight
+    # block size [128, 128], plus "ignored_layers" (only if non-empty) merged from hf_config's
+    # quantization_config, the env var, and the ignored_layers argument, de-duplicated.
     """Build SGLang block-wise FP8 config shared by server init and weight sync."""
     fp8_quant_config = {
         "activation_scheme": "dynamic",
@@ -116,11 +144,18 @@ def build_sglang_fp8_quant_config(hf_config: Any = None, ignored_layers: Any = N
 
 
 class SGLangFP8QuantizerHelper(FP8QuantizerHelper):
+    # [CLASS DOC]
+    # FP8QuantizerHelper subclass that additionally refuses to quantize parameters matching SGLang
+    # ignored-layer rules.
     def __init__(self, quant_config):
+        # [FUNCTION DOC]
+        # Initializes the base helper and computes ignored_layers from quant_config and the env var.
         super().__init__(quant_config)
         self.ignored_layers = get_sglang_fp8_ignored_layers(quant_config)
 
     def should_quantize_param(self, param_name):
+        # [FUNCTION DOC]
+        # Returns False if param_name matches any ignored layer rule; otherwise defers to the base class.
         for ignored_layer in self.ignored_layers:
             if _matches_ignored_layer(param_name, ignored_layer):
                 return False

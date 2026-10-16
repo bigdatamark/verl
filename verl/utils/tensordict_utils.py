@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# TensorDict helpers used as verl's batch container: storing non-tensor data (NonTensorData for scalars/metadata,
+# NonTensorStack for per-sample lists), building TensorDicts from tensors/lists, handling jagged nested tensors
+# (construction, concatenation, chunking, index selection), get/pop with unwrapping, union/equality checks, mini-batch
+# iteration, padding to a divisor and conversion from lists of dicts.
 
 import logging
 from typing import Any, Iterable
@@ -24,6 +29,9 @@ from tensordict.tensorclass import NonTensorData, NonTensorStack
 
 
 def assign_non_tensor_data(tensor_dict: TensorDict, key, val):
+    # [FUNCTION DOC]
+    # Stores val under key wrapped as NonTensorData (a single unbatched value).
+    # Exceptions: AssertionError if tensor_dict is not a TensorDict. Side effects: mutates tensor_dict.
     """Assign a single non-tensor value to a TensorDict.
 
     Wraps the value in NonTensorData so it can be stored alongside tensors
@@ -46,6 +54,9 @@ def assign_non_tensor_data(tensor_dict: TensorDict, key, val):
 
 
 def assign_non_tensor_stack(tensor_dict: TensorDict, key, val: list):
+    # [FUNCTION DOC]
+    # Stores a list under key as a NonTensorStack built from each item wrapped in NonTensorData (one entry per sample,
+    # allowing nested lists/dicts). Exceptions: AssertionError for non-TensorDict. Side effects: mutates tensor_dict.
     """Assign a list with potentially nested structures (lists, dicts, etc.) to TensorDict.
 
     This function handles complex nested data structures like:
@@ -74,6 +85,9 @@ def assign_non_tensor_stack(tensor_dict: TensorDict, key, val: list):
 
 
 def assign_non_tensor(tensor_dict: TensorDict, **kwargs):
+    # [FUNCTION DOC]
+    # For each keyword: stores existing NonTensorData/NonTensorStack as is, lists as NonTensorStack, and anything else as
+    # NonTensorData. Returns the same TensorDict. Exceptions: AssertionError for non-TensorDict. Side effects: mutates it.
     """Assign non-tensor data to a TensorDict.
 
     Automatically detects if the value is a list with nested structures and uses
@@ -108,6 +122,8 @@ def assign_non_tensor(tensor_dict: TensorDict, **kwargs):
 
 
 def unwrap_non_tensor_data(data):
+    # [FUNCTION DOC]
+    # Returns the inner value of a NonTensorData, otherwise the input unchanged.
     """Unwrap a NonTensorData object to get the underlying value.
 
     If the input is a NonTensorData wrapper, extracts and returns the
@@ -133,6 +149,8 @@ def unwrap_non_tensor_data(data):
 
 
 def get_non_tensor_data(data: TensorDict, key: str, default):
+    # [FUNCTION DOC]
+    # Gets key from the TensorDict (default when missing) and unwraps NonTensorData.
     """Retrieve and unwrap non-tensor data from a TensorDict.
 
     Fetches the value for the given key from the TensorDict and automatically
@@ -160,6 +178,13 @@ def get_non_tensor_data(data: TensorDict, key: str, default):
 
 
 def nested_tensor_from_tensor_list(tensors: list[torch.Tensor], ragged_idx: int | None = None) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Builds a jagged nested tensor from per-sample tensors.
+    # Behavior: requires at least one tensor; ragged_idx defaults to the per-sample dim count and must be within
+    # [1, sample_dim]. 1-D samples use the library's jagged constructor. Otherwise concatenates samples along dimension
+    # ragged_idx-1, computes offsets from each sample's length along that dimension, builds a jagged tensor from values and
+    # offsets and sets its private ragged index attribute to ragged_idx.
+    # Exceptions: AssertionError for empty input or invalid ragged_idx; torch errors for incompatible shapes.
     assert len(tensors) > 0, "Must provide at least one tensor"
     sample_dim = tensors[0].dim()
     if ragged_idx is None:
@@ -183,6 +208,10 @@ def nested_tensor_from_tensor_list(tensors: list[torch.Tensor], ragged_idx: int 
 
 
 def concat_nested_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Concatenates nested tensors along the batch dimension by unbinding each (must be nested, contiguous, at least 2-D)
+    # and rebuilding with the first tensor's ragged index (default dim - 1).
+    # Exceptions: AssertionError on violated requirements.
     """Concatenate multiple nested tensors along the batch dimension.
 
     Takes a list of nested tensors with jagged layout and concatenates them
@@ -219,6 +248,8 @@ def concat_nested_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
 
 
 def concat_tensordict_with_none_bsz(data: list[TensorDict]):
+    # [FUNCTION DOC]
+    # HELPER: For unbatched (metadata-only) TensorDicts, asserts every batch size is empty and returns the first one.
     """Handle concatenation of TensorDicts with empty batch size.
 
     For TensorDicts that contain only metadata (NonTensorData) with no batch
@@ -245,6 +276,11 @@ def concat_tensordict_with_none_bsz(data: list[TensorDict]):
 
 
 def concat_tensordict(data: list[TensorDict]) -> TensorDict:
+    # [FUNCTION DOC]
+    # Concatenates TensorDicts along dim 0. Without nested tensors: returns the first element for unbatched dicts, else
+    # uses TensorDict concatenation. With nested tensors (keys taken from the first dict, every dict must have the same nested
+    # key set): concatenates the non-nested parts via TensorDict concatenation and each nested key via
+    # concat_nested_tensors. Exceptions: AssertionError for empty input or inconsistent nested keys.
     """Concatenate multiple TensorDicts along dimension zero.
 
     Combines a list of TensorDicts into a single TensorDict by concatenating
@@ -300,6 +336,12 @@ def concat_tensordict(data: list[TensorDict]) -> TensorDict:
 
 
 def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
+    # [FUNCTION DOC]
+    # Splits a TensorDict into chunks equal parts along the batch dim.
+    # Behavior: non-nested entries are chunked by TensorDict chunking; for each nested key, unbinds samples and rebuilds
+    # per-chunk nested tensors; if unbinding raises RuntimeError (3D+ jagged bug), pads to dense, chunks, slices each
+    # sample to its original length from offsets and rebuilds. Preserves the ragged index attribute.
+    # Exceptions: AssertionError if not a TensorDict or the length is not divisible.
     """Split a TensorDict into equal-sized chunks with special nested tensor handling.
 
     Divides a TensorDict into the specified number of chunks along the batch
@@ -375,6 +417,14 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
 
 
 def get_tensordict(tensor_dict: dict[str, torch.Tensor | list], non_tensor_dict: dict = None) -> TensorDict:
+    # [FUNCTION DOC]
+    # Builds a batched TensorDict from tensors/lists plus unbatched metadata.
+    # Behavior: copies the input mapping. Nested tensors must be contiguous and jagged. NonTensorStack values are accepted as
+    # is and set/verify the batch size. Lists and numpy arrays (whose elements must not be tensors) are converted to
+    # NonTensorStack. Every value must be tensor, list or array; its first-dim length (or len) must match the common batch
+    # size. Batch size is [n] or [] when no batched entries exist. Each non_tensor_dict entry (key must be new) is added as
+    # NonTensorData.
+    # Exceptions: AssertionError for any violated check. Outputs: TensorDict.
     """Create a TensorDict from tensors and non-tensor data.
 
     Automatically handles nested structures in lists by converting them to NonTensorStack.
@@ -456,6 +506,11 @@ def get_tensordict(tensor_dict: dict[str, torch.Tensor | list], non_tensor_dict:
 
 
 def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int]) -> TensorDict:
+    # [FUNCTION DOC]
+    # Selects rows by 1-D indices (list converted to tensor): plain tensors via indexing, nested tensors by unbinding,
+    # picking and rebuilding with the same ragged index, NonTensorStack by indexing and unbatched NonTensorData unchanged.
+    # Returns a new TensorDict with batch size equal to the number of indices, or None if batch is None.
+    # Exceptions: AssertionError for non-1-D indices.
     """Select rows from a TensorDict using indices.
 
     Creates a new TensorDict containing only the rows specified by indices.
@@ -511,6 +566,10 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
 
 
 def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> TensorDict:
+    # [FUNCTION DOC]
+    # Adds to tensor_dict1 every key of tensor_dict2 it lacks (using raw get so non-tensor wrappers are kept); for shared
+    # keys asserts tensor equality or non-tensor equality. Returns tensor_dict1.
+    # Exceptions: AssertionError on batch size mismatch or differing shared values. Side effects: mutates tensor_dict1.
     """Merge two TensorDicts, adding keys from the second to the first.
 
     Performs an in-place union of two TensorDicts. Keys from tensor_dict2
@@ -557,6 +616,10 @@ def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> Ten
 
 
 def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, dataloader_kwargs=None):
+    # [FUNCTION DOC]
+    # Returns an iterator over mini-batches for epochs passes: a DataLoader over row indices (batch size mini_batch_size,
+    # identity collate, optional seeded generator, extra DataLoader kwargs such as shuffle) whose index batches are used to
+    # select rows. Exceptions: AssertionError if the batch size is not divisible or kwargs is not a dict.
     """Create an iterator that yields mini-batches from a TensorDict.
 
     Wraps a TensorDict in a DataLoader-style iterator that yields mini-batches
@@ -605,6 +668,8 @@ def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, da
     )
 
     def get_data():
+        # [FUNCTION DOC]
+        # HELPER: Generator yielding index-selected mini-batches for each epoch.
         for _ in range(epochs):
             for idx in train_dataloader:
                 yield index_select_tensor_dict(tensordict, idx)
@@ -613,6 +678,9 @@ def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, da
 
 
 def assert_tensordict_eq(tensordict1: TensorDict, tensordict2: TensorDict):
+    # [FUNCTION DOC]
+    # Asserts two TensorDicts have the same key set, matching value types, and equal values (nested tensors compared
+    # component-wise, dense tensors element-wise, others with equality). Exceptions: AssertionError on any mismatch.
     """Assert that two TensorDicts are equal.
 
     Performs a deep equality check between two TensorDicts, verifying that
@@ -660,6 +728,9 @@ def assert_tensordict_eq(tensordict1: TensorDict, tensordict2: TensorDict):
 
 
 def get(tensordict: TensorDict, key: str, default=None) -> Any:
+    # [FUNCTION DOC]
+    # Returns default if key is absent; otherwise tensors as is, NonTensorStack as a Python list and NonTensorData as its
+    # value. Exceptions: AssertionError for other stored types.
     """Get a value from a TensorDict with automatic unwrapping.
 
     Retrieves a value from the TensorDict and automatically converts it
@@ -696,6 +767,9 @@ def get(tensordict: TensorDict, key: str, default=None) -> Any:
 
 
 def get_keys(tensordict: TensorDict, keys: Iterable[str]) -> TensorDict:
+    # [FUNCTION DOC]
+    # Builds a new TensorDict containing only keys: tensors kept, NonTensorStacks converted to lists (re-wrapped as stacks),
+    # NonTensorData unwrapped and stored as metadata. Exceptions: KeyError for missing keys; AssertionError for other types.
     """Extract a subset of keys from a TensorDict into a new TensorDict.
 
     Creates a new TensorDict containing only the specified keys. Values
@@ -735,6 +809,8 @@ def get_keys(tensordict: TensorDict, keys: Iterable[str]) -> TensorDict:
 
 
 def pop(tensordict: TensorDict, key: str, default=None) -> Any:
+    # [FUNCTION DOC]
+    # Pops key (default if absent) and returns it converted as in get. Side effects: removes the key.
     """Remove and return a value from a TensorDict with automatic unwrapping.
 
     Removes the specified key from the TensorDict and returns its value,
@@ -770,6 +846,10 @@ def pop(tensordict: TensorDict, key: str, default=None) -> Any:
 
 
 def pop_keys(tensordict: TensorDict, keys: Iterable[str]) -> TensorDict:
+    # [FUNCTION DOC]
+    # Pops the given keys and returns them in a new TensorDict (tensors, NonTensorStacks as lists, NonTensorData as metadata).
+    # Exceptions: KeyError for missing keys. Side effects: removes keys from the source.
+    # KNOWN ISSUE: unlike get_keys, NonTensorData values are passed as the wrapper object rather than its data, so they are wrapped again in NonTensorData.
     """Remove multiple keys from a TensorDict and return them as a new TensorDict.
 
     Removes the specified keys from the source TensorDict and creates a new
@@ -811,6 +891,11 @@ def pop_keys(tensordict: TensorDict, keys: Iterable[str]) -> TensorDict:
 
 
 def pad_to_divisor(data: TensorDict, size_divisor: int):
+    # [FUNCTION DOC]
+    # Pads the batch dimension up to a multiple of size_divisor by appending repeated leading slices of the data (as many
+    # copies as needed), returning (padded data, pad size). Empty data with no padding needed logs a warning.
+    # Exceptions: AssertionError for non-TensorDict.
+    # KNOWN ISSUE: empty data whose length is not divisible cannot occur (0 is divisible), but the loop would never terminate for empty data with a nonzero pad.
     """Pad a TensorDict's batch dimension to be divisible by a given divisor.
 
     If the TensorDict's length is not evenly divisible by size_divisor,
@@ -856,6 +941,8 @@ def pad_to_divisor(data: TensorDict, size_divisor: int):
 
 
 def unpad(data: TensorDict, pad_size):
+    # [FUNCTION DOC]
+    # Removes the last pad_size rows when pad_size is nonzero; returns the data.
     """Remove padding from a TensorDict.
 
     Reverses the effect of pad_to_divisor by removing the specified number
@@ -881,6 +968,10 @@ def unpad(data: TensorDict, pad_size):
 
 
 def contiguous(data: TensorDict) -> TensorDict:
+    # [FUNCTION DOC]
+    # Returns a new TensorDict with contiguous tensors, NonTensorStacks passed through and NonTensorData kept as metadata.
+    # Exceptions: AssertionError for other value types.
+    # KNOWN ISSUE: NonTensorData wrappers are passed to get_tensordict as metadata and wrapped a second time.
     """Call contiguous on a tensor dict. The contiguous function of tensordict lib will make NonTensorStack.
     This function will always return a new tensordict
 
@@ -908,6 +999,9 @@ def contiguous(data: TensorDict) -> TensorDict:
 
 
 def maybe_fix_3d_position_ids(data: TensorDict):
+    # [FUNCTION DOC]
+    # Workaround: if position_ids exists and is a 3-D nested tensor, sets its private ragged index to 2.
+    # Side effects: mutates the tensor's attribute.
     # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
     # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
     # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
@@ -916,6 +1010,10 @@ def maybe_fix_3d_position_ids(data: TensorDict):
 
 
 def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:
+    # [FUNCTION DOC]
+    # Builds a batched TensorDict from a list of per-sample dicts (keys from the first dict): per key, stacks tensors with
+    # identical shapes, makes a jagged nested tensor from tensors with differing shapes, otherwise stores a NonTensorStack.
+    # Exceptions: AssertionError if tensordict is older than 0.10 or the list is empty; KeyError if a later dict lacks a key.
     """
     Create a TensorDict from a list of dict of tensors and non_tensors.
     Note that this requires tensordict version at least 0.10

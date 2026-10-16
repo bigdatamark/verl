@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Monkey-patches for vLLM compressed-tensors NVFP4 schemes so quantized weights can be reloaded repeatedly
+# at runtime (RL weight sync). vLLM's process_weights_after_loading converts HF-format params
+# (weight_packed, weight_scale, weight_global_scale, input_global_scale) into backend formats (Marlin,
+# FlashInfer, CUTLASS, fbgemm) and may delete or reshape them. The patched versions record HF param
+# metadata and weight loaders on the first call, keep references to the backend tensors so later calls
+# copy in place (preserving addresses for CUDA graphs), and the helpers rebuild HF-shape params before each
+# reload and re-run post-processing afterwards. Logging level from VERL_LOGGING_LEVEL.
 """
 vLLM NVFP4 Patches for Dynamic Weight Updates.
 
@@ -37,6 +45,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class ParamMetaDict(dict):
+    # [CLASS DOC]
+    # Name -> Parameter dict for a vLLM model that can lazily rebuild HF-format params that post-processing
+    # deleted, using per-layer _hf_param_meta saved by save_param_meta, and that tracks layers whose
+    # weight_scale (or MoE w13/w2 weight_scale) must be swapped between Marlin and HF shapes.
     """
     Dict-like class for parameter management with metadata-based rebuild and tensor swap.
 
@@ -46,6 +58,9 @@ class ParamMetaDict(dict):
     """
 
     def __init__(self, model: torch.nn.Module, device: Optional[torch.device] = None):
+        # [FUNCTION DOC]
+        # Behavior: unwraps model.model if present, builds metadata caches, and fills the dict with all current
+        # named parameters. Inputs: model; device - for rebuilt params. Side effects: none on the model.
         """
         Initialize ParamMetaDict from a model.
 
@@ -73,6 +88,10 @@ class ParamMetaDict(dict):
             self[name] = param
 
     def _build_mappings(self):
+        # [FUNCTION DOC]
+        # HELPER: Scans modules with _hf_param_meta; caches module+meta per layer name; registers tensor-swap entries
+        # for "weight_scale" (key = layer name) and MoE "w13_weight_scale"/"w2_weight_scale" (keys <layer>.w13 /
+        # <layer>.w2, with param_name) when both metadata and a saved backend tensor ref exist.
         """Build layer metadata cache for rebuild and tensor swap."""
         for layer_name, module in self._model.named_modules():
             # Check for _hf_param_meta which indicates this layer has HF format params
@@ -111,6 +130,10 @@ class ParamMetaDict(dict):
                         }
 
     def _try_rebuild(self, key: str) -> Optional[Parameter]:
+        # [FUNCTION DOC]
+        # HELPER: Splits key into layer and param name; if the layer has metadata for the param, returns the
+        # existing non-None module attribute, otherwise creates a param from metadata and registers it on the
+        # module. Returns None when not rebuildable. Side effects: may register a parameter.
         """
         Try to rebuild a parameter from metadata if it was deleted.
 
@@ -151,6 +174,10 @@ class ParamMetaDict(dict):
         return new_param
 
     def prepare_for_reload(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: for each tensor-swap layer whose module has the param, replaces it with a fresh empty param of
+        # the HF shape/dtype (via _create_param_from_meta). The backend tensor ref stays saved for later in-place
+        # copy. Side effects: replaces module attributes.
         """Replace Marlin-format tensors with HF-shape tensors for reload."""
         for layer_name, swap_info in self._tensor_swap_layers.items():
             module = swap_info["module"]
@@ -161,6 +188,9 @@ class ParamMetaDict(dict):
                 setattr(module, param_name, new_param)
 
     def __getitem__(self, key: str) -> Parameter:
+        # [FUNCTION DOC]
+        # Behavior: returns the stored entry; else attempts rebuild, caching and returning it.
+        # Exceptions: KeyError when neither exists. Side effects: may register a param on a module.
         """Get parameter with rebuild support."""
         # Try standard lookup first
         if key in dict.keys(self):
@@ -175,6 +205,8 @@ class ParamMetaDict(dict):
         raise KeyError(f"Parameter not found: {key}")
 
     def __contains__(self, key: str) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if stored, or if the layer metadata says the param is rebuildable (without rebuilding).
         """Check if parameter exists (with rebuild check)."""
         if super().__contains__(key):
             return True
@@ -191,6 +223,8 @@ class ParamMetaDict(dict):
         return False
 
     def get(self, key: str, default=None):
+        # [FUNCTION DOC]
+        # Behavior: returns self[key] (with rebuild), or default on KeyError.
         """Get parameter with default."""
         try:
             return self[key]
@@ -204,6 +238,14 @@ def _create_param_from_meta(
     meta: dict,
     device: Optional[torch.device] = None,
 ) -> Parameter:
+    # [FUNCTION DOC]
+    # HELPER: Creates an uninitialized parameter from metadata.
+    # Behavior: allocates an empty tensor with meta shape/dtype on device (or meta device, or default device
+    # name). If the recorded param class is a vLLM parameter subclass and a weight loader was saved for the
+    # name, constructs that class with data, weight_loader and optional input_dim/output_dim; otherwise a plain
+    # non-grad Parameter with weight_loader attached if available. Construction failures fall back to a plain
+    # Parameter (warning logged). Copies quant_method if recorded.
+    # Outputs: new Parameter. Side effects: memory allocation, logging.
     """Create a Parameter from saved metadata. Used by rebuild and tensor swap."""
     shape = meta["shape"]
     dtype = meta["dtype"]
@@ -240,6 +282,10 @@ def _create_param_from_meta(
 
 
 def save_param_meta(layer: torch.nn.Module, param_name: str):
+    # [FUNCTION DOC]
+    # Behavior: ensures layer._hf_param_meta exists; if the param exists, records shape, dtype, device string,
+    # param class, and optional _input_dim/_output_dim and quant_method under its name.
+    # Side effects: mutates layer.
     """Save parameter metadata for rebuild."""
     if not hasattr(layer, "_hf_param_meta"):
         layer._hf_param_meta = {}
@@ -269,6 +315,8 @@ def save_param_meta(layer: torch.nn.Module, param_name: str):
 
 
 def _check_first_call(layer: torch.nn.Module) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Increments layer._process_weights_call_count and returns True if it was 0 before.
     """Check if this is the first process_weights call, and increment counter."""
     count = getattr(layer, "_process_weights_call_count", 0)
     layer._process_weights_call_count = count + 1
@@ -277,6 +325,16 @@ def _check_first_call(layer: torch.nn.Module) -> bool:
 
 # Dense W4A16 Patches
 def patched_w4a16_process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    # [FUNCTION DOC]
+    # Replacement for CompressedTensorsW4A16Fp4.process_weights_after_loading (self is the scheme).
+    # Behavior: on first call saves metadata and weight loaders for weight_packed/global_scale/scale and
+    # creates the Marlin workspace. Each call: repacks packed int4 weights to Marlin layout (transpose of the
+    # int32 view), converts the FP8 block scale (transposed, to params dtype) via Marlin permutation and NVFP4
+    # scale processing, and computes the global scale as 1 / max(weight_global_scale). First call registers new
+    # params weight, weight_scale and weight_scale_2 and saves a ref to the Marlin weight_scale tensor; later
+    # calls copy into existing tensors (re-wrapping the saved scale ref, or warning and replacing if missing).
+    # Finally deletes weight_packed and weight_global_scale. Group size fixed at 16.
+    # Inputs: self - scheme; layer - vLLM linear layer. Side effects: mutates layer params.
     """Patched process_weights_after_loading for W4A16 Dense layer."""
     import vllm._custom_ops as ops
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
@@ -367,6 +425,14 @@ def patched_w4a16_process_weights_after_loading(self, layer: torch.nn.Module) ->
 
 
 def patched_w4a4_process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    # [FUNCTION DOC]
+    # Replacement for CompressedTensorsW4A4Fp4.process_weights_after_loading.
+    # Behavior: first call saves metadata/loaders for the four HF params. Computes scalar global input and
+    # weight scales (max), and backend-specific weight/scale layout: flashinfer-trtllm shuffles both with tile
+    # 128; fbgemm swizzles block scale and flattens to uint8; cutlass/flashinfer-cutlass swizzles scale only.
+    # alpha = 1 / (input_scale * weight_scale). First call registers new params for the five tensors and saves
+    # refs; later calls copy into refs (re-wrapping as Parameters) or create new Parameters with a warning.
+    # Side effects: mutates layer params.
     """Patched process_weights_after_loading for W4A4 Dense (all backends)."""
     from vllm.model_executor.layers.quantization.utils.quant_utils import swizzle_blockscale
 
@@ -452,6 +518,9 @@ def patched_w4a4_process_weights_after_loading(self, layer: torch.nn.Module) -> 
 
 
 def _marlin_repack_experts(packed, perm, size_k, size_n, num_experts):
+    # [FUNCTION DOC]
+    # HELPER: For each expert, repacks its packed weight (int32 view transposed) to Marlin format; returns the
+    # stacked tensor.
     """Repack weight for each expert into Marlin format and stack."""
     import vllm._custom_ops as ops
 
@@ -472,6 +541,9 @@ def _marlin_repack_experts(packed, perm, size_k, size_n, num_experts):
 
 
 def _marlin_process_scales_experts(scale_hf, param_dtype, size_k, size_n, group_size, num_experts):
+    # [FUNCTION DOC]
+    # HELPER: Converts each expert's scale (cast to param dtype, transposed) with Marlin permutation and NVFP4
+    # scale processing; returns the stacked tensor.
     """Process scales for each expert into Marlin format and stack."""
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
         marlin_permute_scales,
@@ -493,6 +565,14 @@ def _marlin_process_scales_experts(scale_hf, param_dtype, size_k, size_n, group_
 
 
 def _process_nvfp4_moe_marlin(self, layer: torch.nn.Module, is_first_call: bool) -> None:
+    # [FUNCTION DOC]
+    # HELPER: MoE post-processing for the Marlin (W4A16) backend.
+    # Behavior: creates the workspace on first call; warns if w1 and w3 global scales differ; repacks w13 and
+    # w2 weights and scales per expert; computes processed inverse global scales (w13 uses shard 0). First call
+    # registers w13/w2 weight, weight_scale and weight_scale_2 params and saves scale refs; later calls copy in
+    # place (falling back to copying into current params with a warning). Clears input scales and rebuilds the
+    # fused MoE quant config and kernel (unless using non-naive all2all kernels).
+    # Inputs: self - MoE method; layer; is_first_call. Side effects: mutates layer and self.
     """Process MoE layer with MARLIN backend (W4A16)."""
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import make_nvfp4_moe_kernel
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
@@ -584,6 +664,13 @@ def _process_nvfp4_moe_marlin(self, layer: torch.nn.Module, is_first_call: bool)
 
 
 def _process_nvfp4_moe_flashinfer_cutlass(self, layer: torch.nn.Module, is_first_call: bool) -> None:
+    # [FUNCTION DOC]
+    # HELPER: MoE post-processing for FlashInfer/CUTLASS (W4A4) backends.
+    # Behavior: clones packed weights into temporary params (assigned as w13/w2_weight on first call), warns if
+    # w1/w3 global scales differ, and converts via vLLM's convert_to_nvfp4_moe_kernel_format with inverse
+    # global and input scales. First call replaces params and saves scale refs; later calls copy weights and
+    # scales in place. Sets weight_scale_2 and input scales and rebuilds the quant config and kernel as above.
+    # Side effects: mutates layer and self.
     """Process MoE layer with FlashInfer/CUTLASS backend (W4A4)."""
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
         convert_to_nvfp4_moe_kernel_format,
@@ -679,6 +766,11 @@ def _process_nvfp4_moe_flashinfer_cutlass(self, layer: torch.nn.Module, is_first
 
 # MoE NVFP4 Patches (entry points)
 def patched_nvfp4_moe_process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    # [FUNCTION DOC]
+    # Replacement for CompressedTensorsW4A4Nvfp4MoEMethod.process_weights_after_loading.
+    # Behavior: first call saves metadata and loaders for w13/w2 packed weights and scales; dispatches to the
+    # Marlin or FlashInfer/CUTLASS helper based on self.nvfp4_backend; then deletes the HF packed weights.
+    # Side effects: mutates layer.
     """Patched process_weights_after_loading for NVFP4 MoE layer."""
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
 
@@ -735,6 +827,11 @@ _applied_patches = []
 
 
 def apply_qat_patches():
+    # [FUNCTION DOC]
+    # Behavior: if already applied, warns and returns the existing list. Otherwise starts a unittest.mock
+    # patch for each target (dense W4A16, dense W4A4, MoE), keeping the patchers in a module-level list.
+    # Outputs: list of active patchers. Exceptions: import/attribute errors if vLLM targets are missing.
+    # Side effects: process-global monkey-patching (never stopped), logging.
     """Apply NVFP4 patches to support dynamic weight updates. Call before model loading."""
     global _applied_patches
 
@@ -761,6 +858,15 @@ def prepare_qat_for_load_weights(model, device=None):
         model: vLLM model
         device: Device for created parameters
     """
+    # [FUNCTION DOC]
+    # Behavior: unwraps model.model, builds a ParamMetaDict, swaps tensor-swap layers to HF-shape params, then
+    # for every recorded param in every metadata layer re-creates and registers it unless an existing attribute
+    # already has the HF shape, dtype and a weight_loader. Stores the dict on the inner model as
+    # _param_meta_for_restore.
+    # Inputs: model; device. Outputs: the ParamMetaDict.
+    # KNOWN ISSUE: the model is unwrapped here and again inside ParamMetaDict, so if the inner model also has a
+    # .model attribute only that sub-module is scanned for metadata and parameters.
+    # Side effects: replaces/registers params on modules; logging.
     inner_model = model
     if hasattr(model, "model"):
         inner_model = model.model
@@ -796,6 +902,11 @@ def prepare_qat_for_load_weights(model, device=None):
 
 def manual_process_weights_after_loading(model):
     """Trigger weight post-processing for all quantized layers after load_weights."""
+    # [FUNCTION DOC]
+    # Behavior: unwraps model.model; for each module with a "scheme" calls scheme.process_weights_after_loading;
+    # for modules without a scheme but with a quant_method offering that hook (excluding KV-cache methods)
+    # calls it too.
+    # Outputs: total number of modules processed. Side effects: runs the (patched) post-processing.
     dense_count = 0
     moe_count = 0
 

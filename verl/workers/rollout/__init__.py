@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Rollout package: base rollout interface and backend lookup, HuggingFace and naive in-process
+# rollouts, and the RolloutReplica abstraction for server-mode inference replicas. Re-exports these.
 
 from .base import BaseRollout, get_rollout_class
 from .hf_rollout import HFRollout

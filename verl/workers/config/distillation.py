@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Dataclass configs for on-policy distillation: loss settings, per-teacher model configs (with
+# inference/rollout config and replica sizing), and the top-level DistillationConfig that resolves
+# teachers keyed by routing key and checks they exactly fill the teacher resource pool. Logger level
+# from VERL_LOGGING_LEVEL (default WARN).
+
 import logging
 import os
 from dataclasses import dataclass, field
@@ -30,6 +36,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @dataclass
 class DistillationLossConfig(BaseConfig):
+    # [CLASS DOC]
+    # Distillation loss settings (see docstring), plus chunked top-k options (use_chunked_topk, chunk
+    # size 4096), a mutable global_batch_info dict and runtime-populated loss_settings.
     """Configuration for distillation loss settings.
 
     loss_mode (str):
@@ -98,6 +107,16 @@ class DistillationLossConfig(BaseConfig):
     loss_settings: Optional[dict] = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: adds "loss_settings" to the mutable field set, resolves loss_settings from loss_mode via
+        # the distillation losses registry, raises NotImplementedError if policy_loss_mode is not "vanilla",
+        # prints a warning when forward_kl_topk is used with policy gradient, and raises ValueError for k1
+        # without policy gradient.
+        # Exceptions: NotImplementedError, ValueError, and whatever the registry raises for unknown modes.
+        # Side effects: prints; mutates the mutable-field set.
+        # KNOWN ISSUE: the mutable-field set is the class attribute inherited from BaseConfig, so adding to
+        # it in place mutates the shared set for all BaseConfig subclasses. Also the policy_loss_mode check
+        # runs even when use_policy_gradient is False, despite the message.
         self._mutable_fields.add("loss_settings")
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
@@ -126,6 +145,9 @@ class DistillationLossConfig(BaseConfig):
 
 @dataclass
 class DistillationTeacherModelConfig(BaseConfig):
+    # [CLASS DOC]
+    # Single teacher config: routing key, model path, inference RolloutConfig, and num_replicas
+    # (mutable along with key).
     """Configuration for on-policy distillation teacher.
 
     key (str, optional):
@@ -151,6 +173,8 @@ class DistillationTeacherModelConfig(BaseConfig):
 
     @property
     def per_replica_world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns inference TP times DP times PP size. Outputs: int.
         return (
             self.inference.tensor_model_parallel_size
             * self.inference.data_parallel_size
@@ -159,9 +183,13 @@ class DistillationTeacherModelConfig(BaseConfig):
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns num_replicas times per-replica world size.
         return self.num_replicas * self.per_replica_world_size
 
     def check_configured(self):
+        # [FUNCTION DOC]
+        # Behavior: raises ValueError if model_path, key or num_replicas is None. Outputs: None.
         if self.model_path is None:
             raise ValueError("model_path must be specified for distillation teacher model config.")
         if self.key is None:
@@ -170,6 +198,13 @@ class DistillationTeacherModelConfig(BaseConfig):
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
     def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
+        # [FUNCTION DOC]
+        # Behavior: requires the teacher's max_model_len (if set) to fit prompt length plus response length
+        # plus one; then rewrites the inference config so prompt_length becomes prompt plus response length
+        # and response_length becomes 1 (teacher scores the student sequence as a prompt), and validates
+        # top-k logprob support.
+        # Inputs: use_topk - whether the loss needs top-k; topk - k. Outputs: None.
+        # Exceptions: ValueError; errors from top-k validation. Side effects: mutates the inference config.
         # Prompt + Response from student are fed into teacher as context
         max_model_len = self.inference.max_model_len
         student_prompt_length = self.inference.prompt_length
@@ -186,6 +221,11 @@ class DistillationTeacherModelConfig(BaseConfig):
         self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
 
     def _validate_topk_logprobs(self, use_topk: bool, topk: Optional[int]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: No-op unless use_topk. Requires topk. For vLLM, ensures engine_kwargs["vllm"] contains
+        # max_logprobs (defaulting it to topk) and that it is at least topk, writing back a copy; SGLang
+        # needs nothing; other engines raise NotImplementedError.
+        # Exceptions: ValueError, NotImplementedError. Side effects: mutates inference engine_kwargs.
         if not use_topk:
             return
         if topk is None:
@@ -220,6 +260,10 @@ class DistillationTeacherModelConfig(BaseConfig):
 
 @dataclass
 class DistillationConfig(BaseConfig):
+    # [CLASS DOC]
+    # Top-level distillation config: enabled flag, teacher pool size (GPUs per node, nodes), mapping of
+    # teacher entry name to teacher config (keyed by routing key after post-init), teacher_key data
+    # field name, and loss config. See docstring note about the default teacher_model entry.
     """Configuration for on-policy distillation.
 
     enabled (bool):
@@ -267,6 +311,11 @@ class DistillationConfig(BaseConfig):
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: no-op when disabled. Otherwise resolves teacher models, validates and prepares each for
+        # distillation using the loss's top-k setting, and requires the sum of teacher world sizes to equal
+        # GPUs per node times nodes. Exceptions: ValueError and errors from helpers. Side effects: replaces
+        # teacher_models and mutates teacher configs.
         if not self.enabled:
             return
 
@@ -287,6 +336,14 @@ class DistillationConfig(BaseConfig):
             )
 
     def _resolve_teacher_models(self) -> dict[str, DistillationTeacherModelConfig]:
+        # [FUNCTION DOC]
+        # HELPER: Asserts the default "teacher_model" entry exists. With exactly one entry, sizes it to fill
+        # the pool (num_replicas = pool size divided by per-replica size, which must divide evenly) and sets
+        # its key to "default". With several entries, drops the default entry. Then converts each entry to a
+        # DistillationTeacherModelConfig, checks it is configured, and builds a mapping keyed by teacher key.
+        # Outputs: mapping key to teacher config.
+        # Exceptions: AssertionError; ValueError on uneven pool split, missing fields or duplicate keys.
+        # Side effects: mutates teacher_models entries.
         assert "teacher_model" in self.teacher_models
         if len(self.teacher_models) == 1:
             # Single teacher occupies the entire teacher resource pool.

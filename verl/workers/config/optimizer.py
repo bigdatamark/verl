@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Optimizer dataclass configs (base, VeOmni, FSDP, Megatron-Core, TorchTitan, Automodel) and a
+# generic builder that instantiates an optimizer class by dynamic import from a module path.
+
 import warnings
 from dataclasses import dataclass
 from typing import Optional
@@ -32,6 +36,10 @@ __all__ = [
 
 @dataclass
 class OptimizerConfig(BaseConfig):
+    # [CLASS DOC]
+    # Base optimizer config: lr, warmup ratio / steps, total training steps (filled at runtime), weight
+    # decay, betas, clip_grad and deprecated grad_clip. Mutable: clip_grad, total_training_steps,
+    # lr_warmup_steps.
     """Base optimizer configuration.
 
     Args:
@@ -55,6 +63,11 @@ class OptimizerConfig(BaseConfig):
     grad_clip: Optional[float] = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts lr is not MISSING; if the deprecated grad_clip is set, emits a DeprecationWarning
+        # and copies it to clip_grad.
+        # KNOWN ISSUE: lr defaults to 1e-3, so the "must be specified" assertion only triggers when lr is
+        # explicitly MISSING.
         assert self.lr != MISSING
         if self.grad_clip is not None:
             warnings.warn("`grad_clip` is deprecated, use `clip_grad` instead.", DeprecationWarning, stacklevel=2)
@@ -63,6 +76,9 @@ class OptimizerConfig(BaseConfig):
 
 @dataclass
 class VeOmniOptimizerConfig(OptimizerConfig):
+    # [CLASS DOC]
+    # VeOmni optimizer config: optimizer name, min / start lr, decay ratio, scheduler type and an
+    # optional override dict. Uses a copy of the base mutable-field set. No extra validation.
     """VeOmni optimizer configuration extending base OptimizerConfig.
 
     Args:
@@ -86,6 +102,9 @@ class VeOmniOptimizerConfig(OptimizerConfig):
 
 @dataclass
 class FSDPOptimizerConfig(OptimizerConfig):
+    # [CLASS DOC]
+    # FSDP optimizer config: optimizer class name and import module, min lr ratio, deprecated
+    # warmup_style, scheduler type (mutable), cosine cycles, override dict and zero-indexed step flag.
     """FSDP optimizer configuration extending base OptimizerConfig.
 
     Args:
@@ -114,6 +133,10 @@ class FSDPOptimizerConfig(OptimizerConfig):
     zero_indexed_step: bool = True
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: if warmup_style is set, asserts it is constant / cosine, warns of deprecation and copies
+        # it to lr_scheduler_type; asserts the scheduler type is constant / cosine; then runs base post-init.
+        # Exceptions: AssertionError.
         if self.warmup_style is not None:
             assert self.warmup_style in ["constant", "cosine"]
             warnings.warn(
@@ -126,6 +149,9 @@ class FSDPOptimizerConfig(OptimizerConfig):
 
 @dataclass
 class McoreOptimizerConfig(OptimizerConfig):
+    # [CLASS DOC]
+    # Megatron-Core optimizer config (see docstring): schedule and decay options, precision-aware
+    # optimizer dtypes, layer-wise distributed optimizer and Muon options, and an override dict.
     """Mcore optimizer configuration extending base OptimizerConfig.
 
     Args:
@@ -225,6 +251,9 @@ class McoreOptimizerConfig(OptimizerConfig):
     override_optimizer_config: Optional[dict] = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts each of main_grads_dtype, exp_avg_dtype, exp_avg_sq_dtype (as string) is one of
+        # fp32 / float32 / 32 / bf16 / bfloat16, then runs base post-init. Exceptions: AssertionError.
         allowed_dtypes = {"fp32", "float32", "32", "bf16", "bfloat16"}
         for field_name in ("main_grads_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
             value = getattr(self, field_name)
@@ -236,6 +265,8 @@ class McoreOptimizerConfig(OptimizerConfig):
 
 @dataclass
 class TorchtitanOptimizerConfig(OptimizerConfig):
+    # [CLASS DOC]
+    # TorchTitan optimizer config: name, eps, decay type and min lr factor. No extra validation.
     """Torchtitan optimizer configuration extending base OptimizerConfig.
 
     Args:
@@ -253,6 +284,10 @@ class TorchtitanOptimizerConfig(OptimizerConfig):
 
 @dataclass
 class AutomodelOptimizerConfig(OptimizerConfig):
+    # [CLASS DOC]
+    # Automodel optimizer config: optimizer class and module, init / min lr ratios, scheduler type
+    # (mutable, default cosine), weight-decay increment style, legacy cycles / zero-index fields, eps,
+    # master-weight and moment dtype options, and an override dict.
     """Automodel optimizer configuration extending base OptimizerConfig.
 
     Uses the same optimizer building mechanism as FSDP (dynamic import from optimizer_impl).
@@ -291,11 +326,22 @@ class AutomodelOptimizerConfig(OptimizerConfig):
     override_optimizer_config: Optional[dict] = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts the scheduler type is constant / cosine / linear / inverse-square-root, then
+        # runs base post-init.
         assert self.lr_scheduler_type in ["constant", "cosine", "linear", "inverse-square-root"]
         return super().__post_init__()
 
 
 def build_optimizer(parameters, config: FSDPOptimizerConfig):
+    # [FUNCTION DOC]
+    # Behavior: builds keyword args with lr and weight_decay, adds betas when the lowercase optimizer
+    # name contains "adam" or "ademamix", merges override_optimizer_config, imports optimizer_impl and
+    # fetches the optimizer class by name, and instantiates it with the parameters and args.
+    # Inputs: parameters - iterable of params or param groups; config - FSDP-style optimizer config.
+    # Outputs: optimizer instance.
+    # Exceptions: ImportError (chained) if the module is missing; AttributeError (chained, listing the
+    # module contents) if the class is missing; constructor errors propagate.
     """Build an optimizer based on the configuration.
 
     Dynamically imports and instantiates an optimizer class from the specified module.

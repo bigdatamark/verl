@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# TransferQueue (TQ) bridge utilities. Provides the tqbridge decorator that transparently replaces BatchMeta /
+# KVBatchMeta arguments with the real TensorDict data fetched from TransferQueue, and writes TensorDict outputs back to
+# TQ returning updated metadata. When transfer_queue is not installed, placeholder BatchMeta/KVBatchMeta classes and a
+# mock tq module (raising RuntimeError on any call) are defined. Sync callers run TQ coroutines on a shared daemon
+# event-loop thread (lazily created, shut down at interpreter exit). Module state: TQ_INITIALIZED flag (tq.init called
+# once per process), the bridge loop/thread and a lock; logger level from VERL_LOGGING_LEVEL (default WARN).
 
 import asyncio
 import atexit
@@ -42,17 +49,28 @@ try:
 except ImportError:
 
     class BatchMeta:
+        # [CLASS DOC]
+        # HELPER: Placeholder used for isinstance checks when transfer_queue is not installed.
         pass
 
     class KVBatchMeta:
+        # [CLASS DOC]
+        # HELPER: Placeholder used for isinstance checks when transfer_queue is not installed.
         pass
 
     # Mock transfer_queue module when not installed
     class _MockTQ:
+        # [CLASS DOC]
+        # HELPER: Stand-in for the transfer_queue module: any attribute access returns a function that raises RuntimeError
+        # explaining that transfer_queue must be installed.
         """Mock transfer_queue module that raises RuntimeError on any access."""
 
         def __getattr__(self, name: str) -> Any:
+            # [FUNCTION DOC]
+            # Returns a callable that raises RuntimeError naming the requested attribute when invoked.
             def _raise(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Raises RuntimeError with install instructions, regardless of arguments.
                 raise RuntimeError(
                     f"transfer_queue is not installed. Cannot use tq.{name}(). "
                     "Please install it by calling `pip install TransferQueue==0.1.8`"
@@ -75,6 +93,8 @@ _ASYNC_BRIDGE_LOCK = threading.Lock()
 
 
 def _run_event_loop_forever(loop: asyncio.AbstractEventLoop, ready: threading.Event) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Thread target: sets loop as the thread's event loop, signals ready, and runs the loop until stopped.
     asyncio.set_event_loop(loop)
     ready.set()
     loop.run_forever()
@@ -84,6 +104,10 @@ def _shutdown_async_bridge_runtime(
     loop: asyncio.AbstractEventLoop | None = None,
     thread: threading.Thread | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Stops and closes an event loop runtime. With no arguments, atomically takes and clears the global bridge
+    # loop/thread. If the thread is alive, schedules loop stop thread-safely (ignoring RuntimeError for a closed loop) and
+    # joins it; then closes the loop if not already closed. Registered with atexit.
     global _ASYNC_BRIDGE_LOOP, _ASYNC_BRIDGE_THREAD
 
     # No explicit runtime provided: shutdown the shared global runtime.
@@ -107,6 +131,11 @@ def _shutdown_async_bridge_runtime(
 
 
 def _get_async_bridge_loop() -> asyncio.AbstractEventLoop:
+    # [FUNCTION DOC]
+    # HELPER: Returns the shared bridge event loop, creating it under the lock on first use: a new loop run forever in a
+    # daemon thread; waits up to 5 seconds for it to start.
+    # Exceptions: RuntimeError (after cleanup) if the thread does not signal readiness in time. Side effects: starts a thread,
+    # sets module globals.
     global _ASYNC_BRIDGE_LOOP, _ASYNC_BRIDGE_THREAD
     with _ASYNC_BRIDGE_LOCK:
         loop = _ASYNC_BRIDGE_LOOP
@@ -135,6 +164,10 @@ atexit.register(_shutdown_async_bridge_runtime)
 
 
 def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Runs async_func(args) on the shared bridge loop and blocks until its result, closing the coroutine if
+    # scheduling fails. Exceptions: re-raises scheduling RuntimeError and any exception from the coroutine.
+    # KNOWN ISSUE: called from inside a coroutine running on the bridge loop itself it would deadlock.
     # Use a shared event loop in a background thread because event
     # loop may already exist in server mode.
     loop = _get_async_bridge_loop()
@@ -148,6 +181,8 @@ def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> 
 
 
 def _find_meta(*args, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Returns the first positional, then keyword, argument that is a BatchMeta or KVBatchMeta, else None.
     for arg in args:
         if isinstance(arg, BatchMeta | KVBatchMeta):
             return arg
@@ -158,6 +193,11 @@ def _find_meta(*args, **kwargs):
 
 
 async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
+    # [FUNCTION DOC]
+    # HELPER: Fetches real data for a metadata object: converts KVBatchMeta to BatchMeta first; deep-copies extra_info;
+    # for size 0 returns an empty TensorDict carrying extra_info as non-tensor entries; otherwise gets the data from the TQ
+    # client and attaches each extra_info entry (NonTensorData/Stack directly, others wrapped as non-tensor data).
+    # Outputs: TensorDict. Side effects: network I/O.
     if isinstance(meta, KVBatchMeta):
         meta = await async_kv_batch_meta2batch_meta(meta)
     meta_info = copy.deepcopy(meta.extra_info)
@@ -178,10 +218,18 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
 
 
 def _meta_to_realdata(meta: BatchMeta) -> TensorDict:
+    # [FUNCTION DOC]
+    # HELPER: Synchronous wrapper running the async fetch on the bridge loop.
     return _run_async_in_temp_loop(_async_meta_to_realdata, meta)
 
 
 async def _async_update_meta_with_output(output: TensorDict, meta: BatchMeta, func_name=None) -> BatchMeta:
+    # [FUNCTION DOC]
+    # HELPER: Writes a function's TensorDict output to TQ. Tensor and NonTensorStack entries become stored fields;
+    # NonTensorData values are collected as metadata. If any fields exist, puts the selected fields with the given meta,
+    # logs timing and sets the returned meta's extra_info to the collected metadata. Returns the (possibly new) meta.
+    # Exceptions: ValueError for entries of other types.
+    # KNOWN ISSUE: when there are no tensor fields, the collected non-tensor metadata is dropped and the original meta is returned unchanged.
     fields, meta_data = [], {}
     for k, v in output.items():
         if isinstance(v, torch.Tensor | NonTensorStack):
@@ -203,11 +251,18 @@ async def _async_update_meta_with_output(output: TensorDict, meta: BatchMeta, fu
 
 
 def _update_meta_with_output(output: TensorDict, meta: BatchMeta, func_name=None) -> BatchMeta:
+    # [FUNCTION DOC]
+    # HELPER: Synchronous wrapper running the async output write on the bridge loop.
     updated_meta = _run_async_in_temp_loop(_async_update_meta_with_output, output, meta, func_name)
     return updated_meta
 
 
 def _compute_need_collect(dispatch_mode: "dict | Dispatch", args: list) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Decides whether this worker should collect (write back) the output. True for None or Dispatch enum modes.
+    # For dict modes (must contain collect_fn, else AssertionError): only when collect_fn is a partial of
+    # collect_lazy_compute_data_proto with a mesh name argument and the first arg is a Worker, returns that worker's
+    # query_collect_info for the mesh; otherwise True.
     """Compute whether data collection is needed for the current worker.
 
     This function determines whether the current worker should collect data based on
@@ -260,6 +315,11 @@ def _compute_need_collect(dispatch_mode: "dict | Dispatch", args: list) -> bool:
 
 
 def _postprocess_common(output, put_data, need_collect):
+    # [FUNCTION DOC]
+    # HELPER: Normalizes outputs when not writing back: if output should have been put but this rank does not collect,
+    # returns an empty BatchMeta; if not put and not collected, returns an empty DataProto or empty TensorDict for those
+    # types; else returns output unchanged.
+    # KNOWN ISSUE: docstring mentions BatchMeta.empty() but the code constructs BatchMeta() directly.
     """Common post-processing logic for function outputs in TransferQueue bridge.
 
     This function handles the final return value based on whether data should be
@@ -300,6 +360,10 @@ def _postprocess_common(output, put_data, need_collect):
 
 
 async def async_kv_batch_meta2batch_meta(meta: KVBatchMeta) -> BatchMeta:
+    # [FUNCTION DOC]
+    # Converts a KVBatchMeta to BatchMeta: initializes tq once, retrieves metadata for its keys in its partition (without
+    # creating), selects requested fields (string becomes a single-item list) and copies extra_info.
+    # Side effects: tq init, network I/O, sets TQ_INITIALIZED.
     global TQ_INITIALIZED
     if not TQ_INITIALIZED:
         tq.init()
@@ -317,10 +381,17 @@ async def async_kv_batch_meta2batch_meta(meta: KVBatchMeta) -> BatchMeta:
 
 
 def kv_batch_meta2batch_meta(meta: KVBatchMeta):
+    # [FUNCTION DOC]
+    # Synchronous wrapper of the KV-to-BatchMeta conversion on the bridge loop.
     return _run_async_in_temp_loop(async_kv_batch_meta2batch_meta, meta)
 
 
 async def async_batch_meta2kv_batch_meta(meta: BatchMeta) -> KVBatchMeta:
+    # [FUNCTION DOC]
+    # Converts a BatchMeta to KVBatchMeta: initializes tq once, requires all partition ids to be equal (AssertionError
+    # otherwise), retrieves keys for the global indexes, and builds a KVBatchMeta with those keys, empty tag dicts per sample,
+    # the partition id, field names and extra_info.
+    # KNOWN ISSUE: the tags list repeats the same dict object for every sample.
     global TQ_INITIALIZED
     if not TQ_INITIALIZED:
         tq.init()
@@ -341,10 +412,21 @@ async def async_batch_meta2kv_batch_meta(meta: BatchMeta) -> KVBatchMeta:
 
 
 def batch_meta2kv_batch_meta(meta: BatchMeta):
+    # [FUNCTION DOC]
+    # Synchronous wrapper of the BatchMeta-to-KV conversion on the bridge loop.
     return _run_async_in_temp_loop(async_batch_meta2kv_batch_meta, meta)
 
 
 def tqbridge(dispatch_mode: "dict | Dispatch" = None):
+    # [FUNCTION DOC]
+    # Builds a decorator that bridges TQ metadata and TensorDict for sync or async functions.
+    # Behavior: validates dispatch_mode when given. The wrapper finds a metadata argument; if none, calls the function
+    # unchanged. Otherwise initializes tq once, remembers tags and converts KVBatchMeta to BatchMeta, replaces every metadata
+    # argument with fetched data, logs timing and calls the function. If the output is a TensorDict with a non-empty batch
+    # size (which must equal the meta size, AssertionError otherwise) it is a candidate for write-back. need_collect comes
+    # from dispatch_mode (True when absent). When both hold, writes the output to TQ and returns updated BatchMeta (converted
+    # back to KVBatchMeta with the original tags if the input was KV); otherwise returns the post-processed output.
+    # Inputs: dispatch_mode - None, Dispatch or dict. Outputs: decorator. Exceptions: dispatch validation errors.
     """Creates a decorator for bridging KVBatchMeta and TensorDict.
 
     This decorator automatically handles conversions between `KVBatchMeta`
@@ -369,10 +451,14 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
         _check_dispatch_mode(dispatch_mode)
 
     def decorator(func):
+        # [FUNCTION DOC]
+        # HELPER: Wraps func, choosing the async wrapper for coroutine functions and the sync wrapper otherwise.
         pid = os.getpid()
 
         @wraps(func)
         def inner(*args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Synchronous bridged wrapper as described in tqbridge (uses the bridge-loop sync helpers).
             batch_meta = _find_meta(*args, **kwargs)
             if batch_meta is None:
                 return func(*args, **kwargs)
@@ -420,6 +506,8 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
 
         @wraps(func)
         async def async_inner(*args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Asynchronous bridged wrapper as described in tqbridge (awaits the async helpers directly).
             batch_meta = _find_meta(*args, **kwargs)
             if batch_meta is None:
                 return await func(*args, **kwargs)

@@ -14,6 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/PeterGriffinJin/Search-R1/blob/main/verl/utils/reward_score/qa_em.py
+# [MODULE DOC]
+# Search-R1 style QA reward (adapted from Search-R1 qa_em): extracts the last <answer>...</answer>
+# span and scores exact match (or substring match) against a list of golden answers after SQuAD
+# normalization. ground_truth is a dict whose "target" holds a string or list of golden answers.
 
 import random
 import re
@@ -21,23 +25,37 @@ import string
 
 
 def normalize_answer(s):
+    # [FUNCTION DOC]
+    # HELPER: SQuAD-style normalization: lowercase, remove punctuation, replace articles a/an/the with
+    # spaces, collapse whitespace. Outputs: normalized string.
     def remove_articles(text):
+        # [FUNCTION DOC]
+        # HELPER: Replaces whole-word "a", "an", "the" with a space.
         return re.sub(r"\b(a|an|the)\b", " ", text)
 
     def white_space_fix(text):
+        # [FUNCTION DOC]
+        # HELPER: Collapses runs of whitespace into single spaces and trims ends.
         return " ".join(text.split())
 
     def remove_punc(text):
+        # [FUNCTION DOC]
+        # HELPER: Removes all ASCII punctuation characters.
         exclude = set(string.punctuation)
         return "".join(ch for ch in text if ch not in exclude)
 
     def lower(text):
+        # [FUNCTION DOC]
+        # HELPER: Lowercases text.
         return text.lower()
 
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 
 def em_check(prediction, golden_answers):
+    # [FUNCTION DOC]
+    # Returns 1 if the normalized prediction equals any normalized golden answer (a single string is
+    # treated as a one-element list), else 0.
     if isinstance(golden_answers, str):
         golden_answers = [golden_answers]
     normalized_prediction = normalize_answer(prediction)
@@ -51,6 +69,8 @@ def em_check(prediction, golden_answers):
 
 
 def subem_check(prediction, golden_answers):
+    # [FUNCTION DOC]
+    # Returns 1 if any normalized golden answer is a substring of the normalized prediction, else 0.
     if isinstance(golden_answers, str):
         golden_answers = [golden_answers]
     normalized_prediction = normalize_answer(prediction)
@@ -64,6 +84,9 @@ def subem_check(prediction, golden_answers):
 
 
 def extract_solution(solution_str):
+    # [FUNCTION DOC]
+    # Returns the stripped content of the last <answer>...</answer> span (dot matches newlines), or None
+    # if there is none.
     """Extract the equation from the solution string."""
     # Remove everything before the first "Assistant:"
     # if "Assistant:" in solution_str:
@@ -87,6 +110,8 @@ def extract_solution(solution_str):
 
 
 def count_answer_tags(text):
+    # [FUNCTION DOC]
+    # HELPER: Returns tuple (count of "<answer>", count of "</answer>") in text.
     opening_tags = text.count("<answer>")
     closing_tags = text.count("</answer>")
 
@@ -94,6 +119,11 @@ def count_answer_tags(text):
 
 
 def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
+    # [FUNCTION DOC]
+    # Exact-match score: 0 if no answer extracted; if EM matches ground_truth["target"], returns score
+    # (divided by 4 if more than 10 opening or closing answer tags appear, to penalize tag spam);
+    # otherwise format_score. method is unused. Randomly (1/64) prints debug info.
+    # Exceptions: KeyError/TypeError if ground_truth lacks "target". Side effects: occasional prints.
     """The scoring function for exact match (EM).
 
     Args:
@@ -129,6 +159,9 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.0,
 
 
 def compute_score_subem(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
+    # [FUNCTION DOC]
+    # Substring-match variant: 0 if no answer; score if subem_check succeeds; else format_score.
+    # No tag-count penalty; method unused; random 1/64 debug prints.
     """The scoring function for substring exact match (EM).
 
     Args:

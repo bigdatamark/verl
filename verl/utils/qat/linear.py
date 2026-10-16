@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Fake-quantizing linear layer for NVFP4 QAT. Provides a Triton kernel that emulates NVFP4 quantization
+# (FP4 E2M1 values with per-16-element FP8 E4M3 block scales and a per-tensor FP32 global scale) and
+# dequantizes back to the input dtype, a straight-through-estimator autograd wrapper, the QATMode enum,
+# and QATLinear, an nn.Linear subclass that fake-quantizes weights (and activations in W4A4 mode) in
+# forward. Constants: FP4 max 6.0, FP8 E4M3 max 448.0.
 """QAT FakeQuantized Linear module for NVFP4 (W4A4/W4A16) with FSDP compatibility.
 
 Includes Triton kernels for high-performance FP4 quantization.
@@ -58,6 +64,17 @@ def _fp4_fake_quant_kernel(
     FP4_MAX: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Triton kernel; each program handles a TILE_M x TILE_N tile of a 2-D tensor.
+    # Behavior: loads the tile (zero-padded at boundaries) as fp32 and reshapes into NUM_FP4_BLOCKS blocks of
+    # BLOCK_SIZE per row. Per block: amax / (FP4_MAX * global_scale) (global scale guarded to >= 1e-12),
+    # clipped to FP8_MAX, rounded through float8 e4m3, multiplied back by global_scale to get the effective
+    # block scale (replaced with 1.0 if below 1e-5). Absolute values divided by that scale are rounded to the
+    # nearest FP4 E2M1 magnitude {0, 0.5, 1, 1.5, 2, 3, 4, 6} using midpoint thresholds (ties at 0.25/1.25/
+    # 2.5/5.0 round down, at 0.75/1.75/3.5 round up), rescaled, sign restored, cast to OUT_DTYPE and stored
+    # with boundary checks.
+    # Inputs: x/y pointers, dims M, N, pointer to global scale, strides, compile-time tile/block constants.
+    # Outputs: writes y. Side effects: device memory writes.
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     row_start = pid_m * TILE_M
@@ -132,6 +149,14 @@ def fp4_fake_quant_weight(
     tile_rows: int = 16,
     tile_cols: int = 64,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: flattens weight to 2-D (last dim as columns), allocates output, aligns tile width up to a
+    # multiple of block_size (at least block_size), computes global_amax (tensor abs-max if not given) and
+    # global_scale = amax / (6 * 448), launches the kernel over a 2-D grid, and reshapes to the original shape.
+    # Inputs: weight - fp32/fp16/bf16 CUDA tensor; global_amax - optional scalar tensor; block_size; tile sizes.
+    # Outputs: fake-quantized tensor of same shape and dtype.
+    # Exceptions: KeyError for unsupported dtypes; Triton errors for non-CUDA tensors.
+    # Side effects: GPU kernel launch.
     """Apply FP4 fake quantization using Triton kernel."""
     x_shape = weight.shape
     x_dtype = weight.dtype
@@ -174,18 +199,27 @@ def fp4_fake_quant_weight(
 
 
 class STEFP4QuantTriton(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd function: forward applies fp4_fake_quant_weight; backward passes the gradient straight through
+    # to x (no gradient for global_amax or block_size).
     """Straight-Through Estimator wrapper for Triton FP4 quantization kernel."""
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, global_amax: torch.Tensor, block_size: int) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: returns fp4_fake_quant_weight(x, global_amax, block_size). Side effects: kernel launch.
         return fp4_fake_quant_weight(x, global_amax=global_amax, block_size=block_size)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        # [FUNCTION DOC]
+        # Outputs: (grad_output, None, None).
         return grad_output, None, None
 
 
 class QATMode(str, Enum):
+    # [CLASS DOC]
+    # String enum of QAT modes: W4A4 ("w4a4", weights and activations) and W4A16 ("w4a16", weights only).
     """QAT quantization mode."""
 
     W4A4 = "w4a4"  # Weight 4-bit, Activation 4-bit (dynamic)
@@ -193,6 +227,11 @@ class QATMode(str, Enum):
 
 
 class QATLinear(nn.Linear):
+    # [CLASS DOC]
+    # nn.Linear that fake-quantizes in forward. Caches the weight amax (shared across fusion siblings),
+    # weight global scale and blockwise scale (cleared by invalidate_all_scales). In W4A4 mode holds
+    # persistent buffers input_global_scale and input_amax (initialized to the sentinel -1.0) updated by the
+    # configured activation observer during training.
     """QAT FakeQuantized Linear layer with FSDP compatibility."""
 
     _UNINITIALIZED_SCALE = -1.0
@@ -208,6 +247,10 @@ class QATLinear(nn.Linear):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: initializes the base Linear, stores mode/group_size/observer, initializes caches and sibling
+        # refs to None, registers W4A4 buffers and EMA decay 0.01 when in W4A4 mode, and enables fake quant.
+        # Side effects: parameter/buffer allocation.
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
 
         self.mode = mode
@@ -240,6 +283,10 @@ class QATLinear(nn.Linear):
         group_size: int = 16,
         activation_observer: str = "static_minmax",
     ) -> "QATLinear":
+        # [FUNCTION DOC]
+        # Behavior: creates a QATLinear with the same shape, bias presence, device and dtype; for non-meta
+        # weights, copies (clones) weight and bias into new Parameters (meta weights stay uninitialized).
+        # Outputs: new QATLinear. Side effects: memory allocation.
         """Create QATLinear from an existing nn.Linear."""
         has_bias = linear.bias is not None
 
@@ -262,12 +309,22 @@ class QATLinear(nn.Linear):
         return new_linear
 
     def _is_amax_initialized(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if the input_amax buffer exists and differs from the -1.0 sentinel (device sync via item()).
         """Check if input_amax has been initialized."""
         if not hasattr(self, "input_amax"):
             return False
         return self.input_amax.item() != self._UNINITIALIZED_SCALE
 
     def _update_input_global_scale(self, x: torch.Tensor):
+        # [FUNCTION DOC]
+        # HELPER: Updates the W4A4 static input scale from a batch.
+        # Behavior: computes abs-max of x (fp32, detached), MAX all-reduced across ranks when distributed.
+        # "memoryless_minmax": scale = 2688 / (amax + 1e-12) from the current batch only. "static_minmax":
+        # running max of amax. "minmax": EMA of amax with decay 0.01 (first batch initializes). For the latter two
+        # scale = 2688 / (stored amax + 1e-12). Writes into input_global_scale (and input_amax).
+        # Exceptions: AssertionError if not W4A4; ValueError for unknown observer.
+        # Side effects: buffer mutation; collective communication.
         """Update static input_global_scale based on observer strategy."""
         assert self.mode == QATMode.W4A4, "_update_input_global_scale should only be called in W4A4 mode"
 
@@ -308,6 +365,14 @@ class QATLinear(nn.Linear):
             raise ValueError(f"Unknown activation_observer: {self.activation_observer}")
 
     def _fake_quantize_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Fake-quantizes the weight.
+        # Behavior (no-grad for scale computation): uses cached amax if present; otherwise, with fusion siblings
+        # (live, non-meta), reuses the first sibling's cached amax, or computes the max of all members' abs-max,
+        # caching it on self and all siblings; without siblings uses this weight's abs-max. Sets the cached
+        # global scale if absent. Applies the STE quantization with group_size.
+        # Outputs: fake-quantized weight (gradient flows straight through).
+        # Side effects: mutates caches on self and siblings.
         """Apply fake quantization to weight tensor using Triton kernel."""
         with torch.no_grad():
             if self._cached_weight_amax is not None:
@@ -345,6 +410,11 @@ class QATLinear(nn.Linear):
         return result
 
     def _fake_quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Fake-quantizes activations in W4A4 mode.
+        # Behavior: flattens 3-D input to 2-D; in training updates the input scale; raises if the scale is still
+        # the sentinel; converts scale to amax = 2688 / scale and applies the STE kernel; restores shape.
+        # Exceptions: RuntimeError when uninitialized. Side effects: buffer updates in training; device sync.
         """Apply fake quantization to activation tensor (W4A4 mode only)."""
         original_shape = x.shape
 
@@ -364,6 +434,10 @@ class QATLinear(nn.Linear):
         return result.view(original_shape)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: plain linear if fake quant disabled; otherwise linear of (fake-quantized activation in W4A4,
+        # else raw input) with fake-quantized weight and bias.
+        # Outputs: output tensor.
         """Forward pass with fake quantization."""
         if not self.fake_quant_enabled:
             return F.linear(x, self.weight, self.bias)
@@ -378,6 +452,8 @@ class QATLinear(nn.Linear):
         return F.linear(x_fq, weight_fq, self.bias)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC]
+        # Outputs: string with features, bias presence, mode, group_size and fake_quant_enabled.
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, mode={self.mode.value}, "

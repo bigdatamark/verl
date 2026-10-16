@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# TensorRT-LLM async rollout server. TRTLLMHttpServer is a Ray actor that builds a
+# TRT-LLM AsyncLLM (pytorch backend, Ray orchestrator, workers placed into given
+# placement-group bundles) and serves its OpenAI-compatible app via uvicorn, plus direct
+# token-level generate, pause/resume gating, memory sleep/wake and profiling. TRTLLMReplica
+# maps one replica to one such server actor. Module state: logger (INFO).
 import asyncio
 import logging
 import os
@@ -42,6 +48,15 @@ logger.setLevel(logging.INFO)
 
 
 def _resolve_chat_stop_tokens(model_config) -> tuple[int, list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: Determine the sampler end_id and full stop-token list for chat-format generation.
+    # Behavior: starts the stop list from hf_config.eos_token_id (int or list), adds any
+    # generation_config eos ids not yet present, then for each of the chat-end strings
+    # "<|im_end|>", "<|eot_id|>", "<|end_of_turn|>" found in the tokenizer's added vocab adds
+    # its id; the first one found becomes end_id, else end_id is hf eos_token_id (may be a
+    # list). Logs a warning with the result.
+    # Inputs: model_config with hf_config, optional generation_config and tokenizer.
+    # Outputs: (end_id, stop_token_ids).
     """Return (end_id, stop_token_ids) for TorchSampler.
 
     Both TRTLLM's samplers stops only on end_id.  For chat-format prompts the model
@@ -83,6 +98,12 @@ def _resolve_chat_stop_tokens(model_config) -> tuple[int, list[int]]:
 
 @ray.remote
 class TRTLLMHttpServer:
+    # [CLASS DOC]
+    # Single-actor TRT-LLM server for one replica (the TRT-LLM Ray executor spawns the
+    # per-GPU workers). Holds config, model_config, reward flag, rollout mode, worker handles,
+    # replica rank, colocation count, placement groups/bundle indices, global_steps, a
+    # generation-allowed event plus a rejecting flag for pause gating, the profiler
+    # controller, a VLM flag, the server address/port and fixed sampling args.
     """TensorRT LLM HTTP server in single node.
 
     Args:
@@ -109,6 +130,17 @@ class TRTLLMHttpServer:
         pgs: list[PlacementGroup] = None,
         bundle_indices: list[list[int]] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: sets TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=1, requires CUDA, converts
+        # configs to dataclasses, defaults/validates max_model_len against
+        # max_position_embeddings, stores inputs, opens the generation gate, builds the profiler,
+        # detects VLM models (vision_config on hf_config or model_config), resolves stop tokens,
+        # and sets sampling_args according to TLLM_USE_TORCHSAMPLER: TorchSampler uses
+        # detokenize=True and the resolved end_id; the default TRTLLMSampler uses detokenize=False
+        # and end_id=-1 (stop handled only by stop_token_ids). Both set pad_id, stop_token_ids and
+        # include_stop_str_in_output=True.
+        # Exceptions: AssertionError without CUDA; ValueError if max_model_len is too large.
+        # Side effects: mutates os.environ; logs.
         os.environ["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "1"
         assert torch.cuda.is_available(), "TRTLLM http server should run on GPU node"
 
@@ -175,11 +207,32 @@ class TRTLLMHttpServer:
         logger.info(f"use_torch_sampler={self._use_torch_sampler}, sampling_args={self.sampling_args}")
 
     def get_server_address(self):
+        # [FUNCTION DOC]
+        # Return (server_address, server_port). Exceptions: AssertionError before launch.
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
 
     async def launch_server(self):
+        # [FUNCTION DOC]
+        # Construct the TRT-LLM AsyncLLM and start its OpenAI server.
+        # Behavior: requires pipeline parallel size 1. Takes engine_kwargs["trtllm"], merges its
+        # kv_cache_config overrides into a KvCacheConfig (block reuse from prefix caching,
+        # memory fraction from gpu_memory_utilization). per_worker_gpu_share = 1 /
+        # max_colocate_count. For fp8 quantization sets model_kwargs quantization_config to
+        # dynamic e4m3 128x128 block quant (only allowed with dummy load format). Builds LLM
+        # kwargs (model path, dtype, chunked prefill, tokenizer skip, ray orchestrator, limits,
+        # TP/PP/EP/MoE-TP sizes, load format, placement groups and bundles, GPU share, sleep config
+        # with NONE restore modes when sleep mode is enabled and supported, NCCL allreduce, sampler
+        # type) with remaining engine_kwargs overriding. Selects the worker extension class
+        # (WorkerExtension for VLMs, RlhfWorkerExtension otherwise). Reward models disable CUDA
+        # graphs and the overlap scheduler; others enable padded CUDA graphs over
+        # cudagraph_capture_sizes (max_batch_size 0 when sizes given, else max_num_seqs) and a
+        # MAX_UTILIZATION capacity scheduler. Awaits AsyncLLM, creates OpenAIServer (generator= or
+        # llm= keyword depending on its signature) and serves its app with run_uvicorn.
+        # Exceptions: AssertionError for PP > 1; ValueError for unsupported quantization or fp8
+        # with non-dummy load format.
+        # Side effects: spawns TRT-LLM workers, binds a port, pops kv_cache_config from config.
         from tensorrt_llm import AsyncLLM
         from tensorrt_llm.llmapi import CapacitySchedulerPolicy, CudaGraphConfig, KvCacheConfig, SchedulerConfig
 
@@ -325,6 +378,21 @@ class TRTLLMHttpServer:
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
     ) -> TokenOutput:
+        # [FUNCTION DOC]
+        # Generate tokens for one prompt.
+        # Behavior: max_tokens = min(response_length, prompt_length + response_length - prompt
+        # len), clamped to [0, max_model_len - prompt len]; maps the "logprobs" flag to 0
+        # (TorchSampler) or 1 (TRTLLMSampler) or None; converts top_k -1 to 0; merges
+        # sampling_args; builds TRT-LLM SamplingParams. Waits on the generation gate (returns an
+        # aborted output if rejecting). For VLM requests with images/videos, dedups Qwen2.5-VL
+        # pad tokens, decodes back to a prompt string and passes multimodal data and
+        # mm_processor_kwargs; otherwise passes the ids. Extracts token ids and, when present,
+        # per-position sampled-token logprobs (first entry of each logprob mapping).
+        # Outputs: TokenOutput with stop_reason "aborted" when finish_reason is "cancelled",
+        # else no stop reason; extra_fields has global_steps.
+        # Inputs: sampling_params is mutated in place.
+        # Exceptions: NotImplementedError for audio_data (raised after sampling params are built);
+        # KeyError if sampling_params lacks "top_k".
         from tensorrt_llm.llmapi import SamplingParams
 
         max_tokens = min(
@@ -389,10 +457,16 @@ class TRTLLMHttpServer:
         return TokenOutput(token_ids=token_ids, log_probs=log_probs, extra_fields={"global_steps": self.global_steps})
 
     async def set_global_steps(self, global_steps: int):
+        # [FUNCTION DOC]
+        # Store the weight version reported in outputs.
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
     async def abort_all_requests(self, reject_request: bool = False):
+        # [FUNCTION DOC]
+        # Close the generation gate, set the rejecting mode, pause TRT-LLM generation (aborting
+        # in-flight requests), wait via worker RPC until the engine is idle, and reset the prefix
+        # cache when prefix caching is enabled.
         """Abort all in-flight requests and block new ones. Call resume_generation() to unblock.
 
         Args:
@@ -410,12 +484,17 @@ class TRTLLMHttpServer:
             await self.llm.collective_rpc("reset_prefix_cache")
 
     async def resume_generation(self):
+        # [FUNCTION DOC]
+        # Resume TRT-LLM generation, clear rejecting mode and reopen the gate.
         """Unblock new generation requests after abort_all_requests()."""
         await self.llm.resume_generation()
         self._rejecting = False
         self._generation_allowed.set()
 
     async def _park_until_allowed(self, request_id: str) -> Optional[TokenOutput]:
+        # [FUNCTION DOC]
+        # HELPER: Loop while the gate is closed: if rejecting, return an empty aborted TokenOutput;
+        # otherwise wait for the gate. Returns None once generation is allowed.
         """Wait out a blocked gate, or fail the request when the gate rejects late arrivals.
 
         Returns None once generation is allowed, or an aborted TokenOutput telling the client
@@ -434,10 +513,14 @@ class TRTLLMHttpServer:
         return None
 
     async def clear_kv_cache(self):
+        # [FUNCTION DOC]
+        # Reset the prefix cache on all workers via collective RPC.
         """Invalidate prefix cache entries after weight update."""
         await self.llm.collective_rpc("reset_prefix_cache")
 
     async def release_kv_cache(self):
+        # [FUNCTION DOC]
+        # Release kv_cache memory (only when free_cache_engine is set).
         """Release only kv_cache GPU memory, keeping model weights intact.
 
         This is used during weight sync to free GPU memory for new weights.
@@ -447,10 +530,15 @@ class TRTLLMHttpServer:
         await self.llm.release(tags=["kv_cache"])
 
     async def resume_kv_cache(self):
+        # [FUNCTION DOC]
+        # Resume kv_cache memory (unconditional, unlike release_kv_cache).
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
         await self.llm.resume(tags=["kv_cache"])
 
     async def wake_up(self):
+        # [FUNCTION DOC]
+        # COLOCATED: resume all memory tags defined by the TRT-LLM ServerAdapter; STANDALONE:
+        # log and skip. Exceptions: ValueError in HYBRID mode.
         from verl.workers.rollout.trtllm_rollout.trtllm_rollout import ServerAdapter
 
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -462,6 +550,9 @@ class TRTLLMHttpServer:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
+        # [FUNCTION DOC]
+        # When free_cache_engine is set, release all ServerAdapter memory tags in HYBRID or
+        # COLOCATED mode; STANDALONE logs and skips.
         from verl.workers.rollout.trtllm_rollout.trtllm_rollout import ServerAdapter
 
         if not self.config.free_cache_engine:
@@ -475,6 +566,9 @@ class TRTLLMHttpServer:
             logger.info("skip sleep in standalone mode")
 
     async def report_device_ids(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Return the GPU device UUIDs reported by the workers (collective RPC
+        # "report_device_id", reply from rank 0 only).
         """Report GPU device UUIDs from TRT-LLM workers."""
         return await self.llm.collective_rpc(
             "report_device_id",
@@ -482,10 +576,16 @@ class TRTLLMHttpServer:
         )
 
     async def start_profile(self, **kwargs):
+        # [FUNCTION DOC]
+        # Start profiling on all workers when the profiler is enabled for this replica; kwargs
+        # ignored.
         if self.profiler_controller.check_enable() and self.profiler_controller.check_this_rank():
             await self.llm.collective_rpc("start_profile")
 
     async def stop_profile(self):
+        # [FUNCTION DOC]
+        # Stop profiling on all workers (same conditions) then relocate trace files into the
+        # configured save path keeping the requested global ranks.
         if self.profiler_controller.check_enable() and self.profiler_controller.check_this_rank():
             await self.llm.collective_rpc("stop_profile")
             # Relocate the engine's traces into save_path (when relocate_results is set) so the
@@ -500,6 +600,12 @@ class TRTLLMHttpServer:
             )
 
     def _init_profiler_controller(self) -> DistProfiler:
+        # [FUNCTION DOC]
+        # HELPER: Build the replica's DistProfiler. torch/npu tools use their tool_config entry;
+        # nsys uses global_tool_config["nsys"] or a default NsightToolConfig; any other non-None
+        # tool logs a warning and disables profiling. Also sets replica_world_size (tp * dp * pp)
+        # and profiler_keep_global_ranks.
+        # Outputs: the profiler controller. Side effects: sets the two attributes.
         profiler_config = self.config.profiler
         tool_config = None
         if profiler_config is not None:
@@ -531,6 +637,10 @@ class TRTLLMHttpServer:
 
 
 class TRTLLMReplica(RolloutReplica):
+    # [CLASS DOC]
+    # RolloutReplica mapping one replica to exactly one TRTLLMHttpServer actor; the TRT-LLM
+    # executor places GPU workers in the replica's placement-group bundles, so rollout
+    # workers themselves do not use GPUs.
     def __init__(
         self,
         replica_rank: int,
@@ -541,6 +651,9 @@ class TRTLLMReplica(RolloutReplica):
         is_teacher_model: bool = False,
         name_suffix: str = "",
     ) -> None:
+        # [FUNCTION DOC]
+        # Initialize the base replica and record this node's IP.
+        # Exceptions: NotImplementedError for teacher models.
         if is_teacher_model:
             raise NotImplementedError("TRTLLMReplica doesn't support teacher model yet.")
         super().__init__(
@@ -549,9 +662,21 @@ class TRTLLMReplica(RolloutReplica):
         self.node_ip = ray.util.get_node_ip_address().strip("[]")
 
     def rollout_worker_use_gpu(self) -> bool:
+        # [FUNCTION DOC]
+        # Return False: rollout worker actors do not reserve GPUs for this backend.
         return False
 
     def get_pgs_and_bundle_indices(self) -> tuple[list[PlacementGroup], list[list[int]]]:
+        # [FUNCTION DOC]
+        # Compute the placement groups and per-group bundle index lists that hold this replica's
+        # world_size bundles.
+        # Behavior: starting bundle is the sub-pool's start index for SubRayResourcePool (whose
+        # subgroup size must equal world_size), 0 in STANDALONE mode, else world_size *
+        # replica_rank. Skips whole placement groups until the start bundle falls inside one, then
+        # takes contiguous bundles across subsequent groups until world_size are collected.
+        # Outputs: (list of placement groups, list of bundle index lists).
+        # Exceptions: AssertionError if sizes mismatch, the start is out of range, or not enough
+        # bundles exist.
         """Get placement groups and bundle indices for the replica."""
 
         start_pg_index = 0
@@ -616,6 +741,13 @@ class TRTLLMReplica(RolloutReplica):
         return pgs, bundle_indices
 
     async def launch_servers(self):
+        # [FUNCTION DOC]
+        # Create the server actor on the node hosting the first assigned bundle (hard node
+        # affinity), named trtllm_server[_reward]_{replica}{suffix}, with platform env vars and
+        # propagated TLLM_ENABLE_NSYS / TLLM_NSYS_OUTPUT_DIR / TLLM_USE_TORCHSAMPLER; launch it and
+        # record its handle and "host:port" address (IPv6 bracketed).
+        # Exceptions: AssertionError if placement groups are not initialized.
+        # Side effects: creates a named Ray actor; prints placement info.
         assert self.resource_pool.pgs is not None, "placement groups are not initialized"
 
         pgs, bundle_indices = self.get_pgs_and_bundle_indices()

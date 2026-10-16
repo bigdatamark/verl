@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Naive reward manager (registered as "naive"): scores samples one by one in the driver process with
+# an optional per-sample wall-clock timeout implemented with SIGALRM.
 
 import signal
 from collections import defaultdict
@@ -27,6 +30,13 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 @contextmanager
 def _score_timeout(seconds: Optional[float]):
+    # [FUNCTION DOC]
+    # HELPER: Context manager bounding the wrapped block's run time.
+    # Behavior: with no/non-positive seconds, just runs the block. Otherwise installs a SIGALRM handler
+    # raising TimeoutError and starts a real-time interval timer; if installing fails (non-main thread)
+    # runs without a timeout. On exit cancels the timer and restores the previous handler.
+    # Inputs: seconds - optional float timeout. Exceptions: TimeoutError from inside the block.
+    # Side effects: temporarily replaces the process SIGALRM handler and itimer.
     """Raise ``TimeoutError`` if the wrapped block runs longer than ``seconds``.
 
     A single ``compute_score`` call on a pathological model output (e.g. a long,
@@ -44,6 +54,8 @@ def _score_timeout(seconds: Optional[float]):
         return
 
     def _handler(signum, frame):
+        # [FUNCTION DOC]
+        # HELPER: Signal handler; always raises TimeoutError with the configured seconds.
         raise TimeoutError(f"compute_score timed out after {seconds}s")
 
     try:
@@ -63,11 +75,16 @@ def _score_timeout(seconds: Optional[float]):
 
 @register("naive")
 class NaiveRewardManager(AbstractRewardManager):
+    # [CLASS DOC]
+    # Per-sample reward manager storing tokenizer, examine count, scorer (default rule-based), data
+    # source key and optional per-sample scoring timeout.
     """The reward manager."""
 
     def __init__(
         self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", compute_score_timeout=None
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: stores arguments; scorer falls back to the default. Outputs: none.
         """
         Initialize the NaiveRewardManager instance.
 
@@ -88,6 +105,18 @@ class NaiveRewardManager(AbstractRewardManager):
         self.compute_score_timeout = compute_score_timeout  # per-sample timeout (seconds) for compute_score
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: returns precomputed rm_scores if present. Otherwise, per sample: computes valid prompt
+        # (last N prompt tokens, N = prompt-region mask sum) and valid response (first M tokens), decodes
+        # both; reads ground truth, data source, extra info (default empty) and adds "num_turns" (from
+        # "__num_turns__", default None) and rollout reward scores into it. Calls the scorer under the
+        # timeout guard; on TimeoutError prints a message and uses 0.0. Dict scores contribute "score" as
+        # reward and all items to extra info lists; scalars used directly. Writes reward at the last valid
+        # response token. Prints up to num_examine samples per data source.
+        # Inputs: data; return_dict. Outputs: reward tensor or dict with reward_tensor and extra info.
+        # Side effects: mutates per-sample extra_info; prints; uses SIGALRM.
+        # KNOWN ISSUE: same zero-length edge cases as other managers (whole prompt chosen; index -1 written);
+        # a timeout fallback of 0.0 among dict scores leaves extra info lists misaligned.
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn

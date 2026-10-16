@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# DAPO reward manager (registered as "dapo"): per-sample rule-based scoring with an optional linear
+# overlong-response penalty inside a configurable buffer zone before the max response length.
 
 from collections import defaultdict
 
@@ -24,6 +27,9 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 @register("dapo")
 class DAPORewardManager(AbstractRewardManager):
+    # [CLASS DOC]
+    # Stores tokenizer, examine count, scoring function (default rule-based scorer), data source key,
+    # max response length and overlong buffer config (enable, len, penalty_factor, log).
     """The reward manager."""
 
     def __init__(
@@ -35,6 +41,13 @@ class DAPORewardManager(AbstractRewardManager):
         max_resp_len=None,
         overlong_buffer_cfg=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: stores arguments (scoring function falls back to the default). When the overlong buffer
+        # is enabled, validates configuration.
+        # Inputs: tokenizer; num_examine - samples to print per data source; compute_score; reward_fn_key;
+        # max_resp_len; overlong_buffer_cfg.
+        # Exceptions: AssertionError if enabled and max_resp_len missing, smaller than buffer len, or
+        # buffer len not positive.
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
@@ -56,6 +69,22 @@ class DAPORewardManager(AbstractRewardManager):
             )
 
     def __call__(self, data: DataProto, return_dict: bool = False):
+        # [FUNCTION DOC]
+        # Behavior: returns precomputed rm_scores if present. Otherwise for each sample: valid prompt =
+        # last N prompt tokens where N is the attention-mask sum over the prompt region; valid response =
+        # first M response tokens with M the mask sum over the response region; decodes both (special tokens
+        # skipped) and strips a trailing eos token string from the response. Reads ground truth from
+        # reward_model, data source, extra info (default empty) and stores rollout reward scores into it.
+        # Calls the scorer with keyword args. Dict results contribute "score" and all items to extra info;
+        # scalar results are also recorded under "acc". When overlong buffer is enabled, adds
+        # min(-(M - (max_resp_len - buffer_len)) / buffer_len * penalty_factor, 0) and optionally logs the
+        # penalty and an overlong flag. Writes the reward at the last valid response token. Prints up to
+        # num_examine samples per data source (prompt, response, ground truth, and all result items or
+        # score).
+        # Inputs: data - DataProto; return_dict. Outputs: reward tensor or dict with extra info lists.
+        # Side effects: mutates per-sample extra_info; prints.
+        # KNOWN ISSUE: zero valid prompt length selects the whole prompt (negative zero slice) and zero
+        # valid response length writes at index -1; the overlong reward is a tensor (from the mask sum).
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn

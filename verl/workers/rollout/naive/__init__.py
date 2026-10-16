@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Naive rollout subpackage: re-exports NaiveRollout, a single-GPU sampling loop over a HuggingFace-style model.
 
 from .naive_rollout import NaiveRollout
 

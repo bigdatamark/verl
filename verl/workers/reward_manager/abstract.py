@@ -13,6 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Abstract base for reward managers plus the type alias for raw scoring callables (any callable
+# returning any value).
 
 from abc import ABC, abstractmethod
 from typing import Any, Callable
@@ -25,6 +28,10 @@ RawRewardFn = Callable[..., Any]
 
 
 class AbstractRewardManager(ABC):
+    # [CLASS DOC]
+    # Abstract interface: constructor takes a tokenizer, number of samples to print per data source,
+    # a scoring function, and the non-tensor key naming the data source; calling the manager on a
+    # DataProto returns a token-level reward tensor or a dict with it plus extra info.
     @abstractmethod
     def __init__(
         self,
@@ -34,6 +41,9 @@ class AbstractRewardManager(ABC):
         reward_fn_key: str = "data_source",
         **kwargs: Any,
     ):
+        # [FUNCTION DOC]
+        # Behavior: abstract; no implementation. Inputs: tokenizer; num_examine; compute_score - scoring
+        # callable or None; reward_fn_key - data source key; kwargs - manager-specific options.
         pass
 
     @abstractmethod
@@ -42,11 +52,20 @@ class AbstractRewardManager(ABC):
         data: DataProto,
         return_dict: bool = False,
     ) -> torch.Tensor | dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: abstract. Inputs: data - batch; return_dict - whether to return a dict with
+        # "reward_tensor" and "reward_extra_info". Outputs: reward tensor (shaped like responses) or dict.
         pass
 
     def _extract_reward_from_rm_scores(
         self, data: DataProto, return_dict: bool = False
     ) -> torch.Tensor | dict[str, Any] | None:
+        # [FUNCTION DOC]
+        # HELPER: Deprecated shortcut returning precomputed "rm_scores" from the batch.
+        # Behavior: returns None if absent. Otherwise returns the tensor, or when return_dict a dict with
+        # it as reward_tensor and reward_extra_info built from the non-tensor fields named in meta_info
+        # "reward_extra_keys" (default none).
+        # Exceptions: KeyError if a listed extra key is missing from non-tensor batch.
         """
         Extract reward from already-computed rm_scores if available.
         This has been deprecated.

@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Rollout tracing utilities supporting Weave, MLflow and Trackio backends. A process-wide singleton
+# config selects the backend; a context manager attaches per-sample attributes (sample index, step,
+# rollout number, validate flag, experiment name) to traces; and a decorator traces sync or async
+# methods, optionally decoding prompt/response token ids into text. Two context variables hold
+# whether tracing is enabled (default true) and the current attribute dict (used by non-weave backends).
 
 import contextlib
 import functools
@@ -29,6 +35,10 @@ _trace_attributes: ContextVar[dict | None] = ContextVar("_trace_attributes", def
 
 
 class RolloutTraceConfig:
+    # [CLASS DOC]
+    # Singleton holding tracing settings as class-level defaults overridden on the single instance:
+    # backend name, backend client, token2text flag, project/experiment names,
+    # max_samples_per_step_per_worker (stored only; sampling is enforced elsewhere) and an initialized flag.
     """Configuration for rollout tracing with various backends.
 
     Singleton configuration class for managing rollout trace settings across different
@@ -56,6 +66,8 @@ class RolloutTraceConfig:
     max_samples_per_step_per_worker: int | None = None
 
     def __new__(cls, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Returns the single shared instance, creating it (with initialized False) on first call.
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
@@ -63,6 +75,8 @@ class RolloutTraceConfig:
 
     @classmethod
     def get_instance(cls) -> "RolloutTraceConfig":
+        # [FUNCTION DOC]
+        # Returns the singleton instance, creating it if needed.
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
@@ -76,6 +90,14 @@ class RolloutTraceConfig:
         token2text: bool = False,
         max_samples_per_step_per_worker: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Initializes the singleton once (later calls are no-ops). Stores the settings, then by backend:
+        # "weave" -> client from weave.init(project_name); "mlflow" -> enables async logging, sets the
+        # tracking URI from env MLFLOW_TRACKING_URI (default a sqlite file under /tmp), sets experiment to
+        # project_name, client is the mlflow module; "trackio" -> calls trackio.init(project, name, config
+        # {"framework": "verl"}) only if no current run exists, client is the trackio module; otherwise
+        # client None. Marks initialized.
+        # Side effects: imports and initializes the backend library; may create runs/experiments.
         config = cls.get_instance()
         if config._initialized:
             return
@@ -114,18 +136,26 @@ class RolloutTraceConfig:
 
     @classmethod
     def get_backend(cls) -> str | None:
+        # [FUNCTION DOC]
+        # Returns the configured backend name or None.
         return cls.get_instance().backend
 
     @classmethod
     def get_client(cls) -> object | None:
+        # [FUNCTION DOC]
+        # Returns the configured backend client or None.
         return cls.get_instance().client
 
     @classmethod
     def enable_token2text(cls) -> bool | None:
+        # [FUNCTION DOC]
+        # Returns whether token ids should be decoded to text in traces.
         return cls.get_instance().token2text
 
     @classmethod
     def reset(cls):
+        # [FUNCTION DOC]
+        # Discards the singleton so the next access creates a fresh, uninitialized instance.
         cls._instance = None
 
 
@@ -133,6 +163,14 @@ class RolloutTraceConfig:
 def rollout_trace_attr(
     sample_index=None, step=None, rollout_n=None, name="rollout_trace", validate=False, trace: bool = True
 ):
+    # [FUNCTION DOC]
+    # Context manager scoping trace attributes. If a backend is set and trace is False, disables tracing
+    # (context var) for the body. If no backend, yields without changes. Otherwise builds attributes
+    # (sample_index, step, rollout_n only if not None; validate; experiment_name), stores them in the
+    # attribute context var for the body, and additionally: weave -> wraps the body in weave.attributes;
+    # mlflow -> opens a span named name and sets each attribute as a trace tag; others (trackio) -> only
+    # the context var. Context vars are restored on exit.
+    # Side effects: backend span/attribute creation.
     """A context manager to add attributes to a trace for the configured backend.
 
     Args:
@@ -199,12 +237,18 @@ def rollout_trace_attr(
 
 
 def _json_trace_content(value):
+    # [FUNCTION DOC]
+    # HELPER: JSON-serializes value (pydantic models dumped first; non-serializable values stringified;
+    # non-ASCII preserved).
     if isinstance(value, BaseModel):
         value = value.model_dump()
     return json.dumps(value, default=str, ensure_ascii=False)
 
 
 def _json_trace_metadata(value):
+    # [FUNCTION DOC]
+    # HELPER: Recursively converts value into JSON-safe metadata: pydantic models dumped; None and
+    # primitives kept; dict keys stringified; lists/tuples become lists; anything else stringified.
     if isinstance(value, BaseModel):
         value = value.model_dump()
     if value is None or isinstance(value, str | int | float | bool):
@@ -217,6 +261,8 @@ def _json_trace_metadata(value):
 
 
 def _trackio_message_dict(message):
+    # [FUNCTION DOC]
+    # HELPER: Returns a shallow copy of message if it is a dict with a string "role", else None.
     if not isinstance(message, dict):
         return None
     role = message.get("role")
@@ -226,6 +272,8 @@ def _trackio_message_dict(message):
 
 
 def _trackio_output_dict(output):
+    # [FUNCTION DOC]
+    # HELPER: Converts output to a dict (pydantic dump, dict as-is, or the object's attribute dict), else None.
     if isinstance(output, BaseModel):
         return output.model_dump()
     if isinstance(output, dict):
@@ -236,10 +284,15 @@ def _trackio_output_dict(output):
 
 
 def _trackio_trace_key(op_name):
+    # [FUNCTION DOC]
+    # HELPER: Builds the log key "rollout_trace/<op_name>" with characters other than alphanumerics,
+    # ".", "_" and "-" replaced by "_".
     return "rollout_trace/" + "".join(char if char.isalnum() or char in "._-" else "_" for char in op_name)
 
 
 def _trackio_trace_step(attributes):
+    # [FUNCTION DOC]
+    # HELPER: Returns attributes["step"] as int, or None if missing or not convertible.
     step = attributes.get("step")
     if step is None:
         return None
@@ -250,6 +303,15 @@ def _trackio_trace_step(attributes):
 
 
 def _log_trackio_trace(op_name, inputs, output=None, exception=None):
+    # [FUNCTION DOC]
+    # HELPER: Logs one operation as a trackio Trace.
+    # Behavior: metadata includes op name, backend, experiment name, JSON-safe inputs (excluding
+    # "messages"), current trace attributes, and either status "error" with exception type or status
+    # "success" with output. Messages: valid role dicts from inputs["messages"] if present, else a system
+    # message naming the op and a user message with JSON inputs; then an assistant message containing
+    # the exception, the output's "response_text", its "answer", or the JSON output (first that applies).
+    # Logged under the op-specific key at the attribute step.
+    # Side effects: calls the trackio client's log.
     trackio = RolloutTraceConfig.get_client()
     attributes = _current_trace_attributes()
     metadata_inputs = {key: value for key, value in inputs.items() if key != "messages"}
@@ -307,6 +369,9 @@ def _log_trackio_trace(op_name, inputs, output=None, exception=None):
 
 
 def _current_trace_attributes():
+    # [FUNCTION DOC]
+    # HELPER: Returns a copy of current attributes: from weave's call context when backend is weave,
+    # otherwise from the attribute context var (empty dict if unset).
     backend = RolloutTraceConfig.get_backend()
     if backend == "weave":
         from weave.trace.context import call_context
@@ -316,12 +381,16 @@ def _current_trace_attributes():
 
 
 def _trace_field(value, field_name):
+    # [FUNCTION DOC]
+    # HELPER: Reads field_name from a dict key or object attribute; None if absent.
     if isinstance(value, dict):
         return value.get(field_name)
     return getattr(value, field_name, None)
 
 
 def _trace_output_copy(output):
+    # [FUNCTION DOC]
+    # HELPER: Returns a mutable dict copy of output (pydantic dump, dict copy, attribute dict) or None.
     if isinstance(output, BaseModel):
         return output.model_dump()
     if isinstance(output, dict):
@@ -332,6 +401,12 @@ def _trace_output_copy(output):
 
 
 async def _add_token2text(instance, inputs, output):
+    # [FUNCTION DOC]
+    # HELPER: Async. Adds decoded text to a traced output using instance.tokenizer.decode if available.
+    # Prompt ids come from output "prompt_ids" or inputs["prompt_ids"]; response ids from output
+    # "response_ids" or "token_ids". If no decoder, no ids, or output can't be copied to a dict, returns
+    # output unchanged. Otherwise decodes in the event loop's default executor and returns a copy with
+    # "prompt_text" and/or "response_text" added. The original output is not modified.
     tokenizer = getattr(instance, "tokenizer", None)
     decode = getattr(tokenizer, "decode", None)
     if not callable(decode):
@@ -362,8 +437,18 @@ async def _add_token2text(instance, inputs, output):
 
 
 def rollout_trace_op(func):
+    # [FUNCTION DOC]
+    # Decorator for methods (first arg self) that records each call with the configured backend.
+    # Returns an async wrapper for coroutine functions, else a sync wrapper. Inputs recorded are the
+    # bound arguments with defaults applied, excluding self.
     @functools.wraps(func)
     async def async_wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Async tracing wrapper. Calls through directly if tracing is disabled or no backend.
+        # weave: create a call (op = qualified name, current attributes), finish with output (token-decoded
+        # if enabled) or exception (re-raised). mlflow: run inside a span named after the function, setting
+        # inputs and outputs (decoded if enabled). trackio: log via _log_trackio_trace with output or
+        # exception (re-raised). Always returns the original, undecoded result.
         if not _trace_enabled.get():
             return await func(self, *args, **kwargs)
 
@@ -428,6 +513,9 @@ def rollout_trace_op(func):
 
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Sync tracing wrapper: same as the async one without token decoding; for mlflow delegates
+        # to mlflow.trace applied to the function.
         if not _trace_enabled.get():
             return func(self, *args, **kwargs)
 
