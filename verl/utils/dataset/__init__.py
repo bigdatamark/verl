@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# HELPER: Dataset package. Re-exports RLHFDataset (prompt dataset for RL training) from rl_dataset and
+#   RMDataset (reward-model pairwise dataset) from rm_dataset.
+# Inputs: none. Outputs: public names RLHFDataset and RMDataset.
+# Exceptions: import errors from the submodules propagate. Side effects: imports both submodules.
+
 # [PACKAGE]
 # Dataset package. Exposes RLHFDataset (prompt dataset for RL) and RMDataset (reward-model dataset).
 

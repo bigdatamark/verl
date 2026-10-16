@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# HELPER: Re-export hub for the verl.utils package (general utilities used across trainers, workers and models).
+# Behavior: on import, loads the config and tokenizer submodules and re-exports their public names, plus
+#   omega_conf_to_dataclass and validate_config (config helpers), the tokenizer/processor helpers
+#   (build_multimodal_processor_inputs, get_processor_token_id, hf_processor, hf_tokenizer, normalize_token_ids)
+#   and the groupwise helpers as_torch_index and group_mean_std.
+# Inputs: none. Outputs: the public names list is the concatenation of the tokenizer and config public lists
+#   plus the explicitly named helpers above.
+# Exceptions: import errors from the submodules propagate. Side effects: importing submodules (and their deps).
+
 # [PACKAGE]
 # Top-level verl utilities package. Re-exports config helpers (omega_conf_to_dataclass, validate_config),
 # tokenizer/processor helpers, and groupwise statistics helpers (as_torch_index, group_mean_std); __all__ combines

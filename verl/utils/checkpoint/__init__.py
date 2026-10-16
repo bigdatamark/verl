@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# HELPER: Checkpoint utilities package. Re-exports CheckpointHandler (orchestrates saving/loading training
+#   checkpoints) and OrchestrationMode (the enumeration of how checkpointing is coordinated) from checkpoint_handler.
+# Inputs: none. Outputs: public names CheckpointHandler and OrchestrationMode.
+# Exceptions: import errors from checkpoint_handler propagate. Side effects: imports checkpoint_handler.
+
 # [PACKAGE]
 # Checkpoint utilities package. Exposes CheckpointHandler and OrchestrationMode from checkpoint_handler; the
 # FSDP/Megatron checkpoint managers live in submodules and are imported directly.
