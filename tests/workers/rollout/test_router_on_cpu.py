@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CPU unit tests for the rollout request router (verl.workers.rollout.router) and its client-side use.
+# Covers: default router selection, plugin routers loaded from an external YAML (router_class FQN plus kwargs),
+# the require_acquire_fields / require_release_fields protocol that limits RPC payloads, config path resolution,
+# release_server signature, and precedence of load_balancer_cls over router_config_path.
+# Side effects: starts a local Ray session (module-scoped fixture); writes temporary YAML files.
+
 """Unit tests for verl.workers.rollout.router"""
 
 import asyncio
@@ -33,12 +41,22 @@ MOCK_PLUGIN_FQN = __name__ + "._MockPluginLoadBalancer"
 
 @ray.remote
 class _MockPluginLoadBalancer:
+    # [CLASS DOC]
+    # HELPER: Ray actor test double implementing the RequestLoadBalancer protocol with least-inflight routing
+    # (ties resolved by server insertion order) and no sticky state. Records every acquire/release call and counts
+    # how many times the require_*_fields declarations were queried, so tests can assert what crossed the RPC boundary.
+    # State: server_id->handle mapping, server_id->inflight count, copy of constructor kwargs, recorded calls/counters.
     """Ray actor implementing RequestLoadBalancer Protocol.
 
     Used as the ``router_class`` for plugin tests via ``importlib`` dynamic
     loading, and directly for Protocol structural checks."""
 
     def __init__(self, servers: dict[str, Any], router_kwargs: dict):
+        # [FUNCTION DOC]
+        # HELPER: Stores copies of the servers mapping and router_kwargs, initializes inflight to 0 for every server,
+        # and empty call records / zero query counters.
+        # Inputs: servers - mapping server_id -> handle; router_kwargs - dict forwarded by get_router_handle (whole YAML dict).
+        # Side effects: none beyond instance state.
         self._servers = dict(servers)
         self._inflight: dict[str, int] = {sid: 0 for sid in self._servers}
         self._router_kwargs = dict(router_kwargs)
@@ -48,32 +66,51 @@ class _MockPluginLoadBalancer:
         self.release_field_queries = 0
 
     def get_router_kwargs(self) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Returns a shallow copy of the constructor's router_kwargs.
         """Return the kwargs dict passed to the constructor."""
         return dict(self._router_kwargs)
 
     def get_releases(self) -> list[tuple]:
+        # [FUNCTION DOC]
+        # HELPER: Returns a copy of recorded (server_id, request_id) release tuples.
         """Return recorded release_server calls (server_id, request_id)."""
         return list(self.releases)
 
     def get_acquire_calls(self) -> list[tuple]:
+        # [FUNCTION DOC]
+        # HELPER: Returns a copy of recorded (request_id, prompt_ids) acquire tuples.
         """Return recorded acquire_server calls as (request_id, prompt_ids)."""
         return list(self.acquire_calls)
 
     def get_require_query_counts(self) -> tuple[int, int]:
+        # [FUNCTION DOC]
+        # HELPER: Returns a tuple (times require_acquire_fields was called, times require_release_fields was called).
         """Return (require_acquire_fields, require_release_fields) RPC counts."""
         return (self.acquire_field_queries, self.release_field_queries)
 
     def require_acquire_fields(self) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Protocol method; increments the acquire-field query counter and returns ["prompt_ids"].
         """Protocol: this content-aware mock routes on prompt token ids."""
         self.acquire_field_queries += 1
         return ["prompt_ids"]
 
     def require_release_fields(self) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Protocol method; increments the release-field query counter and returns ["request_id"].
         """Protocol: attribute releases by request_id."""
         self.release_field_queries += 1
         return ["request_id"]
 
     def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> tuple[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Records the call, then picks the server with the smallest inflight count (first in insertion order on ties),
+        # increments its count, and returns (server_id, handle).
+        # Inputs: request_id - request identifier; prompt_ids - optional token id list.
+        # Outputs: tuple (server_id, server handle).
+        # Exceptions: RuntimeError "No available prompt_ids" if prompt_ids is empty/None (checked first, after recording);
+        # RuntimeError "No available servers" if no servers remain.
         self.acquire_calls.append((request_id, prompt_ids))
         if not prompt_ids:
             raise RuntimeError("No available prompt_ids")
@@ -85,24 +122,36 @@ class _MockPluginLoadBalancer:
         return sid, self._servers[sid]
 
     def release_server(self, server_id: str, request_id: str | None = None) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Records (server_id, request_id) and decrements that server's inflight count if it exists and is positive.
+        # Inputs: server_id; request_id - optional.
+        # Outputs: none.
         self.releases.append((server_id, request_id))
         if server_id in self._inflight and self._inflight[server_id] > 0:
             self._inflight[server_id] -= 1
 
     def add_servers(self, servers: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Adds/overwrites each server_id->handle and resets its inflight count to 0.
         for sid, handle in servers.items():
             self._servers[sid] = handle
             self._inflight[sid] = 0
 
     def remove_servers(self, server_ids: list[str]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Removes each given server_id from both inflight and servers maps; unknown ids ignored.
         for sid in server_ids:
             self._inflight.pop(sid, None)
             self._servers.pop(sid, None)
 
     def get_all_servers(self) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Returns the list of current server_ids in insertion order.
         return list(self._inflight.keys())
 
     def get_status(self) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Returns dict with "servers" (copy of server_id->inflight), "total_inflight" (sum), "active_servers" (count).
         return {
             "servers": dict(self._inflight),
             "total_inflight": sum(self._inflight.values()),
@@ -110,22 +159,33 @@ class _MockPluginLoadBalancer:
         }
 
     def clear_sticky_cache(self) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Protocol method; mock has no sticky cache. Returns {"cleared_entries": 0, "server_loads": copy of inflight map}.
         """Protocol: clear sticky state (mock has none) and report loads."""
         return {"cleared_entries": 0, "server_loads": dict(self._inflight)}
 
     def get_total_inflight(self) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Protocol method; returns the sum of inflight counts across servers.
         """Protocol: total in-flight across servers."""
         return sum(self._inflight.values())
 
 
 @pytest.fixture(scope="module")
 def ray_session():
+    # [FUNCTION DOC]
+    # HELPER: Module-scoped pytest fixture; initializes Ray (ignoring re-init), yields, then shuts Ray down.
+    # Side effects: starts/stops a local Ray runtime.
     ray.init(ignore_reinit_error=True)
     yield
     ray.shutdown()
 
 
 def _write_router_yaml(tmp_path, router_class, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Dumps a YAML mapping {router_class: <router_class>, **kwargs} to tmp_path/"router.yaml".
+    # Inputs: tmp_path - directory path object; router_class - FQN string; kwargs - extra keys.
+    # Outputs: string path of the written file. Side effects: writes/overwrites the file.
     """Write a plugin router YAML and return its path."""
     content = {"router_class": router_class, **kwargs}
     yaml_path = tmp_path / "router.yaml"
@@ -134,14 +194,22 @@ def _write_router_yaml(tmp_path, router_class, **kwargs):
 
 
 def _plugin_lb(servers, tmp_path, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Writes a router YAML pointing at the mock plugin balancer (plus kwargs) and returns the router actor handle
+    # from get_router_handle for the given servers mapping.
     """Router handle backed by _MockPluginLoadBalancer, loaded from a temp YAML."""
     yaml_path = _write_router_yaml(tmp_path, MOCK_PLUGIN_FQN, **kwargs)
     return get_router_handle(servers=servers, router_config_path=yaml_path)
 
 
 class TestGetRouterHandleDefault:
+    # [CLASS DOC]
+    # Tests the default router chosen when no config path is given.
     @pytest.mark.parametrize("path", [None, ""])
     def test_none_or_empty_path_defaults_to_sticky_inflight(self, ray_session, path):
+        # [FUNCTION DOC]
+        # With router_config_path None or "", get_router_handle returns the default balancer: status reports 2 active servers
+        # and 0 inflight.
         lb = get_router_handle(servers={"s0": None, "s1": None}, router_config_path=path)
         status = ray.get(lb.get_status.remote())
         assert status["active_servers"] == 2
@@ -149,21 +217,29 @@ class TestGetRouterHandleDefault:
 
 
 class TestGetRouterHandlePluginExtensionYaml:
+    # [CLASS DOC]
+    # Tests for plugin routers loaded from an external YAML via router_config_path (see docstring).
     """Plugin router via external YAML (router_config_path): the ``router_class``
     FQN is imported and the whole YAML dict is passed to the constructor as
     ``router_kwargs``."""
 
     def test_missing_yaml_file_raises(self, ray_session):
+        # [FUNCTION DOC]
+        # A nonexistent absolute YAML path raises FileNotFoundError mentioning "Router config file not found".
         with pytest.raises(FileNotFoundError, match="Router config file not found"):
             get_router_handle(servers={"s0": None}, router_config_path="/nonexistent/path/router.yaml")
 
     def test_yaml_missing_router_class_raises(self, ray_session, tmp_path):
+        # [FUNCTION DOC]
+        # A YAML without a router_class key raises ValueError "must contain 'router_class'".
         yaml_path = tmp_path / "no_class.yaml"
         yaml_path.write_text(yaml.dump({"some_key": "value"}))
         with pytest.raises(ValueError, match="must contain 'router_class'"):
             get_router_handle(servers={"s0": None}, router_config_path=str(yaml_path))
 
     def test_add_remove_get_all_servers(self, ray_session, tmp_path):
+        # [FUNCTION DOC]
+        # Plugin router supports adding servers, listing them, and removing one (order preserved).
         lb = _plugin_lb({"s0": None}, tmp_path)
         ray.get(lb.add_servers.remote({"s1": None, "s2": None}))
         assert sorted(ray.get(lb.get_all_servers.remote())) == ["s0", "s1", "s2"]
@@ -171,6 +247,8 @@ class TestGetRouterHandlePluginExtensionYaml:
         assert ray.get(lb.get_all_servers.remote()) == ["s1", "s2"]
 
     def test_release_and_get_status(self, ray_session, tmp_path):
+        # [FUNCTION DOC]
+        # Three acquires distribute as s0=2, s1=1 under least-loaded routing; total 3; releasing s0 lowers total to 2.
         lb = _plugin_lb({"s0": None, "s1": None}, tmp_path)
         ray.get(lb.acquire_server.remote("a", prompt_ids=[1]))  # s0: 1
         ray.get(lb.acquire_server.remote("a", prompt_ids=[1]))  # s1: 1 (mock has no sticky: least-loaded)
@@ -182,18 +260,24 @@ class TestGetRouterHandlePluginExtensionYaml:
         assert ray.get(lb.get_status.remote())["total_inflight"] == 2
 
     def test_empty_pool_raises(self, ray_session, tmp_path):
+        # [FUNCTION DOC]
+        # After removing the only server, acquire raises a RayTaskError wrapping "No available servers".
         lb = _plugin_lb({"s0": None}, tmp_path)
         ray.get(lb.remove_servers.remote(["s0"]))
         with pytest.raises(ray.exceptions.RayTaskError, match="No available servers"):
             ray.get(lb.acquire_server.remote("req", prompt_ids=[1]))
 
     def test_yaml_forwards_composed_dict_to_constructor(self, ray_session, tmp_path):
+        # [FUNCTION DOC]
+        # Extra YAML keys plus router_class are passed verbatim as router_kwargs to the plugin constructor.
         """The whole YAML dict (router_class included) is passed as router_kwargs."""
         lb = _plugin_lb({"s0": None}, tmp_path, extra_param="hello")
         kwargs = ray.get(lb.get_router_kwargs.remote())
         assert kwargs == {"router_class": MOCK_PLUGIN_FQN, "extra_param": "hello"}
 
     def test_yaml_defaults_block_rejected(self, ray_session, tmp_path):
+        # [FUNCTION DOC]
+        # A YAML containing a Hydra "defaults" list is rejected with ValueError "uses a Hydra 'defaults' block".
         """A Hydra 'defaults' block is not composed — reject it with guidance
         instead of silently passing it through as a plain field."""
         main = tmp_path / "composed.yaml"
@@ -203,17 +287,24 @@ class TestGetRouterHandlePluginExtensionYaml:
 
 
 class TestRequireFields:
+    # [CLASS DOC]
+    # Tests the require_*_fields protocol and that the client sends only declared fields (see docstring).
     """Balancers declare which generate() kwargs they consume at acquire time.
     LLMServerClient._acquire_server packs all keyword args locally (free,
     same-process) and only serializes the declared fields into the RPC."""
 
     def test_default_balancer_needs_nothing(self):
+        # [FUNCTION DOC]
+        # GlobalRequestLoadBalancer (instantiated directly, not as actor) declares no acquire or release fields.
         """The default strategy routes on request_id only — no extra payload."""
         lb = GlobalRequestLoadBalancer(servers={"s0": None})
         assert lb.require_acquire_fields() == []
         assert lb.require_release_fields() == []
 
     def test_client_acquire_serializes_only_declared_fields(self, ray_session, tmp_path):
+        # [FUNCTION DOC]
+        # LLMServerClient queries the field declarations lazily (zero at construction, once each on first acquire, cached
+        # afterwards); the balancer only receives (request_id, prompt_ids) despite extra kwargs; release forwards request_id.
         """Declarations are queried lazily exactly once (verified via the mock's
         query counters), then cached; only the declared fields cross the wire on
         both acquire and release — sampling_params and friends stay in-process."""
@@ -244,6 +335,9 @@ class TestRequireFields:
         assert ray.get(lb.get_releases.remote()) == [(sid, "req-2")]
 
     def test_client_acquire_with_empty_declaration_sends_request_id_only(self, ray_session):
+        # [FUNCTION DOC]
+        # With the default balancer as an actor, a client acquire carrying extra kwargs still succeeds (single-arg RPC),
+        # leaving total inflight at 1.
         """The default balancer declares [] — the acquire RPC carries
         request_id only and matches the single-arg acquire signature."""
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
@@ -260,16 +354,25 @@ class TestRequireFields:
         assert ray.get(lb.get_total_inflight.remote()) == 1
 
     def test_legacy_signatures_survive_client_path(self, ray_session):
+        # [FUNCTION DOC]
+        # A subclass with old single-argument acquire/release signatures still works via the client; the fire-and-forget
+        # release is verified by polling total inflight until 0 (10 s deadline, asserts on timeout).
         """A subclass overriding acquire/release with main's pre-plugin
         signatures keeps working through the client: the default ([], [])
         declaration sends request_id/server_id only."""
 
         @ray.remote
         class _LegacyBalancer(GlobalRequestLoadBalancer):
+            # [CLASS DOC]
+            # HELPER: Ray actor subclass of GlobalRequestLoadBalancer overriding acquire/release with single-argument signatures.
             def acquire_server(self, request_id):  # main's single-arg signature
+                # [FUNCTION DOC]
+                # HELPER: Delegates to the parent acquire with request_id only; returns its (server_id, handle).
                 return super().acquire_server(request_id)
 
             def release_server(self, server_id):  # main's single-arg signature
+                # [FUNCTION DOC]
+                # HELPER: Delegates to the parent release with server_id only.
                 return super().release_server(server_id)
 
         lb = _LegacyBalancer.remote(servers={"s0": None, "s1": None})
@@ -293,29 +396,41 @@ class TestRequireFields:
 
 
 class TestResolveConfigPath:
+    # [CLASS DOC]
+    # Tests resolve_config_path lookup order (see docstring).
     """Path resolution via the shared verl.utils.import_utils.resolve_config_path:
     absolute → CWD → verl project root → verl package dir."""
 
     def test_absolute_path_passthrough(self):
+        # [FUNCTION DOC]
+        # An absolute path is returned unchanged without checking existence.
         assert resolve_config_path("/abs/path/router.yaml") == "/abs/path/router.yaml"
 
     def test_relative_path_found_in_cwd(self, tmp_path, monkeypatch):
+        # [FUNCTION DOC]
+        # A relative file existing in the current working directory resolves to its joined CWD path.
         (tmp_path / "router.yaml").write_text("router_class: x.Y")
         monkeypatch.chdir(tmp_path)
         assert resolve_config_path("router.yaml") == os.path.join(tmp_path, "router.yaml")
 
     def test_relative_path_not_found_raises(self, tmp_path, monkeypatch):
+        # [FUNCTION DOC]
+        # A relative path not found anywhere raises FileNotFoundError "configuration file not found".
         monkeypatch.chdir(tmp_path)
         with pytest.raises(FileNotFoundError, match="configuration file not found"):
             resolve_config_path("no_such_router.yaml")
 
 
 class TestReleaseServerSignature:
+    # [CLASS DOC]
+    # Tests the release_server(server_id, request_id) signature on plugin and default balancers.
     """release_server carries only request_id; content-aware balancers look up the
     prompt length from their own acquire-time bookkeeping instead of re-receiving
     the full token list over RPC."""
 
     def test_release_accepts_request_id_only(self, ray_session, tmp_path):
+        # [FUNCTION DOC]
+        # Plugin release_server accepts (server_id, request_id=...) and records exactly that; inflight returns to 0.
         """release_server takes (server_id, request_id) — no prompt_ids."""
         lb = _plugin_lb({"s0": None, "s1": None}, tmp_path)
         sid, _ = ray.get(lb.acquire_server.remote("req-1", prompt_ids=[1, 2, 3]))
@@ -326,6 +441,8 @@ class TestReleaseServerSignature:
         assert ray.get(lb.get_total_inflight.remote()) == 0
 
     def test_default_balancer_release_ignores_request_id(self, ray_session):
+        # [FUNCTION DOC]
+        # The default balancer accepts a request_id keyword on release and decrements inflight to 0.
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         sid, _ = ray.get(lb.acquire_server.remote("req-1"))
         ray.get(lb.release_server.remote(sid, request_id="req-1"))
@@ -333,12 +450,17 @@ class TestReleaseServerSignature:
 
 
 class TestGetRouterHandlePrecedence:
+    # [CLASS DOC]
+    # Tests that load_balancer_cls wins over router_config_path and that the path is read defensively.
     """``load_balancer_cls`` overrides ``router_config_path``; the YAML path is
     ignored with a warning. Downstream config schemas (e.g. verl-omni's
     DiffusionRolloutConfig) may omit ``router_config_path`` entirely — it must
     be read defensively."""
 
     def test_both_set_warns_and_uses_subclass(self, ray_session, tmp_path, caplog):
+        # [FUNCTION DOC]
+        # When both load_balancer_cls and a (bogus) router_config_path are given, the class is used (2 active servers),
+        # the YAML is never imported, and a warning mentioning "load_balancer_cls" and "ignored" is logged.
         """load_balancer_cls takes precedence over router_config_path; the
         YAML is ignored and a warning is logged."""
         # A YAML that would, if loaded, point at a *different* class.
@@ -360,6 +482,9 @@ class TestGetRouterHandlePrecedence:
         )
 
     def test_router_config_path_missing_from_struct_config_does_not_raise(self, ray_session):
+        # [FUNCTION DOC]
+        # Builds an LLMServerManager without __init__, sets a struct rollout config lacking router_config_path plus minimal
+        # attributes, and verifies _init_global_load_balancer succeeds and the balancer reports 2 active servers.
         """A struct rollout config without ``router_config_path`` (e.g. verl-omni's
         DiffusionRolloutConfig) must not raise when the manager initializes the
         router — the field is read defensively, not by direct attribute access."""

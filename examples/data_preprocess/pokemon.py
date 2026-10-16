@@ -1,4 +1,11 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
+# [MODULE DOC]
+# CLI script converting llamafactory/pokemon-gpt4o-captions into a multimodal SFT parquet with a
+# "messages" column (roles mapped gpt->assistant, human->user), keeping other columns such as
+# images. Train split is mapped with 16 processes then randomly split 90/10 (no fixed seed).
+# Args: --local_dataset_path, --local_save_dir (default ~/data/pokemon-gpt4o-captions),
+# deprecated --local_dir, --hdfs_dir.
+# KNOWN ISSUE: the train/test split is unseeded, so it is not reproducible; the save dir is not expanded or created.
 """
 Preprocess the llamafactory/pokemon-gpt4o-captions dataset to parquet format
 """
@@ -36,6 +43,10 @@ if __name__ == "__main__":
         )
 
     def map_fn(row: dict):
+        # [FUNCTION DOC]
+        # Converts a row's "conversations" list (entries with from/value) into a "messages" list of
+        # role/content dicts and stores it on the row (conversations is removed).
+        # Inputs: row dict. Outputs: the mutated row. Exceptions: ValueError for unknown "from" roles.
         messages = []
         conversation = row.pop("conversations")
         for conv in conversation:

@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU-only tests verifying that the router_replay setting is no longer a top-level actor config field
+# and instead lives on the per-engine config (megatron / veomni) of the actor config.
+# Side effects: none (pure dataclass construction).
+
 from dataclasses import fields
 
 from verl.workers.config.actor import ActorConfig, McoreActorConfig, VeOmniActorConfig
@@ -20,10 +25,17 @@ from verl.workers.config.optimizer import OptimizerConfig
 
 
 def test_actor_config_has_no_top_level_router_replay():
+    # [FUNCTION DOC]
+    # Asserts that the ActorConfig dataclass field set does not contain a field named "router_replay".
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on failure.
     assert "router_replay" not in {f.name for f in fields(ActorConfig)}
 
 
 def test_mcore_router_replay_lives_on_engine():
+    # [FUNCTION DOC]
+    # Builds a McoreActorConfig with an engine config whose router replay mode is "R3" and asserts the actor
+    # object has no router_replay attribute while the engine's router_replay.mode equals "R3".
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on failure.
     cfg = McoreActorConfig(
         rollout_n=1,
         ppo_micro_batch_size_per_gpu=1,
@@ -35,6 +47,9 @@ def test_mcore_router_replay_lives_on_engine():
 
 
 def test_veomni_router_replay_lives_on_engine():
+    # [FUNCTION DOC]
+    # Same as the Mcore variant but for VeOmniActorConfig (with use_remove_padding enabled) and mode "R2".
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on failure.
     cfg = VeOmniActorConfig(
         rollout_n=1,
         ppo_micro_batch_size_per_gpu=1,

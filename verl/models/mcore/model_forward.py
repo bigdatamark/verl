@@ -13,6 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Forward-pass wrappers for Megatron-Core GPT / VLM models used by verl actors and critics. They convert padded
+# (legacy path) or nested-tensor (model-engine path) batches into packed THD or padded BSHD layouts, call the model,
+# optionally run a logits_processor on the last pipeline stage, and map outputs back to the input layout.
+
 from typing import Optional
 
 import torch
@@ -36,6 +42,11 @@ from .util import (
 
 
 def model_forward_gen(vision_model: bool = False):
+    # [FUNCTION DOC]
+    # Behavior: factory returning a model_forward closure specialized for text-only (vision_model false) or vision-language
+    # models.
+    # Inputs: vision_model - whether the wrapped model is a VLM.
+    # Outputs: the model_forward function.
     def model_forward(
         model,
         input_ids,
@@ -48,6 +59,24 @@ def model_forward_gen(vision_model: bool = False):
         data_format: str = "thd",
         mtp_config: MtpConfig = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: reads pre/post-process flags, sequence-parallel and fp8 settings from the unwrapped model (pre-process is
+        # forced off for VLMs, which pack inside the model); fp8 e4m3/hybrid enables fp8 padding. Moves any pixel_values,
+        # image_grid_thw, pixel_values_videos, video_grid_thw inputs to the input device.
+        # THD: packs input_ids by attention_mask (pre-processing when first stage or when MTP training on the last stage);
+        # when MTP training on the last stage, packs logits_processor_args "label"/"label_mask" and passes them as
+        # labels/loss_mask. Calls the model with packed ids, packed_seq_params and position_ids (None for VLMs, which instead
+        # receive the original padded input_ids and attention_mask). On the last stage with a logits_processor, packs each
+        # logits_processor arg, runs the processor, and unpacks every returned entry; otherwise unpacks the raw output.
+        # BSHD: requires fp8 off; preprocesses to padded layout (VLMs use a generated arange position_ids and always
+        # pre-process), calls the model, and analogously applies the processor and postprocess_bshd.
+        # For value models on the last stage, returns the first channel of the last dimension.
+        # Inputs: model; input_ids, attention_mask, position_ids - padded [batch, seq] tensors; multi_modal_inputs - dict;
+        # logits_processor - optional callable(output, **args) -> dict; logits_processor_args - dict of padded tensors;
+        # value_model; data_format - "thd" or "bshd"; mtp_config - optional MTP settings.
+        # Outputs: a tensor or a dict of tensors in padded [batch, seq, ...] layout (on non-last stages, the hidden states).
+        # Exceptions: AssertionError for bad data_format or fp8 with bshd; KeyError if MTP args lack label/label_mask.
+        # KNOWN ISSUE: the value_model slicing assumes a tensor output; it fails if a logits_processor returned a dict.
         """Forward pass for models with sequence packing."""
         assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
         pre_process = (
@@ -179,6 +208,10 @@ def model_forward_gen(vision_model: bool = False):
 
 
 def _convert_to_nested_tensor(v, input_ids_lengths):
+    # [FUNCTION DOC]
+    # HELPER: Converts a padded [batch, seq] tensor to a jagged NestedTensor whose i-th row has length
+    # input_ids_lengths[i], truncating longer rows and right-padding shorter rows with ones. Returns NestedTensors unchanged.
+    # Exceptions: AssertionError if the number of lengths differs from batch size.
     """Convert regular tensor to NestedTensor, slicing according to input_ids_lengths.
 
     Args:
@@ -211,6 +244,15 @@ def _convert_to_nested_tensor(v, input_ids_lengths):
 
 
 def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_attention_mask):
+    # [FUNCTION DOC]
+    # HELPER: Builds a nested MTP loss mask aligned to [prompt; response] inputs.
+    # Behavior: obtains per-sample response lengths from the NestedTensor offsets, or (for padded masks) from
+    # response_attention_mask sums (must be a padded tensor of the same shape). For each sample, prepends
+    # (total length - response length) zeros to the valid response mask span (keeping internal zeros).
+    # Inputs: response_mask - nested or padded response-only mask; input_ids_lengths - per-sample total lengths;
+    # response_attention_mask - padded validity mask (required when response_mask is padded).
+    # Outputs: jagged NestedTensor of full-length masks.
+    # Exceptions: AssertionError on missing/mismatched masks, batch size mismatch, or response longer than input.
     """Build a nested loss_mask aligned to ``input_ids = [prompt; response]`` for MTP.
 
     ``response_mask`` is response-only data. This expands it to full packed
@@ -279,6 +321,27 @@ def gptmodel_forward_model_engine(
     router_padding_mask: torch.Tensor | None = None,
     mtp_loss_normalization_factor: float | None = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: model-engine forward for nested (jagged) input_ids. Moves multimodal inputs to device. THD: packs ids with
+    # preprocess_thd_engine (supports dynamic CP size, length bucketing and CP layout), optionally stores an MTP loss
+    # normalization factor on packed_seq_params; when MTP training on the last stage, converts "label" to nested form and
+    # builds the nested "loss_mask", stores them back in logits_processor_args, packs them with rolling and passes them as
+    # labels/loss_mask. Removes loss_mask and response_attention_mask from logits_processor_args. For VLMs builds padded
+    # ids and attention mask via build_vlm_attn_mask_thd. Adds router_padding_mask as padding_mask if given. Calls the model
+    # (position ids only when MTP training). On the last stage with a processor, packs each remaining arg (rolling only
+    # "label"), runs the processor and unpacks each output with postprocess_thd_engine; else unpacks the raw output.
+    # BSHD: requires no dynamic CP; pads via preprocess_bshd_engine (optionally to forced_max_seqlen), same MTP handling
+    # using BSHD preprocessing, VLM masks via build_vlm_attn_mask_bshd, then processor/postprocess_bshd_engine.
+    # For value models on the last stage, squeezes the last dimension (indexing breaks nested backward).
+    # Inputs: model; input_ids - jagged NestedTensor; multi_modal_inputs; logits_processor and its args (nested tensors,
+    # must include label and loss_mask when MTP training); value_model; vision_model; pad_token_id; data_format;
+    # mtp_enable_train; local_cp_size; forced_max_seqlen; pad_to_length_bucket; cp_layout; router_padding_mask;
+    # mtp_loss_normalization_factor.
+    # Outputs: nested tensor or dict of nested tensors matching input_ids layout.
+    # Exceptions: AssertionError for bad data_format or CP with bshd; KeyError if MTP args are missing.
+    # Side effects: mutates logits_processor_args (replaces label/loss_mask, pops loss_mask and response_attention_mask);
+    # sets an attribute on packed_seq_params.
+    # KNOWN ISSUE: the value_model squeeze assumes a tensor output; it fails if a logits_processor returned a dict.
     """Default forward pass for GPT models with optional sequence packing."""
 
     assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"

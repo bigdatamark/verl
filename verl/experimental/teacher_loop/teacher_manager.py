@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Async client-side utilities for querying teacher LLM servers for prompt log-probabilities during distillation,
+# with routing across multiple teacher models and padding of results to batch widths.
 import logging
 import os
 from typing import Any, Optional
@@ -36,6 +40,14 @@ def _get_teacher_sampling_params(
     teacher_model_config: DistillationTeacherModelConfig,
     distillation_loss_config: DistillationLossConfig,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds the sampling-params dict sent to a teacher server for logprob scoring.
+    # Behavior: always uses temperature 1.0 (logs a warning if the configured teacher temperature differs, since
+    # prompt logprobs are a pure forward pass); requests 1 max token, no detokenization, and prompt_logprobs equal to
+    # the loss topk when top-k distillation is enabled, else 0.
+    # Inputs: teacher_model_config - teacher config (inference.temperature); distillation_loss_config - loss config (topk, loss_settings.use_topk).
+    # Outputs: dict with keys max_tokens, temperature, prompt_logprobs, detokenize.
+    # Side effects: may log a warning.
     """Get sampling parameters for teacher model when computing log probabilities for distillation."""
     # Temperature has no effect on prompt_logprobs: the teacher performs a forward pass over
     # existing tokens (no sampling). Always use temperature=1.0 regardless of the config value.
@@ -66,6 +78,14 @@ def _pad_teacher_outputs(
     response_length: int,
     pad_token_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Pads per-sequence teacher ids/logprobs (shape [seq, K]) along the sequence dimension to batch widths.
+    # Behavior: left-pads by prompt_width - prompt_length and right-pads by response_width - response_length; ids padded
+    # with pad_token_id, logprobs padded with 0.0; then adds a leading batch dimension of size 1.
+    # Inputs: teacher_ids, teacher_logprobs - 2D tensors; prompt_width/response_width - target padded widths;
+    # prompt_length/response_length - actual lengths; pad_token_id - id pad value.
+    # Outputs: tuple of (ids [1, prompt_width+response_width, K], logprobs of the same shape).
+    # Side effects: none.
     # TODO(wuxibin): remove padding and use tensordict.
     left_pad_size = prompt_width - prompt_length
     right_pad_size = response_width - response_length
@@ -77,6 +97,10 @@ def _pad_teacher_outputs(
 
 
 class AsyncTeacherLLMServerManager:
+    # [CLASS DOC]
+    # Client wrapper that routes logprob requests to the appropriate teacher LLM server.
+    # Holds the parsed distillation config, loss config, teacher routing key name, per-teacher configs, and a mapping
+    # from teacher name to LLMServerClient.
     """Teacher-specific async client used for distillation logprob computation."""
 
     def __init__(
@@ -84,6 +108,12 @@ class AsyncTeacherLLMServerManager:
         config: DictConfig,
         teacher_client: dict[str, LLMServerClient],
     ):
+        # [FUNCTION DOC]
+        # Behavior: converts config.distillation into a DistillationConfig dataclass and stores loss config, teacher_key and
+        # teacher_models; validates that teacher_client keys exactly equal the configured teacher names.
+        # Inputs: config - full config with a distillation section; teacher_client - mapping teacher name -> LLMServerClient.
+        # Exceptions: ValueError when client keys do not match configured teacher names.
+        # Side effects: sets instance attributes.
         self.distillation_config: DistillationConfig = omega_conf_to_dataclass(config.distillation)
         self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
         self.teacher_key: str = self.distillation_config.teacher_key
@@ -98,6 +128,13 @@ class AsyncTeacherLLMServerManager:
         self.teacher_client: dict[str, LLMServerClient] = teacher_client
 
     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Picks the teacher name for a sample.
+        # Behavior: with exactly one configured teacher, returns it regardless of routing_key; otherwise requires
+        # routing_key to be non-None and among configured teachers.
+        # Inputs: routing_key - optional per-sample routing value.
+        # Outputs: teacher name string.
+        # Exceptions: ValueError if routing_key is missing or unknown in multi-teacher mode.
         if len(self.teacher_model_configs) == 1:
             # Single-teacher path: route everything to the one teacher regardless of the sample's key.
             return next(iter(self.teacher_model_configs))
@@ -121,6 +158,15 @@ class AsyncTeacherLLMServerManager:
         mm_processor_output: Optional[list[dict[str, Any]]] = None,
         routing_key: Optional[str] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: resolves the teacher, sends a generate request (random uuid request id, the full sequence as prompt,
+        # teacher sampling params, and any images/videos/audios plus multimodal processor kwargs/output) and reads
+        # prompt_ids and prompt_logprobs from the response's extra_fields into tensors (ids as int32).
+        # Inputs: sequence_ids - full unpadded token ids; multi_modal_data - optional dict with images/videos/audios;
+        # mm_processor_kwargs, mm_processor_output - optional multimodal processor data; routing_key - teacher routing value.
+        # Outputs: tuple (teacher_ids [S, K], teacher_logprobs [S, K]) where S == len(sequence_ids) and K is 1 or topk.
+        # Exceptions: ValueError from routing; AssertionError if returned lengths differ from the input length.
+        # Side effects: network call to the teacher server.
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
         teacher_key = self._resolve_teacher_key(routing_key)

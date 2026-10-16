@@ -11,3 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Tests for the experimental agent loop: tool calling, multi-modal, extra fields schema, tool parsers. No code; enables importing shared helpers such as agent_utils.

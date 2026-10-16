@@ -13,6 +13,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for verl.utils groupwise helpers: as_torch_index (factorizes labels into contiguous long group
+# ids) and group_mean_std (per-group mean, unbiased std and count). Sets VERL_FORCE_DEVICE=cpu at import
+# if unset (side effect on the process environment).
+
 import os
 
 os.environ.setdefault("VERL_FORCE_DEVICE", "cpu")  # ensure CPU for tests
@@ -25,6 +30,8 @@ from verl.utils import as_torch_index, group_mean_std
 
 
 def test_as_torch_index_basic_integers():
+    # [FUNCTION DOC]
+    # Integer labels map to a CPU long tensor; equal labels share an id and 3 distinct labels give 3 groups.
     g = as_torch_index([2, 2, 5, 7, 5, 2])
     assert g.dtype == torch.long
     assert g.device.type == "cpu"
@@ -34,6 +41,8 @@ def test_as_torch_index_basic_integers():
 
 
 def test_as_torch_index_near_integer_floats():
+    # [FUNCTION DOC]
+    # Near-integer float64 labels are rounded before factorizing, yielding 3 groups.
     arr = np.array([1.0000001, 2.0, 1.0, 3.0000000001], dtype=np.float64)
     g = as_torch_index(arr)  # should round to integers then factorize
     assert g.dtype == torch.long
@@ -41,6 +50,8 @@ def test_as_torch_index_near_integer_floats():
 
 
 def test_as_torch_index_factorization_mixed():
+    # [FUNCTION DOC]
+    # Mixed string/int labels are factorized without coercion: "0042" and 42 are distinct; 5 groups total.
     labels = ["a", "b", "a", "c", "0042", 42]
     g = as_torch_index(labels)
     # "0042" and 42 should NOT be the same group (strings are not coerced here)
@@ -49,6 +60,9 @@ def test_as_torch_index_factorization_mixed():
 
 
 def test_group_mean_std_simple():
+    # [FUNCTION DOC]
+    # For scores [1,2,3] with groups [0,1,0]: asserts group 0 mean 2, std sqrt(2), count 2; and the singleton
+    # group 1 is reported with mean 0 and std 1 (the function's convention for singleton groups), count 1.
     # groups: 0 -> [1, 3], 1 -> [2]
     scores = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
     gidx = as_torch_index([0, 1, 0])
@@ -66,6 +80,9 @@ def test_group_mean_std_simple():
 
 
 def test_group_mean_std_low_variance_matches_torch_std():
+    # [FUNCTION DOC]
+    # With eps=0 and nearly equal values per group, asserts means, counts and that each group std matches
+    # torch.std on the corresponding slice (guards against catastrophic cancellation).
     scores = torch.tensor([1.0, 1.00001, 2.0, 2.00001], dtype=torch.float32)
     gidx = as_torch_index(["prompt-a", "prompt-a", "prompt-b", "prompt-b"])
 
@@ -78,6 +95,8 @@ def test_group_mean_std_low_variance_matches_torch_std():
 
 
 def test_group_mean_std_empty():
+    # [FUNCTION DOC]
+    # Empty scores and index tensors produce empty mean, std and count outputs.
     scores = torch.tensor([], dtype=torch.float32)
     gidx = torch.tensor([], dtype=torch.long)
     mean_g, std_g, cnt_g = group_mean_std(scores, gidx)
@@ -85,6 +104,10 @@ def test_group_mean_std_empty():
 
 
 def test_group_mean_std_default_device_no_force_env(monkeypatch):
+    # [FUNCTION DOC]
+    # Regression test: with VERL_FORCE_DEVICE and PYTEST_CURRENT_TEST removed and groupwise.get_device_name patched
+    # to "cpu", calling group_mean_std with default device must not crash and all outputs must be on CPU.
+    # Side effects: monkeypatches environment and module attribute.
     """
     Regression test:
     - group_mean_std(device=None) must not pass a device *module* (e.g., torch.cuda)

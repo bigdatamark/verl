@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Multi-GPU (>= 2, launched under torchrun) test of HFRollout generation with an FSDP-wrapped
+# Qwen2-7B-Instruct, checking output batch size, attention masks and position ids. BASE_HF_ROLLOUT_CONFIG holds
+# the default sampling config (64-token prompt/response, temperature 1, greedy validation kwargs).
+
 import os
 
 import torch
@@ -46,6 +51,10 @@ BASE_HF_ROLLOUT_CONFIG = {
 
 
 def prepare_input_dataproto(tokenizer, config, validate):
+    # [FUNCTION DOC]
+    # HELPER: renders three fixed chat prompts with the tokenizer's chat template, tokenizes them padded to the
+    # config prompt length, and returns a DataProto with input_ids, attention_mask and position ids computed from the
+    # mask, plus meta_info bos/eos/pad token ids and the validate flag. Inputs: tokenizer, config, validate.
     preencode_prompts = [
         [{"role": "user", "content": "Who won the Champions League in 2019?"}],
         [{"role": "user", "content": "The founder of Apple is"}],
@@ -73,6 +82,10 @@ def prepare_input_dataproto(tokenizer, config, validate):
 
 
 def prepare_fsdp_model(model, world_size):
+    # [FUNCTION DOC]
+    # HELPER: wraps the model in FSDP over a 1-D CUDA device mesh of world_size with FULL_SHARD, original params,
+    # no auto wrap, bf16 params with fp32 reduce/buffers, no CPU offload, no module-state sync, and sets the sharded
+    # state dict type. Inputs: model, world_size. Outputs: FSDP model.
     from torch.distributed.device_mesh import init_device_mesh
 
     device_mesh = init_device_mesh("cuda", mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -98,6 +111,15 @@ def prepare_fsdp_model(model, world_size):
 
 
 def test_hf_rollout(n: int = 1, do_sample: bool = True, validate: bool = False):
+    # [FUNCTION DOC]
+    # Builds the rollout config with n and do_sample overrides, asserts >= 2 GPUs, initializes the process group,
+    # copies the model to ~/.cache/verl/rlhf, loads a left-padding tokenizer with pad = eos and a bf16 model, wraps it
+    # in FSDP and generates. Asserts output batch size equals input size times n; per sample asserts attention mask and
+    # position ids span prompt plus response, response attention is 1 through the first pad/EOS token and 0 after
+    # (or all 1 with no EOS), and response position ids continue consecutively from the last prompt position for the
+    # valid (non-pad) response length. Rank 0 prints decoded prompt/response.
+    # Inputs: n (default 1), do_sample (default True), validate (default False).
+    # Side effects: distributed init, model download/cache, GPU memory.
     config = OmegaConf.create(BASE_HF_ROLLOUT_CONFIG)
     config.update({"n": n, "do_sample": do_sample})
 

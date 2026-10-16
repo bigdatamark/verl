@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# HELPER: shared test fixtures for checkpoint-engine tests. Provides a trainer
+# worker that sends weights via a checkpoint engine, a mock rollout server
+# adapter that captures received weights and compares them against the HF model,
+# a mock rollout replica, a checkpoint-engine worker using the mock adapter, and
+# factory functions creating trainer and rollout Ray worker groups.
+
 import asyncio
 from typing import Generator
 
@@ -29,7 +37,15 @@ from verl.workers.rollout import BaseRollout, RolloutReplica
 
 
 class TrainingWorkerTest(TrainingWorker):
+    # [CLASS DOC]
+    # HELPER: TrainingWorker that owns a checkpoint engine for sending weights.
     def __init__(self, config: TrainingWorkerConfig, checkpoint_engine_config: CheckpointEngineConfig) -> None:
+        # [FUNCTION DOC]
+        # HELPER: initializes the base TrainingWorker, then builds a checkpoint engine
+        # from the registry using the configured backend, bucket size of
+        # update_weights_bucket_megabytes converted to bytes, and per-backend
+        # engine_kwargs; rank 0 additionally gets is_master=True.
+        # Side effects: mutates the engine_kwargs mapping of the passed config on rank 0; requires torch.distributed initialized.
         super().__init__(config)
 
         backend = checkpoint_engine_config.backend
@@ -41,25 +57,41 @@ class TrainingWorkerTest(TrainingWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+        # [FUNCTION DOC]
+        # HELPER: async RPC (all ranks, non-blocking). Gets the per-tensor param
+        # iterator from the training engine and sends it through the checkpoint engine
+        # with global_steps. mode is accepted but unused.
         per_tensor_param, _ = self.engine.get_per_tensor_param()
         await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: RPC (DP_COMPUTE, non-blocking) that invokes the named method on the
+        # checkpoint engine with the given args and returns its result.
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
 
 
 class MockServerAdapter(BaseRollout):
+    # [CLASS DOC]
+    # HELPER: rollout stand-in that records received weights for verification.
     def __init__(self, config: RolloutConfig, model_config: HFModelConfig, check_allclose: bool = True):
+        # [FUNCTION DOC]
+        # HELPER: initializes BaseRollout without a device mesh; stores check_allclose,
+        # a lazily-loaded reference model (None) and an empty name-to-tensor mapping.
         super().__init__(config, model_config, device_mesh=None)
         self.check_allclose = check_allclose
         self.model = None
         self.received_weights: dict[str, torch.Tensor] = {}
 
     async def resume(self, tags: list[str]):
+        # [FUNCTION DOC]
+        # HELPER: not supported; always raises NotImplementedError.
         raise NotImplementedError()
 
     async def release(self):
+        # [FUNCTION DOC]
+        # HELPER: not supported; always raises NotImplementedError.
         raise NotImplementedError()
 
     async def update_weights(
@@ -67,12 +99,22 @@ class MockServerAdapter(BaseRollout):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # HELPER: async; consumes the async (name, tensor) iterator, cloning each tensor
+        # and, when check_allclose, storing a clone under its name.
+        # KNOWN ISSUE: annotated as a sync Generator but consumed with async iteration; clones twice when storing.
         async for name, weight in weights:
             weight = weight.clone()
             if self.check_allclose:
                 self.received_weights[name] = weight.clone()
 
     def check_weights(self):
+        # [FUNCTION DOC]
+        # HELPER: no-op if check_allclose is false. Otherwise lazily loads the HF model
+        # (bf16, CPU) from model_config.path, asserts every state_dict entry was
+        # received and is allclose after casting to the received tensor's device/dtype,
+        # then clears received weights and prints success.
+        # Exceptions: AssertionError on missing or mismatched weights.
         if not self.check_allclose:
             return
 
@@ -91,7 +133,11 @@ class MockServerAdapter(BaseRollout):
 
 
 class MockReplica(RolloutReplica):
+    # [CLASS DOC]
+    # HELPER: RolloutReplica that only binds its slice of hybrid workers; no servers.
     async def init_hybrid(self, worker_group: RayWorkerGroup):
+        # [FUNCTION DOC]
+        # HELPER: assigns self.workers to the contiguous slice of world_size workers starting at replica_rank * world_size.
         """Init hybrid rollout server, rollout engine and training engine(fsdp/megatron) fused in same process.
 
         Args:
@@ -102,29 +148,44 @@ class MockReplica(RolloutReplica):
         ]
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
+        # [FUNCTION DOC]
+        # HELPER: not supported; raises NotImplementedError.
         """Get rollout worker actor class for colocated and standalone mode."""
         raise NotImplementedError
 
     async def launch_servers(self):
+        # [FUNCTION DOC]
+        # HELPER: not supported; raises NotImplementedError.
         """Launch http server in each node."""
         raise NotImplementedError
 
 
 class CheckpointEngineWorkerTest(CheckpointEngineWorker):
+    # [CLASS DOC]
+    # HELPER: CheckpointEngineWorker wired to a MockServerAdapter, with a check RPC.
     def __init__(
         self, rollout_config: RolloutConfig, model_config: HFModelConfig, check_allclose: bool = True, *args, **kwargs
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: creates a MockServerAdapter and passes it to the base worker along with extra args.
         server_adapter = MockServerAdapter(rollout_config, model_config, check_allclose)
         super().__init__(rollout_config, model_config, server_adapter, *args, **kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def check_weights(self):
+        # [FUNCTION DOC]
+        # HELPER: RPC on all ranks delegating to the adapter's check_weights.
         self.server_adapter.check_weights()
 
 
 def create_trainer_worker_group(
     resource_pool: RayResourcePool, model_config: HFModelConfig, checkpoint_engine_config: CheckpointEngineConfig
 ) -> RayWorkerGroup:
+    # [FUNCTION DOC]
+    # HELPER: builds a forward-only FSDP language-model TrainingWorkerTest group
+    # over the resource pool (fsdp_size = pool world size), with
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in the runtime env.
+    # Outputs: the (not yet model-initialized) RayWorkerGroup.
     engine_config = FSDPEngineConfig(forward_only=True, fsdp_size=resource_pool.world_size, strategy="fsdp")
     trainer_config = TrainingWorkerConfig(
         model_type="language_model",
@@ -156,6 +217,11 @@ async def create_rollout_worker_group(
     rollout_config: RolloutConfig,
     check_allclose: bool = True,
 ) -> tuple[RayWorkerGroup, list[MockReplica]]:
+    # [FUNCTION DOC]
+    # HELPER: async. Creates a CheckpointEngineWorkerTest group over the pool, then
+    # computes per-replica size as TP x DP x PP from rollout_config, creates
+    # world_size // that many MockReplicas and awaits init_hybrid on all of them.
+    # Outputs: tuple (worker group, list of replicas).
     # create rollout worker group
     ray_cls_with_init = RayClassWithInitArgs(
         cls=ray.remote(CheckpointEngineWorkerTest),

@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# torchrun (>= 2 GPUs) differential oracle script for verl's comm-stubbed Megatron-Bridge conversion probe (see module
+# docstring). At import time prepends VERL_PATH (default a hard-coded developer path) to sys.path and reads MODEL_KIND
+# (qwen2, qwen2_tied, qwen3_moe, nemotron_h, falcon_h1), TP_SIZE, PP_SIZE and EP_SIZE from env vars.
+# KNOWN ISSUE: the default VERL_PATH "/home/changyi/verl_ab_pre" is a developer-specific path; when unset it may shadow or miss the intended verl checkout.
+# KNOWN ISSUE: the docstring lists only qwen2/qwen3_moe/nemotron_h, though qwen2_tied and falcon_h1 are also supported.
+
 """TP>1 differential oracle for the comm-stubbed mcore probe.
 
 For every conversion task of a tiny model the REAL ``megatron_to_hf`` (true
@@ -47,6 +55,16 @@ EP = int(os.environ.get("EP_SIZE", "1"))
 
 
 def _build_tiny_hf_dir(rank: int) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Creates (once) a tiny HF checkpoint directory /tmp/tiny_<MODEL_KIND>_probe_diff_v4 for the selected model kind.
+    # Behavior: builds a small HF config per kind (raises ValueError for unknown kinds); for the Mamba hybrids
+    # (nemotron_h, falcon_h1) best-effort stubs the transformers hub-kernel loaders to no-ops so offline init uses the
+    # reference path (failures printed, not raised). On rank 0, if model.safetensors does not exist, instantiates the
+    # model in bf16 and saves it; for the hybrids rewrites keys "backbone.embedding." to "backbone.embeddings." to match
+    # released checkpoints. All ranks then barrier.
+    # Inputs: rank. Outputs: the directory path.
+    # Side effects: monkey-patches transformers modules, writes files under /tmp, collective barrier.
+    # KNOWN ISSUE: the cache check is existence-only, so a stale directory from a different config is reused.
     from transformers import AutoConfig
 
     cfg_dir = f"/tmp/tiny_{MODEL_KIND}_probe_diff_v4"
@@ -172,6 +190,18 @@ def _build_tiny_hf_dir(rank: int) -> str:
 
 
 def _pp_differential(bridge, model, rank: int, world: int) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Production-path differential used when PP>1, EP>1 or ENGINE_DIFF is set (see docstring).
+    # Behavior: builds the export index with a fresh slot cache; all-gathers per-rank row names and slot tables and on rank 0
+    # records failures if row counts or any row's slot table diverge. For each row: rows without a local param must yield
+    # an empty delta entry (else failure); non-float params are skipped; otherwise all local elements (bf16, flattened)
+    # are submitted as a full delta and the returned per-slot HF positions/values are accumulated per slot name on CPU.
+    # Then obtains the bridge's own full CPU export as reference, all-gathers the per-rank pieces, and on rank 0: flags
+    # reference tensors not covered by any slot and slots absent from the export; for each slot merges contributions into a
+    # NaN-initialised flat tensor, checking shape equality and that overlapping positions agree bitwise, and checks no NaN
+    # remains and bitwise equality with the reference. Prints failures (up to 20) and a summary.
+    # Inputs: bridge, model (list of model chunks), rank, world.
+    # Outputs: none. Side effects: collectives, destroys the process group, and rank 0 exits with status 1 on any failure or nothing checked.
     """PP>1 differential: run the PRODUCTION export path (global directory +
     slot pre-seed + probe entries, a full-delta sync where every local element
     is 'changed') and compare the merged wire-view against
@@ -288,6 +318,16 @@ def _pp_differential(bridge, model, rank: int, world: int) -> None:
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: inits NCCL distributed, sets CUDA device to the global rank, asserts world >= 2, initializes Megatron model
+    # parallel (TP/PP/EP; expert TP 1 when EP > 1) and seeds the model-parallel RNG with 1234. Builds the tiny checkpoint,
+    # creates an AutoBridge and a provider configured for TP/PP/EP in bf16, builds the distributed model chunks (no DDP),
+    # moves them to CUDA bf16 and loads the HF weights. If PP>1, EP>1 or ENGINE_DIFF is set, delegates to _pp_differential.
+    # Otherwise for each floating conversion task: computes the real megatron_to_hf output with collectives, computes a
+    # stubbed probe output on a clone of the local shard, all-gathers the probe outputs, and on rank 0 merges non-NaN
+    # contributions per HF name (checking overlaps agree bitwise) and compares the merge to the real output bitwise,
+    # counting passes; barriers after each task. Prints summary, destroys the process group, rank 0 exits 1 on failure.
+    # KNOWN ISSUE: torch.cuda.set_device uses the global rank, which is wrong for multi-node runs (should be local rank).
     dist.init_process_group(backend="nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.cuda.set_device(rank)

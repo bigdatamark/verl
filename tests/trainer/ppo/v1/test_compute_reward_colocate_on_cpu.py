@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Note: these tests exercise local replicas of the production helpers rather than importing them, so they
+# only pin the intended contracts; drift in the real trainer/reward code would not be detected.
+
 """CPU-only unit tests for the colocated reward model data plumbing in the V1 PPO trainer.
 
 These tests cover the dependency-light pieces of ``PPOTrainer._compute_reward_colocate``:
@@ -32,6 +36,9 @@ import torch
 
 
 def _lengths_to_mask(lengths: torch.Tensor, width: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: returns an int64 mask of shape (rows, width) where row i has ones in positions less than
+    # lengths[i] and zeros after (right padding), on the lengths' device. Inputs: 1-D lengths tensor, width.
     """Standalone copy of ``PPOTrainer._lengths_to_mask`` for unit testing.
 
     Kept in sync with ``verl/trainer/ppo/v1/trainer_base.py``; importing the trainer
@@ -42,6 +49,11 @@ def _lengths_to_mask(lengths: torch.Tensor, width: int) -> torch.Tensor:
 
 
 def _assemble_rm_scores(prompts, attention_mask, responses, scores):
+    # [FUNCTION DOC]
+    # HELPER: replicates reward-score assembly: valid response length per row is the sum of the attention mask
+    # past the prompt width; returns a float32 zeros tensor shaped like responses with each row's score placed
+    # at index (valid length - 1). Inputs: prompts (only width used), attention_mask, responses, list of
+    # scores. Outputs: score tensor. Note: a zero-length response would index -1 (the last column).
     """Replica of ``RewardManagerBase.assemble_rm_scores`` to assert the contract."""
     prompt_length = prompts.size(1)
     valid_response_length = attention_mask[:, prompt_length:].sum(dim=1)
@@ -51,7 +63,11 @@ def _assemble_rm_scores(prompts, attention_mask, responses, scores):
 
 
 class TestLengthsToMask:
+    # [CLASS DOC]
+    # Tests for _lengths_to_mask.
     def test_basic_right_padding(self):
+        # [FUNCTION DOC]
+        # Lengths 1,3,2 with width 4 yield the expected right-padded rows.
         lengths = torch.tensor([1, 3, 2])
         mask = _lengths_to_mask(lengths, width=4)
         expected = torch.tensor(
@@ -65,21 +81,29 @@ class TestLengthsToMask:
         assert torch.equal(mask, expected)
 
     def test_full_and_empty_rows(self):
+        # [FUNCTION DOC]
+        # Length 0 gives an all-zero row and length equal to width gives all ones.
         lengths = torch.tensor([0, 4])
         mask = _lengths_to_mask(lengths, width=4)
         expected = torch.tensor([[0, 0, 0, 0], [1, 1, 1, 1]], dtype=torch.int64)
         assert torch.equal(mask, expected)
 
     def test_row_count_matches_lengths(self):
+        # [FUNCTION DOC]
+        # Output shape is (number of lengths, width).
         lengths = torch.tensor([2, 2, 2, 2, 2])
         mask = _lengths_to_mask(lengths, width=3)
         assert mask.shape == (5, 3)
 
 
 class TestAttentionMaskContract:
+    # [CLASS DOC]
+    # Tests that concatenated prompt+response masks satisfy the reward assembly contract.
     """The mask built by ``_compute_reward_colocate`` must satisfy assemble_rm_scores."""
 
     def test_valid_response_length_recovered(self):
+        # [FUNCTION DOC]
+        # Summing the attention mask after the prompt width recovers the response lengths.
         prompt_lengths = torch.tensor([2, 1, 3])
         response_lengths = torch.tensor([3, 2, 1])
         prompt_width, response_width = 4, 4
@@ -93,6 +117,8 @@ class TestAttentionMaskContract:
         assert torch.equal(recovered, response_lengths)
 
     def test_score_lands_on_last_valid_response_token(self):
+        # [FUNCTION DOC]
+        # Scores 0.5 and -1.0 land at the last valid response index of each row and nowhere else.
         prompt_lengths = torch.tensor([2, 1])
         response_lengths = torch.tensor([3, 2])
         prompt_width, response_width = 4, 5
@@ -114,6 +140,9 @@ class TestAttentionMaskContract:
 
 
 class TestRmScoresJaggedWriteBack:
+    # [CLASS DOC]
+    # Tests converting padded (batch, response_width) reward scores into a jagged nested tensor whose row
+    # lengths equal response lengths, as the streaming reward path expects.
     """rm_scores must be written back as per-sample jagged rows (response-aligned).
 
     The streaming reward path stores rm_scores as a jagged tensor whose per-row length
@@ -124,12 +153,17 @@ class TestRmScoresJaggedWriteBack:
 
     @staticmethod
     def _to_jagged(padded_rm_scores, response_lengths):
+        # [FUNCTION DOC]
+        # HELPER: builds a jagged-layout nested tensor from the first response_lengths[i] entries of each padded row.
+        # Inputs: padded scores tensor, response lengths. Outputs: nested tensor.
         return torch.nested.as_nested_tensor(
             [padded_rm_scores[i, : response_lengths[i]] for i in range(len(response_lengths))],
             layout=torch.jagged,
         )
 
     def test_jagged_layout_and_lengths(self):
+        # [FUNCTION DOC]
+        # Asserts the result is nested, jagged, contiguous, and its offsets differences equal the lengths 3,2,1.
         padded = torch.zeros(3, 5)
         padded[0, 2] = 0.5
         padded[1, 1] = -1.0
@@ -145,6 +179,8 @@ class TestRmScoresJaggedWriteBack:
         assert nt.offsets().diff().tolist() == [3, 2, 1]
 
     def test_padded_roundtrip_preserves_scores(self):
+        # [FUNCTION DOC]
+        # Re-padding with 0 gives width equal to the maximum length (4) and preserves per-row score sums.
         padded = torch.zeros(2, 6)
         padded[0, 3] = 1.25
         padded[1, 0] = -2.0
@@ -159,10 +195,15 @@ class TestRmScoresJaggedWriteBack:
 
 
 class TestRawPromptObjectArray:
+    # [CLASS DOC]
+    # Tests building a 1-D object array of per-sample chat-message lists for raw_prompt.
     """raw_prompt must remain a 1-D object array (one chat-message list per sample)."""
 
     @staticmethod
     def _build(raw_prompts):
+        # [FUNCTION DOC]
+        # HELPER: converts the input iterable to a plain list, allocates an empty 1-D object array of that length
+        # and assigns elements element-wise (avoiding numpy's nested-list collapsing). Outputs: the object array.
         # Mirror the production normalization in _compute_reward_colocate: the TransferQueue
         # field may be a tensordict LinkedList (list subclass), NonTensorStack or numpy array,
         # so it is wrapped with list(...) (not .tolist(), which only exists on numpy/tensors).
@@ -172,6 +213,8 @@ class TestRawPromptObjectArray:
         return arr
 
     def test_equal_length_messages_not_collapsed(self):
+        # [FUNCTION DOC]
+        # Two equal-structure one-message chats produce shape (2,) object array with each element the original list.
         # Two samples, each with a single-message chat of equal structure.
         raw_prompts = [
             [{"role": "user", "content": "a"}],
@@ -185,6 +228,8 @@ class TestRawPromptObjectArray:
         assert list(arr[1]) == [{"role": "user", "content": "b"}]
 
     def test_naive_np_array_would_collapse(self):
+        # [FUNCTION DOC]
+        # Documents that naive array construction collapses to shape (2,1) while _build keeps (2,).
         # Documents why element-wise assignment is required: np.array collapses
         # equal-length nested lists into a 2-D array, breaking per-sample indexing.
         raw_prompts = [
@@ -198,6 +243,8 @@ class TestRawPromptObjectArray:
         assert safe.shape == (2,)  # preserved - correct
 
     def test_chunk_and_index_roundtrip(self):
+        # [FUNCTION DOC]
+        # Splitting the array into 2 chunks keeps per-row items intact (first item is sample "0"'s messages).
         raw_prompts = [[{"role": "user", "content": str(i)}] for i in range(4)]
         arr = self._build(raw_prompts)
         # Simulate DataProto.chunk -> np.array_split along axis 0, then per-row index.
@@ -207,10 +254,15 @@ class TestRawPromptObjectArray:
         assert list(first_item) == [{"role": "user", "content": "0"}]
 
     def test_list_subclass_input_like_tensordict_linkedlist(self):
+        # [FUNCTION DOC]
+        # Regression: a list subclass without a tolist method (mimicking tensordict LinkedList) still yields a
+        # correct 1-D object array.
         # Regression: TransferQueue may return raw_prompt as a tensordict LinkedList,
         # which is a `list` subclass without `.tolist()`. The production code uses
         # list(...) to normalize it; verify that path yields a correct 1-D object array.
         class _FakeLinkedList(list):
+            # [CLASS DOC]
+            # HELPER: empty list subclass standing in for tensordict's LinkedList.
             """Stand-in for tensordict.utils.LinkedList (a list subclass)."""
 
         raw_prompts = _FakeLinkedList(

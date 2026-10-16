@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Parametrized regression test for verl.utils.flops_counter.FlopsCounter. The module-level CONFIG mapping
+# holds, per model type, a reduced HF-style config dict, two batches of sequence lengths (and for VL models
+# image sequence lengths), and the expected TFLOPs for each batch (derived in the inline formulas: roughly
+# 6 * dense parameter count * token count plus an attention term over squared sequence lengths).
+# KNOWN ISSUE: VALID_CONFIG_TYPE is defined but never used, and it omits types tested below (gpt_oss,
+# qwen3_vl, qwen3_vl_moe).
+
 import math
 
 import pytest
@@ -33,7 +41,12 @@ VALID_CONFIG_TYPE = {
 
 
 class Config:
+    # [CLASS DOC]
+    # HELPER: Lightweight attribute-access wrapper that mimics a HF PretrainedConfig built from a dict.
     def __init__(self, config_dict):
+        # [FUNCTION DOC]
+        # HELPER: Sets each dict entry as an attribute; nested dicts are recursively wrapped into Config objects.
+        # Inputs: config_dict - mapping of attribute name to value. Side effects: sets attributes on self.
         for key, value in config_dict.items():
             if isinstance(value, dict):
                 value = Config(value)
@@ -544,6 +557,11 @@ CONFIG = {
     ],
 )
 def test_flops_counter(config_type: str):
+    # [FUNCTION DOC]
+    # For the given model type, builds a FlopsCounter from the CONFIG entry and, for each batch, calls
+    # estimate_flops with delta time 1 (so the result equals TFLOPs) and, when present, image sequence lengths.
+    # Asserts the counted value is math.isclose to the expected value. Prints both values. Raises
+    # AssertionError on mismatch.
     test_config = CONFIG[config_type]
     config = Config(test_config["config"])
     flops_counter = FlopsCounter(config)

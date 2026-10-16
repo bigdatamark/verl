@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Ray backend of the single controller. Provides: Ray placement-group based resource pools (including splitting into
+# sub-pools and merging), a manager creating named pools from a spec, a Ray actor class wrapper that applies scheduling
+# and resource options, RayWorkerGroup (creates/attaches Ray actor workers, binds registered methods via func_generator,
+# executes remote calls on all workers or rank zero, supports spawning per-role groups and fused colocated workers),
+# and factories that build colocated worker classes (deprecated WorkerDict and the newer FusedWorker). Logger level from
+# VERL_LOGGING_LEVEL (default WARN).
+
 import inspect
 import logging
 import os
@@ -39,6 +47,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def get_random_string(length: int) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Outputs: random string of the given length drawn from ASCII letters and digits (not cryptographically secure).
     import random
     import string
 
@@ -47,8 +57,19 @@ def get_random_string(length: int) -> str:
 
 
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
+    # [FUNCTION DOC]
+    # HELPER: Behavior: builds a callable object, whose class is dynamically named after method_name for observability, that
+    # when called: runs dispatch_fn(worker_group, args, kwargs) to get per-rank arguments; pops the padding-size key from
+    # kwargs (default 0); calls execute_fn(method_name, args, kwargs); ray.get the result if blocking; runs collect_fn; and if
+    # padding was added, strips the trailing padding_count entries (index selection for DataProto, slicing for lists).
+    # Inputs: self - the worker group; method_name; dispatch_fn; collect_fn; execute_fn; blocking.
+    # Outputs: instance of the dynamically created functor class.
     class Functor:
+        # [CLASS DOC]
+        # HELPER: callable wrapper class; see func_generator.
         def __call__(this, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: performs dispatch, execute, optional blocking get, collect and padding removal; see func_generator.
             args, kwargs = dispatch_fn(self, *args, **kwargs)
             padding_count = kwargs.pop(_padding_size_key, 0)
             output = execute_fn(method_name, *args, **kwargs)
@@ -68,6 +89,12 @@ def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, block
 
 
 def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[PlacementGroup]:
+    # [FUNCTION DOC]
+    # Behavior: maps node id to node IP from ray.nodes(); for each placement group, looks up the node of its first bundle via
+    # Ray's internal placement group table, and returns the groups sorted by that IP string (stable rank assignment across
+    # restarts for checkpoint resume).
+    # Inputs: pgs - placement groups (each assumed to live on a single node). Outputs: sorted list.
+    # Side effects: queries Ray GCS state.
     """
     Sort the placement groups by node ip, all bundles in a single placement group should be on the same node.
 
@@ -89,6 +116,11 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
 
 @ray.remote
 def get_master_addr_port(master_port_range: Optional[list[int]] = None) -> tuple[str, str]:
+    # [FUNCTION DOC]
+    # Ray remote task. Behavior: get the node IP (brackets stripped). Without a range, bind port 0 to pick a free port.
+    # With a range [start, end), try binding ports sequentially from start until one succeeds, logging collisions.
+    # Inputs: master_port_range - optional two-element list. Outputs: (address, port as string).
+    # Exceptions: RuntimeError if no port in range is free. Note: the port is released before use (race possible).
     addr = ray.util.get_node_ip_address().strip("[]")
 
     if master_port_range is None:
@@ -111,6 +143,9 @@ def get_master_addr_port(master_port_range: Optional[list[int]] = None) -> tuple
 
 
 class RayResourcePool(ResourcePool):
+    # [CLASS DOC]
+    # Ray resource pool backed by placement groups, one per node. Extra state: use_gpu, name_prefix (random 6 chars if none),
+    # cached placement groups (pgs), detached flag, optional accelerator_type.
     def __init__(
         self,
         process_on_nodes: Optional[list[int]] = None,
@@ -120,6 +155,10 @@ class RayResourcePool(ResourcePool):
         detached=False,
         accelerator_type: Optional[str] = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Inputs: process_on_nodes - per-node process counts; use_gpu; name_prefix; max_colocate_count; detached - create
+        # placement groups with detached lifetime; accelerator_type - optional Ray accelerator-type resource to require.
+        # Side effects: none (pgs created lazily). Note n_gpus_per_node is left at the base default.
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
         # print(f"in RayProcessDispatchConfiguration: name_prefix = {name_prefix}")
@@ -129,6 +168,18 @@ class RayResourcePool(ResourcePool):
         self.accelerator_type = accelerator_type
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
+        # [FUNCTION DOC]
+        # Behavior: returns cached placement groups if present. Otherwise builds one placement group per node, each with one
+        # bundle per process: CPU equal to max_colocate_count plus, if use_gpu, one unit of the platform's Ray accelerator
+        # resource (and a tiny 1e-4 amount of accelerator_type if set). Names are the given name or the prefix plus
+        # verl_group_ plus the per-node counts joined by underscores and a colon, then the node index. Waits for all groups to
+        # be ready, caches the IP-sorted list.
+        # Inputs: strategy - Ray placement strategy (default STRICT_PACK); name - optional name prefix; device_name - requested
+        # device (only a warning if it differs from the platform's device).
+        # Outputs: list of placement groups.
+        # Side effects: creates Ray placement groups (blocking).
+        # KNOWN ISSUE: on the first call it returns the unsorted creation-order list while caching the sorted list, so the first
+        # and later calls may return different orders.
         if self.pgs is not None:
             return self.pgs
 
@@ -164,6 +215,9 @@ class RayResourcePool(ResourcePool):
 
 
 class SubRayResourcePool(RayResourcePool):
+    # [CLASS DOC]
+    # Sub-pool view over a contiguous range of bundles of an existing pool's placement groups. Extra state: start_bundle_index
+    # (global bundle offset across the pool's groups) and subgroup_world_size, which overrides world_size.
     def __init__(
         self,
         placement_groups: list[PlacementGroup],
@@ -171,6 +225,9 @@ class SubRayResourcePool(RayResourcePool):
         subgroup_world_size: int,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC]
+        # Inputs: placement_groups - parent's groups (shared, set as cached pgs); start_bundle_index; subgroup_world_size;
+        # kwargs - forwarded to RayResourcePool.
         super().__init__(**kwargs)
         self.pgs = placement_groups
         self.start_bundle_index = start_bundle_index
@@ -178,11 +235,16 @@ class SubRayResourcePool(RayResourcePool):
 
     @property
     def world_size(self):
+        # [FUNCTION DOC]
+        # Outputs: subgroup_world_size.
         return self.subgroup_world_size
 
 
 @dataclass
 class ResourcePoolManager:
+    # [CLASS DOC]
+    # Dataclass. Fields: resource_pool_spec - mapping pool name to per-node process counts; mapping - role to pool name;
+    # max_colocate_count (default 3); resource_pool_dict - created pools by name.
     """
     Define a resource pool specification. Resource pool will be initialized first.
     """
@@ -193,6 +255,10 @@ class ResourcePoolManager:
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
 
     def create_resource_pool(self):
+        # [FUNCTION DOC]
+        # Behavior: create a RayResourcePool (use_gpu, the manager's colocate count, name prefix = pool name) per spec entry, store
+        # it, then verify the cluster has enough accelerators.
+        # Exceptions: ValueError from the availability check. Side effects: fills resource_pool_dict.
         """Create Ray resource pools for distributed training.
 
         Initializes resource pools based on the resource pool specification,
@@ -216,14 +282,22 @@ class ResourcePoolManager:
         self._check_resource_available()
 
     def get_resource_pool(self, role) -> RayResourcePool:
+        # [FUNCTION DOC]
+        # Inputs: role - role key. Outputs: its RayResourcePool. Exceptions: KeyError if unmapped or not created.
         """Get the resource pool of the worker_cls"""
         return self.resource_pool_dict[self.mapping[role]]
 
     def get_n_gpus(self) -> int:
+        # [FUNCTION DOC]
+        # Outputs: total processes (accelerators) across all pool specs.
         """Get the number of gpus in this cluster."""
         return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
 
     def _check_resource_available(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: read available resources per node from Ray internals, counting GPU if present else NPU per node; raise
+        # if the cluster total is below the sum of all spec counts. Only totals are compared, not per-node fit.
+        # Exceptions: ValueError when insufficient.
         """Check if the resource pool can be satisfied in this ray cluster."""
         node_available_resources = ray._private.state.available_resources_per_node()
         node_available_gpus = {
@@ -245,6 +319,14 @@ class ResourcePoolManager:
 def extract_pg_from_exist(
     resource_pools: dict[str, RayResourcePool], src_role_names: list[str], resource_pool: RayResourcePool
 ) -> list:
+    # [FUNCTION DOC]
+    # Behavior: collect the placement groups of all pools whose role name is in src_role_names, sort by bundle count
+    # descending; sort the target pool's per-node process counts descending; greedily assign the i-th largest request to the
+    # i-th largest group, then return the groups ordered by the target's original node index.
+    # Inputs: resource_pools - name to pool; src_role_names - names to reuse; resource_pool - target pool.
+    # Outputs: list of placement groups for the target's nodes.
+    # Exceptions: AssertionError if there are too few groups or a group has too few bundles.
+    # Side effects: may create placement groups of source pools.
     src_pgs = [
         pg
         for role_name, resource_pool in resource_pools.items()
@@ -272,6 +354,13 @@ def extract_pg_from_exist(
 def split_resource_pool(
     resource_pool: RayResourcePool | SubRayResourcePool, split_size: int | list[int]
 ) -> list[SubRayResourcePool]:
+    # [FUNCTION DOC]
+    # Behavior: normalize split_size into a list (an int must divide world_size, producing equal splits), assert the sum
+    # equals world_size, compute start bundle indices as cumulative offsets (starting at the sub-pool's own start for an
+    # already-split pool), ensure placement groups exist, and build one SubRayResourcePool per split sharing those groups
+    # with name prefix suffixed by _split_ and the index.
+    # Outputs: list of sub-pools. Exceptions: AssertionError on bad sizes.
+    # Side effects: may create placement groups.
     """
     Split a RayResourcePool into multiple SubRayResourcePool.
     resouce_pool can also be a SubRayResourcePool (have been splited) for multiple-time spliting.
@@ -319,6 +408,12 @@ def split_resource_pool(
 
 
 def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResourcePool:
+    # [FUNCTION DOC]
+    # Behavior: assert both pools agree on use_gpu, max_colocate_count, n_gpus_per_node and detached; create a new pool of the
+    # same type as rp1 with concatenated per-node counts and combined name prefix, and set its cached placement groups to the
+    # concatenation of both pools' groups.
+    # Outputs: merged pool. Exceptions: AssertionError on mismatch. Side effects: may create placement groups.
+    # Note: accelerator_type is not carried over to the merged pool.
     assert rp1.use_gpu == rp2.use_gpu, "Both RayResourcePool must either use_gpu or not"
     assert rp1.max_colocate_count == rp2.max_colocate_count, "Both RayResourcePool must has the same max_colocate_count"
     assert rp1.n_gpus_per_node == rp2.n_gpus_per_node, "Both RayResourcePool must has the same n_gpus_per_node"
@@ -337,6 +432,8 @@ def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResour
 
 
 class RayClassWithInitArgs(ClassWithInitArgs):
+    # [CLASS DOC]
+    # Ray actor wrapper adding actor options (_options) and additional custom resources (_additional_resource).
     """A wrapper class for Ray actors with initialization arguments.
 
     This class extends ClassWithInitArgs to provide additional functionality for
@@ -345,12 +442,16 @@ class RayClassWithInitArgs(ClassWithInitArgs):
     """
 
     def __init__(self, cls, *args, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Inputs: cls - Ray remote class; args/kwargs - constructor arguments. Initializes empty options and resources.
         # self._options = kwargs.pop('options', dict())
         super().__init__(cls, *args, **kwargs)
         self._options = {}
         self._additional_resource = {}
 
     def set_additional_resource(self, additional_resource):
+        # [FUNCTION DOC]
+        # Side effects: replaces the additional resource mapping.
         """Set additional resource requirements for the actor.
 
         Args:
@@ -359,6 +460,8 @@ class RayClassWithInitArgs(ClassWithInitArgs):
         self._additional_resource = additional_resource
 
     def update_options(self, options: dict):
+        # [FUNCTION DOC]
+        # Side effects: merges options into the stored Ray options.
         """Update the Ray actor creation options.
 
         Args:
@@ -375,6 +478,16 @@ class RayClassWithInitArgs(ClassWithInitArgs):
         sharing_with=None,
         device_name="cuda",
     ) -> Any:
+        # [FUNCTION DOC]
+        # Behavior: if sharing_with is given, fetch that actor's node id and visible devices, and create the actor with strict
+        # node affinity to that node, passing those visible devices as cuda_visible_devices (stored options are ignored in this
+        # path). Otherwise schedule into the given placement group bundle, merge stored options, add the platform's accelerator
+        # resource options for num_gpus when use_gpu, add additional resources, and create the actor.
+        # Inputs: placement_group; placement_group_bundle_idx; use_gpu; num_gpus (fractional allowed); sharing_with - optional
+        # actor handle; device_name (unused).
+        # Outputs: Ray actor handle.
+        # KNOWN ISSUE: additional resources are only applied when the mapping has more than one entry, so a single additional
+        # resource is silently ignored.
         """Create and return a Ray actor with the configured options.
 
         Args:
@@ -416,6 +529,11 @@ class RayClassWithInitArgs(ClassWithInitArgs):
 
 
 class RayWorkerGroup(WorkerGroup):
+    # [CLASS DOC]
+    # Ray implementation of WorkerGroup. Extra state: ray_cls_with_init, name_prefix, use_gpu, master port range, register
+    # center timeout, fused_worker_used, sub_cls_name (role bound when spawned from a fused group), device_name,
+    # profiling settings (profile_steps, worker_nsight_options), customized worker env, resource_pool, _world_size,
+    # wg_dict (spawned role groups) and method_names (methods bound on the fused group itself).
     """A group of Ray workers that can be managed collectively.
 
     This class extends WorkerGroup to provide Ray-specific functionality for
@@ -435,6 +553,18 @@ class RayWorkerGroup(WorkerGroup):
         ray_wait_register_center_timeout: int = 300,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: pops master_addr, master_port, use_gpu (default from pool or True) and master_port_range from kwargs, calls
+        # the base init, then records settings; device_name, profile_steps, worker_nsight_options and worker_env are read from
+        # the remaining kwargs. If nsight options have no capture-range-end, sets it to repeat-shutdown with 6 times the number
+        # of profile steps. Initializes workers by attaching to detached workers (no pool), from a sub-pool, or from a regular
+        # pool; then binds registered methods of the worker class via func_generator if a class is given.
+        # Inputs: resource_pool; ray_cls_with_init; bin_pack - STRICT_PACK vs PACK; name_prefix; detached; worker_names /
+        # worker_handles - for attaching; ray_wait_register_center_timeout (stored only); kwargs as above.
+        # Exceptions: AssertionError if worker_names are given with a pool (non-fused); errors from worker creation.
+        # Side effects: creates placement groups and Ray actors.
+        # KNOWN ISSUE: master_addr/master_port popped from kwargs are assigned before the base initializer, which resets both to
+        # None, so manually specified master address/port are discarded.
         """Initialize a RayWorkerGroup.
 
         Args:
@@ -497,6 +627,8 @@ class RayWorkerGroup(WorkerGroup):
         self.method_names = []
 
     def _is_worker_alive(self, worker: ray.actor.ActorHandle):
+        # [FUNCTION DOC]
+        # Behavior: query Ray state API for the actor; True iff its state is ALIVE (False if not found).
         """Check if a worker actor is still alive.
 
         Args:
@@ -509,6 +641,8 @@ class RayWorkerGroup(WorkerGroup):
         return worker_state_dict.get("state", "undefined") == "ALIVE" if worker_state_dict is not None else False
 
     def _init_with_detached_workers(self, worker_names, worker_handles):
+        # [FUNCTION DOC]
+        # HELPER: use the given handles (strong references) or look up named actors; set workers and world size.
         # ray.get_actor holds a weak reference to the actor, which causes actors garbage collected unexpectedly
         # if we only hold spawn RayWorkerGroup. By passing actor handle explicitly, spawn RayWorkerGroup have
         # strong reference to these actors.
@@ -518,6 +652,10 @@ class RayWorkerGroup(WorkerGroup):
         self._world_size = len(workers)
 
     def _get_master_addr_port(self, pg, bundle_index=0, master_port_range=None):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: if neither master addr nor port is set, run the get_master_addr_port remote task in the given placement
+        # group bundle and store the result; if both are set, keep them; otherwise raise.
+        # Exceptions: ValueError when only one of addr/port is set. Side effects: launches a Ray task (blocking).
         """Get master addr and port for this worker group"""
         if self._master_addr is None and self._master_port is None:
             self._master_addr, self._master_port = ray.get(
@@ -543,6 +681,12 @@ class RayWorkerGroup(WorkerGroup):
         detached,
         worker_env=None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: get placement groups (STRICT_PACK if bin_pack else PACK), set world size, then iterate over the
+        # IP-sorted groups: get master addr/port from bundle 0 of the first group; for each local rank up to the first node's
+        # process count create a worker with incrementing global rank.
+        # Side effects: stores resource_pool; creates actors.
+        # Note: uses the first node's process count for all nodes (assumes homogeneous nodes).
         """Initialize the worker group by creating new workers from a resource pool.
 
         Args:
@@ -581,6 +725,11 @@ class RayWorkerGroup(WorkerGroup):
                 )
 
     def _init_with_subresource_pool(self, resource_pool, ray_cls_with_init, bin_pack, detached, worker_env=None):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: like the regular pool init, but over global bundle indices from start_bundle_index for world_size
+        # workers; the group index and local rank are derived by dividing by and taking the remainder against the first node's
+        # process count; master addr/port come from the start bundle.
+        # Side effects: creates actors.
         """Initialize the worker group by creating new workers from a resource pool or sub resource pool.
         Args:
             resource_pool: Resource pool for worker allocation
@@ -621,6 +770,14 @@ class RayWorkerGroup(WorkerGroup):
             )
 
     def _create_worker(self, rank, pg_idx, pg, local_rank, resource_pool, ray_cls_with_init, worker_env, detached):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: builds env vars WORLD_SIZE, RANK, WG_PREFIX, WG_BACKEND=ray, RAY_LOCAL_WORLD_SIZE, MASTER_ADDR,
+        # MASTER_PORT, merges user worker_env (refusing overrides of these keys), derives the actor name as prefix + underlying
+        # class name (parsed from the Ray ActorClass(...) type name) + _<pg index>:<local rank>, sets runtime_env (adding nsight
+        # options when profiling on cuda), name and optional detached lifetime on the wrapper, and creates the actor in the given
+        # bundle with 1/max_colocate_count accelerators.
+        # Exceptions: ValueError if use_gpu is requested but the pool has no GPUs, or on env conflicts.
+        # Side effects: mutates wrapper options; creates an actor; appends to workers and names.
         world_size = resource_pool.world_size
         use_gpu = resource_pool.use_gpu
         if self.use_gpu and not use_gpu:
@@ -680,6 +837,8 @@ class RayWorkerGroup(WorkerGroup):
 
     @property
     def worker_names(self):
+        # [FUNCTION DOC]
+        # Outputs: list of worker actor names.
         return self._worker_names
 
     @classmethod
@@ -691,6 +850,9 @@ class RayWorkerGroup(WorkerGroup):
         ray_cls_with_init=None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Classmethod. Behavior: construct a group with no resource pool attached to existing workers by names/handles.
+        # Outputs: new group.
         """Create a worker group from existing detached workers.
 
         Args:
@@ -712,6 +874,11 @@ class RayWorkerGroup(WorkerGroup):
         return worker_group
 
     def spawn(self, prefix_set):
+        # [FUNCTION DOC]
+        # Behavior: for fused groups delegate to spawn_fused. Otherwise for each prefix, create a detached-attached copy sharing
+        # the same workers and class, then for every attribute name starting with prefix plus underscore, also expose it under
+        # the name without the prefix.
+        # Inputs: prefix_set - role names. Outputs: mapping role -> worker group.
         """Spawn to a dictionary of worker groups, each with a subset of method with prefix.
 
         Args:
@@ -724,6 +891,8 @@ class RayWorkerGroup(WorkerGroup):
             return self.spawn_fused(prefix_set)
 
         def _rebind_actor_methods(worker_group, actor_name):
+            # [FUNCTION DOC]
+            # HELPER: aliases prefixed methods of worker_group under their unprefixed names.
             prefix: str = actor_name + "_"
             for method_name in dir(worker_group):
                 if method_name.startswith(prefix):
@@ -747,6 +916,9 @@ class RayWorkerGroup(WorkerGroup):
         return new_worker_group_dict
 
     def spawn_fused(self, prefix_set):
+        # [FUNCTION DOC]
+        # Behavior: for each role key, deep-copy this group, bind methods of that role's raw class (from the fused class's
+        # raw_cls_dict) and record the role as sub_cls_name. Outputs: mapping role -> group.
         """Create a dictionary of worker groups for fused workers.
 
         Args:
@@ -764,6 +936,10 @@ class RayWorkerGroup(WorkerGroup):
         return wg_dict
 
     def fuse(self, prefix_set):
+        # [FUNCTION DOC]
+        # Behavior: spawn role groups once (cached in wg_dict), set each as an attribute named by role, and bind the fused class's
+        # own registered methods, recording their names in method_names.
+        # Side effects: adds attributes to self.
         """Fuse multiple worker groups into the current worker group.
 
         Args:
@@ -776,6 +952,10 @@ class RayWorkerGroup(WorkerGroup):
         self.method_names = self._bind_worker_method(self.ray_cls_with_init.cls, func_generator)
 
     def _execute_remote_single_worker(self, worker, method_name: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: for fused groups when the method is not one of the fused class's own methods, call the actor's fused
+        # routing method with the encoded name sub-role + _fwmn_ + method; otherwise call the actor method directly.
+        # Outputs: Ray object ref.
         """Execute a method on a single worker remotely.
 
         Args:
@@ -795,6 +975,8 @@ class RayWorkerGroup(WorkerGroup):
         return remote_call.remote(*args, **kwargs)
 
     def execute_rank_zero_sync(self, method_name: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Outputs: result of calling method on rank 0 (blocking).
         """Execute a method on rank zero worker synchronously.
 
         Args:
@@ -808,6 +990,8 @@ class RayWorkerGroup(WorkerGroup):
         return ray.get(self.execute_rank_zero_async(method_name, *args, **kwargs))
 
     def execute_rank_zero_async(self, method_name: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Outputs: object ref of calling method on rank 0.
         """Execute a method on rank zero worker asynchronously.
 
         Args:
@@ -821,6 +1005,8 @@ class RayWorkerGroup(WorkerGroup):
         return self._execute_remote_single_worker(self._workers[0], method_name, *args, **kwargs)
 
     def execute_rank_zero(self, method_name: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Alias of execute_rank_zero_async.
         """Alias for execute_rank_zero_async.
 
         Args:
@@ -834,6 +1020,8 @@ class RayWorkerGroup(WorkerGroup):
         return self.execute_rank_zero_async(method_name, *args, **kwargs)
 
     def execute_all(self, method_name: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Alias of execute_all_async.
         """Alias for execute_all_async.
 
         Args:
@@ -847,6 +1035,8 @@ class RayWorkerGroup(WorkerGroup):
         return self.execute_all_async(method_name, *args, **kwargs)
 
     def execute_all_sync(self, method_name: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Outputs: list of results from all workers (blocking).
         """Execute a method on all workers synchronously.
 
         Args:
@@ -860,6 +1050,10 @@ class RayWorkerGroup(WorkerGroup):
         return ray.get(self.execute_all_async(method_name, *args, **kwargs))
 
     def execute_all_async(self, method_name: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: if every arg and kwarg value is a list of length equal to the worker count, send element i to worker i;
+        # otherwise broadcast all arguments unchanged to every worker.
+        # Outputs: list of object refs, one per worker.
         """Execute a method on all workers asynchronously.
 
         Args:
@@ -891,18 +1085,26 @@ class RayWorkerGroup(WorkerGroup):
 
     @property
     def master_address(self):
+        # [FUNCTION DOC]
+        # Outputs: master address.
         return self._master_addr
 
     @property
     def master_port(self):
+        # [FUNCTION DOC]
+        # Outputs: master port.
         return self._master_port
 
     @property
     def workers(self):
+        # [FUNCTION DOC]
+        # Outputs: list of worker handles.
         return self._workers
 
     @property
     def world_size(self):
+        # [FUNCTION DOC]
+        # Outputs: world size.
         return self._world_size
 
 
@@ -914,6 +1116,12 @@ with code written in separate ray.Actors.
 
 # deprecated, switching to FusedWorker
 def _bind_workers_method_to_parent(cls, key, user_defined_cls):
+    # [FUNCTION DOC]
+    # HELPER (deprecated): Behavior: for each register-decorated method of user_defined_cls, create a forwarding function
+    # (sync or async matching the original) that calls the same method on the inner worker stored under key, copy the
+    # register metadata onto it, and attach it to cls: DIRECT_ROLLOUT_METHOD methods of roles whose key contains rollout
+    # are attached unprefixed (asserting no name conflict), others as key + underscore + method name.
+    # Exceptions: ValueError if attaching fails (including the conflict assertion). Side effects: mutates cls; prints.
     """
     Binds the methods of each worker to the WorkerDict.
     Note that we only bind public methods that are decorated by register
@@ -930,11 +1138,17 @@ def _bind_workers_method_to_parent(cls, key, user_defined_cls):
         if hasattr(method, MAGIC_ATTR):
 
             def generate_function(name, key=key):
+                # [FUNCTION DOC]
+                # HELPER: builds the forwarding function for method name (key bound by default arg).
                 def func(self, *args, **kwargs):
+                    # [FUNCTION DOC]
+                    # HELPER: sync forwarder to the inner worker method.
                     # dispatch to the actual worker
                     return getattr(self.worker_dict[key], name)(*args, **kwargs)
 
                 async def async_func(self, *args, **kwargs):
+                    # [FUNCTION DOC]
+                    # HELPER: async forwarder awaiting the inner worker method.
                     # dispatch to the actual worker
                     return await getattr(self.worker_dict[key], name)(*args, **kwargs)
 
@@ -962,12 +1176,17 @@ def _bind_workers_method_to_parent(cls, key, user_defined_cls):
 
 
 def _unwrap_ray_remote(cls):
+    # [FUNCTION DOC]
+    # HELPER: Outputs: the underlying Python class of a Ray remote class (via its actor class attribute), or the input.
     if hasattr(cls, "__ray_actor_class__"):
         cls = cls.__ray_actor_class__
     return cls
 
 
 def _determine_fsdp_megatron_base_class(mros: list):
+    # [FUNCTION DOC]
+    # HELPER: Behavior: walk the MRO of the first class only and return the first class named MegatronWorker or Worker.
+    # Exceptions: ValueError if neither appears.
     """
     - megatron: base class should be MegatronWorker
     - fsdp: base class should be Worker
@@ -982,6 +1201,12 @@ def _determine_fsdp_megatron_base_class(mros: list):
 
 # deprecated, switching to FusedWorker
 def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
+    # [FUNCTION DOC]
+    # Deprecated colocation factory. Behavior: determine base worker class, record each role's class and init args, define a
+    # WorkerDict subclass whose init instantiates each underlying class locally (with DISABLE_WORKER_INIT=1) into worker_dict,
+    # bind forwarding methods for each role, and wrap WorkerDict as a Ray remote class in RayClassWithInitArgs.
+    # Inputs: class_dict - role -> RayClassWithInitArgs. Outputs: RayClassWithInitArgs of the combined actor.
+    # Exceptions: AssertionError if base is not a Worker subclass; ValueError from base detection.
     """
     This function should return a class instance that delegates the calls to every
     cls in cls_dict
@@ -1002,7 +1227,11 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
 
     # TODO: create a class with customizable name
     class WorkerDict(worker_cls):
+        # [CLASS DOC]
+        # Combined actor holding one locally constructed worker per role in worker_dict.
         def __init__(self):
+            # [FUNCTION DOC]
+            # Behavior: initialize base worker, then construct each role's raw class with its stored args under DISABLE_WORKER_INIT=1.
             super().__init__()
             self.worker_dict = {}
             for key, user_defined_cls in cls_dict.items():
@@ -1029,6 +1258,14 @@ FusedWorkerCLSName = "FusedWorker"
 
 
 def create_colocated_worker_raw_cls(class_dict: dict[str, RayClassWithInitArgs]):
+    # [FUNCTION DOC]
+    # Behavior: builds a FusedWorker class (dynamically renamed FusedWorker_<roles joined by underscore>) from unwrapped role
+    # classes and their init args. Its instances construct every role class (with DISABLE_WORKER_INIT=1, after patching each
+    # role class's Ray actor-name and method-prefix getters to the fused class name and role prefix), expose each as an
+    # attribute named by role and in fused_worker_dict, and give every sub-worker a reference to that mapping. The class gets
+    # is_fused_worker True and raw_cls_dict.
+    # Inputs: class_dict - role -> RayClassWithInitArgs. Outputs: the renamed class (not Ray-wrapped).
+    # Side effects: the role classes are patched globally when an instance is constructed.
     """
     This function returns a FusedWorker class.
 
@@ -1055,7 +1292,11 @@ def create_colocated_worker_raw_cls(class_dict: dict[str, RayClassWithInitArgs])
     class_name_renamed = "_".join([FusedWorkerCLSName] + cls_names)
 
     class FusedWorker(Worker):
+        # [CLASS DOC]
+        # Worker hosting multiple role workers in a single process; routes calls via _fuw_execute.
         def __init__(self, *args, **kwargs):
+            # [FUNCTION DOC]
+            # Behavior: base Worker init with given args, then build sub-workers as described in create_colocated_worker_raw_cls.
             super().__init__(*args, **kwargs)
             self.cls_names = cls_names
             self.raw_cls_dict = raw_cls_dict
@@ -1081,6 +1322,9 @@ def create_colocated_worker_raw_cls(class_dict: dict[str, RayClassWithInitArgs])
                 setattr(worker, Worker.fused_worker_attr_name, self.fused_worker_dict)
 
         def _fuw_execute(self, method_name: str, *args, **kwargs):
+            # [FUNCTION DOC]
+            # Behavior: split the encoded name on _fwmn_ into role and method name, assert role exists, call the method on that
+            # sub-worker with the arguments. Outputs: the method's result. Exceptions: AssertionError for unknown role.
             # for fused_worker, method_name is in a form of "{cls_name}_fwmn_{method_name}"
             # where fwmn stands "fused worker method name"
             names = method_name.split("_fwmn_")
@@ -1101,6 +1345,9 @@ def create_colocated_worker_raw_cls(class_dict: dict[str, RayClassWithInitArgs])
 
 
 def create_colocated_worker_cls_fused(class_dict: dict[str, RayClassWithInitArgs]):
+    # [FUNCTION DOC]
+    # Behavior: build the fused raw class, wrap with ray.remote, wrap in RayClassWithInitArgs with fused_worker_used True.
+    # Outputs: RayClassWithInitArgs. Groups built from it support spawn/fuse per role.
     """
     This function returns a RayClassWithInitArgs instance of FusedWorker, which is an replacement
     of `create_colocated_worker_cls`. WorkerGroup constructed using this class will be a colocated

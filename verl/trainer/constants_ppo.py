@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Ray runtime-environment defaults for PPO jobs. At import it queries device compute capability and builds:
+# optional GB200 NCCL workaround env vars (capability >= 10 and TLLM_DISABLE_NVLS_MNNVL=1 disables NVLS and MNNVL),
+# a ROCm-only Ray accelerator-override env var, a Hopper/Ampere flag (capability 8 or 9), the NVTX injection variable
+# name and an intentionally unloadable path used to disable it, and PPO_RAY_RUNTIME_ENV with base env vars
+# (tokenizers parallelism, NCCL/vLLM log levels, vLLM LoRA updating, disabled vLLM compile cache, HCCL port ranges,
+# HSA scratch reclaim) merged with the conditional ones.
+# Side effects: device capability query and torch import at import time.
+
 import json
 import logging
 import os
@@ -50,6 +59,9 @@ _is_hopper_or_ampere = (_major or 0) in (8, 9)
 
 
 def _uses_megatron(config) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if config is non-None and either the actor strategy or the critic strategy (selected via
+    # OmegaConf dotted-path lookup, default None) equals "megatron"; otherwise False.
     """Return True if any trainable engine in the config uses the Megatron strategy."""
     if config is None:
         return False
@@ -62,6 +74,8 @@ def _uses_megatron(config) -> bool:
 
 
 def _uses_torch_profiler(config) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if config is non-None and global_profiler.tool equals "torch"; otherwise False.
     """Return True if the run collects traces with the torch profiler."""
     if config is None:
         return False
@@ -103,6 +117,17 @@ PPO_RAY_RUNTIME_ENV = {
 
 
 def get_ppo_ray_runtime_env(config=None):
+    # [FUNCTION DOC]
+    # Behavior: builds the runtime env for Ray workers. Reads the Ray job config JSON from the environment to see if a
+    # working_dir is set; if not, includes working_dir None explicitly. Copies the base env vars; adds
+    # CUDA_DEVICE_MAX_CONNECTIONS=1 when on Hopper/Ampere and Megatron is used. Then drops every env var already
+    # present in the current process environment (so the inherited value wins). After that filter: when the torch profiler
+    # is used and VERL_KEEP_NVTX_INJECTION is not "1", forces the NVTX injection var to the disabled path and logs a
+    # warning. Always sets VERL_FULL_DETERMINISM, VLLM_BATCH_INVARIANT, VERL_RL_INSIGHT_ENABLE from the environment
+    # (default "0"), and forwards PYTHONHASHSEED, CUBLAS_WORKSPACE_CONFIG, FLASH_ATTENTION_DETERMINISTIC,
+    # NCCL_DETERMINISTIC, NCCL_ALGO only when set.
+    # Inputs: config - optional OmegaConf training config. Outputs: dict with "env_vars" and possibly "working_dir".
+    # Exceptions: JSON decode error if the Ray job config env var is malformed. Side effects: may log a warning.
     """
     A filter function to return the PPO Ray runtime environment.
     To avoid repeat of some environment variables that are already set.

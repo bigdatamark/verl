@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# FP8 weight quantization helper used when pushing trainer weights to an FP8 rollout engine: decides per parameter name whether to quantize and streams blockwise-quantized weights plus inverse scales.
+
 import logging
 import os
 
@@ -26,10 +29,19 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 class FP8QuantizerHelper:
+    # [CLASS DOC]
+    # Holds a quantization config (dict or object exposing weight_block_size) and provides name-based filtering and asynchronous streaming quantization.
     def __init__(self, quant_config):
+        # [FUNCTION DOC]
+        # Stores quant_config.
         self.quant_config = quant_config
 
     def should_quantize_param(self, param_name):
+        # [FUNCTION DOC]
+        # Behavior: returns False unless the name ends with ".weight"; False if the lowercased name contains any exclude substring (embed_tokens, lm_head, layernorm, norm, ln_, embeddings, mlp.gate.weight); True if it contains any include substring (q/k/v/o_proj, gate/up/down_proj, fc1, fc2, mlp); otherwise False.
+        # Inputs: param_name - parameter name.
+        # Outputs: bool.
+        # Side effects: debug logging.
         """Determine whether to quantize to FP8 based on parameter name
 
         Quantization rules:
@@ -84,6 +96,12 @@ class FP8QuantizerHelper:
         return False
 
     async def quant_weights_by_name(self, weights, dtype=torch.bfloat16):
+        # [FUNCTION DOC]
+        # Behavior: async generator. Reads weight_block_size from the config (dict key or attribute). For each (name, tensor) from a sync or async iterable: passes through unchanged if not quantizable; otherwise casts to dtype, quantizes with scaled_fp8_blockwise, squeezes the trailing dim of the scale, and yields (name, fp8 tensor) then (name + "_scale_inv", scale). On any quantization error logs it and yields the original tensor.
+        # Inputs: weights - iterable/async iterable of (name, tensor); dtype - intermediate dtype.
+        # Outputs: yields (name, tensor) pairs.
+        # Exceptions: ValueError if weight_block_size is missing.
+        # Note: calls torch.distributed.get_rank() for logging, which raises if no process group exists; that error is caught and causes the weight to pass through unquantized.
         """FP8 quantization based on parameter name using a memory-efficient generator.
 
 

@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Ulysses sequence-parallel attention forward replacement for HF Apertus models (Llama-like attention
+# with per-head QK normalization).
+
 import sys
 from typing import Callable, Optional
 
@@ -47,6 +51,22 @@ def apertus_attn_forward(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    # [FUNCTION DOC]
+    # Behavior: replacement for ApertusAttention.forward. Projects hidden states to q/k/v heads
+    # [b, heads, s, d], applies q_norm/k_norm, and when Ulysses SP size > 1 validates head divisibility
+    # and all-to-all gathers the sequence while scattering heads. Applies rotary embeddings with the
+    # given cos/sin, updates the KV cache if provided, chooses the attention implementation (eager when
+    # configured or when sdpa is requested with output_attentions, else the registered implementation),
+    # runs it with dropout only in training, reshapes, all-to-all back (gather heads, scatter sequence)
+    # when SP is active, and applies o_proj.
+    # Inputs: self - attention module (q/k/v/o projections, q_norm, k_norm, head_dim, config, scaling,
+    # attention_dropout, layer_idx); hidden_states [b, local_s, hidden]; position_embeddings - (cos, sin)
+    # for the full sequence; attention_mask; past_key_value - optional cache; cache_position; kwargs -
+    # forwarded to the attention function.
+    # Outputs: tuple (attn_output [b, local_s, hidden], attention weights or None).
+    # Exceptions: errors from validate_ulysses_config when heads are not divisible by SP size.
+    # Side effects: SP collectives; cache mutation; one-time warning.
+    # KNOWN ISSUE: return annotation lists three elements but only two are returned.
     """
     Adapted from transformers 4.49.0 to support Ulysses sequence parallelism for transformers >= 4.48.0.
 

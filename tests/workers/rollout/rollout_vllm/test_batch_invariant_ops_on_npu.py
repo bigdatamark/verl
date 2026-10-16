@@ -8,6 +8,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Ascend NPU tests for vLLM-Ascend batch-invariant operators toggled by verl's rollout full_determinism
+# setting. Each check runs in a fresh spawned subprocess that constructs a vLLMHttpServer (no engine or Ray
+# cluster) to apply the determinism env switch, initializes vllm_ascend batch invariance, then verifies that
+# operator dispatch (mm, matmul, sum, add_rms_norm, fused attention binding) routes to batch_invariant_ops
+# kernels only when enabled and that results are exact. Skipped without torch_npu, an NPU, or the
+# batch_invariant_ops package.
+
 """Check each Ascend operator independently through the real verl switch."""
 
 import importlib.util
@@ -20,6 +29,15 @@ import pytest
 
 
 def _run_check(check, enabled):
+    # [FUNCTION DOC]
+    # HELPER: subprocess entry point. Clears VLLM_BATCH_INVARIANT, VERL_FULL_DETERMINISM and VERL_SEED, imports
+    # NPU and vLLM-Ascend modules, builds a RolloutConfig (vllm, full_determinism=enabled, TP 1, max_model_len 128)
+    # and a stub model, constructs vLLMHttpServer in STANDALONE mode with Ray runtime context and node IP patched,
+    # closes the server's three sockets, asserts VLLM_BATCH_INVARIANT is "1" iff enabled and the AscendC
+    # batch-invariant package loaded, runs init_batch_invariance with a patched ascend config (weight_nz_mode 1),
+    # selects NPU 0 and calls check(enabled).
+    # Inputs: check - callable taking the enabled flag; enabled - bool. Side effects: env var mutation, global
+    # operator registration. Exceptions: AssertionError (surfaces as non-zero exit code).
     for name in ("VLLM_BATCH_INVARIANT", "VERL_FULL_DETERMINISM", "VERL_SEED"):
         os.environ.pop(name, None)
 
@@ -54,6 +72,10 @@ def _run_check(check, enabled):
 
 
 def run_on_npu(check, enabled):
+    # [FUNCTION DOC]
+    # HELPER: skips unless torch, torch_npu, an available NPU and the batch_invariant_ops spec exist; then runs
+    # _run_check in a spawn-context process, joins with 180 s timeout, asserts exit code 0 (message names the check),
+    # and always kills a still-alive process and closes it. Inputs: check, enabled.
     torch = pytest.importorskip("torch")
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
@@ -78,6 +100,12 @@ def run_on_npu(check, enabled):
 
 
 def profile_operator(entry, call, enabled, operator=None):
+    # [FUNCTION DOC]
+    # HELPER: runs call under the legacy autograd profiler (CPU mode) followed by NPU synchronize, collects event
+    # counts by key, filters those starting with "batch_invariant_ops::", and asserts the named operator count is
+    # positive when enabled and an operator is given, otherwise that no batch-invariant ops ran. Prints counts.
+    # Inputs: entry label, call (zero-arg callable), enabled, optional operator name.
+    # Outputs: (call result, mapping of all event keys to counts).
     import torch
     from torch.autograd.profiler_legacy import profile
 
@@ -95,6 +123,8 @@ def profile_operator(entry, call, enabled, operator=None):
 
 
 def _check_switch(enabled):
+    # [FUNCTION DOC]
+    # HELPER: asserts the env switch matches enabled and the batch-invariant torch library object exists iff enabled.
     import vllm_ascend.batch_invariant as bi
 
     assert os.environ.get("VLLM_BATCH_INVARIANT", "0") == ("1" if enabled else "0")
@@ -104,10 +134,15 @@ def _check_switch(enabled):
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
 def test_batch_invariant_switch(enabled):
+    # [FUNCTION DOC]
+    # Parametrized enabled/disabled; runs _check_switch on NPU.
     run_on_npu(_check_switch, enabled)
 
 
 def _check_mm(enabled):
+    # [FUNCTION DOC]
+    # HELPER: builds deterministic small-integer bf16 16x32 and 32x16 matrices, computes the expected product in
+    # fp32 then bf16, profiles torch.mm on NPU expecting npu_mm_batch_invariant when enabled, and asserts exact equality.
     import torch
 
     x_cpu = (torch.arange(512).reshape(16, 32) % 7 - 3).to(torch.bfloat16)
@@ -122,10 +157,14 @@ def _check_mm(enabled):
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
 def test_mm(enabled):
+    # [FUNCTION DOC]
+    # Parametrized; runs _check_mm on NPU.
     run_on_npu(_check_mm, enabled)
 
 
 def _check_matmul(enabled):
+    # [FUNCTION DOC]
+    # HELPER: same as _check_mm but through torch.matmul expecting npu_matmul_batch_invariant.
     import torch
 
     x_cpu = (torch.arange(512).reshape(16, 32) % 7 - 3).to(torch.bfloat16)
@@ -140,10 +179,15 @@ def _check_matmul(enabled):
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
 def test_matmul(enabled):
+    # [FUNCTION DOC]
+    # Parametrized; runs _check_matmul on NPU.
     run_on_npu(_check_matmul, enabled)
 
 
 def _check_torch_sum(enabled):
+    # [FUNCTION DOC]
+    # HELPER: asserts torch.sum is replaced by the batch-invariant reduce_sum iff enabled, then checks a last-dim sum
+    # on NPU equals the fp32-computed bf16 expectation exactly, expecting npu_reduce_sum_batch_invariant when enabled.
     import torch
     import vllm_ascend.batch_invariant as bi
 
@@ -158,6 +202,8 @@ def _check_torch_sum(enabled):
 
 
 def _check_tensor_sum(enabled):
+    # [FUNCTION DOC]
+    # HELPER: same as _check_torch_sum for the Tensor.sum method with dim 1 and keepdim.
     import torch
     import vllm_ascend.batch_invariant as bi
 
@@ -175,15 +221,24 @@ def _check_tensor_sum(enabled):
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
 def test_torch_sum(enabled):
+    # [FUNCTION DOC]
+    # Parametrized; runs _check_torch_sum on NPU.
     run_on_npu(_check_torch_sum, enabled)
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
 def test_tensor_sum(enabled):
+    # [FUNCTION DOC]
+    # Parametrized; runs _check_tensor_sum on NPU.
     run_on_npu(_check_tensor_sum, enabled)
 
 
 def _check_add_rms_norm(enabled):
+    # [FUNCTION DOC]
+    # HELPER: asserts torch_npu.npu_add_rms_norm is replaced iff enabled; computes reference residual add and RMSNorm
+    # (eps 1e-6) in fp32; profiles the call and, when enabled, requires separate add and npu_rms_norm events with
+    # no fused op and rstd None, otherwise requires the fused op event. Asserts devices match, residual output is
+    # exact and normalized output is within 1e-2 tolerance. Prints relevant event counts.
     import torch
     import torch_npu
     import vllm_ascend.batch_invariant as bi
@@ -220,10 +275,14 @@ def _check_add_rms_norm(enabled):
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
 def test_add_rms_norm(enabled):
+    # [FUNCTION DOC]
+    # Parametrized; runs _check_add_rms_norm on NPU.
     run_on_npu(_check_add_rms_norm, enabled)
 
 
 def _check_fused_infer_attention_score_binding(enabled):
+    # [FUNCTION DOC]
+    # HELPER: asserts torch_npu.npu_fused_infer_attention_score is the batch-invariant op iff enabled.
     import torch
     import torch_npu
 
@@ -237,4 +296,6 @@ def _check_fused_infer_attention_score_binding(enabled):
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
 def test_fused_infer_attention_score_binding(enabled):
+    # [FUNCTION DOC]
+    # Parametrized; runs the attention binding check on NPU.
     run_on_npu(_check_fused_infer_attention_score_binding, enabled)

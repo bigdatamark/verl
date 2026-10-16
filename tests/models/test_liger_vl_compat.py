@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Requires CUDA and the optional liger_kernel package.
+
 """Test that Liger kernel integration doesn't break VL models.
 
 Regression test for https://github.com/verl-project/verl/issues/2609
@@ -31,6 +34,11 @@ from verl.models.transformers.monkey_patch import apply_monkey_patch
 
 
 def create_tiny_qwen3_vl():
+    # [FUNCTION DOC]
+    # HELPER: Builds a randomly initialized Qwen3-VL model with a 1-layer text tower (hidden 64, 4 heads, 2 KV heads,
+    # vocab 1000, mrope sections 4/4/4) and a 1-layer vision tower (patch 16, temporal patch 2, merge 2), cast to
+    # bfloat16 on cuda.
+    # Outputs: Qwen3VLForConditionalGeneration.
     """Create a minimal Qwen3-VL model (random weights, 1 layer) for testing."""
     config = Qwen3VLConfig(
         text_config=dict(
@@ -62,6 +70,10 @@ def create_tiny_qwen3_vl():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_liger_vl_forward_with_monkey_patch():
+    # [FUNCTION DOC]
+    # Behavior: skips if liger_kernel is missing; applies Liger to the instance with fused linear cross entropy
+    # disabled and swiglu enabled, then verl's apply_monkey_patch (no remove padding, no fused kernels), runs a text-only
+    # forward on random ids (1 x 32) and asserts logits exist with last dim 1000. Frees the model and CUDA cache.
     """Liger with fused_linear_cross_entropy=False + apply_monkey_patch works on VL models."""
     pytest.importorskip("liger_kernel")
     from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance

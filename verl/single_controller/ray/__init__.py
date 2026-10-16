@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Ray backend of the single controller: re-exports Ray resource pools, the Ray worker group, class-with-init-args wrapper,
+# ResourcePoolManager and the colocated-worker class factories from the base module.
 from .base import (
     RayClassWithInitArgs,
     RayResourcePool,

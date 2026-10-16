@@ -11,3 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Marks the top-level scripts directory as a package so its standalone utility scripts
+# (diagnostics, checkpoint converters, chat-template checkers, env management helpers) can be
+# imported as modules, e.g. by tests. Contains no code and has no side effects.

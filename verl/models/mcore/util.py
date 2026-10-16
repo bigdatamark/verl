@@ -13,6 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Sequence layout utilities for Megatron-core models: converting padded (bshd) or jagged nested-tensor
+# batches into packed THD buffers (with PackedSeqParams) or trimmed/padded BSHD batches, sharding the
+# sequence dimension across context-parallel (CP) ranks (zigzag: each rank gets one chunk from the front
+# and its mirror chunk from the back of each sequence; contiguous: each rank gets one slice of the
+# global packed buffer), aligning lengths for TP sequence parallel, CP and FP8, and the inverse
+# postprocessing (all-gather across CP and restore original per-sample layout). Also NPU (Ascend /
+# MindSpeed) specific mask/position helpers and VLM attention-mask builders.
+# Module state: logger; ContextParallelLayout literal type; a flag computed at import telling whether
+# PackedSeqParams accepts cp_partition_mode (explicit parameter or **kwargs).
+
 import inspect
 import logging
 import math
@@ -42,12 +53,19 @@ _PACKED_SEQ_PARAMS_HAS_CP_PARTITION_MODE = "cp_partition_mode" in _PACKED_SEQ_PA
 
 
 def _packed_seq_params_supports(field_name: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Reports whether PackedSeqParams declares a dataclass field of the given name.
+    # Inputs: field_name. Outputs: bool. Side effects: none.
     if is_dataclass(PackedSeqParams):
         return field_name in {field.name for field in fields(PackedSeqParams)}
     return field_name in getattr(PackedSeqParams, "__dataclass_fields__", {})
 
 
 def _compute_fp8_thd_align_size(align_size: int) -> tuple[int, int]:
+    # [FUNCTION DOC]
+    # HELPER: Computes FP8 THD alignment: per-sequence alignment lcm(16, align_size) and total-length
+    # alignment align_size*128.
+    # Inputs: align_size - base alignment. Outputs: tuple (per_seq_align, total_align). Side effects: none.
     """Compute FP8 alignment sizes for thd-format sequences.
 
     For FP8 block quantization, each sequence must be padded to a multiple of
@@ -62,6 +80,20 @@ def _compute_fp8_thd_align_size(align_size: int) -> tuple[int, int]:
 def preprocess_packed_seqs(
     input_ids: torch.Tensor, attention_mask: torch.Tensor, pre_process: bool = True, use_fp8_padding: bool = False
 ) -> tuple[torch.Tensor, PackedSeqParams]:
+    # [FUNCTION DOC]
+    # Behavior: packs a right/left padded batch into a THD buffer. Valid lengths come from the mask sum;
+    # each is padded up to align_size (tp*cp*2 when cp>1 else tp; replaced by FP8 per-seq alignment when
+    # use_fp8_padding, with the last sequence additionally padded so the total is a multiple of
+    # total_align). Builds padded cumulative lengths. When pre_process, creates a zero buffer of total
+    # padded length / cp and copies masked tokens of each sample: without CP at its padded offset; with
+    # CP, the rank's zigzag pair (front chunk cp_rank and back mirror chunk) of half-length
+    # padded_len/(2*cp), clipped to the valid length.
+    # Inputs: input_ids - [batch, seq, ...]; attention_mask - bool [batch, seq]; pre_process - whether to
+    # build packed ids (first pp stage); use_fp8_padding - apply FP8 alignment.
+    # Outputs: tuple (packed ids with leading dim 1 when pre_process else original input_ids,
+    # PackedSeqParams in thd format using padded cu_seqlens for q/kv and padded variants, max padded len).
+    # Exceptions: none explicit.
+    # Side effects: one device-to-host sync for lengths; reads mpu state.
     """
     Preprocess packed sequences
     CP splits sequence into CP*2 chunks, and each GPU gets 2 chunks (GPU0 gets first and last chunks, GPU1
@@ -159,6 +191,16 @@ def postprocess_packed_seqs(
     seq_len: int,
     post_process: bool = True,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: inverse of preprocess_packed_seqs. If post_process is false returns output unchanged.
+    # Otherwise allocates zeros [batch, seq_len, ...]; with CP all-gathers each rank's packed output
+    # (keeping the local tensor to preserve autograd), then for each sample reassembles the zigzag chunks
+    # (rank j's front half to position j, back half to mirrored position) and scatters the first valid
+    # length into the masked positions; without CP slices directly from padded offsets.
+    # Inputs: output - [1, packed_len, ...]; packed_seq_params - from preprocess; attention_mask - original
+    # bool mask; batch_size; seq_len - original padded length; post_process - last pp stage flag.
+    # Outputs: tensor [batch, seq_len, ...].
+    # Side effects: CP all_gather collective; host syncs.
     """
     Postprocess packed sequences
     """
@@ -218,6 +260,15 @@ def preprocess_bshd(
     sequence_parallel: bool = False,
     pre_process: bool = True,
 ):
+    # [FUNCTION DOC]
+    # Behavior: removes left padding by compacting each row's valid tokens to the front; target length is
+    # the max valid length, rounded up to a multiple of TP size when sequence_parallel. Mask and
+    # position ids are always compacted; input ids only when pre_process.
+    # Inputs: input_ids [b, s, ...]; attention_mask [b, s] bool; position_ids [b, s]; sequence_parallel;
+    # pre_process.
+    # Outputs: (new or original input_ids, new_attention_mask, new_position_ids).
+    # Exceptions: AssertionError if masks are not 2-D or CP size is not 1.
+    # Side effects: host sync via item().
     """
     Remove left padding from input_ids, attention_mask and position_ids
     return new_input_ids, new_attention_mask, new_position_ids
@@ -259,6 +310,13 @@ def postprocess_bshd(
     origin_seqlen: int,
     post_process: bool = True,
 ):
+    # [FUNCTION DOC]
+    # Behavior: inverse of preprocess_bshd: scatters each row's values at positions valid in the
+    # compacted mask back to the positions valid in the original mask, into a zero tensor of length
+    # origin_seqlen. Returns result unchanged when post_process is false.
+    # Inputs: result [b, s', ...]; attention_mask - compacted mask; original_attention_mask; origin_seqlen;
+    # post_process.
+    # Outputs: tensor [b, origin_seqlen, ...]. Side effects: none.
     """
     Recover left padding from result
     return result
@@ -283,6 +341,15 @@ def postprocess_packed_seqs_for_dict_output(
     seq_len: int,
     post_process: bool = True,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: for fused-kernel outputs, flattens entropy and log_probs to [1, -1], zeroes log_probs where
+    # labels_mask is false, and unpacks both via postprocess_packed_seqs.
+    # Inputs: labels_mask - bool mask broadcastable to [1, packed]; output - object with entropy and
+    # log_probs; packed_seq_params; attention_mask; batch_size; seq_len; post_process.
+    # Outputs: dict with keys entropy and log_probs.
+    # Side effects: mutates output.entropy and output.log_probs in place (reassigns attributes).
+    # KNOWN ISSUE: docstring says it returns CausalLMOutputForPPO but it returns a plain dict; labels_mask
+    # is undocumented.
     """_summary_
     For fused kernels, the output is a dictionary with keys like 'log_probs', 'entropy', etc.
     This function post-processes each tensor in the output dictionary.
@@ -310,6 +377,14 @@ def postprocess_packed_seqs_for_dict_output(
 
 
 def preprocess_for_mindspeed(input_ids, cu_seqlens_padded, seqlens_in_batch_padded, batch_size):
+    # [FUNCTION DOC]
+    # HELPER: On NPU only, passes padded cu_seqlens to MindSpeed's set_actual_seq_len and sets packed
+    # position ids (0..len-1 restarting within each padded segment) via set_position_ids as a
+    # [total, 1] tensor. No-op when NPU unavailable; logs a warning if mindspeed cannot be imported.
+    # Inputs: input_ids (for device); cu_seqlens_padded; seqlens_in_batch_padded; batch_size.
+    # Outputs: None. Side effects: sets MindSpeed global state; per-sample host syncs.
+    # KNOWN ISSUE: called by preprocess_thd_engine before the FP8 / min_local_rows / length-bucket padding
+    # of the last sequence, so MindSpeed sees shorter cu_seqlens than the final PackedSeqParams.
     if not is_npu_available:
         return
     try:
@@ -342,6 +417,35 @@ def preprocess_thd_engine(
     pad_to_length_bucket: int | None = None,
     cp_layout: ContextParallelLayout = "zigzag",
 ) -> tuple[torch.Tensor, PackedSeqParams, torch.Tensor | None]:
+    # [FUNCTION DOC]
+    # Behavior: packs a jagged nested tensor of sequences into a THD buffer for the model engine and
+    # shards it across CP. Steps: validate cp_layout; determine CP size/rank/group (dynamic CP groups when
+    # local_cp_size is given, recorded in extra PackedSeqParams args); align_size = tp*cp*(2 for zigzag
+    # with cp>1 else 1); pad each length to align_size (FP8 per-seq alignment optional); compute padded
+    # cu_seqlens; call preprocess_for_mindspeed; then optionally extend the last sequence so that the
+    # total is a multiple of FP8 total_align, at least cp*min_local_rows, and a multiple of
+    # lcm(pad_to_length_bucket, cp[, fp8 total]). When pre_process, builds local ids buffer of
+    # total/cp rows plus position ids:
+    # - contiguous: rank owns global rows [rank*local, (rank+1)*local); copies the overlap of each valid
+    # sequence; with need_roll, takes token at (index+1) modulo sequence length and uses that index as the
+    # position id.
+    # - no CP: copy each sequence at its padded offset with positions 0..len-1.
+    # - zigzag CP: zero-pad the sequence to its padded length, copy front chunk cp_rank and mirrored back
+    # chunk; positions follow original indices (back chunk positions clamped to valid length). With
+    # need_roll, records replacement values for the last row of each chunk (next token across the chunk
+    # boundary, or wrap to first token), then the whole buffer is rolled left by one and replacements
+    # applied (also applies when cp<=1 in zigzag mode, with no replacements).
+    # Finally sets cp_partition_mode when supported and builds PackedSeqParams.
+    # Inputs: input_ids - jagged nested tensor [batch, ragged, ...]; pre_process; need_roll - produce
+    # next-token-shifted ids (labels); use_fp8_padding; local_cp_size - dynamic CP size; min_local_rows -
+    # minimum rows per rank; pad_to_length_bucket - total length bucket; cp_layout - zigzag or contiguous.
+    # Outputs: (packed ids [1, rows, ...], PackedSeqParams, position ids [1, rows]) when pre_process, else
+    # (input_ids, PackedSeqParams, None).
+    # Exceptions: ValueError for unknown cp_layout, non-positive pad_to_length_bucket, or contiguous layout
+    # with cp>1 on a Megatron without cp_partition_mode.
+    # Side effects: host syncs, MindSpeed state on NPU, one-time warning when padding for CP.
+    # KNOWN ISSUE: with need_roll and no CP in zigzag mode, the global left roll makes each sequence's last
+    # row take the next sequence's first token (no fix-up), relying on loss masks to ignore it.
     """Pack nested THD sequences and shard their rows across CP ranks.
 
     ``zigzag`` is the default causal-attention layout: each rank receives a
@@ -573,6 +677,18 @@ def postprocess_thd_engine(
     local_cp_size: int | None = None,
     cp_layout: ContextParallelLayout = "zigzag",
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: inverse of preprocess_thd_engine. Validates cp_layout; returns output if not post_process.
+    # Determines CP group (dynamic from packed_seq_params.cp_group when local_cp_size set), all-gathers
+    # outputs across CP (local tensor kept for autograd). Contiguous: concatenates rank outputs in rank
+    # order and slices each sequence's valid length at its padded offset. Zigzag/no-CP: reassembles like
+    # postprocess_packed_seqs, keeping the first valid length. Original lengths come from
+    # input_ids.offsets().
+    # Inputs: output [1, rows, ...]; packed_seq_params; input_ids - original nested tensor; batch_size;
+    # post_process; local_cp_size; cp_layout.
+    # Outputs: jagged nested tensor of per-sequence outputs.
+    # Exceptions: ValueError for unknown cp_layout.
+    # Side effects: CP all_gather; host syncs.
     """
     Postprocess packed sequences
     """
@@ -647,6 +763,10 @@ def postprocess_thd_engine(
 
 
 def _build_npu_attn_mask(original_attention_mask: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Builds an NPU fusion-attention mask [B, 1, S, S] where true means masked: combines pairwise
+    # validity of the [B, S] mask with a lower-triangular causal mask and inverts it.
+    # Inputs: original_attention_mask bool [B, S]. Outputs: bool tensor. Side effects: none.
     """Build attn_mask for torch_npu.npu_fusion_attention (B1SS / [B, 1, Sq, Skv])"""
     _, seq_len = original_attention_mask.shape
     causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=original_attention_mask.device, dtype=torch.bool))
@@ -662,6 +782,22 @@ def preprocess_bshd_engine(
     use_fp8_padding: bool = False,
     forced_max_seqlen: int | None = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: pads a jagged nested tensor to a dense BSHD batch for the engine. max length is
+    # forced_max_seqlen or the batch max, rounded up to tp*cp*2 (cp>1) or tp; with FP8, further rounded so
+    # that batch*len is divisible by 128*tp*cp and remains aligned. Without CP, copies each sequence to the
+    # front and marks its mask. With CP, zero-pads each sequence to max length and keeps the zigzag pair of
+    # chunks of length max/(2*cp) (front chunk cp_rank, back chunk 2*cp-rank-1); need_roll replaces tokens
+    # with those at the next global position (mod max length); mask marks valid parts of each chunk.
+    # Position ids are 0..local-1 without CP or the zigzag global positions with CP, broadcast over batch.
+    # Without CP, need_roll rolls ids left by one along seq. On NPU the mask is converted to [B,1,S,S]
+    # masked-form via _build_npu_attn_mask.
+    # Inputs: input_ids nested [b, ragged, ...dense]; pre_process (unused); need_roll; use_fp8_padding;
+    # forced_max_seqlen - raw unaligned max length override.
+    # Outputs: (ids [b, local_len, ...], attention_mask [b, local_len] bool or NPU 4-D mask, position_ids).
+    # Side effects: host sync.
+    # KNOWN ISSUE: pre_process is accepted but never used. Without CP, need_roll's roll lets the last
+    # padded row wrap to the first token of the row.
     """
     Preprocess bshd sequences
     return "input_ids, attention_mask, position_ids"
@@ -777,6 +913,16 @@ def postprocess_bshd_engine(
     attention_mask: torch.Tensor,
     post_process: bool = True,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: inverse of preprocess_bshd_engine. Returns output if not post_process. On NPU, recovers a
+    # [B, S] validity mask from the diagonal of the 4-D masked-form mask. Asserts output's first two dims
+    # match the mask. With CP, all-gathers outputs and masks, rebuilds full-length rows by placing each
+    # rank's front half at slot j and back half at the mirror slot, then selects valid positions; without
+    # CP selects masked positions per row.
+    # Inputs: output [b, local_len, ...]; attention_mask; post_process.
+    # Outputs: jagged nested tensor of per-sample valid outputs.
+    # Exceptions: AssertionError on shape mismatch or odd local length under CP.
+    # Side effects: CP all_gather collectives.
     """
     Postprocess bshd sequences
     """
@@ -849,6 +995,11 @@ def postprocess_bshd_engine(
 
 
 def build_vlm_attn_mask_thd(input_ids: torch.Tensor, pad_token_id: int = None):
+    # [FUNCTION DOC]
+    # Behavior: pads a nested input_ids tensor to (batch, max length aligned to tp*cp*2 or tp) using
+    # pad_token_id and builds a bool mask of valid prefix per row.
+    # Inputs: input_ids nested tensor; pad_token_id.
+    # Outputs: (padded ids, bool attention mask). Side effects: host sync.
     seqlens_in_batch = input_ids.offsets().diff()
 
     # Align to TP/CP so ``combined_embeddings`` is divisible by tp_size before
@@ -872,6 +1023,11 @@ def build_vlm_attn_mask_thd(input_ids: torch.Tensor, pad_token_id: int = None):
 def build_vlm_attn_mask_bshd(
     input_ids: torch.Tensor, batch_size: int, pad_token_id: int = None, forced_max_seqlen: int | None = None
 ):
+    # [FUNCTION DOC]
+    # Behavior: same as build_vlm_attn_mask_thd but the raw max may be overridden by forced_max_seqlen and
+    # batch_size is given explicitly; on NPU returns no mask.
+    # Inputs: input_ids nested; batch_size; pad_token_id; forced_max_seqlen.
+    # Outputs: (padded ids [batch, len], bool mask or None on NPU). Side effects: host sync.
     seqlens_in_batch = input_ids.offsets().diff()
     # When ``forced_max_seqlen`` is given, pad to the mini-batch global max (raw, unaligned)
     # so the VLM padded tensors share the same `s_q` as the label/loss_mask produced by

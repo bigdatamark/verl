@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for SGLang rollout weight-bucketing utilities: get_named_tensor_buckets (async generator grouping
+# (name, tensor) pairs into buckets bounded by a byte size) and _compact_for_bucket (clones a tensor only when it is
+# non-contiguous or a view into a larger storage). Module constants: a 512x512 float32 tensor (1 MiB) and 1 MiB in bytes.
+
 import pytest
 import torch
 
@@ -49,6 +54,10 @@ _BYTES_1MB = 1 << 20
 )
 @pytest.mark.asyncio
 async def test_get_named_tensor_buckets(named_tensors, bucket_size_mb, gt_groups: list[list[str]]):
+    # [FUNCTION DOC]
+    # Parametrized: two 1 MiB tensors are split into separate buckets for limits of 0.5, 1 and 1.5 MiB, and grouped
+    # together at 2 MiB. Asserts the bucket count and the names in each bucket, in order.
+    # Inputs: named_tensors - list of (name, tensor); bucket_size_mb - limit in bytes (despite the name); gt_groups - expected names.
     named_tensors_iter = iter(named_tensors)
     groups = [g async for g in get_named_tensor_buckets(named_tensors_iter, bucket_size_mb)]
     assert len(groups) == len(gt_groups)
@@ -59,6 +68,8 @@ async def test_get_named_tensor_buckets(named_tensors, bucket_size_mb, gt_groups
 
 
 def test_compact_for_bucket_skips_clone_for_owned_contiguous_tensor():
+    # [FUNCTION DOC]
+    # A freshly allocated contiguous tensor is returned as the identical object (no clone).
     # A freshly-allocated contiguous tensor owns tight storage (the DTensor.full_tensor() case).
     # It must be returned as-is so bucketing does not transiently double its peak memory.
     tensor = torch.randn(128, 64)
@@ -66,6 +77,9 @@ def test_compact_for_bucket_skips_clone_for_owned_contiguous_tensor():
 
 
 def test_compact_for_bucket_clones_view_into_larger_buffer():
+    # [FUNCTION DOC]
+    # A contiguous slice of a larger tensor is cloned into a tight storage (storage bytes equal numel x element size)
+    # with identical values.
     # A contiguous view that spans only part of a larger backing buffer must be compacted,
     # otherwise the whole buffer stays resident / gets shipped.
     base = torch.randn(256, 64)
@@ -78,6 +92,8 @@ def test_compact_for_bucket_clones_view_into_larger_buffer():
 
 
 def test_compact_for_bucket_clones_non_contiguous_tensor():
+    # [FUNCTION DOC]
+    # A transposed (non-contiguous) tensor is cloned into new storage with identical values.
     tensor = torch.randn(64, 128).t()
     assert not tensor.is_contiguous()
     out = _compact_for_bucket(tensor)
@@ -88,6 +104,8 @@ def test_compact_for_bucket_clones_non_contiguous_tensor():
 
 @pytest.mark.asyncio
 async def test_get_named_tensor_buckets_preserves_values():
+    # [FUNCTION DOC]
+    # Bucketing three small random tensors with a 0.5 MiB limit yields all names with values equal to the originals.
     # The conditional clone must not change the data that ends up in the buckets.
     named_tensors = [("a", torch.randn(64, 64)), ("b", torch.randn(64, 64)), ("c", torch.randn(64, 64))]
     expected = {name: tensor.clone() for name, tensor in named_tensors}

@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module sparse_gather: sharded delta computation. Each rank diffs its local FSDP2 Shard(0) slice
+# bytewise against a local snapshot, producing global flattened positions plus values, then a batched
+# variable-length gather moves only the changes to group rank 0. _DTYPE_INT maps element byte size to
+# the same-size integer dtype used for bitwise comparison.
 """Sharded delta: diff each rank's local FSDP shard, gather only the changes to rank 0.
 
 The default delta path all-gathers the full parameter (``DTensor.full_tensor()``) and
@@ -43,6 +49,15 @@ def shard_delta_indices(
     local_snap: torch.Tensor,
     offset: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: reinterprets both tensors as the same-width integer dtype, finds elements whose bits differ,
+    # collects their local flat indices and the new values at those indices, and shifts indices by offset to
+    # become positions in the full flattened parameter.
+    # Inputs: local_new - current local shard (expected 1-D/flattened); local_snap - snapshot of same shape/dtype;
+    # offset - flat start position of this shard in the full parameter.
+    # Outputs: tuple of (int64 global positions, values tensor in local_new dtype).
+    # Exceptions: ValueError if element size is not 1, 2, 4 or 8 bytes; torch errors on shape/dtype mismatch.
+    # Side effects: none (nonzero triggers a device sync).
     """Byte-diff a local shard against its snapshot; return (global_positions, values).
 
     Positions are int64 indices into the *full flattened parameter* (offset + local index).
@@ -66,6 +81,25 @@ def gather_slot_entries_to_rank0(
     group: dist.ProcessGroup | None = None,
     max_round_bytes: int | None = None,
 ) -> list | None:
+    # [FUNCTION DOC]
+    # Behavior: batched sparse gather of K per-parameter deltas from all ranks to group rank 0.
+    # 1) all_gather each rank's counts vector, move to CPU as a world x K list of lists.
+    # 2) If max_round_bytes is given and K > 1: walk parameters accumulating per-rank running element totals;
+    # start a new cut whenever any rank's running total exceeds the budget (max_round_bytes divided by bytes per
+    # index+value element, minimum 1) and the current round is non-empty. If more than one round results, compute
+    # this rank's per-parameter offsets, recursively call itself (without a byte limit) for each slice of
+    # parameters, concatenating rank 0 results; return the list on rank 0, None elsewhere.
+    # 3) Otherwise compute per-rank totals; if all are zero, rank 0 returns K pairs of empty tensors, others None.
+    # 4) Pad local index and value blobs to the max total, gather both to the global rank of group rank 0.
+    # 5) On rank 0, compute per-rank cumulative offsets, and for each parameter concatenate the non-empty
+    # slices from every rank in rank order (empty tensors if none) into an (idx, val) pair.
+    # Inputs: idx_concat/val_concat - this rank's concatenated positions/values; counts - length-K int64 per-parameter
+    # counts; group - optional process group (None means default world); max_round_bytes - optional per-round byte cap.
+    # Outputs: on rank 0 a list of K (idx, val) tuples; None on other ranks.
+    # Exceptions: propagates torch.distributed errors; all ranks must call it collectively with equal K.
+    # Side effects: issues collectives (all_gather, two gathers per round) and host syncs.
+    # KNOWN ISSUE: the receive buffers for the counts all_gather are created on counts' own device while the
+    # sent tensor is moved to the idx_concat device; if counts lives on CPU while data is on GPU this mismatch may fail under NCCL.
     """Variable-length sparse gather, batched: one collective round for K parameters.
 
     Each rank passes its K per-parameter deltas concatenated (``idx_concat``,

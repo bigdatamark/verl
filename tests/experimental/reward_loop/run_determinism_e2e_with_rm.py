@@ -12,6 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Standalone CLI script (not a pytest test). Module constants: SEED (42) shared by every seed override;
+# _STEP_LINE_RE matches console-logger lines "step:N - k:v - ..." capturing the step and the remainder;
+# _NP_WRAP / _NUM_RE help parse numpy-repr or embedded numeric tokens.
+
 """
 E2E determinism gate: run PPO twice with identical seeds, verify the per-step
 reward curves are bitwise aligned in float32.
@@ -77,6 +82,20 @@ def run_training(
     max_num_seqs=4,
     save_metrics=False,
 ):
+    # [FUNCTION DOC]
+    # Behavior: builds a subprocess environment (copy of os.environ plus VLLM compile cache disabled, tokenizer
+    # parallelism, quiet NCCL/vLLM logs, PYTHONHASHSEED=SEED), chooses loggers (console, plus file logger with
+    # VERL_FILE_LOGGER_PATH=OUTPUT_DIR/RUN_NAME.jsonl when save_metrics), assembles a "python -m
+    # verl.trainer.main_ppo" command with Hydra overrides enabling full determinism and fixed seeds for vLLM async
+    # rollout (priority scheduling, eager, short 64/64 lengths), FSDP actor/ref, colocated discriminative vLLM
+    # reward model (max_num_seqs=1, dapo reward manager), GRPO without critic, V0 trainer backend, small batch/sample
+    # limits, and optional train/val files. Runs "ray stop", sleeps 3s, launches the trainer with stderr merged into
+    # stdout, tees each line to our stdout while collecting it.
+    # Inputs: model paths, n_gpus, n_steps, run_name, output_dir, per-replica TP sizes, data files, rollout
+    # temperature, rollout max_num_seqs, save_metrics flag.
+    # Outputs: the full captured stdout as one string.
+    # Exceptions: on non-zero exit prints an error (and any partial JSONL) and calls sys.exit(1).
+    # Side effects: stops Ray, spawns a long GPU training subprocess, writes to stdout, possibly a JSONL file.
     """Run one PPO training session via main_ppo using Hydra overrides.
 
     Captures stdout so the caller can parse the per-step reward curve. No JSONL
@@ -211,6 +230,9 @@ _NUM_RE = re.compile(r"(?<![A-Za-z0-9._])[-+]?(?:\d+\.\d+|\d+\.|\.\d+|\d+)(?:[eE
 
 
 def _parse_float(token: str) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Strips the token, unwraps np.<type>(...) reprs, then tries float conversion; on failure extracts the
+    # first standalone numeric literal, or returns NaN if none.
     """Parse a metric value to float (handles ``np.float64(x)``, ``np.int32(n)``, plain floats)."""
     token = token.strip()
     m = _NP_WRAP.match(token)
@@ -224,6 +246,15 @@ def _parse_float(token: str) -> float:
 
 
 def parse_reward_curve_from_stdout(stdout: str):
+    # [FUNCTION DOC]
+    # Behavior: scans stdout lines for step lines, splits the remainder on " - " and each chunk on its first ":" to
+    # build a per-step key->string mapping (later lines for the same step overwrite). If none found returns
+    # (None, None). For each step in sorted order picks a reward key and parses its value; if any step lacks one,
+    # prints available keys and returns (None, None). Prints the chosen training (step 1) and validation (step 0)
+    # keys.
+    # Inputs: stdout - full training output.
+    # Outputs: tuple (sorted step list, list of float rewards) or (None, None).
+    # Side effects: prints.
     """Parse per-step reward metrics from training stdout.
 
     Console logger lines look like ``step:1 - critic/rewards/mean:0.5 - ...``.
@@ -269,6 +300,10 @@ def parse_reward_curve_from_stdout(stdout: str):
 
 
 def read_metrics_from_jsonl(output_dir, run_name):
+    # [FUNCTION DOC]
+    # Behavior: reads OUTPUT_DIR/RUN_NAME.jsonl where each line is JSON with "step" and "data"; returns a mapping
+    # step -> data dict (last entry wins).
+    # Exceptions: prints and sys.exit(1) if the file is missing; JSON/KeyError on malformed lines.
     """Read per-step metrics from FileLogger JSONL output (opt-in path)."""
     filepath = os.path.join(output_dir, f"{run_name}.jsonl")
     if not os.path.exists(filepath):
@@ -285,6 +320,10 @@ def read_metrics_from_jsonl(output_dir, run_name):
 
 
 def _pick_reward_key(data: dict) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns the first present key among training reward keys (critic/rewards/mean, reward/mean,
+    # train/reward/mean), then validation keys (val-core/unknown/reward/mean@1, val-core/reward/mean), then any key
+    # containing both "reward" and "mean" case-insensitively; else None.
     """Pick the reward key from a step's data dict (training or validation)."""
     for key in ["critic/rewards/mean", "reward/mean", "train/reward/mean"]:
         if key in data:
@@ -299,6 +338,11 @@ def _pick_reward_key(data: dict) -> str | None:
 
 
 def extract_reward_curve(metrics_by_step):
+    # [FUNCTION DOC]
+    # Behavior: JSONL-path counterpart of the stdout parser: for each sorted step picks the reward key and converts
+    # the value with float(); prints the chosen train/val keys.
+    # Outputs: (steps, rewards).
+    # Exceptions: prints and sys.exit(1) when a step has no reward key.
     """Extract mean reward per step from a metrics dict (JSONL path)."""
     steps = sorted(metrics_by_step.keys())
     rewards = []
@@ -318,6 +362,12 @@ def extract_reward_curve(metrics_by_step):
 
 
 def verify_bitwise_alignment(rewards1, rewards2):
+    # [FUNCTION DOC]
+    # Behavior: casts both curves to float32 arrays; on length mismatch returns (False, reason) immediately.
+    # Otherwise checks exact elementwise equality, computes max absolute difference, prints a summary and each
+    # differing step.
+    # Outputs: tuple (aligned bool, human-readable reason).
+    # Side effects: prints.
     """Verify two reward curves are bitwise aligned (float32).
 
     Returns ``(aligned, reason)`` so the caller surfaces a concrete failure cause.
@@ -353,6 +403,10 @@ def verify_bitwise_alignment(rewards1, rewards2):
 
 
 def print_reward_table(steps, rewards1, rewards2, aligned):
+    # [FUNCTION DOC]
+    # Behavior: prints a fixed-width table of step, both rewards (8 decimals), absolute diff, and a check/cross
+    # mark per row, then a verdict line based on the aligned flag. Assumes both reward lists are at least as long as
+    # steps.
     """Print a compact side-by-side reward comparison to stdout."""
     print(f"\n{'Step':>6} | {'Run 1':>16} | {'Run 2':>16} | {'Diff':>12} | {'Match':>5}")
     print("-" * 64)
@@ -368,6 +422,12 @@ def print_reward_table(steps, rewards1, rewards2, aligned):
 
 
 def plot_reward_curves(steps1, rewards1, rewards2, output_path):
+    # [FUNCTION DOC]
+    # Behavior: lazily imports matplotlib with the Agg backend, overlays both curves against steps1, labels axes,
+    # annotates aligned/not-aligned status (recomputed via float32 equality) and, if aligned, a max_diff=0 note;
+    # saves a 150-dpi PNG at output_path.
+    # Exceptions: ImportError if matplotlib is missing (caught by main).
+    # Side effects: writes the image file and prints its path.
     """Plot two reward curves overlaid for visual comparison."""
     import matplotlib
 
@@ -414,6 +474,15 @@ def plot_reward_curves(steps1, rewards1, rewards2, output_path):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: parses CLI args (models, n_gpus, TP sizes, n_steps, data files, output_dir default
+    # /tmp/determinism_e2e, temperature, rollout max_num_seqs, project_name, save_metrics, plot), expands paths,
+    # creates output_dir, runs training twice with identical kwargs (run1, run2), extracts reward curves from JSONL
+    # when save_metrics else from stdout (exit 1 if unparseable), verifies bitwise alignment, prints a table when
+    # step lists match or raw curves otherwise, optionally plots (truncating to the common length when steps
+    # differ), then exits 0 if aligned else 1.
+    # Side effects: filesystem writes, subprocesses, process exit.
+    # KNOWN ISSUE: --project_name is parsed but never passed to training.
     parser = argparse.ArgumentParser(
         description="E2E determinism gate: run PPO twice, verify reward curves bitwise aligned.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

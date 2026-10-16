@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# GPU integration test for inter-node TensorRT-LLM rollout: TP 2 across two simulated 1-GPU "nodes" on a
+# local Ray cluster, served via an OpenAI-compatible endpoint.
+
 import asyncio
 import os
 
@@ -24,6 +29,10 @@ from verl.workers.rollout.replica import get_rollout_replica_class
 
 @pytest.fixture
 def init_config() -> DictConfig:
+    # [FUNCTION DOC]
+    # HELPER: fixture composing ppo_trainer (verl/trainer/config relative to CWD) with 1 GPU per node and 2 nodes,
+    # Qwen2.5-0.5B-Instruct under TRTLLM_TEST_MODEL_PATH_ROOT (default ~/models), trtllm async rollout with tokenizer
+    # init enabled and load_format auto. Outputs: DictConfig.
     from hydra import compose, initialize_config_dir
 
     config_dir = os.path.abspath("verl/trainer/config")
@@ -46,6 +55,12 @@ def init_config() -> DictConfig:
 
 @pytest.mark.asyncio
 async def test_inter_node_trtllm_rollout(init_config):
+    # [FUNCTION DOC]
+    # Sets TP 2, computes replica count (total GPUs / TP), builds trtllm replicas via get_rollout_replica_class,
+    # runs init_standalone concurrently, asserts one server handle and address per replica, removes HTTP(S)/NO_PROXY
+    # env vars (both cases), sends a chat completion to the first server via AsyncOpenAI and prints the reply.
+    # Side effects: ray.init/shutdown, mutates process env vars.
+    # KNOWN ISSUE: the completion content is only printed, never asserted.
     """Test TRT-LLM rollout with TP=2 spanning 2 simulated nodes (1 GPU each).
 
     On CI with 2+ GPUs on 1 node, we set gpus_per_node=1 so init_standalone()

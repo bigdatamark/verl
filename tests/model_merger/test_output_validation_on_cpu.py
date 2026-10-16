@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for model merger output validation: BaseModelMerger.save_hf_model_and_tokenizer must refuse output
+# directories lacking real weights, generation config save/load behavior, and validate_hf_model_output checks on
+# config.json, single and sharded weight files, index consistency, and unsafe shard paths.
+# Mergers are created via __new__ to skip __init__, with only the attributes each method needs set by hand.
+
 import json
 from types import SimpleNamespace
 
@@ -25,38 +31,65 @@ from verl.model_merger.output_validation import validate_hf_model_output
 
 
 class _TestModelMerger(BaseModelMerger):
+    # [CLASS DOC]
+    # HELPER: Concrete BaseModelMerger subclass with no-op abstract methods.
     def merge_and_save(self):
+        # [FUNCTION DOC]
+        # HELPER: No-op.
         pass
 
     def cleanup(self):
+        # [FUNCTION DOC]
+        # HELPER: No-op.
         pass
 
 
 class _ConfigOnlyModel:
+    # [CLASS DOC]
+    # HELPER: Fake model whose save_pretrained writes only config.json (no weights).
     def to_empty(self, device):
+        # [FUNCTION DOC]
+        # HELPER: Returns self, ignoring device.
         return self
 
     def can_generate(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns False so no generation config handling is triggered.
         return False
 
     def save_pretrained(self, target_dir, state_dict):
+        # [FUNCTION DOC]
+        # HELPER: Writes {"model_type": "test"} to target_dir/config.json; ignores state_dict.
+        # Side effects: writes a file.
         with open(target_dir / "config.json", "w", encoding="utf-8") as f:
             json.dump({"model_type": "test"}, f)
 
 
 class _ConfigOnlyAutoModel:
+    # [CLASS DOC]
+    # HELPER: Fake auto-model class.
     @classmethod
     def from_config(cls, model_config, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Classmethod returning a new _ConfigOnlyModel regardless of arguments.
         return _ConfigOnlyModel()
 
 
 class _FakeTokenizer:
+    # [CLASS DOC]
+    # HELPER: Fake tokenizer that saves only tokenizer.json.
     def save_pretrained(self, target_dir):
+        # [FUNCTION DOC]
+        # HELPER: Writes {"version": "1.0"} to target_dir/tokenizer.json.
         with open(target_dir / "tokenizer.json", "w", encoding="utf-8") as f:
             json.dump({"version": "1.0"}, f)
 
 
 def test_save_rejects_tokenizer_only_output(monkeypatch, tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: patches the merger to use the config-only auto model and fake tokenizer (and stubs tied-key dropping
+    # and processor loading), then asserts saving raises RuntimeError "no complete model weights".
+    # Inputs: monkeypatch, tmp_path fixtures.
     merger = _TestModelMerger.__new__(_TestModelMerger)
     merger.config = SimpleNamespace(target_dir=tmp_path, trust_remote_code=False, local_dir=None)
     merger.hf_model_config_path = tmp_path
@@ -72,6 +105,9 @@ def test_save_rejects_tokenizer_only_output(monkeypatch, tmp_path):
 
 
 def test_save_accepts_actual_hf_model_output(monkeypatch, tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: builds a tiny random Qwen2 causal LM, saves its state dict through the merger (generation config
+    # patching and tokenizer/processor stubbed out), and asserts config.json and model.safetensors exist.
     model_config = Qwen2Config(
         vocab_size=32,
         hidden_size=16,
@@ -99,6 +135,9 @@ def test_save_accepts_actual_hf_model_output(monkeypatch, tmp_path):
 
 
 def test_save_generation_config_preserves_pretrained_values(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: saves a GenerationConfig with two eos ids and max_new_tokens 4096 in the source dir, calls
+    # save_generation_config into the target dir, and asserts the values round-trip.
     source_dir = tmp_path / "source"
     target_dir = tmp_path / "target"
     source_dir.mkdir()
@@ -118,6 +157,9 @@ def test_save_generation_config_preserves_pretrained_values(tmp_path):
 
 
 def test_save_generation_config_allows_missing_file(capsys, tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: with no source generation config, asserts save_generation_config deletes a stale target
+    # generation_config.json and prints nothing.
     source_dir = tmp_path / "source"
     target_dir = tmp_path / "target"
     source_dir.mkdir()
@@ -134,6 +176,8 @@ def test_save_generation_config_allows_missing_file(capsys, tmp_path):
 
 
 def test_load_generation_config_warns_when_file_is_missing(capsys, tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: asserts load_generation_config returns None and prints a "Generation config file not found" warning.
     merger = _TestModelMerger.__new__(_TestModelMerger)
     merger.hf_model_config_path = tmp_path
 
@@ -142,6 +186,9 @@ def test_load_generation_config_warns_when_file_is_missing(capsys, tmp_path):
 
 
 def test_save_generation_config_rejects_invalid_source(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: with malformed source JSON, asserts OSError "not a valid JSON file" and that the stale target file is
+    # left intact.
     source_dir = tmp_path / "source"
     target_dir = tmp_path / "target"
     source_dir.mkdir()
@@ -161,6 +208,9 @@ def test_save_generation_config_rejects_invalid_source(tmp_path):
 
 @pytest.mark.parametrize("weight_name", ("model.safetensors", "pytorch_model.bin"))
 def test_validate_hf_model_output_accepts_single_weight_file(tmp_path, weight_name):
+    # [FUNCTION DOC]
+    # Behavior: asserts no error for config.json plus one non-empty single weight file (parametrized over safetensors
+    # and .bin names).
     (tmp_path / "config.json").write_text('{"model_type": "test"}', encoding="utf-8")
     (tmp_path / weight_name).write_bytes(b"weights")
 
@@ -175,6 +225,9 @@ def test_validate_hf_model_output_accepts_single_weight_file(tmp_path, weight_na
     ),
 )
 def test_validate_hf_model_output_accepts_complete_sharded_weights(tmp_path, index_name, shard_names):
+    # [FUNCTION DOC]
+    # Behavior: writes an index whose weight_map references two shards and both shard files; asserts validation
+    # passes (parametrized for safetensors and bin indexes).
     (tmp_path / "config.json").write_text('{"model_type": "test"}', encoding="utf-8")
     weight_map = {f"layer.{index}.weight": shard_name for index, shard_name in enumerate(shard_names)}
     (tmp_path / index_name).write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
@@ -185,6 +238,8 @@ def test_validate_hf_model_output_accepts_complete_sharded_weights(tmp_path, ind
 
 
 def test_validate_hf_model_output_rejects_missing_shard(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: index references two shards but only one exists; asserts RuntimeError naming the missing shard.
     (tmp_path / "config.json").write_text('{"model_type": "test"}', encoding="utf-8")
     index = {
         "weight_map": {
@@ -200,6 +255,8 @@ def test_validate_hf_model_output_rejects_missing_shard(tmp_path):
 
 
 def test_validate_hf_model_output_accepts_single_file_with_stale_index(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: a present single pytorch_model.bin wins over a stale safetensors index referencing a missing shard.
     (tmp_path / "config.json").write_text('{"model_type": "test"}', encoding="utf-8")
     (tmp_path / "pytorch_model.bin").write_bytes(b"weights")
     index = {"weight_map": {"layer.0.weight": "model-00001-of-00001.safetensors"}}
@@ -209,6 +266,9 @@ def test_validate_hf_model_output_accepts_single_file_with_stale_index(tmp_path)
 
 
 def test_validate_hf_model_output_rejects_escaping_shard_path(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: a weight_map entry pointing outside the directory ("../") raises RuntimeError "unsafe shard paths"
+    # even though the file exists.
     target_dir = tmp_path / "output"
     target_dir.mkdir()
     (target_dir / "config.json").write_text('{"model_type": "test"}', encoding="utf-8")
@@ -221,6 +281,8 @@ def test_validate_hf_model_output_rejects_escaping_shard_path(tmp_path):
 
 
 def test_validate_hf_model_output_rejects_non_string_shard_name(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: a weight_map value that is a list raises RuntimeError "invalid shard names".
     (tmp_path / "config.json").write_text('{"model_type": "test"}', encoding="utf-8")
     index = {"weight_map": {"layer.0.weight": []}}
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
@@ -230,6 +292,8 @@ def test_validate_hf_model_output_rejects_non_string_shard_name(tmp_path):
 
 
 def test_validate_hf_model_output_rejects_missing_config(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: weights without config.json raise RuntimeError "missing or empty config.json".
     (tmp_path / "model.safetensors").write_bytes(b"weights")
 
     with pytest.raises(RuntimeError, match="missing or empty config.json"):
@@ -237,6 +301,8 @@ def test_validate_hf_model_output_rejects_missing_config(tmp_path):
 
 
 def test_validate_hf_model_output_rejects_empty_weight_file(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: a zero-byte model.safetensors raises RuntimeError "no complete model weights".
     (tmp_path / "config.json").write_text('{"model_type": "test"}', encoding="utf-8")
     (tmp_path / "model.safetensors").touch()
 

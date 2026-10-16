@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# FSDP (v1 and v2) checkpoint manager: per-rank sharded model/optimizer files, per-rank extra state (lr scheduler +
+# RNG), HF config/tokenizer/custom code and fsdp_config.json on rank 0, optional LoRA-only saves and metadata, and
+# optional full HF-format model export. File names: model_/optim_/extra_state_world_size_<W>_rank_<R>.pt.
+
 import json
 import logging
 import os
@@ -43,6 +48,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 @dataclass
 class FSDPConfig:
+    # [CLASS DOC]
+    # Dataclass written to fsdp_config.json describing the saving run: FSDP_version (1 or 2) and world_size.
     """Configuration for FSDP checkpointing.
 
     Args:
@@ -55,6 +62,8 @@ class FSDPConfig:
 
 
 class FSDPCheckpointManager(BaseCheckpointManager):
+    # [CLASS DOC]
+    # Checkpoint manager for FSDP-wrapped models in SPMD training; adds trust_remote_code for HF model reconstruction.
     """
     Manage FSDP checkpointing in SPMD training.
 
@@ -84,6 +93,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         trust_remote_code: bool = False,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: accepts deprecated "tokenizer" kwarg as processing_class (with DeprecationWarning) when processing_class is
+        # None, then delegates to the base constructor and stores trust_remote_code.
+        # Inputs: model, optimizer, lr_scheduler, processing_class, checkpoint_config, trust_remote_code, kwargs.
+        # Outputs: none. Side effects: warning.
         if processing_class is None and "tokenizer" in kwargs:
             warnings.warn(
                 "`tokenizer` is deprecated. use `processing_class` instead.", DeprecationWarning, stacklevel=2
@@ -100,6 +114,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         self.trust_remote_code = trust_remote_code
 
     def _get_lora_train_meta(self, unwrap_model):
+        # [FUNCTION DOC]
+        # HELPER: Reads peft_config from the unwrapped model (dict: "default" entry or first value). Returns None without a
+        # config or with rank <= 0; else dict with r, lora_alpha (default r), task_type (enum value or string, default
+        # "CAUSAL_LM"). Inputs: unwrap_model. Outputs: dict or None.
         peft_config = getattr(unwrap_model, "peft_config", None)
         if not peft_config:
             return None
@@ -120,6 +138,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         return {"r": lora_rank, "lora_alpha": lora_alpha, "task_type": str(task_type)}
 
     def _save_lora_train_meta(self, local_path: str, unwrap_model):
+        # [FUNCTION DOC]
+        # HELPER: Writes LoRA metadata to local_path/lora_train_meta.json if available and logs it.
+        # Inputs: local_path, unwrap_model. Outputs: written path or None. Side effects: file write.
         lora_train_meta = self._get_lora_train_meta(unwrap_model)
         if lora_train_meta is None:
             return None
@@ -136,10 +157,17 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         return lora_meta_path
 
     def _has_lora(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if the (FSDP1-unwrapped) model has a peft_config attribute.
         unwrap = getattr(self.model, "_fsdp_wrapped_module", self.model)
         return hasattr(unwrap, "peft_config")
 
     def _backfill_optimizer_state(self, state_dict: dict) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: For flattened (distributed-checkpoint style) optimizer state dicts, i.e. ones without "state"/"param_groups",
+        # when the live optimizer's state dict is also flattened, merges live entries for keys missing in the checkpoint
+        # (checkpoint entries win) and logs the count. Plain-format dicts are returned unchanged.
+        # Inputs: state_dict - loaded optimizer state. Outputs: possibly merged state dict.
         """Fill in entries that a flattened DSD optimizer checkpoint does not contain.
 
         Engines that save through ``torch.distributed.checkpoint.state_dict`` with
@@ -174,6 +202,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         return {**current_state_dict, **state_dict}
 
     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
+        # [FUNCTION DOC]
+        # Behavior: no-op for None local_path. Asserts model/optimizer exist when they are to be loaded. Under a sharded
+        # state-dict context (CPU offload when CUDA is available): loads this rank's model shard (LoRA-only shards load
+        # non-strictly and raise if unexpected keys appear) and optimizer shard (backfilled). If extra is loaded, restores RNG
+        # state when present and the lr scheduler when both saved state and scheduler exist. Rank 0 optionally deletes the
+        # downloaded local copies of remote files (errors logged and ignored). Ends with a barrier.
+        # Inputs: local_path - dir (may be remote; files are copied local); hdfs_path - unused; del_local_after_load.
+        # Outputs: none. Exceptions: AssertionError, ValueError (LoRA unexpected keys), file/load errors.
+        # KNOWN ISSUE: when model or optimizer is not loaded, del_local_after_load references undefined local paths; the
+        # resulting NameError is swallowed by the broad except and only logged.
         """
         Load an FSDP checkpoint for this rank.
 
@@ -270,6 +308,22 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         torch.distributed.barrier()
 
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+        # [FUNCTION DOC]
+        # Behavior: no-op for None local_path. Records previous_global_step; rank 0 prunes old checkpoints to make room; creates
+        # the directory and barriers. Asserts required components exist. Under a sharded state-dict context (warnings
+        # suppressed) saves this rank's model shard (if save_lora_only and model has LoRA, only keys containing "lora_" or
+        # ".adapter_", raising ValueError if none, logging their size), optimizer shard, and extra state {lr_scheduler state or
+        # None, rng}. Rank 0 then writes to "huggingface/": generation config (best effort, from name_or_path), the model
+        # config (removing a None key from auto_map), the processing class, custom model code when auto_map exists (using the
+        # PEFT base model), plus fsdp_config.json and LoRA metadata. Barrier. If hf_model saving is requested, gathers a full
+        # state dict to rank 0 (CPU offload), picks the HF auto class by architecture suffix (TokenClassification, CausalLM,
+        # ConditionalGeneration -> vision2seq), builds an empty bf16 model from config, attaches generation config, drops tied
+        # target keys and saves with save_pretrained; barrier. Finally rank 0 registers the checkpoint for retention.
+        # Inputs: local_path, hdfs_path (unused), global_step, max_ckpt_to_keep. Outputs: none.
+        # Exceptions: AssertionError, ValueError, NotImplementedError for unknown architectures.
+        # Side effects: files, collectives, deletion of old checkpoints.
+        # KNOWN ISSUE: the NotImplementedError message indexes the config like a dict (model_config['architectures']), which
+        # itself fails for PretrainedConfig objects.
         """
         Save an FSDP checkpoint for this rank.
 

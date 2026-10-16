@@ -11,3 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Model merger package: tools to convert verl FSDP / Megatron training checkpoints into HuggingFace-format models
+# (merge), or compare them against a reference HF model (test). Entry point is the package __main__ module.

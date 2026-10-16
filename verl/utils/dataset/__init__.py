@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE]
+# Dataset package. Exposes RLHFDataset (prompt dataset for RL) and RMDataset (reward-model dataset).
+
 from .rl_dataset import RLHFDataset
 from .rm_dataset import RMDataset
 

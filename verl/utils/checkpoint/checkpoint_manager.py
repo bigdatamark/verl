@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Base checkpoint manager shared by FSDP/Megatron managers (save/load content selection, retention of old checkpoint
+# directories, RNG state capture/restore), plus helpers for the latest-step tracker file and for deciding whether to
+# save before a capacity-block (ESI) expiration.
+
 import os
 import random
 import shutil
@@ -27,6 +32,10 @@ from verl.utils.device import get_device_name, get_torch_device, is_device_avail
 
 
 class BaseCheckpointManager:
+    # [CLASS DOC]
+    # Abstract SPMD checkpoint manager. Stores model, optimizer, lr scheduler, processing class (tokenizer/processor),
+    # checkpoint config, which contents to load/save (default model, optimizer, extra), rank/world size, and the list of
+    # previously saved paths used for retention. Subclasses implement load_checkpoint/save_checkpoint.
     """
     A checkpoint manager that saves and loads the following states in a SPMD way:
     - model
@@ -48,6 +57,11 @@ class BaseCheckpointManager:
         processing_class: PreTrainedTokenizer | ProcessorMixin = None,
         checkpoint_config: DictConfig | CheckpointConfig = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores inputs; reads load_contents/save_contents from config (default ["model", "optimizer", "extra"]);
+        # initializes previous_global_step None and an empty saved-path list; reads rank and world size.
+        # Inputs: model, optimizer, lr_scheduler, processing_class, checkpoint_config (DictConfig or dataclass, may be None).
+        # Outputs: none. Exceptions: requires torch.distributed initialized.
         self.checkpoint_config = checkpoint_config
         checkpoint_load_contents = checkpoint_config.get("load_contents", None) if checkpoint_config else None
         checkpoint_save_contents = checkpoint_config.get("save_contents", None) if checkpoint_config else None
@@ -70,6 +84,8 @@ class BaseCheckpointManager:
 
     @property
     def should_save_model(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "model" is in save contents.
         """
         Returns True if 'model' is in checkpoint_save_contents, indicating the model state should be saved.
         """
@@ -77,6 +93,8 @@ class BaseCheckpointManager:
 
     @property
     def should_save_optimizer(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "optimizer" is in save contents.
         """
         Returns True if 'optimizer' is in checkpoint_save_contents, indicating the optimizer state should be saved.
         """
@@ -84,6 +102,8 @@ class BaseCheckpointManager:
 
     @property
     def should_save_extra(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "extra" is in save contents.
         """
         Returns True if 'extra' is in checkpoint_save_contents, indicating the extra state should be saved.
         """
@@ -91,6 +111,8 @@ class BaseCheckpointManager:
 
     @property
     def should_save_hf_model(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "hf_model" is in save contents.
         """
         Returns True if 'hf_model' is in checkpoint_save_contents, indicating the model should be converted to hf
         model and saved.
@@ -99,6 +121,8 @@ class BaseCheckpointManager:
 
     @property
     def should_save_lora_only(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: returns config save_lora_only (dict lookup or attribute; default False); False with no config.
         if not self.checkpoint_config:
             return False
         if isinstance(self.checkpoint_config, dict):
@@ -107,12 +131,17 @@ class BaseCheckpointManager:
 
     @staticmethod
     def is_lora_only_state_dict(state_dict: dict) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if the state dict is non-empty and every key contains "lora_" or ".adapter_".
+        # Inputs: state_dict - mapping. Outputs: bool.
         if not state_dict:
             return False
         return all("lora_" in k or ".adapter_" in k for k in state_dict)
 
     @property
     def should_load_model(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "model" is in load contents.
         """
         Returns True if 'model' is in checkpoint_load_contents, indicating the model state should be loaded.
         """
@@ -120,6 +149,8 @@ class BaseCheckpointManager:
 
     @property
     def should_load_optimizer(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "optimizer" is in load contents.
         """
         Returns True if 'optimizer' is in checkpoint_load_contents, indicating the optimizer state should be loaded.
         """
@@ -127,6 +158,8 @@ class BaseCheckpointManager:
 
     @property
     def should_load_extra(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "extra" is in load contents.
         """
         Returns True if 'extra' is in checkpoint_load_contents, indicating the extra state should be loaded.
         """
@@ -134,6 +167,8 @@ class BaseCheckpointManager:
 
     @property
     def should_load_hf_model(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "hf_model" is in load contents.
         """
         Returns True if 'hf_model' is in checkpoint_load_contents, indicating an HF-format model
         checkpoint should be loaded (e.g. via a bridge).
@@ -141,19 +176,29 @@ class BaseCheckpointManager:
         return "hf_model" in self.checkpoint_load_contents
 
     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load: bool = False):
+        # [FUNCTION DOC]
+        # Behavior: abstract; raises NotImplementedError. Inputs: local_path, hdfs_path, del_local_after_load.
         raise NotImplementedError
 
     def save_checkpoint(
         self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep: int = None
     ):
+        # [FUNCTION DOC]
+        # Behavior: abstract; raises NotImplementedError. Inputs: local_path, hdfs_path, global_step, max_ckpt_to_keep.
         raise NotImplementedError
 
     @staticmethod
     def checkpath(local_path: str, hdfs_path: str):
+        # [FUNCTION DOC]
+        # Behavior: returns (is local, path), preferring local_path over hdfs_path.
+        # Exceptions: AssertionError if both are None.
         assert local_path is not None or hdfs_path is not None, "local_path and hdfs_path cannot be both None"
         return local_path is not None, local_path if local_path is not None else hdfs_path
 
     def remove_previous_save_local_path(self, path):
+        # [FUNCTION DOC]
+        # Behavior: for each given path (string or list), prints and recursively deletes it if it exists, ignoring errors.
+        # Inputs: path - str or list of str. Outputs: none. Side effects: filesystem deletion.
         if isinstance(path, str):
             path = [path]
         for p in path:
@@ -164,6 +209,9 @@ class BaseCheckpointManager:
             shutil.rmtree(abs_path, ignore_errors=True)
 
     def ensure_checkpoint_capacity(self, max_ckpt_to_keep: int):
+        # [FUNCTION DOC]
+        # Behavior: pre-save retention. Only for integer max_ckpt_to_keep > 1: if tracked paths already number at least the
+        # limit, deletes the oldest so that limit - 1 remain. Inputs: max_ckpt_to_keep. Side effects: deletes dirs.
         """
         Remove old checkpoints to make room for a new one, keeping a safety buffer.
 
@@ -179,6 +227,9 @@ class BaseCheckpointManager:
             self.previous_saved_paths = self.previous_saved_paths[keep_start:]
 
     def register_checkpoint(self, new_path: str, max_ckpt_to_keep: int):
+        # [FUNCTION DOC]
+        # Behavior: appends new_path to tracked paths; for integer max_ckpt_to_keep > 0, deletes the oldest paths beyond the
+        # limit. Inputs: new_path, max_ckpt_to_keep. Side effects: deletes dirs.
         """
         Register a successfully saved checkpoint and enforce retention limit.
 
@@ -195,6 +246,9 @@ class BaseCheckpointManager:
 
     @staticmethod
     def get_rng_state():
+        # [FUNCTION DOC]
+        # Behavior: captures CPU torch, numpy and Python random RNG states, plus the accelerator RNG state keyed by device name
+        # when a non-CPU device is actually available. Outputs: dict of states.
         rng_state = {
             "cpu": torch.get_rng_state(),
             "numpy": np.random.get_state(),
@@ -211,6 +265,9 @@ class BaseCheckpointManager:
 
     @staticmethod
     def load_rng_state(rng_state):
+        # [FUNCTION DOC]
+        # Behavior: restores CPU torch, numpy and random states, and the accelerator state if available and present.
+        # Inputs: rng_state dict. Exceptions: KeyError if cpu/numpy/random entries missing.
         torch.set_rng_state(rng_state["cpu"])
         np.random.set_state(rng_state["numpy"])
         random.setstate(rng_state["random"])
@@ -220,6 +277,11 @@ class BaseCheckpointManager:
 
 
 def find_latest_ckpt_path(path, directory_format="global_step_{}"):
+    # [FUNCTION DOC]
+    # Behavior: returns None for None path or missing tracker (printing on rank 0 / non-distributed); reads the integer
+    # step from the tracker, builds path/directory_format(step), returns None if that folder is missing.
+    # Inputs: path, directory_format. Outputs: path or None. Exceptions: ValueError on non-integer tracker contents.
+    # KNOWN ISSUE: print calls use logging-style "%s" formatting, so the message and path print separately unformatted.
     """
     Return the most recent checkpoint directory based on a tracker file.
 
@@ -253,6 +315,8 @@ def find_latest_ckpt_path(path, directory_format="global_step_{}"):
 
 
 def get_checkpoint_tracker_filename(root_path: str):
+    # [FUNCTION DOC]
+    # Behavior: returns root_path joined with "latest_checkpointed_iteration.txt". Inputs: root_path. Outputs: str.
     """
     Tracker file rescords the latest chckpoint during training to restart from.
     """
@@ -260,6 +324,13 @@ def get_checkpoint_tracker_filename(root_path: str):
 
 
 def should_save_ckpt_esi(max_steps_duration: float, save_ckpt_duration: float = 60, redundant_time: float = 0) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: if MLP_CURRENT_CAPACITY_BLOCK_EXPIRATION_TIMESTAMP is set (seconds), returns True when remaining time is
+    # positive, max_steps_duration > 0 and remaining <= save + step + redundant durations (False on unparsable value).
+    # Else if SAGEMAKER_CURRENT_CAPACITY_BLOCK_EXPIRATION_TIMESTAMP is set, returns True when time until expiration is below
+    # that total duration. Else False.
+    # Inputs: max_steps_duration, save_ckpt_duration (default 60), redundant_time (default 0), all seconds. Outputs: bool.
+    # Exceptions: ValueError if the AWS timestamp is not an integer.
     """
     Determine if checkpoint should be saved based on capacity esi expiration.
 

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for verl.utils.fs: directory-structure recording/checking and copy_to_local caching
+# behavior for non-local (HDFS) paths, with the actual copy mocked.
+
 import os
 from pathlib import Path
 
@@ -19,6 +23,11 @@ import verl.utils.fs as fs
 
 
 def test_record_and_check_directory_structure(tmp_path):
+    # [FUNCTION DOC]
+    # Creates a small tree (a file and a subdir with a file) under tmp_path, records its structure with
+    # _record_directory_structure, asserts the record file exists and _check_directory_structure returns True,
+    # then adds a new file and asserts the check returns False.
+    # Side effects: writes files under tmp_path.
     # Create test directory structure
     test_dir = tmp_path / "test_dir"
     test_dir.mkdir()
@@ -41,11 +50,16 @@ def test_record_and_check_directory_structure(tmp_path):
 
 
 def test_copy_from_hdfs_with_mocks(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # Mocks is_non_local to True and fs.copy to touch an empty destination file, then calls copy_to_local on an
+    # HDFS path and asserts the result is cache_dir / md5(hdfs path) / basename and that the file exists.
     # Mock HDFS dependencies
     monkeypatch.setattr(fs, "is_non_local", lambda path: True)
 
     # side_effect will simulate the copy by creating parent dirs + empty file
     def fake_copy(src: str, dst: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake copy that creates the destination's parent directories and writes an empty file at dst.
         dst_path = Path(dst)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         dst_path.write_bytes(b"")  # touch an empty file
@@ -64,12 +78,17 @@ def test_copy_from_hdfs_with_mocks(tmp_path, monkeypatch):
 
 
 def test_always_recopy_flag(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # Counts fake copy calls: first copy_to_local copies (1), always_recopy=True forces a second copy (2),
+    # and a subsequent normal call reuses the cache (still 2).
     # Mock HDFS dependencies
     monkeypatch.setattr(fs, "is_non_local", lambda path: True)
 
     copy_call_count = 0
 
     def fake_copy(src: str, dst: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake copy that increments the enclosing copy_call_count and touches an empty dst file.
         nonlocal copy_call_count
         copy_call_count += 1
         dst_path = Path(dst)

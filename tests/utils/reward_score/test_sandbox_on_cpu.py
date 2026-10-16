@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for code/math reward scoring: PRIME math answers vs ground truths, PRIME code execution against
+# input/output test cases (a correct solution scoring 1.0 and one failing 2 of 11 cases scoring 0.9), parallel
+# async scoring via a process pool, and optional Sandbox Fusion remote execution when SANDBOX_FUSION_URL is set.
+# Module-level lists hold the sample answers, ground truths (code ground truths are JSON strings of
+# inputs/outputs) and expected scores.
 
 import asyncio
 import json
@@ -93,6 +99,10 @@ prime_code_scores = [1.0, 0.9]
 
 
 def test_parallelism():
+    # [FUNCTION DOC]
+    # Behavior: repeats code and math samples until at least 32 sequences (with data sources "codecontests" and
+    # "numina_aops_forum"), scores them via parallel_compute_score_async with 16 processes inside asyncio, and prints
+    # the scores. No assertions. Inputs: none. Outputs: none. Side effects: spawns processes, executes code, prints.
     """
     Test if process pool works properly
     """
@@ -115,6 +125,9 @@ def test_parallelism():
 
 
 def test_prime_code():
+    # [FUNCTION DOC]
+    # Behavior: scores each code sample locally with default_compute_score for "codecontests" and asserts the float
+    # score equals the expected (1.0 and 0.9). Inputs: none. Outputs: none. Side effects: executes candidate code.
     """
     Test PRIME code sandbox.
     """
@@ -127,6 +140,9 @@ def test_prime_code():
 # Use the pytest.mark.skipif decorator to skip the test
 @pytest.mark.skipif(not os.environ.get("SANDBOX_FUSION_URL"), reason="SANDBOX_FUSION_URL environment variable not set")
 def test_prime_code_sandbox_fusion():
+    # [FUNCTION DOC]
+    # Behavior: skipped unless SANDBOX_FUSION_URL is set; same as test_prime_code but passes the URL via
+    # extra_info "sandbox_fusion_url" so scoring runs remotely. Inputs: none. Outputs: none. Side effects: HTTP calls.
     """
     Test PRIME code on sandbox fusion. Skips if SANDBOX_FUSION_URL is not set.
     """
@@ -144,6 +160,13 @@ def test_prime_code_sandbox_fusion():
 
 @pytest.mark.skipif(not os.environ.get("SANDBOX_FUSION_URL"), reason="SANDBOX_FUSION_URL environment variable not set")
 def test_continuous_score_consistency():
+    # [FUNCTION DOC]
+    # Behavior: skipped unless SANDBOX_FUSION_URL is set; computes the continuous score of the second code sample via
+    # sandbox_fusion.compute_score (URL, no memory limit argument) and via prime_code.compute_score, asserts both are
+    # approximately 0.9 and equal to each other, and prints them.
+    # KNOWN ISSUE: variable names and comments are swapped - "prime_score" is computed by sandbox_fusion and
+    # "fusion_score" by prime_code; the assertions are symmetric so the test still behaves correctly.
+    # Inputs: none. Outputs: none. Side effects: HTTP calls, local code execution, prints.
     """
     Verify that continuous score calculation is consistent between prime_code and sandbox_fusion.
     Uses a test case where the first 9 out of 11 sub-cases pass (expected score 0.9).
@@ -172,6 +195,9 @@ def test_continuous_score_consistency():
 
 
 def test_check_correctness():
+    # [FUNCTION DOC]
+    # Behavior: runs apps_check_correctness on the first code sample against only its first input/output case with a
+    # 5 s timeout and prints the result and metadata. No assertions. Inputs: none. Outputs: none.
     from verl.utils.reward_score.prime_code import apps_check_correctness
 
     completion = prime_code_answers[0]
@@ -182,6 +208,9 @@ def test_check_correctness():
 
 
 def test_prime_math():
+    # [FUNCTION DOC]
+    # Behavior: scores each math answer with data source "numina_aops_forum" and asserts every score is 1.0
+    # (matrix bracket style, identical fraction, and symbolically equivalent polynomial). Inputs: none. Outputs: none.
     data_source = "numina_aops_forum"
     for completion, ground_truth in zip(prime_math_answers, prime_math_gts, strict=True):
         score = default_compute_score(data_source, completion, ground_truth)

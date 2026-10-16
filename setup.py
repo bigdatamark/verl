@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Fallback setuptools install script for verl (pyproject.toml is primary).
+# Reads the version string from verl/version/version, declares core
+# install_requires and optional extras (test, prime, geo, gpu, math, vllm,
+# sglang, trl, mcore, trtllm), uses README.md as the markdown long description,
+# discovers all packages from the repo root and ships version files plus trainer
+# and experimental YAML configs as package data.
+# Side effects: reads files relative to this script; invokes setuptools.setup.
+
 # setup.py is the fallback installation script when pyproject.toml does not work
 import os
 from pathlib import Path

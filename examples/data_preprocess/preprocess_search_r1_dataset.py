@@ -12,6 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script that downloads the Search-R1 train/test parquet files from a HuggingFace dataset repo
+# (default PeterJinGo/nq_hotpotqa_train), rewrites each row into verl's tool-calling RL format
+# for a "search" tool, and saves them to a local dir (default ~/data/searchR1_processed_direct),
+# optionally copying to HDFS. Logging is configured at INFO at import time. The globals
+# system_content, user_content_prefix and args are only defined in the __main__ block and are
+# read by the functions below, so the functions cannot be used when imported.
 
 import argparse
 import logging
@@ -43,6 +50,16 @@ DEFAULT_USER_CONTENT_PREFIX = (
 
 
 def process_single_row(row, current_split_name, row_index):
+    # [FUNCTION DOC]
+    # Builds one processed row. Prompt is a system message (system_content global) plus a user
+    # message of the prefix (trailing newlines stripped) followed by the question. Ground truth comes
+    # from reward_model.ground_truth when reward_model is a dict containing it, otherwise from
+    # golden_answers (default empty list). data_source is prefixed with "searchR1_". extra_info holds
+    # index, need_tools_kwargs=true, question, split and tools_kwargs.search.create_kwargs
+    # {ground_truth, question, data_source}.
+    # Inputs: row - pandas row; current_split_name; row_index.
+    # Outputs: a pandas Series with data_source, prompt, ability, reward_model (original), extra_info, metadata.
+    # Side effects: none (reads module globals).
     """
     Process a single row of data for SearchR1-like format.
 
@@ -99,6 +116,12 @@ def process_single_row(row, current_split_name, row_index):
 
 
 def main():
+    # [FUNCTION DOC]
+    # For each of train and test: downloads the parquet into a temporary dir, reads it, applies
+    # process_single_row per row, and writes <local_dir>/<split>.parquet. A missing file logs a warning;
+    # any other error is logged and that split is skipped. If nothing was produced it warns and returns.
+    # Otherwise optionally creates and copies to the HDFS dir, logging (not raising) copy errors.
+    # Inputs: none (uses global args). Outputs: none. Side effects: network downloads, file writes, logs.
     local_save_dir = os.path.expanduser(args.local_dir)
     os.makedirs(local_save_dir, exist_ok=True)
 
@@ -126,6 +149,9 @@ def main():
                 logger.info(f"Loaded {len(df_raw)} rows from {parquet_filename}")
 
                 def apply_process_row(row, split_name=split):
+                    # [FUNCTION DOC]
+                    # HELPER: Adapter for DataFrame row-wise apply: calls process_single_row with the split name
+                    # (bound by default arg to avoid late binding) and the row's index label.
                     return process_single_row(row, current_split_name=split_name, row_index=row.name)
 
                 df_processed = df_raw.apply(apply_process_row, axis=1)

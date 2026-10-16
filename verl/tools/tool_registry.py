@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Loading of agent tools: native BaseTool subclasses from a yaml config and decorator-registered function tools
+# from a Python file, merged with name-collision checks. Logger level from VERL_LOGGING_LEVEL (default WARN).
+
 from __future__ import annotations
 
 import importlib
@@ -34,11 +38,21 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class ToolType(Enum):
+    # [CLASS DOC]
+    # Enum of supported tool types; only NATIVE ("native") is currently supported (MCP was removed).
     # MCP tool is removed for now.
     NATIVE = "native"
 
 
 def get_tool_class(cls_name):
+    # [FUNCTION DOC]
+    # Behavior: splits a dotted "module.Class" path; imports the module via importlib spec (registering it in
+    # sys.modules) if not already loaded, else reuses it; returns the named attribute.
+    # Inputs: cls_name - fully-qualified class path. Outputs: the class object.
+    # Exceptions: ValueError if there is no dot; AttributeError if class missing; failure if module not found.
+    # Side effects: executes and registers module in sys.modules.
+    # KNOWN ISSUE: relies on importlib.util being imported elsewhere (only importlib is imported); and a missing module
+    # gives a None spec leading to an obscure AttributeError rather than ImportError. Parent packages are not imported first.
     module_name, class_name = cls_name.rsplit(".", 1)
     if module_name not in sys.modules:
         spec = importlib.util.find_spec(module_name)
@@ -53,6 +67,11 @@ def get_tool_class(cls_name):
 
 
 def initialize_tools_from_config(tools_config_file) -> list:
+    # [FUNCTION DOC]
+    # Behavior: loads the yaml with OmegaConf; for each entry under "tools", resolves class_name, parses config.type into
+    # ToolType, and for NATIVE builds the optional tool_schema (resolved container validated into OpenAIFunctionToolSchema)
+    # and instantiates the class with config (resolved plain dict) and tool_schema. Returns list of instances.
+    # Exceptions: ValueError for unknown type string; NotImplementedError for unsupported enum values; import errors.
     """Instantiate ``BaseTool`` subclasses declared in a yaml config."""
     tools_config = OmegaConf.load(tools_config_file)
     tool_list = []
@@ -84,6 +103,10 @@ def load_all_tools(
     tool_config_path: Optional[str],
     function_tool_path: Optional[str],
 ) -> list[BaseTool | FunctionTool]:
+    # [FUNCTION DOC]
+    # Behavior: loads native tools if tool_config_path given and function tools if function_tool_path given; when both
+    # exist, raises ValueError listing (sorted) function tool names colliding with native names. Returns native + function tools.
+    # Inputs: two optional paths. Outputs: combined list. Side effects: imports/executes tool code.
     """Load native + function tools, check for name collisions, return merged list."""
     native_tools: list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
     function_tools: list[FunctionTool] = load_function_tools_from_path(function_tool_path) if function_tool_path else []

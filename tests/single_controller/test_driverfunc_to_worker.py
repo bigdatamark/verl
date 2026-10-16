@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# GPU Ray test that a driver-side function executed on workers via execute_with_func_generator gives the same result
+# as calling it directly on the driver.
+# Side effects on import: sets RAY_DEDUP_LOGS=0 and NCCL_DEBUG=WARN.
+
 import os
 
 import ray
@@ -30,16 +35,28 @@ os.environ["NCCL_DEBUG"] = "WARN"
 
 @ray.remote
 class ModelActor(Worker):
+    # [CLASS DOC]
+    # HELPER: Empty Ray worker used to execute driver-provided functions.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Does nothing; intentionally skips the base Worker initializer.
         pass
 
 
 class HackSelf:
+    # [CLASS DOC]
+    # HELPER: Dummy stand-in for a worker "self" when calling get_aux_metrics on the driver.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Does nothing.
         pass
 
 
 def get_aux_metrics(self, test_proto):
+    # [FUNCTION DOC]
+    # HELPER: Worker-style function computing per-sequence decode counts.
+    # Inputs: self - unused worker (or stand-in); test_proto - DataProto with "sequence_ids" (batch x len).
+    # Outputs: new DataProto with "sequence_ids" and "decode_count" (per row, the full row length).
     sequence_ids = test_proto.batch["sequence_ids"]
     decode_count = []
     for i in range(sequence_ids.size(0)):
@@ -54,6 +71,10 @@ def get_aux_metrics(self, test_proto):
 
 def test():
     # construct model
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, creates 2 GPU workers, builds an 8 x 2048 ones DataProto with meta query_length, runs
+    # get_aux_metrics sharded on the workers and locally, and asserts decode_count matches.
+    # Side effects: starts/stops Ray.
     ray.init()
 
     # create 2 workers, each hold a GPU

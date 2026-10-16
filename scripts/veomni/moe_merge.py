@@ -1,5 +1,10 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 
+# [MODULE DOC]
+# VeOmni utility script: converts an HF MoE checkpoint with per-expert weights
+# into one stacked tensor per (layer, projection), saving with config and
+# tokenizer via veomni save_model_weights. CLI: --raw_hf_path, --merge_hf_path.
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -44,9 +49,17 @@ from veomni.models import build_tokenizer, save_model_weights
 
 @dataclass
 class StateDictIterator:
+    # [CLASS DOC]
+    # HELPER: lazily iterates the (name, tensor) pairs of one checkpoint shard.
+    # Field filepath - path to a .safetensors file or a torch-serialized state dict.
     filepath: str
 
     def __iter__(self) -> Generator[tuple[str, "torch.Tensor"], None, None]:
+        # [FUNCTION DOC]
+        # HELPER: yields (key, tensor) for every entry, all on CPU. For .safetensors,
+        # opens with safe_open and loads tensors one at a time; otherwise loads the
+        # file with torch.load (CPU, weights_only, memory-mapped) and yields its items.
+        # Exceptions: I/O or deserialization errors from the underlying loaders.
         if self.filepath.endswith(".safetensors"):
             with safe_open(self.filepath, framework="pt", device="cpu") as f:
                 for key in f.keys():
@@ -59,6 +72,19 @@ class StateDictIterator:
 
 
 def main(raw_hf_path, merge_hf_path):
+    # [FUNCTION DOC]
+    # Behavior: sets default dtype to bfloat16, creates output dir, loads config and
+    # tokenizer, loads all sorted safetensors shards into one CPU mapping and prints
+    # its keys. Expert count comes from config.num_experts (Qwen3-MoE) else
+    # config.n_routed_experts (DeepSeek). MoE layers start at
+    # config.first_k_dense_replace if present, else 0. For each MoE layer and each of
+    # gate_proj, up_proj, down_proj, pops every per-expert
+    # "model.layers.{i}.mlp.experts.{j}.{proj}.weight" in expert order and stores
+    # their stack (new leading expert dim) under "model.layers.{i}.mlp.experts.{proj}".
+    # Inputs: raw_hf_path - input dir; merge_hf_path - output dir. Outputs: none.
+    # Exceptions: RuntimeError if expert count cannot be determined; KeyError if an
+    # expected per-expert weight is missing.
+    # Side effects: global dtype change, dir creation, file writes, stdout prints.
     torch.set_default_dtype(torch.bfloat16)
     os.makedirs(merge_hf_path, exist_ok=True)
 

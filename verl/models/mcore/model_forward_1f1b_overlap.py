@@ -14,6 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Forward support for Megatron's combined 1F1B (forward/backward overlap) schedule: builds a model-chunk schedule plan
+# for packed sequences and patches the post-process stage so the last stage directly returns fused-kernel log-probs.
+
 from typing import Callable, Optional
 
 import torch
@@ -42,6 +46,17 @@ def gptmodel_forward_1f1b_overlap(
     logits_processor_args: Optional[dict] = None,
     temperature: float = 1.0,
 ) -> TransformerModelChunkSchedulePlan:
+    # [FUNCTION DOC]
+    # Behavior: packs input_ids by attention_mask (THD), asks the model to build a TransformerModelChunkSchedulePlan with
+    # packed ids, the padded attention mask, labels, position ids and packed_seq_params. On the last pipeline stage, binds
+    # a replacement _postprocess method onto the unwrapped model and a replacement forward_impl onto the plan's
+    # post-process node.
+    # Inputs: model - GPTModel (possibly wrapped); input_ids, position_ids, attention_mask - padded [batch, seq]; labels,
+    # labels_mask - padded label ids and mask (required on the last stage); multi_modal_inputs - unused;
+    # logits_processor - must be None; logits_processor_args - unused in practice; temperature - for log-prob computation.
+    # Outputs: the schedule plan.
+    # Exceptions: AssertionError if a logits_processor is supplied.
+    # Side effects: monkey-patches the model instance and the plan's post-process node.
     pre_process: bool = unwrap_model(model).pre_process
     post_process: bool = unwrap_model(model).post_process
     assert logits_processor is None, "only support fused kernel"
@@ -79,6 +94,23 @@ def gptmodel_forward_1f1b_overlap(
             extra_block_kwargs=None,
             inference_context=None,
         ):
+            # [FUNCTION DOC]
+            # HELPER: Replacement for GPTModel._postprocess (adapted from Megatron core r0.14).
+            # Behavior: optionally runs the MTP block on hidden states; returns hidden states if not the last stage. With MTP
+            # enabled, splits hidden states into main + MTP chunks, computes for each MTP layer the logits, rolls labels and loss
+            # mask left by one (CP-aware), computes masked LM loss, logs it in training, and attaches the scaled loss to the main
+            # hidden states via MTPLossAutoScaler (per-token or normalized by token count). Then, in the default fused path, packs
+            # labels and labels_mask, gathers sequence-parallel hidden states, computes per-token log-probs and entropy with the
+            # fused linear cross-entropy kernel against the output layer weight (at the given temperature, TP group), and unpacks
+            # to padded form. A logits_processor branch (compute logits, pack args, call processor, unpack) exists but is
+            # unreachable because of the outer assertion.
+            # Inputs: Megatron postprocess arguments (hidden states, ids, positions, labels, rotary embeddings, loss mask,
+            # packed params, etc.); closure values batch_size, seq_len, attention mask, labels_mask, temperature.
+            # Outputs: a 1-tuple containing the padded log_probs tensor (entropy is computed but dropped).
+            # Exceptions: AssertionError in inference mode without runtime_gather_output.
+            # KNOWN ISSUE: the unreachable logits_processor branch returns per-key outputs, but the final indexing of "log_probs"
+            # assumes the fused output structure; enabling it would likely break.
+            # Side effects: MTP loss logging to Megatron trackers.
             """patched from https://github.com/NVIDIA/Megatron-LM/blob/core_r0.14.0/megatron/core/models/gpt/gpt_model.py#L412"""
             """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -217,6 +249,13 @@ def gptmodel_forward_1f1b_overlap(
             return output_
 
         def _custom_post_process_node_forward_impl(self, hidden_states):
+            # [FUNCTION DOC]
+            # HELPER: Replacement forward_impl for the schedule plan's post-process node: applies the decoder final layernorm
+            # (when present and MTP is not handled in postprocess), converts the result into a viewless tensor for safe
+            # deallocation, then calls the model's (patched) _postprocess with values from the node's chunk_state and MTP
+            # disabled in postprocess.
+            # Inputs: self - the post-process node; hidden_states.
+            # Outputs: whatever _postprocess returns (tuple of log_probs).
             if self.gpt_model.decoder.final_layernorm and not self.gpt_model.mtp_process:
                 hidden_states = self.gpt_model.decoder.final_layernorm(hidden_states)
                 # TENorm produces a "viewed" tensor. This will result in schedule.py's

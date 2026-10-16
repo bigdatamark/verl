@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# FSDP (v1) and FSDP2 (fully_shard) utilities: model init contexts, auto-wrap policies, CPU<->GPU offloading of params and optimizer states, parallel safetensors loading, full/sharded state-dict save/load, gradient clipping for DTensor params, LoRA parameter collection / merge / unmerge for syncing weights to rollout engines, and runtime reshard control. FSDP2 symbols are imported from version-dependent locations (torch >= 2.6 vs >= 2.4) and are None on older torch; fully_shard_module refers to the module that defines FSDPModule (patched by maybe_patch_fsdp_module).
+
 import functools
 import itertools
 import json
@@ -55,6 +58,9 @@ else:
 
 
 def init_fn(x: torch.nn.Module):
+    # [FUNCTION DOC]
+    # HELPER: param_init_fn for FSDP1 sync_module_states: on non-zero ranks materializes the module's own (non-recursive) meta tensors as empty storage on the current device and empties the cache; rank 0 returns the module unchanged.
+    # Inputs: x - module. Outputs: the module.
     if torch.distributed.get_rank() != 0:
         x = x.to_empty(device=get_device_id(), recurse=False)
         get_torch_device().empty_cache()
@@ -62,6 +68,10 @@ def init_fn(x: torch.nn.Module):
 
 
 def get_init_weight_context_manager(use_meta_tensor=True, mesh: DeviceMesh = None):
+    # [FUNCTION DOC]
+    # Behavior: returns a zero-arg context factory for model construction. With use_meta_tensor, ranks other than rank 0 (or, given a mesh, ranks whose last mesh coordinate is non-zero) use accelerate init_empty_weights (meta device), while the source rank uses a CPU device context; without meta tensors everyone uses the CPU device context.
+    # Inputs: use_meta_tensor; mesh - optional DeviceMesh.
+    # Outputs: callable returning a context manager.
     from accelerate import init_empty_weights
 
     cpu_init_weights = lambda: torch.device("cpu")
@@ -78,6 +88,11 @@ def get_init_weight_context_manager(use_meta_tensor=True, mesh: DeviceMesh = Non
 # Copyright 2020-present the HuggingFace Inc. team.
 # Adapted from https://github.com/huggingface/transformers/src/transformers/trainer.py
 def get_fsdp_wrap_policy(module, config=None, is_lora=False):
+    # [FUNCTION DOC]
+    # Behavior: builds an FSDP1 auto_wrap_policy. Returns None if config.disable. Reads transformer_layer_cls_to_wrap (default module._no_split_modules) and min_num_params (default 0). Policies: for LoRA with min_num_params 0, a lambda policy wrapping leaf modules with trainable weight; if min_num_params > 0, a size-based policy; else a transformer-layer policy over class names resolved in the module (unresolvable names skipped with a warning). Combines policies with OR.
+    # Inputs: module; config - dict-like or dataclass (or None); is_lora.
+    # Outputs: policy callable or None.
+    # Exceptions: generic Exception if none of the class names resolve.
     """Get FSDP wrap policy for the module.
 
     Args:
@@ -91,6 +106,8 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
     # NOTE: This is a temporary workaround to be compatible with the OmegaConf & dataclass. We will remove this
     # once we have make all config in verl from OmegaConf to data class.
     def _get_attr(attr_name, default_value=None):
+        # [FUNCTION DOC]
+        # HELPER: Reads an attribute from config using get(name, default) if available, else plain attribute access (default ignored; raises AttributeError if missing).
         if hasattr(config, "get"):
             return config.get(attr_name, default_value)
         else:
@@ -115,6 +132,8 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
     if is_lora and min_num_params == 0:
 
         def lambda_policy_fn(module):
+            # [FUNCTION DOC]
+            # HELPER: True for leaf modules (no children) that have a weight requiring grad.
             return bool(
                 len(list(module.named_children())) == 0
                 and getattr(module, "weight", None) is not None
@@ -167,6 +186,11 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
 
 @torch.no_grad()
 def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
+    # [FUNCTION DOC]
+    # Behavior: for FSDP2 / non-FSDP modules delegates to offload_fsdp2_model_to_cpu. For FSDP1: lazily initializes the root, and for each flat-param handle not already CPU-offloaded asserts the flat param data aliases its local shard, moves it to CPU non-blocking, and repoints _local_shard to the new data. Optionally empties the device cache.
+    # Inputs: model; empty_cache.
+    # Exceptions: AssertionError if not root or internal invariants fail.
+    # Side effects: moves parameters; runs under no_grad.
     if fsdp_version(model) == 2 or fsdp_version(model) == 0:
         offload_fsdp2_model_to_cpu(model, empty_cache)
         return
@@ -206,6 +230,8 @@ def offload_fsdp2_model_to_cpu(model, empty_cache: bool = True):
     # host must synchronize first, and a caller that reloads them on another
     # stream must establish an explicit stream dependency. empty_cache() below
     # is not a synchronization point.
+    # [FUNCTION DOC]
+    # Moves the whole module to CPU non-blocking (pinned host memory) and optionally empties the device cache. Callers must synchronize before host reads (see comments).
     model.to("cpu", non_blocking=True)
     if empty_cache:
         get_torch_device().empty_cache()
@@ -213,6 +239,9 @@ def offload_fsdp2_model_to_cpu(model, empty_cache: bool = True):
 
 @torch.no_grad()
 def load_fsdp_model_to_gpu(model: FSDP):
+    # [FUNCTION DOC]
+    # Behavior: FSDP2 / non-FSDP delegates to load_fsdp2_model_to_gpu. FSDP1: lazy-inits the root and moves each non-offloaded handle's flat param to the current device non-blocking, repointing _local_shard.
+    # Exceptions: AssertionError if not FSDP or not root.
     if fsdp_version(model) == 2 or fsdp_version(model) == 0:
         load_fsdp2_model_to_gpu(model)
         return
@@ -233,12 +262,16 @@ def load_fsdp_model_to_gpu(model: FSDP):
 
 @torch.no_grad()
 def load_fsdp2_model_to_gpu(model):
+    # [FUNCTION DOC]
+    # Moves the module to the current device id non-blocking.
     device = get_device_id()
     model.to(device, non_blocking=True)
 
 
 @torch.no_grad()
 def offload_fsdp_optimizer(optimizer):
+    # [FUNCTION DOC]
+    # Moves every tensor in the optimizer per-parameter state to CPU non-blocking; no-op if the state is empty.
     if not optimizer.state:
         return
     for param_group in optimizer.param_groups:
@@ -251,6 +284,8 @@ def offload_fsdp_optimizer(optimizer):
 
 @torch.no_grad()
 def load_fsdp_optimizer(optimizer, device_id):
+    # [FUNCTION DOC]
+    # Moves every tensor in the optimizer per-parameter state to device_id non-blocking; no-op if the state is empty.
     if not optimizer.state:
         return
     for param_group in optimizer.param_groups:
@@ -263,6 +298,9 @@ def load_fsdp_optimizer(optimizer, device_id):
 
 @contextmanager
 def meta_device_init():
+    # [FUNCTION DOC]
+    # Behavior: context manager that temporarily monkey-patches nn.Module.register_parameter so every newly registered (non-shared, not seen before) parameter is re-created on the meta device with the same class, attributes and requires_grad. Buffers are untouched. Restores the original method on exit.
+    # Side effects: global patch of nn.Module during the context.
     """
     Create model parameters with meta device.
 
@@ -275,6 +313,8 @@ def meta_device_init():
     registered = set()
 
     def register_empty_parameter(module, name, param):
+        # [FUNCTION DOC]
+        # HELPER: Replacement register_parameter: calls the original, then converts the parameter to meta (once per parameter object) and tracks it.
         old_register_parameter(module, name, param)
         # we will skip register shared parameters as it
         # is already registered previously
@@ -294,6 +334,12 @@ def meta_device_init():
 
 
 def parallel_load_safetensors(filepath):
+    # [FUNCTION DOC]
+    # Behavior: builds a map file -> parameter names from model.safetensors.index.json (or the single model.safetensors). Sorts files and splits them into contiguous chunks of ceil(files/world_size) per rank. The current rank loads its files directly onto its device; for parameters in other ranks' files it records the owning rank integer.
+    # Inputs: filepath - HF checkpoint dir.
+    # Outputs: dict name -> tensor (local) or int (owner rank).
+    # Exceptions: AssertionError if no index and no model.safetensors.
+    # Side effects: file I/O, GPU allocation (single-file case reads the file fully once to list names).
     """
     Parallel load safetensors from huggingface checkpoint
 
@@ -350,6 +396,10 @@ def parallel_load_safetensors(filepath):
 
 
 def parallel_init_module_fn(module: torch.nn.Module, shard_states: dict[str, torch.nn.Parameter]):
+    # [FUNCTION DOC]
+    # Behavior: builds a mapping from each parameter/buffer object to all its FQNs (shared tensors have several) and returns an init function that materializes meta-device states from shard_states produced by parallel_load_safetensors, broadcasting each from its owning rank.
+    # Inputs: module; shard_states - consumed (entries popped) as states are materialized.
+    # Outputs: init function suitable as FSDP param_init_fn.
     """
     Generate a function to initialize sub-modules in the `module` with `shard_states`
     from huggingface checkpoint.
@@ -373,6 +423,10 @@ def parallel_init_module_fn(module: torch.nn.Module, shard_states: dict[str, tor
 
     @torch.no_grad()
     def create_and_sync_state(param_name, state, is_param):
+        # [FUNCTION DOC]
+        # HELPER: Allocates an empty parameter (preserving requires_grad) or buffer on the device; if this rank holds the loaded tensor copies it in and broadcasts from itself, otherwise receives a broadcast from the recorded owner rank. Pops the entry from shard_states.
+        # Exceptions: AssertionError if the name was not loaded.
+        # Side effects: collective broadcast (all ranks must call in the same order).
         assert param_name in shard_states, f"{param_name} not loaded"
         device = get_device_id()
         if is_param:
@@ -392,6 +446,9 @@ def parallel_init_module_fn(module: torch.nn.Module, shard_states: dict[str, tor
         return param
 
     def init_fn(sub_mod: torch.nn.Module, recurse: bool = True):
+        # [FUNCTION DOC]
+        # HELPER: For each meta param/buffer directly owned by sub_mod, takes the next FQN for that state; skips non-persistent buffers absent from the checkpoint (raising RuntimeError if they are meta); shared states are materialized once and reused (dropping duplicate shard entries); assigns the materialized tensor into the module. Recurses into children when recurse.
+        # Outputs: sub_mod.
         param_and_buffers = tuple(sub_mod.named_parameters(recurse=False)) + tuple(sub_mod.named_buffers(recurse=False))
         # param_and_buffers = sorted(sub_mod.named_parameters(recurse=False), key=lambda x: x[0])
         for name, state in param_and_buffers:
@@ -434,6 +491,8 @@ def parallel_init_module_fn(module: torch.nn.Module, shard_states: dict[str, tor
 
 
 def fsdp_version(model):
+    # [FUNCTION DOC]
+    # Returns 1 for FSDP1-wrapped modules, 2 for FSDP2 FSDPModule instances, else 0.
     if isinstance(model, FSDP):
         return 1
     elif isinstance(model, FSDPModule):
@@ -443,6 +502,8 @@ def fsdp_version(model):
 
 
 def get_fsdp_state_ctx(model, state_type, state_cfg, optim_cfg):
+    # [FUNCTION DOC]
+    # Returns FSDP.state_dict_type context for FSDP1 models, else a null context.
     if fsdp_version(model) == 1:
         return FSDP.state_dict_type(model, state_type, state_cfg, optim_cfg)
     else:
@@ -450,6 +511,10 @@ def get_fsdp_state_ctx(model, state_type, state_cfg, optim_cfg):
 
 
 def get_fsdp_full_state_dict(model: torch.nn.Module, offload_to_cpu: bool = True, rank0_only: bool = True):
+    # [FUNCTION DOC]
+    # Behavior: FSDP1 uses FULL_STATE_DICT with FullStateDictConfig(offload_to_cpu, rank0_only); FSDP2/non-FSDP uses torch.distributed.checkpoint get_model_state_dict with full_state_dict, cpu_offload, and broadcast_from_rank0 = not rank0_only.
+    # Outputs: full state dict.
+    # Note: the final NotImplementedError branch is unreachable (fsdp_version only returns 0/1/2) and its message formats the function object.
     """
     Get the full state dict from an FSDP model.
 
@@ -486,6 +551,11 @@ def get_fsdp_full_state_dict(model: torch.nn.Module, offload_to_cpu: bool = True
 
 
 def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_mesh=None, cpu_offload=None):
+    # [FUNCTION DOC]
+    # Behavior: moves the model to the device on rank 0 and allocates empty device storage elsewhere, then loads full_state with set_model_state_dict (full state, broadcast from rank 0; uses a vendored copy for torch < 2.7 to avoid OOM). Then broadcasts every buffer from rank 0 in name-sorted order (buffers like rotary embeddings are not in the state dict). If cpu_offload, moves the model to CPU but keeps buffers on device.
+    # Inputs: model; full_state (meaningful on rank 0); device_mesh (unused); cpu_offload - treated as enabled whenever not None.
+    # KNOWN ISSUE: passing cpu_offload=False is treated as enabling offload because only None disables it.
+    # Side effects: collectives; in-place model mutation.
     """
     Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
     parameters from rank 0 to all other ranks. This function modifies the model in-place.
@@ -529,6 +599,8 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_
 
 @contextmanager
 def maybe_patch_fsdp_module(model):
+    # [FUNCTION DOC]
+    # Behavior: context manager. If FSDP2 is available and the model is an instance of ABC, temporarily replaces FSDPModule in the fully_shard module with a subclass that also inherits ABC, so fully_shard's dynamic class creation does not hit a metaclass conflict; always restores the original afterwards. No-op if FSDP2 unavailable.
     if fully_shard_module is None:
         yield
         return
@@ -536,6 +608,8 @@ def maybe_patch_fsdp_module(model):
     orig_fsdp_module = fully_shard_module.FSDPModule
 
     class FSDPModuleABC(ABC, orig_fsdp_module):
+        # [CLASS DOC]
+        # HELPER: Empty class combining ABC with the original FSDPModule.
         pass
 
     try:
@@ -547,6 +621,8 @@ def maybe_patch_fsdp_module(model):
 
 
 def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
+    # [FUNCTION DOC]
+    # HELPER: Returns modules to individually fully_shard: those whose class name is in the wrap list, plus (unless tie_word_embeddings) any nn.Embedding and any module whose leaf name is embed_tokens or lm_head and has a weight. Order follows named_modules.
     """Select modules to wrap individually with fully_shard in FSDP2.
 
     Matches transformer layers by class name, and embed_tokens/lm_head by name
@@ -571,6 +647,11 @@ def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
 
 
 def apply_fsdp2(model, fsdp_kwargs, config):
+    # [FUNCTION DOC]
+    # Behavior: resolves the layer class names to wrap (config.wrap_policy.transformer_layer_cls_to_wrap or model._no_split_modules; string/set normalized to list), fully_shards each selected submodule then the root with fsdp_kwargs (each under maybe_patch_fsdp_module). If config.forward_prefetch, sets each wrapped module to prefetch the next one (depth 1) when the API exists.
+    # Inputs: model; fsdp_kwargs - fully_shard kwargs; config - dict-like FSDP config.
+    # Exceptions: AssertionError if FSDP2 unavailable or no wrap classes.
+    # Side effects: shards the model in place.
     """model: AutoModelForCausalLM"""
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
 
@@ -614,9 +695,13 @@ def apply_fsdp2(model, fsdp_kwargs, config):
 
 
 def get_shard_placement_fn(fsdp_size):
+    # [FUNCTION DOC]
+    # Returns a placement function for fully_shard choosing Shard on the first dimension divisible by fsdp_size (avoiding padding), defaulting to Shard(0).
     """Choose the dimension that can divide fsdp_size to avoid padding"""
 
     def shard_placement_fn(param):
+        # [FUNCTION DOC]
+        # HELPER: Picks the first evenly divisible dim of param.shape, else dim 0.
         shape = list(param.shape)
         for i in range(len(shape)):
             if shape[i] % fsdp_size == 0:
@@ -627,6 +712,10 @@ def get_shard_placement_fn(fsdp_size):
 
 
 def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinite=False, foreach=None):
+    # [FUNCTION DOC]
+    # Behavior: materializes parameters into a list, computes the total grad norm with torch internal helper, moves it to the current device, then clips grads in place by max_norm.
+    # Inputs: parameters; max_norm; norm_type; error_if_nonfinite; foreach.
+    # Outputs: total norm tensor (on device).
     """torch.nn.utils.clip_grad_norm_ cann't run on cpu parameter DTensor"""
     from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
 
@@ -643,6 +732,10 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
 
 
 def layered_summon_lora_params(fsdp_module) -> OrderedDict:
+    # [FUNCTION DOC]
+    # Behavior: iterates FSDP units (skipping root, non-FSDP modules and units whose cleaned name ends with ".model" or ".layers"). For each unit with LoRA params not belonging to nested FSDP children: for FSDP1 marks it root temporarily and uses summon_full_params (no writeback); for FSDP2 no context. Extracts the PEFT LoRA state dict restricted to the unit's own params, prefixes keys with the cleaned unit name, gathers DTensors via full_tensor, moves to CPU, and merges into the result. Empties the cache after each unit.
+    # Outputs: OrderedDict name -> CPU tensor.
+    # KNOWN ISSUE: when a unit yields an empty LoRA dict the loop continues before resetting _is_root to False for FSDP1 units.
     """Collect LoRA params one FSDP unit at a time to keep peak GPU memory low.
 
     Iterates every FSDP unit (parent before child via named_modules order) and
@@ -713,6 +806,12 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
 
 
 def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool) -> OrderedDict:
+    # [FUNCTION DOC]
+    # Behavior: for FSDP modules: with layered_summon (requires base_sync_done) uses the layered collector, falling back to a full gather of the PEFT state dict if empty; otherwise under FSDP.summon_full_params returns either PEFT LoRA weights (base_sync_done) or the full base model weights with LoRA tensors excluded and names cleaned of FSDP wrappers and ".base_layer" (moving the model to CPU temporarily). Non-FSDP modules follow the same two branches without summoning.
+    # Inputs: module; layered_summon; base_sync_done - whether the rollout engine already has base weights.
+    # Outputs: OrderedDict of CPU tensors (PEFT LoRA state dict tensors may stay on device in the non-FSDP base_sync_done branch).
+    # Exceptions: ValueError when layered_summon without base_sync_done.
+    # Note: the non-layered FSDP branch uses the FSDP1 summon_full_params API even for FSDP2 modules, where it does not gather anything; full_tensor handles DTensors.
     """
     collect lora params or full params if base model is not ready in vllm
     work with if isinstance(self.module._fsdp_wrapped_module, PeftModel)
@@ -790,6 +889,10 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
 
 
 def replace_lora_wrapper(k, peft_config):
+    # [FUNCTION DOC]
+    # Behavior: for keys ending in .weight or .bias, returns key unchanged if the module is excluded by peft_config; if the module name ends with a standard projection name or is a PEFT target, inserts ".base_layer" before the suffix; otherwise unchanged.
+    # Inputs: k - parameter key; peft_config.
+    # Outputs: transformed key.
     """Replace LoRA parameter keys with base layer equivalents.
 
     Transforms LoRA parameter names to their corresponding base layer
@@ -818,6 +921,10 @@ def replace_lora_wrapper(k, peft_config):
 
 
 def set_reshard_after_forward(module: FSDPModule, reshard_after_forward: bool, recurse: bool = True) -> None:
+    # [FUNCTION DOC]
+    # Behavior: for the module (and all submodules if recurse) that are FSDPModule, disables auto reshard decision and sets the param group's post-forward mesh info according to reshard_after_forward.
+    # Exceptions: ValueError if reshard_after_forward is not a bool.
+    # Side effects: mutates FSDP internal state.
     """
     Sets if the module should reshard parameters after forward. This can be
     used to change the ``reshard_after_forward`` FSDP arg at runtime. For
@@ -852,6 +959,10 @@ def set_reshard_after_forward(module: FSDPModule, reshard_after_forward: bool, r
 
 
 def normalize_peft_param_name(params: dict) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: strips "base_model.model." / "base_model." prefixes and ".base_layer" from names and drops LoRA/adapter keys.
+    # Inputs: params - dict name -> tensor.
+    # Outputs: new dict with base-model names.
     """
     Converts peft model parameter name to base parameter name
     For example,
@@ -862,10 +973,14 @@ def normalize_peft_param_name(params: dict) -> dict:
     """
 
     def _normalize_peft_name(name: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Removes PEFT prefixes and ".base_layer" from a name.
         return name.replace("base_model.model.", "").replace("base_model.", "").replace(".base_layer", "")
 
     def _is_lora_key(name: str) -> bool:
         # catch typical PEFT keys
+        # [FUNCTION DOC]
+        # HELPER: True if the name contains "lora_" or ".adapter_".
         return ("lora_" in name) or (".adapter_" in name)
 
     params = [(_normalize_peft_name(k), v) for k, v in params.items()]
@@ -875,6 +990,8 @@ def normalize_peft_param_name(params: dict) -> dict:
 
 
 def _merge_or_unmerge_lora_(module, merge: bool):
+    # [FUNCTION DOC]
+    # HELPER: For each LoraLayer in module, merges if merge requested and not merged, or unmerges if requested and merged (no_grad).
     """Merge or unmerge LoRA adapters in a module.
 
     Args:
@@ -895,6 +1012,8 @@ def _merge_or_unmerge_lora_(module, merge: bool):
 
 # merged_adapters
 def _clean_merged_lora_(module):
+    # [FUNCTION DOC]
+    # HELPER: Resets merged_adapters to an empty list on every LoraLayer that has merged adapters (marking them unmerged without changing weights).
     """Cleans the merged lora adapters"""
     from peft.tuners.lora import LoraLayer
 
@@ -907,6 +1026,10 @@ def _clean_merged_lora_(module):
 
 
 def fsdp_merge_unmerge(module: nn.Module, do_merge: bool):
+    # [FUNCTION DOC]
+    # Behavior: FSDP1: summon full params with writeback and merge/unmerge the whole module. FSDP2: for each non-root FSDPModule submodule, merge/unmerge within FSDP.summon_full_params.
+    # Exceptions: AssertionError if module is not FSDP1/2.
+    # KNOWN ISSUE: the FSDP2 branch uses the FSDP1 summon_full_params context, which does not unshard FSDP2 modules; merging then operates on DTensor shards directly rather than gathering layer-by-layer as the docstring claims.
     """Merge or unmerge LoRA adapters in FSDP module.
 
     For FSDP (v1), it gathers all model parameters to each device, which may cause OOM.
@@ -932,6 +1055,10 @@ def fsdp_merge_unmerge(module: nn.Module, do_merge: bool):
 
 
 def collect_merged_lora_params(module: nn.Module) -> OrderedDict:
+    # [FUNCTION DOC]
+    # Behavior: FSDP1: under full summon with writeback, clones base weights of LoRA layers, merges LoRA, collects base-model state dict (excluding flat/LoRA keys, cleaning names) to CPU, then restores cloned weights and clears merged flags. FSDP2: backs up all base weights to CPU, merges, collects every non-LoRA named parameter (full_tensor gathered) under cleaned keys, restores the backup and clears merged flags.
+    # Outputs: OrderedDict HF name -> CPU tensor.
+    # Exceptions: AssertionError if not FSDP1/2.
     """Merge LoRA into base weights and extract full state dict with HF key names.
 
     For rollout backends (e.g. SGLang) whose load_weights() expects standard
@@ -961,6 +1088,8 @@ def collect_merged_lora_params(module: nn.Module) -> OrderedDict:
     from peft.tuners.lora import LoraLayer
 
     def _backup_base_weights(mod):
+        # [FUNCTION DOC]
+        # HELPER: Clones the base-layer weight of each LoraLayer, keyed by module name.
         """Clone base weights of LoRA target modules before merge."""
         backups = {}
         for mname, m in mod.named_modules():
@@ -970,6 +1099,8 @@ def collect_merged_lora_params(module: nn.Module) -> OrderedDict:
         return backups
 
     def _restore_base_weights(mod, backups):
+        # [FUNCTION DOC]
+        # HELPER: Copies backed-up base weights back into LoraLayer base layers and clears merged flags.
         """Restore base weights from backup, avoiding merge/unmerge drift."""
         for mname, m in mod.named_modules():
             if isinstance(m, LoraLayer) and mname in backups:
@@ -978,6 +1109,8 @@ def collect_merged_lora_params(module: nn.Module) -> OrderedDict:
         _clean_merged_lora_(mod)
 
     def _clean_key(key):
+        # [FUNCTION DOC]
+        # HELPER: Removes FSDP wrapper, "base_model.model." and ".base_layer" segments from a key.
         key = key.replace("_fsdp_wrapped_module.", "")
         key = key.replace("base_model.model.", "")
         key = key.replace(".base_layer", "")
@@ -1020,6 +1153,9 @@ def collect_merged_lora_params(module: nn.Module) -> OrderedDict:
 
 
 def backup_base_model_weights(module):
+    # [FUNCTION DOC]
+    # Behavior: for PeftModel, with adapters disabled, clones every parameter whose name does not contain "lora" to CPU; for other models clones all parameters.
+    # Outputs: dict name -> CPU tensor.
     """Backup base model weights to CPU with LoRA temporarily disabled.
 
     This function temporarily disables LoRA adapters, backs up the clean base model weights
@@ -1051,6 +1187,8 @@ def backup_base_model_weights(module):
 
 
 def restore_base_model_weights(module, backup):
+    # [FUNCTION DOC]
+    # Copies each backed-up tensor into the matching named parameter on its device (no_grad).
     """Restore base model weights from CPU backup.
 
     This function restores the base model weights from the CPU backup, effectively
@@ -1068,6 +1206,9 @@ def restore_base_model_weights(module, backup):
 
 @contextmanager
 def merged_lora_context(actor, backup_adapters=False):
+    # [FUNCTION DOC]
+    # Behavior: context manager. Optionally backs up base weights, merges LoRA, yields; on exit restores from backup and clears merged flags if backed up, else unmerges.
+    # Inputs: actor - FSDP PEFT module; backup_adapters.
     """Context manager to temporarily merge LoRA adapters.
 
     This context manager merges LoRA adapters into the base model weights,
@@ -1103,6 +1244,8 @@ def merged_lora_context(actor, backup_adapters=False):
 
 
 def fsdp1_sharded_save_to_cpu(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Returns a dict of each named parameter's local data copied to CPU.
     """
     Sharded Save for FSDP1: each rank copies its own local parameter shards to CPU memory.
 
@@ -1123,6 +1266,9 @@ def fsdp1_sharded_save_to_cpu(model: torch.nn.Module) -> dict[str, torch.Tensor]
 
 
 def fsdp1_sharded_load_from_cpu(model: torch.nn.Module, cpu_sharded_state: dict[str, torch.Tensor]) -> None:
+    # [FUNCTION DOC]
+    # Copies saved CPU shards back into matching parameters on their device (skipping missing names), then barriers.
+    # Side effects: collective barrier.
     """
     Sharded Load for FSDP1: each rank copies its own CPU shards back into the live parameters.
 
@@ -1146,6 +1292,10 @@ def fsdp1_sharded_load_from_cpu(model: torch.nn.Module, cpu_sharded_state: dict[
 def fsdp2_sharded_save_to_cpu(
     model: torch.nn.Module,
 ) -> tuple[dict[str, tuple[torch.Tensor, DTensorSpec]], DTensorSpec]:
+    # [FUNCTION DOC]
+    # Behavior: for each parameter, saves (local shard on CPU, its DTensorSpec) for DTensors or (CPU tensor, None) for regular params; records the first DTensor spec as the global spec.
+    # Outputs: (state dict, global_spec).
+    # Exceptions: AssertionError if no DTensor param exists or spec lacks mesh/placements.
     """
     Sharded Save: Each process only saves the local DTensor shard from its own GPU to CPU memory.
 
@@ -1190,6 +1340,10 @@ def fsdp2_sharded_load_from_cpu(
     cpu_sharded_state: dict[str, tuple[torch.Tensor, Optional[DTensorSpec]]],
     target_spec: DTensorSpec,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: asserts the model's first DTensor mesh equals target_spec's mesh; for each saved param, DTensors require matching placements and get their local tensor overwritten; regular params copy data. Ends with a barrier.
+    # Exceptions: AssertionError on mesh/spec mismatch or missing spec.
+    # Side effects: in-place parameter writes; collective barrier.
     """
     Sharded Load: Each process only loads the CPU shard it is responsible for to the GPU,
                   keeping sharding rules unchanged.

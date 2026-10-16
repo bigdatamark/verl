@@ -1,4 +1,10 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
+# [MODULE DOC]
+# Platform registry and process-wide platform singleton. Provides name-to-class registration (decorator), environment
+# auto-detection, and get/set accessors. Module state: a module-level current-platform variable (initially unset) and a
+# logger whose level comes from VERL_LOGGING_LEVEL (default INFO). Built-in CUDA, NPU and ROCm platforms are imported at
+# the bottom of the module so their registration decorators run at import time.
+
 """Singleton platform manager with registry and auto-detection.
 
 The platform is resolved **once** on first call to :func:`get_platform` and
@@ -27,6 +33,9 @@ _current_platform: PlatformBase | None = None
 
 
 class PlatformRegistry:
+    # [CLASS DOC]
+    # Class-level registry (shared mapping from lowercase platform name to PlatformBase subclass); all methods are
+    # classmethods, no instances needed. Registration order determines auto-detection probe order.
     """Registry that maps platform names to concrete ``PlatformBase`` subclasses.
 
     Built-in platforms (``cuda``, ``npu``) are registered at import time.
@@ -41,6 +50,13 @@ class PlatformRegistry:
 
     @classmethod
     def register(cls, platform: str):
+        # [FUNCTION DOC]
+        # Behavior: returns a class decorator that registers the decorated class under the normalized (stripped, lowercased)
+        # name, logging an info message when overriding an existing entry, and returns the class unchanged.
+        # Inputs: platform - registration name.
+        # Outputs: decorator callable.
+        # Exceptions: decorator raises AssertionError if the class is not a PlatformBase subclass.
+        # Side effects: mutates the class-level registry.
         """Class decorator that registers a ``PlatformBase`` subclass.
 
         Usage::
@@ -55,6 +71,8 @@ class PlatformRegistry:
         """
 
         def decorator(platform_cls: type[PlatformBase]) -> type[PlatformBase]:
+            # [FUNCTION DOC]
+            # HELPER: the decorator returned by register; see register for behavior.
             assert issubclass(platform_cls, PlatformBase), f"{platform_cls.__name__} must be a subclass of PlatformBase"
             name = platform.strip().lower()
             if name in cls._platforms:
@@ -71,16 +89,25 @@ class PlatformRegistry:
 
     @classmethod
     def get(cls, name: str) -> type[PlatformBase] | None:
+        # [FUNCTION DOC]
+        # Inputs: name - platform name (normalized by strip+lowercase). Outputs: registered class or None.
         """Look up a registered platform class by name."""
         return cls._platforms.get(name.strip().lower())
 
     @classmethod
     def registered_names(cls) -> tuple[str, ...]:
+        # [FUNCTION DOC]
+        # Outputs: tuple of registered names in registration order.
         """Return a tuple of all registered platform names."""
         return tuple(cls._platforms.keys())
 
 
 def _detect_platform_name() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: if VERL_PLATFORM is set (non-empty after strip/lowercase) return it unchecked. Otherwise iterate over
+    # registered names, instantiate each class and return the first whose is_platform_available(use_smi_check=True) is True;
+    # exceptions during a probe are logged at debug and skipped. If none match, log a warning and return nvidia.
+    # Outputs: platform name string. Side effects: logging; instantiates platform classes.
     """Probe the environment and return the best platform name.
 
     Detection order:
@@ -118,6 +145,11 @@ def _detect_platform_name() -> str:
 
 
 def _create_platform(name: str) -> PlatformBase:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: look up class by name and instantiate it; if the instance reports not available, log a warning
+    # (may be a CPU-only Ray actor) but still return it.
+    # Inputs: name - platform name. Outputs: platform instance.
+    # Exceptions: ValueError if the name is not registered (e.g. a bad VERL_PLATFORM value).
     """Instantiate the concrete platform for *name*."""
     platform_cls = PlatformRegistry.get(name)
     if platform_cls is None:
@@ -138,6 +170,9 @@ def _create_platform(name: str) -> PlatformBase:
 
 
 def get_platform() -> PlatformBase:
+    # [FUNCTION DOC]
+    # Behavior: lazily detects and creates the platform singleton on first call, caches it in module state, returns it.
+    # Outputs: PlatformBase instance. Exceptions: propagates ValueError from creation. Side effects: sets module global.
     """Return the current platform singleton (auto-detected on first call)."""
     global _current_platform
     if _current_platform is None:
@@ -148,6 +183,9 @@ def get_platform() -> PlatformBase:
 
 
 def set_platform(platform: PlatformBase) -> None:
+    # [FUNCTION DOC]
+    # Behavior: replaces the module singleton with the given instance, warning if one was already set.
+    # Inputs: platform - PlatformBase instance. Side effects: mutates module global; logs.
     """Override the platform singleton with an already-instantiated platform.
 
     Must be called **before** any code calls :func:`get_platform`,

@@ -12,6 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Single-GPU test for verl's offload_megatron_optimizer / load_megatron_optimizer on a Megatron precision-aware
+# distributed Adam optimizer, checking all optimizer state moves to CPU and back to CUDA. Requires CUDA and
+# Megatron-Core.
 
 import torch
 import torch.distributed as dist
@@ -34,6 +38,10 @@ SEQUENCE_LENGTH = 64
 
 
 def init_model():
+    # [FUNCTION DOC]
+    # HELPER: Builds a 2-layer, hidden 512, 4-head bf16 GPTModel (local layer spec, vocab 128, max seq length
+    # SEQUENCE_LENGTH) on CUDA, wraps it in Megatron DDP with distributed optimizer, and returns a one-element list of
+    # model chunks. Side effects: GPU allocation; requires initialized parallel state.
     """Initialize a small GPT model for the test, wrapped in Megatron DDP."""
 
     transformer_config = TransformerConfig(
@@ -57,6 +65,9 @@ def init_model():
 
 
 def init_precision_aware_optimizer(model):
+    # [FUNCTION DOC]
+    # HELPER: Builds a Megatron Adam optimizer (lr/min_lr 1e-6, clip 1.0, no weight decay, distributed, bf16,
+    # precision-aware) for the given model chunks. Inputs: model - list of chunks. Outputs: the optimizer.
     """Initialize a precision-aware optimizer for the model."""
 
     optimizer_config = OptimizerConfig(
@@ -74,6 +85,13 @@ def init_precision_aware_optimizer(model):
 
 
 def precision_aware_optimizer_is_on_device(optimizer, device):
+    # [FUNCTION DOC]
+    # HELPER: Treats the optimizer as a list of sub-optimizers (chained or single). First asserts, for each,
+    # that every entry in shard_fp32_from_float16_groups is None and every per-parameter state has a non-None
+    # "master_param" (the layout verl's offload code assumes). Then returns False if any tensor value in any
+    # per-parameter state is not on device, else True.
+    # Inputs: optimizer; device - torch device to compare against. Outputs: bool.
+    # Exceptions: AssertionError if the layout assumption is violated.
     """Check that all optimizer state tracked by a given precision-aware
     optimizer is on the specified device."""
 
@@ -105,6 +123,13 @@ def precision_aware_optimizer_is_on_device(optimizer, device):
 
 
 def test_precision_aware_optimizer_offload_and_load(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: sets CUDA device 0, initializes a single-rank process group (gloo for CPU, NCCL for CUDA) via a file
+    # rendezvous in tmp_path, initializes Megatron model parallel and seeds with 123. Builds model and optimizer,
+    # zeroes grad buffers and grads (kept as zeros, not None) and steps to materialize optimizer state, asserting
+    # the step succeeded. Offloads and asserts all state is on CPU; loads and asserts all state is on cuda:0.
+    # Always destroys model parallel state and the process group afterwards.
+    # Inputs: tmp_path fixture. Outputs: none. Side effects: distributed init/teardown, GPU memory, rendezvous file.
     # Initialize torch distributed and Megatron parallel state.
     rendezvous_file = tmp_path / "rdzv_optimizer"
 

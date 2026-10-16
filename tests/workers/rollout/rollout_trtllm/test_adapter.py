@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Tests for the TensorRT-LLM rollout HTTP adapter (AsyncTRTLLMHttpAdapter, aiohttp mocked) and a GPU
+# integration test that brings up a standalone TRTLLMReplica with TP 2 on a local Ray cluster.
+
 import asyncio
 import os
 import subprocess
@@ -25,6 +30,8 @@ from verl.workers.rollout.trtllm_rollout.trtllm_rollout import AsyncTRTLLMHttpAd
 
 
 class TestAsyncTRTLLMHttpAdapter:
+    # [CLASS DOC]
+    # Unit tests of the adapter's async request helper with mocked aiohttp sessions.
     def _build_async_session(
         self,
         *,
@@ -32,6 +39,11 @@ class TestAsyncTRTLLMHttpAdapter:
         method: str,
         response: AsyncMock | None = None,
     ) -> tuple[AsyncMock, AsyncMock]:
+        # [FUNCTION DOC]
+        # HELPER: builds a mock aiohttp session (spec ClientSession, not closed) and an async context manager yielding
+        # it; if a response is given, the session's named method (get or post) returns an async context manager
+        # yielding that response. Inputs: adapter (unused), method name, optional response mock.
+        # Outputs: (session context manager mock, session mock).
         mock_session = AsyncMock(spec=aiohttp.ClientSession)
         mock_session.closed = False
 
@@ -46,6 +58,9 @@ class TestAsyncTRTLLMHttpAdapter:
 
     @pytest.mark.asyncio
     async def test_make_async_request_get_method(self):
+        # [FUNCTION DOC]
+        # Patches _get_session; asserts a GET returns the JSON body and session.get was called once with the
+        # http://localhost:8000/test_endpoint URL and the adapter timeout.
         """Test HTTP GET request."""
         adapter = AsyncTRTLLMHttpAdapter(host="localhost", port=8000)
 
@@ -68,6 +83,8 @@ class TestAsyncTRTLLMHttpAdapter:
 
     @pytest.mark.asyncio
     async def test_make_async_request_post_method(self):
+        # [FUNCTION DOC]
+        # Same for POST with a JSON payload; asserts result and that post was called with URL, json and timeout.
         """Test HTTP POST request."""
         adapter = AsyncTRTLLMHttpAdapter(host="localhost", port=8000)
 
@@ -92,6 +109,8 @@ class TestAsyncTRTLLMHttpAdapter:
 
     @pytest.mark.asyncio
     async def test_make_async_request_http_error(self):
+        # [FUNCTION DOC]
+        # Response raise_for_status raises ClientResponseError (500); asserts the error propagates.
         """Test HTTP error handling."""
         adapter = AsyncTRTLLMHttpAdapter(host="localhost", port=8000)
 
@@ -118,6 +137,8 @@ class TestAsyncTRTLLMHttpAdapter:
 
     @pytest.mark.asyncio
     async def test_make_async_request_max_attempts_exceeded(self):
+        # [FUNCTION DOC]
+        # With max_attempts 1 and post raising asyncio TimeoutError, asserts RuntimeError "Failed to complete async request".
         """Test max retries exceeded."""
         adapter = AsyncTRTLLMHttpAdapter(host="localhost", port=8000, max_attempts=1)
 
@@ -133,7 +154,15 @@ class TestAsyncTRTLLMHttpAdapter:
 
 
 class TestTRTLLMServerAdapter:
+    # [CLASS DOC]
+    # GPU integration tests for TRTLLM replica initialization.
     def test_init_without_device_mesh(self):
+        # [FUNCTION DOC]
+        # Temporarily sets RANK=0, starts a local Ray cluster (TLLM_RAY_FORCE_LOCAL_CLUSTER defaulted to 1), composes
+        # ppo_trainer (config dir verl/verl/trainer/config or verl/trainer/config relative to CWD), configures 2 GPUs,
+        # Qwen2.5-1.5B-Instruct under TRTLLM_TEST_MODEL_PATH_ROOT (default ~/models), trtllm async rollout with TP 2 and
+        # load_format auto. Runs init_standalone on replica 0 and asserts 2 workers, replica rank 0, worker 0 is leader
+        # and worker 1 is not. Side effects: env var restore, ray.shutdown and "ray stop" subprocess in finally.
         """Test ServerAdapter init path without device mesh."""
         from hydra import compose, initialize_config_dir
 

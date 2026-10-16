@@ -11,3 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Root package of the verl test suite; contains no code, only marks the directory as a package so tests can import sibling helpers.

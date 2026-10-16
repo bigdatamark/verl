@@ -11,6 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CPU tests for BlockPlacement (a rank's shard as one hyper-rectangular block:
+# local_shape, global_offset, full_shape) and translate_flat_indices (local flat
+# index -> global flat index, with an integer-offset fast path and a
+# flat-contiguous fast path), plus NaN-sentinel rebuild schemes that feed
+# permutation-only to_hf converters (qwen3-moe and veomni expert layouts),
+# checked against a full convert-then-diff reference.
+# Common pattern: per block, find changed elements by comparing raw bytes,
+# write changed values into a NaN-filled buffer, assemble/convert, and scan
+# non-NaN positions per HF tensor.
+
 """CPU tests for the block-placement machinery behind FSDP+EP support.
 
 ``BlockPlacement`` describes a rank's local shard as one hyper-rectangular block
@@ -30,6 +42,11 @@ from verl.workers.engine.spec import BlockPlacement, translate_flat_indices
 
 
 def _blocks_for_grid(full_shape, grid):
+    # [FUNCTION DOC]
+    # HELPER: generator; for each dim, splits evenly into grid.get(dim, 1) pieces
+    # (asserting divisibility) and yields a BlockPlacement for every combination of
+    # per-dim (offset, size) pieces in row-major product order.
+    # Exceptions: AssertionError on uneven splits.
     """Split ``full_shape`` into an even grid of blocks; yield BlockPlacements.
 
     ``grid`` maps tensor dim -> number of splits (even division assumed here;
@@ -48,6 +65,8 @@ def _blocks_for_grid(full_shape, grid):
 
 
 def test_translate_int_fast_path():
+    # [FUNCTION DOC]
+    # Behavior: integer offsets translate by plain addition (offset 0 is identity).
     lidx = torch.tensor([0, 3, 17], dtype=torch.int64)
     assert torch.equal(translate_flat_indices(lidx, 0), lidx)
     assert torch.equal(translate_flat_indices(lidx, 100), lidx + 100)
@@ -63,6 +82,10 @@ def test_translate_int_fast_path():
     ],
 )
 def test_translate_matches_full_coordinates(full_shape, grid):
+    # [FUNCTION DOC]
+    # Behavior: for every block of a grid, translating all local flat indices yields
+    # global indices whose full-tensor values equal the block's contiguous values.
+    # Inputs: full_shape, grid (parametrized).
     torch.manual_seed(0)
     full = torch.randn(full_shape)
     flat = full.reshape(-1)
@@ -75,6 +98,9 @@ def test_translate_matches_full_coordinates(full_shape, grid):
 
 
 def test_translate_sparse_subset():
+    # [FUNCTION DOC]
+    # Behavior: translating a sparse subset of local indices of one interior block
+    # gives global positions holding the same values.
     full_shape = (8, 4, 6)
     torch.manual_seed(1)
     full = torch.randn(full_shape)
@@ -87,10 +113,17 @@ def test_translate_sparse_subset():
 
 
 def _qwen3_style_to_hf(full_shape, inter_dim):
+    # [FUNCTION DOC]
+    # HELPER: returns a to_hf converter for a fused [n, dim, 2I] expert tensor that
+    # yields per-expert gate_proj (first I columns) and up_proj (rest), each
+    # transposed to [I, dim].
     """Mimic the automodel expert closure: fused [n, dim, 2I] -> per-expert
     gate/up [I, dim] via slice + split + transpose -- a pure permutation."""
 
     def to_hf(shards):
+        # [FUNCTION DOC]
+        # HELPER: takes a single-element sequence holding the full flat tensor, views it
+        # as full_shape and returns list of (name, tensor) for experts in order.
         (full_flat,) = shards
         fused = full_flat.view(full_shape)
         out = []
@@ -104,6 +137,10 @@ def _qwen3_style_to_hf(full_shape, inter_dim):
 
 
 def test_block_nan_rebuild_matches_full_convert_then_diff():
+    # [FUNCTION DOC]
+    # Behavior: 3 changed elements, 4x2 block grid; the NaN rebuild passed through
+    # to_hf yields, per HF tensor, exactly the byte-changed positions and new values
+    # of the reference conversion; total 3 positions.
     """Replicate the engine's block converter profile end to end on CPU:
     per-block local diff -> translate-free local NaN rebuild -> slice-assign into
     a full NaN tensor -> to_hf -> isnan scan == diff of the converted tensors."""
@@ -150,11 +187,17 @@ def test_block_nan_rebuild_matches_full_convert_then_diff():
 
 
 def _veomni_style_to_hf(full_shape):
+    # [FUNCTION DOC]
+    # HELPER: returns a to_hf converter for veomni fused [n, 2I, H] gate_up tensors:
+    # concatenates shards (or uses the only one), chunks dim 1 into gate/up and
+    # yields "mlp.experts.{i}.gate_proj.weight"/"up_proj.weight" per expert.
     """Mimic the veomni expert closure: fused [n, 2I, H] gate_up -> per-expert
     gate/up via chunk(dim=1) + per-expert slice + rename -- pure permutation,
     mirroring verl.workers.engine.veomni.utils.default_moe_param_handler."""
 
     def to_hf(shards):
+        # [FUNCTION DOC]
+        # HELPER: inner converter; see enclosing description.
         full_flat = shards[0] if len(shards) == 1 else torch.cat([sh.reshape(-1) for sh in shards])
         fused = full_flat.view(full_shape)
         gate, up = fused.chunk(2, dim=1)
@@ -168,6 +211,10 @@ def _veomni_style_to_hf(full_shape):
 
 
 def test_explicit_place_block_rebuild_veomni_style():
+    # [FUNCTION DOC]
+    # Behavior: synthesizes blocks for manual ep split on dim 0 (4 ranks) and FSDP
+    # split on dim 1 (2 ranks), performs the NaN rebuild and checks equality with
+    # the reference per-expert delta; total 2 positions.
     """veomni experts: manual ep split on dim0 (outside DTensor) + Shard(1)-style
     block on dim1. The exporter synthesizes BlockPlacement in a virtual full
     tensor; verify the engine-style rebuild -> to_hf -> isnan scan equals the
@@ -225,6 +272,9 @@ def test_explicit_place_block_rebuild_veomni_style():
 
 
 def test_explicit_place_never_reaches_derive():
+    # [FUNCTION DOC]
+    # Behavior: a ShardSpec with explicit place and gather_group must make
+    # derive_dtensor_placement raise AssertionError mentioning "dispatched by the caller".
     """Explicit-place specs are dispatched by the caller (which reads the
     exporter's (place, contributes, gather_group) triple verbatim);
     derive_dtensor_placement only accepts DTensor-declared specs."""
@@ -239,6 +289,9 @@ def test_explicit_place_never_reaches_derive():
 
 
 def test_flat_contiguous_block_matches_int_fast_path():
+    # [FUNCTION DOC]
+    # Behavior: dim-0 row blocks are flat contiguous with flat_offset equal to the
+    # integer offset and translate identically to it; a 1-D block too; a dim-1 cut is not flat contiguous.
     """A dim-0 cut expressed as a BlockPlacement (the unified derive_dtensor_placement
     output for FSDP2 ``Shard(0)``) must translate exactly like the plain-int
     offset it replaces, via the ``is_flat_contiguous`` add fast path."""
@@ -260,6 +313,10 @@ def test_flat_contiguous_block_matches_int_fast_path():
 
 
 def test_explicit_place_block_rebuild_muon_shard0_layout():
+    # [FUNCTION DOC]
+    # Behavior: dim 0 split by ep (2) then FSDP Shard(0) (2) gives whole-expert
+    # blocks at offset ep_rank * n_local + fsdp_rank * rows; asserts each is flat
+    # contiguous and the NaN rebuild matches the reference (3 positions).
     """veomni muon_expert_zero_comm layout: the expert stack is split on dim 0
     TWICE -- manually by ep, then FSDP ``Shard(0)`` inside each ep slice (vs the
     standard ``Shard(1)``). The exporter's offset math
@@ -322,10 +379,16 @@ def test_explicit_place_block_rebuild_muon_shard0_layout():
 
 
 def _qwen3_style_to_hf_chunk(inter_dim):
+    # [FUNCTION DOC]
+    # HELPER: returns a segment-aware converter to_hf_chunk(start, seg) mapping a
+    # run of whole experts [rows, dim, 2I] starting at expert id start to per-expert
+    # gate/up tensors (same split+transpose as _qwen3_style_to_hf).
     """Segment-aware counterpart of _qwen3_style_to_hf: converts a dim-0 run of
     whole experts starting at global expert id ``start``."""
 
     def to_hf_chunk(start, seg):
+        # [FUNCTION DOC]
+        # HELPER: inner segment converter; see enclosing description.
         out = []
         for i in range(seg.shape[0]):
             w = seg[i]
@@ -338,6 +401,12 @@ def _qwen3_style_to_hf_chunk(inter_dim):
 
 @pytest.mark.parametrize("seg_rows", [1, 3, 8])
 def test_chunked_rebuild_matches_full_rebuild(seg_rows):
+    # [FUNCTION DOC]
+    # Behavior: collects per-block changed global indices/values, sorts them, then
+    # for consecutive segments of seg_rows experts locates the index range by binary
+    # search, scatters into a NaN segment and converts with to_hf_chunk; asserts the
+    # set of changed HF names and their (position, value) pairs equal the full rebuild.
+    # Inputs: seg_rows - segment size in experts (parametrized 1, 3, 8).
     """The engine's segmented NaN rebuild (translate per-rank shard-local positions
     to full coordinates, sort, scatter per dim-0 segment, convert per segment) must
     extract exactly the same (hf_name, position, value) set as the full rebuild."""
@@ -410,6 +479,14 @@ def test_chunked_rebuild_matches_full_rebuild(seg_rows):
 
 
 def test_scoped_sender_side_matches_rank0_rebuild():
+    # [FUNCTION DOC]
+    # Behavior: builds the reference from a full NaN rebuild; then per simulated
+    # rank, translates its changed indices to global, groups by expert row, converts
+    # each touched row individually via to_hf_chunk (expecting 2 outputs per row),
+    # checks the output name matches the slot table, and unions positions/values per
+    # HF name. Asserts the same names, no overlapping positions across ranks, and
+    # identical sorted positions/values as the reference.
+    # KNOWN ISSUE: the slot-name assertion's string replace substitutes a string with itself (a no-op), so it reduces to a direct name equality check.
     """Sender-side scoped conversion (each simulated rank converts only its own
     touched dim-0 rows via a NaN row window + to_hf_chunk, emitting slot-keyed
     HF-coordinate entries) must produce exactly the union the rank-0 full

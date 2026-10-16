@@ -14,6 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Fused-kernel forward for Megatron GPT models: instead of materializing vocabulary logits, the last stage computes
+# per-token log-probs and entropy directly from hidden states with a fused linear cross-entropy kernel. Two mechanisms:
+# on Megatron Core >= 0.18 the native output_processor hook is used ("hook" mode); otherwise GPTModel.forward is
+# monkey-patched ("legacy" mode). The chosen mode is cached on the model under a private attribute.
+
 import inspect
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -44,6 +50,8 @@ _LEGACY_MODE = "legacy"
 
 
 def _supports_output_processor_hook(patching_model: torch.nn.Module) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns true if the model's forward signature accepts both output_processor and output_processor_context.
     """Check whether the model supports Megatron's native output-processor hook.
 
     The ``output_processor`` / ``output_processor_context`` contract was
@@ -58,10 +66,15 @@ def _supports_output_processor_hook(patching_model: torch.nn.Module) -> bool:
 
 
 def _resolve_fused_forward_mode(patching_model: torch.nn.Module) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns "hook" if the model supports the output-processor hook, else "legacy".
     return _HOOK_MODE if _supports_output_processor_hook(patching_model) else _LEGACY_MODE
 
 
 def _get_fused_forward_mode(model: torch.nn.Module) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Reads the cached fused-forward mode from the unwrapped model, or from its language_model when absent;
+    # defaults to "legacy" if missing or invalid.
     model = unwrap_model(model)
     mode = getattr(model, _FUSED_FORWARD_MODE_ATTR, None)
     if mode is None and hasattr(model, "language_model"):
@@ -70,11 +83,15 @@ def _get_fused_forward_mode(model: torch.nn.Module) -> str:
 
 
 def _use_output_processor_hook(model: torch.nn.Module) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns true if the cached mode for the model is "hook".
     return _get_fused_forward_mode(model) == _HOOK_MODE
 
 
 @dataclass
 class FusedOutputProcessorContext:
+    # [CLASS DOC]
+    # Dataclass carried through Megatron's output-processor hook; holds the sampling temperature for log-prob computation.
     """Context passed through Megatron's native output-processor hook."""
 
     temperature: float
@@ -90,6 +107,15 @@ def fused_output_processor(
     config,
     **_ignored,
 ):
+    # [FUNCTION DOC]
+    # Behavior: output-processor hook implementation. Creates a CausalLMOutputForPPO holding the (un-gathered) hidden
+    # states, gathers sequence-parallel hidden states if enabled, uses output_weight when given (tied embeddings) else the
+    # output layer weight, computes log-probs and entropy with the fused kernel at context.temperature over the TP group,
+    # and optionally logs inputs and results to disk when Megatron's config logger is enabled.
+    # Inputs (keyword only): hidden_states, output_layer, output_weight, labels (packed), context
+    # (FusedOutputProcessorContext), config; other keywords ignored (input_ids, position_ids, etc. used only for logging).
+    # Outputs: CausalLMOutputForPPO with log_probs and entropy set.
+    # Side effects: optional disk logging.
     """Compute fused log probabilities and entropy at Megatron's postprocess boundary."""
     output = CausalLMOutputForPPO(
         loss=None,
@@ -135,6 +161,9 @@ def fused_output_processor(
 
 
 def _get_patching_model(model: torch.nn.Module):
+    # [FUNCTION DOC]
+    # HELPER: Returns the GPTModel to patch: the unwrapped model itself, or its language_model if that is a GPTModel;
+    # otherwise prints an unsupported message and returns None.
     model = unwrap_model(model)
     if isinstance(model, GPTModel):
         return model
@@ -147,6 +176,12 @@ def _get_patching_model(model: torch.nn.Module):
 
 
 def patch_fused_forward(model: torch.nn.Module):
+    # [FUNCTION DOC]
+    # Behavior: resolves the GPTModel, determines and caches the fused-forward mode on it; in hook mode does nothing more.
+    # In legacy mode asserts Megatron Core >= 0.13.0 and, if not already patched, stores the original forward as
+    # forward_backup and binds the fused forward in its place.
+    # Exceptions: AssertionError for older Megatron versions.
+    # Side effects: mutates the model instance.
     model = _get_patching_model(model)
     if model is None:
         return
@@ -168,6 +203,10 @@ def patch_fused_forward(model: torch.nn.Module):
 
 
 def unpatch_fused_forward(model: torch.nn.Module):
+    # [FUNCTION DOC]
+    # Behavior: restores the original forward from forward_backup and removes the backup, unless the model is unsupported
+    # or in hook mode.
+    # Side effects: mutates the model instance.
     model = _get_patching_model(model)
     if model is None or _get_fused_forward_mode(model) == _HOOK_MODE:
         return
@@ -177,6 +216,9 @@ def unpatch_fused_forward(model: torch.nn.Module):
 
 
 def fused_forward_model_gen(vision_model: bool = False):
+    # [FUNCTION DOC]
+    # Behavior: factory returning a fused forward closure for padded inputs (legacy actor path), specialized for VLMs.
+    # Outputs: fused_forward_model function.
     def fused_forward_model(
         model,
         input_ids: Tensor,
@@ -187,6 +229,15 @@ def fused_forward_model_gen(vision_model: bool = False):
         temperature: float,
         multi_modal_inputs: dict,
     ):
+        # [FUNCTION DOC]
+        # Behavior: moves multimodal tensors to device; packs input_ids (pre-processing except for VLMs), labels and
+        # labels_mask into THD; calls the model with packed ids, packed_seq_params, packed labels and position ids (VLMs get
+        # the padded input_ids and attention mask and compute positions themselves). In hook mode passes the fused output
+        # processor and temperature context; in legacy mode passes temperature to the patched forward. On the last stage
+        # unpacks log_probs/entropy to padded layout masked by labels_mask.
+        # Inputs: model; input_ids, position_ids, attention_mask, labels, labels_mask - padded [batch, seq]; temperature;
+        # multi_modal_inputs - dict.
+        # Outputs: dict-like with log_probs and entropy (last stage) or hidden states (other stages).
         pre_process: bool = (
             unwrap_model(model).pre_process if not vision_model else False
         )  # vision model does not need pre_process, because we pack the input_ids to thd in the forward function
@@ -257,6 +308,9 @@ def fused_forward_model_gen(vision_model: bool = False):
 
 
 def fused_forward_model_engine(vision_model: bool = False):
+    # [FUNCTION DOC]
+    # Behavior: factory returning a fused forward closure for the model-engine path (nested inputs).
+    # Outputs: fused_forward_model_engine_inner function.
     def fused_forward_model_engine_inner(
         model,
         input_ids: Tensor,
@@ -270,6 +324,16 @@ def fused_forward_model_engine(vision_model: bool = False):
         router_padding_mask: Tensor | None = None,
         pad_to_length_bucket: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: packs nested input_ids with preprocess_thd_engine (fp8 padding, minimum local rows equal to
+        # csa_window_size for the "dsv4_hybrid" attention variant, length bucketing, CP layout and dynamic CP size), collects
+        # router padding mask and multimodal inputs, builds VLM ids/mask when needed, packs labels with a left roll, and calls
+        # the model with no position ids (hook mode via output processor, legacy mode via temperature kwarg). On non-last
+        # stages returns the raw output. Otherwise unpacks log_probs (adding a leading dim if 1-D) to the nested input layout
+        # and, when calculate_entropy, the entropy likewise.
+        # Inputs: model; input_ids, labels - nested tensors; multi_modal_inputs; temperature; calculate_entropy; pad_token_id;
+        # cp_layout; local_cp_size; router_padding_mask; pad_to_length_bucket.
+        # Outputs: dict with log_probs and optionally entropy, or the raw output on non-last stages.
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
 
@@ -391,6 +455,17 @@ def _fused_GPTModel_forward(
     padding_mask: Tensor | None = None,
     **kwargs,
 ) -> CausalLMOutputForPPO:
+    # [FUNCTION DOC]
+    # HELPER: Legacy replacement for GPTModel.forward (bound to the model instance).
+    # Behavior: runs the model's _preprocess (forwarding padding_mask only when provided), passes the sequence-parallel
+    # scattered padding mask and, for models with hash MoE layers, input_ids to the decoder as extra block kwargs, runs
+    # the decoder, and returns hidden states on non-last stages. On the last stage gathers sequence-parallel hidden states,
+    # selects the output layer weight (or the word embedding weight when no output weight exists), computes fused
+    # log-probs/entropy at the given temperature, optionally logs to disk, and returns a CausalLMOutputForPPO.
+    # Inputs: standard GPTModel forward args plus temperature and padding_mask; loss_mask is accepted but unused; extra
+    # kwargs go to the decoder.
+    # Outputs: hidden states tensor or CausalLMOutputForPPO with log_probs and entropy.
+    # KNOWN ISSUE: when extra_block_kwargs is supplied, padding_mask/input_ids are written into the caller's dict in place.
     """
     Patch self._postprocess in forward for GPT models to enable fused kernel support.
     https://github.com/NVIDIA/Megatron-LM/blob/core_v0.13.0/megatron/core/models/gpt/gpt_model.py

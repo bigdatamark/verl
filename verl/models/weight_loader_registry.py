@@ -13,7 +13,19 @@
 # limitations under the License.
 
 
+# [MODULE DOC]
+# Registry lookups mapping HuggingFace architecture names to Megatron-core weight loader / saver functions.
+# Imports of the mcore loader/saver modules are deferred into each function to avoid heavy imports at module load.
+
+
 def get_weight_loader(arch: str):
+    # [FUNCTION DOC]
+    # Behavior: lazily imports the GPT-model Megatron loader and returns the state-dict loading function registered for the
+    # architecture. Supported: LlamaForCausalLM, Qwen2ForCausalLM (both map to the generic GPT-model loader).
+    # Inputs: arch - HF architecture class name string.
+    # Outputs: callable that loads a HF state dict into a Megatron GPT model.
+    # Exceptions: ValueError if arch is not registered (message lists supported keys).
+    # Side effects: imports verl.models.mcore.loader.
     from verl.models.mcore.loader import load_state_dict_to_megatron_gptmodel
 
     _MODEL_WEIGHT_MEGATRON_LOADER_REGISTRY = {
@@ -30,6 +42,14 @@ def get_weight_loader(arch: str):
 
 
 def get_weight_saver(arch: str):
+    # [FUNCTION DOC]
+    # Behavior: lazily imports Megatron checkpoint merge functions and returns the saver registered for the architecture.
+    # Llama/Qwen2/Qwen3 dense and token-classification variants use the generic GPT merger; Mixtral, Qwen2-MoE/Qwen3-MoE,
+    # Qwen2.5-VL and DeepseekV3 use their specialized mergers (Qwen3Moe reuses the Qwen MoE merger).
+    # Inputs: arch - HF architecture class name string.
+    # Outputs: callable that merges a distributed Megatron checkpoint into a HF-style state dict.
+    # Exceptions: ValueError if arch is not registered.
+    # Side effects: imports verl.models.mcore.saver.
     from verl.models.mcore.saver import (
         merge_megatron_ckpt_gptmodel,
         merge_megatron_ckpt_gptmodel_dpskv3,

@@ -29,6 +29,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# GPU correctness/performance comparison of four ways to compute per-token log-probs and entropy from
+# hidden states times an LM-head weight: a plain torch reference, verl's original logits-based helpers
+# (compiled entropy_from_logits + logprobs_from_logits), the torch FusedLinearForPPO (compiled), and the
+# Triton linear_cross_entropy kernel. Also contains a pytest regression test for the kernel's padding of
+# non-divisible vocab sizes. When run as a script, iterates over MAX_TEST_CASES shape presets running the
+# correctness/latency and peak-memory checks, then the regression test.
+# Side effects at import: compiles functions with torch.compile.
+# KNOWN ISSUE: MAX_TEST_CASES is read from the environment as a string when set, so range() and the
+# "<= 5" comparison would raise TypeError; it only works with the integer default.
+
 import os
 
 import torch
@@ -49,6 +60,12 @@ MAX_TEST_CASES = os.environ.get("MAX_TEST_CASES", 5)
 def run_torch_entropy(
     hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, temperature: float, reduction="none"
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Reference implementation. Squeezes the batch dim of hidden, computes float32 logits as hidden times
+    # the transposed weight divided by temperature, entropy as logsumexp minus sum(softmax * logits), and
+    # log-probs as negated cross entropy against labels (squeezed) with the given reduction.
+    # Outputs: (logprobs, entropy), each per token when reduction is "none".
+    # KNOWN ISSUE: annotated as returning a list but returns a tuple.
     hidden = hidden.squeeze(0).to(torch.float32)
     weight = weight.transpose(0, 1).to(torch.float32)
     logits = torch.matmul(hidden, weight)  # [num_tokens, vocab_size]
@@ -68,6 +85,9 @@ def run_verl_original_entropy(
     labels: torch.Tensor,
     temperature: float,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Same float32 logits as the reference, then entropy via the compiled verl entropy_from_logits and
+    # log-probs via logprobs_from_logits (no in-place backward). Outputs: (logprobs, entropy).
     hidden = hidden.squeeze(0).to(torch.float32)
     weight = weight.transpose(0, 1).to(torch.float32)
     logits = torch.matmul(hidden, weight)  # [num_tokens, vocab_size]
@@ -86,6 +106,9 @@ def run_verl_torch_fused_entropy(
     labels: torch.Tensor,
     temperature: float,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Casts hidden and weight to float32 and runs the module-level compiled FusedLinearForPPO; squeezes the
+    # batch dim from both outputs. Outputs: (logprobs, entropy).
     hidden = hidden.to(torch.float32)
     weight = weight.to(torch.float32)
     logprobs, entropy = fused_linear_for_ppo(
@@ -98,11 +121,17 @@ def run_verl_torch_fused_entropy(
 
 
 class TestLinearCrossEntropy:
+    # [CLASS DOC]
+    # Benchmark/correctness harness for one shape preset (not collected by pytest because it defines __init__).
     def __init__(self, test_case_idx: int, temperature: float = 1.5) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Stores the preset index and softmax temperature (default 1.5).
         self.test_case_idx = test_case_idx
         self.temperature = temperature
 
     def cleanup(self):
+        # [FUNCTION DOC]
+        # HELPER: Empties the CUDA cache, resets peak memory stats, runs garbage collection and synchronizes.
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         import gc
@@ -111,6 +140,9 @@ class TestLinearCrossEntropy:
         torch.cuda.synchronize()
 
     def generate_hyper(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets dtype bf16 and batch_size/num_tokens/hidden_size/vocab_size from preset 0..4 (Qwen/DeepSeek-like
+        # shapes). Raises ValueError for other indices; asserts MAX_TEST_CASES <= 5.
         global MAX_TEST_CASES
 
         self.dtype = torch.bfloat16
@@ -144,6 +176,9 @@ class TestLinearCrossEntropy:
         assert MAX_TEST_CASES <= 5, "MAX_TEST_CASES should be less than or equal to 5."
 
     def generate_forward_inputs(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates CUDA bf16 hidden (batch, tokens, hidden) and weight (vocab, hidden) uniform in [-0.5, 0.5]
+        # requiring grad, and random integer labels (batch, tokens). Outputs: (hidden, weight, labels).
         hidden = (
             torch.empty((self.batch_size, self.num_tokens, self.hidden_size), dtype=self.dtype, device="cuda")
             .uniform_(-0.5, 0.5)
@@ -158,11 +193,21 @@ class TestLinearCrossEntropy:
         return hidden, weight, labels
 
     def generate_backward_inputs(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates random bf16 CUDA upstream gradients for entropy (uniform +-0.5) and log-probs (uniform +-1),
+        # each of shape (num_tokens). Outputs: (g_entropy, g_logprobs).
         g_entropy = torch.empty((self.num_tokens,), dtype=self.dtype, device="cuda").uniform_(-0.5, 0.5)
         g_logprobs = torch.empty((self.num_tokens,), dtype=self.dtype, device="cuda").uniform_(-1, 1)
         return g_entropy, g_logprobs
 
     def verify_correctness(self, iterations=5):
+        # [FUNCTION DOC]
+        # For the given number of iterations, generates fresh inputs and, timing each with CUDA events, runs forward for
+        # all four implementations and asserts pairwise closeness (tight 1e-4 among torch-based ones, looser for the
+        # kernel), then computes gradients w.r.t. hidden and weight for each with the same upstream gradients and
+        # asserts closeness (atol 1e-2 among torch-based, 2e-2/rtol 4e-2 for the kernel). Drops the first (warm-up)
+        # latency sample and prints average forward/backward latencies per implementation.
+        # Exceptions: AssertionError on mismatch. Side effects: GPU allocation, prints.
         self.cleanup()
         self.generate_hyper()
 
@@ -321,6 +366,10 @@ class TestLinearCrossEntropy:
         )
 
     def check_storage(self, method_name, run_forward):
+        # [FUNCTION DOC]
+        # Measures and prints peak CUDA memory (MB) for one implementation's forward and then its backward pass.
+        # Inputs: method_name - label for printing; run_forward - callable (hidden, weight, labels, temperature) to
+        # (logprobs, entropy).
         self.cleanup()
         self.generate_hyper()
 
@@ -343,6 +392,8 @@ class TestLinearCrossEntropy:
         print(f"[INFO]: {method_name} Backward pass peak memory: {torch_backward_max_memory:.2f} MB")
 
     def check_storage_all(self):
+        # [FUNCTION DOC]
+        # Runs check_storage for the torch, verl, verl fused and kernel implementations.
         self.check_storage("Torch", run_torch_entropy)
         self.check_storage("VeRL", run_verl_original_entropy)
         self.check_storage("VeRL Torch Fused", run_verl_torch_fused_entropy)
@@ -350,6 +401,10 @@ class TestLinearCrossEntropy:
 
 
 def test_lce_non_divisible_vocab_padding():
+    # [FUNCTION DOC]
+    # Skips (returns) if CUDA is unavailable or on NPU. Builds a peaked-softmax construction (label 0 logit +3,
+    # others -15 after temperature) for a vocab size not divisible by 1024 and a divisible control, and asserts the
+    # kernel's log-probs and entropy match a float32 reference within 1e-3.
     """Regression test for the logsumexp padding bug.
 
     When vocab_size % BLOCK_SIZE_N != 0 the last tile has fewer than
@@ -373,6 +428,9 @@ def test_lce_non_divisible_vocab_padding():
     T = 1.5
 
     def reference(hidden, weight, labels):
+        # [FUNCTION DOC]
+        # HELPER: Float32 reference computing negated cross-entropy log-probs and entropy from hidden, weight and labels
+        # at the enclosing temperature T. Outputs: (logprobs, entropy).
         h = hidden.squeeze(0).float()
         logits = torch.matmul(h, weight.float().T) / T
         lp = -torch.nn.functional.cross_entropy(logits, labels.squeeze(0), reduction="none")

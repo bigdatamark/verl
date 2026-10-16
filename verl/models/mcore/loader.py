@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Loads a full (merged, HF-named) state dict held on a single source rank into a Megatron-Core GPTModel sharded across
+# tensor/pipeline/virtual-pipeline parallelism, by broadcasting each tensor (or its TP shards) from the source rank over
+# the model-parallel group and then broadcasting parameters within data-parallel groups.
+
 import time
 
 import torch
@@ -24,6 +29,13 @@ from .saver import _megatron_calc_global_rank
 
 
 def _megatron_calc_layer_map(config):
+    # [FUNCTION DOC]
+    # HELPER: Builds a map from global layer index to (pp_rank, virtual_pp_rank, local layer index) assuming layers are
+    # split evenly: each model chunk holds num_hidden_layers / (pp * vpp) layers, and chunk (pp, vpp) starts at
+    # vpp * (num_layers / vpp) + pp * layers_per_chunk.
+    # Inputs: config - HF config (num_hidden_layers).
+    # Outputs: dict global index -> tuple.
+    # Exceptions: AssertionError if layers do not divide evenly.
     """Calculate the mapping of global layer_idx to local layer_idx
     Returns:
         layer_map (Dict: int -> tuple(int, int, int)):
@@ -54,6 +66,25 @@ def _megatron_calc_layer_map(config):
 
 
 def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, params_dtype, is_value_model=False):
+    # [FUNCTION DOC]
+    # Behavior: on the source rank (tp=0, dp=0, pp=0, same cp rank) reads tensors from state_dict; all ranks of the
+    # model-parallel group participate in broadcasts. Only dp rank 0 groups load: embeddings (vocab TP shards, to pp
+    # rank 0), then for every layer (located via the layer map) the input layernorm, optional q/k norms, fused QKV weight
+    # and optional bias (re-laid out per TP rank and per query group), o_proj (TP sharded on dim 1), post-attention
+    # layernorm, fused gate/up (interleaved per TP rank), and down_proj (TP sharded on dim 1); then the final norm and the
+    # lm_head (TP sharded, or for value models a single-row lm_head / reward_head / score weight broadcast whole). Ranks
+    # whose pipeline stage does not own a tensor pass None and receive into a temporary buffer. Afterwards a global
+    # barrier, a data-parallel broadcast of all parameters, and device cache clearing.
+    # Inputs: state_dict - full HF-named tensors (meaningful on source rank); wrapped_models - list/tuple of model chunks
+    # (one per virtual stage, possibly DDP/Float16 wrapped); config - HF config; params_dtype - dtype for temp buffers;
+    # is_value_model - whether to load a scalar value head.
+    # Outputs: none.
+    # Exceptions: AssertionError on rank/shape/layer-count mismatches; KeyError for missing gate/up or qkv entries.
+    # KNOWN ISSUE: in the value-model branch the state_dict membership checks run on every rank; if non-source ranks do
+    # not hold the same state_dict they can take different branches and broadcast mismatched names, risking a hang.
+    # KNOWN ISSUE: a non-list wrapped_models is converted with list(...), which iterates the module rather than wrapping it.
+    # KNOWN ISSUE: the rank-0 assertion message prints the bound method mp_group.rank rather than its value.
+    # Side effects: copies into model parameters in place; collective communication; prints progress on rank 0.
     """Load merged state_dict to sharded Megatron module in training."""
     from megatron.core import DistributedDataParallel as LocalDDP
     from megatron.core import mpu
@@ -66,9 +97,14 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
     start_time = time.time()
 
     def _get_gpt_model(model):
+        # [FUNCTION DOC]
+        # HELPER: Identity accessor returning the unwrapped GPT model.
         return model
 
     def broadcast_params(module):
+        # [FUNCTION DOC]
+        # HELPER: Broadcasts every parameter of a module from the data-parallel source rank within the data-parallel group.
+        # Side effects: overwrites parameter data; collective communication.
         for param in module.parameters():
             torch.distributed.broadcast(
                 param.data, src=mpu.get_data_parallel_src_rank(), group=mpu.get_data_parallel_group()
@@ -102,6 +138,14 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
         assert len(gpt_model_module.decoder.layers) == num_layers_per_model
 
     def _broadcast_tensor(tensor, name) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Broadcasts a full (non-sharded) tensor by name from the source rank across the model-parallel group.
+        # Behavior: the source rank broadcasts the tensor shape (or None if absent); if None all ranks skip with a log
+        # message. Ranks with no destination tensor allocate an empty buffer in params_dtype; the source copies the weight in;
+        # then the tensor is broadcast.
+        # Inputs: tensor - destination parameter or None; name - state dict key.
+        # Outputs: none (despite the Tensor annotation).
+        # Side effects: writes into tensor; collective communication.
         """broadcast tensor from rank0 across mp_group"""
         nonlocal state_dict
         nonlocal mp_group
@@ -136,6 +180,14 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
         dist.broadcast(tensor, src=src_rank, group=mp_group)
 
     def _broadcast_tp_shard_tensor_vocab(tensor, name, chunk_dim=0, mutate_func=None) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Broadcasts a tensor split into TP chunks along chunk_dim (used for vocab embedding).
+        # Behavior: the source optionally applies mutate_func, chunks the full weight into tp_size parts and broadcasts the
+        # chunk shape (None -> all skip). Each chunk i is broadcast in turn into a sync buffer and the rank whose TP rank is i
+        # copies it into its destination tensor (if any).
+        # Inputs: tensor - destination or None; name; chunk_dim; mutate_func - optional transform of the full weight.
+        # Exceptions: AssertionError if the destination shape differs from the chunk shape.
+        # Side effects: writes into tensor; collective communication.
         """broadcast tensor in tp shards across mp_group"""
         nonlocal state_dict
         nonlocal mp_group
@@ -184,6 +236,9 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                 tensor.data.copy_(sync_tensor)
 
     def _broadcast_tp_shard_tensor(tensor, name, chunk_dim=0, mutate_func=None) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Same as the vocab variant (identical logic): broadcasts TP chunks of a tensor along chunk_dim and each TP
+        # rank keeps its own chunk.
         """broadcast tensor in tp shards across mp_group"""
         nonlocal state_dict
         nonlocal mp_group
@@ -231,6 +286,14 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                 tensor.data.copy_(sync_tensor)
 
     def _broadcast_tp_shard_tensor_gate_up(tensor, gate_name, up_name) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Builds the fused Megatron fc1 weight from HF gate and up weights: for each TP rank i, its slice is the i-th
+        # intermediate/tp rows of gate followed by those of up; the fused weight is then chunked per TP rank and broadcast
+        # like the generic TP-shard helper.
+        # Inputs: tensor - destination or None; gate_name, up_name - state dict keys.
+        # Exceptions: KeyError on source if keys are missing; AssertionError on shape mismatch.
+        # KNOWN ISSUE: the assertion message prints a boolean (rank == src_rank) instead of the rank number.
+        # Side effects: writes into tensor; collective communication.
         """broadcast tensor in tp shards across mp_group"""
         nonlocal state_dict
         nonlocal mp_group
@@ -286,6 +349,18 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                 tensor.data.copy_(sync_tensor)
 
     def _broadcast_tp_shard_tensor_qkv(tensor, q_name, k_name, v_name, bias=False) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Builds the fused Megatron QKV weight (or bias when bias is true) from HF q/k/v tensors and broadcasts TP shards.
+        # Behavior: with head dim from config.head_dim or hidden/heads: if num_key_value_heads >= tp, each TP rank gets
+        # heads/tp q rows and kv_heads/tp k and v rows, laid out per query group as [q rows of group, k rows, v rows]. If
+        # kv_heads < tp, each TP rank gets one replicated kv head (selected by start index i*kv_heads/tp) and the q, k, v
+        # slices are chunked into num_attention_heads pieces and interleaved piece-wise.
+        # Inputs: tensor - destination or None; q_name/k_name/v_name - keys; bias - whether these are 1-D biases.
+        # Exceptions: AssertionError if any key is missing on source or shape mismatch.
+        # KNOWN ISSUE: in the kv_heads < tp branch the per-TP q slice holds only heads/tp heads but is chunked into the global
+        # num_attention_heads pieces (and the single k/v head likewise), which does not match Megatron's per-group
+        # [q..., k, v] layout; this path looks incorrect.
+        # Side effects: writes into tensor; collective communication.
         """broadcast tensor in tp shards across mp_group"""
         nonlocal state_dict
         nonlocal mp_group

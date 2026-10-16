@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tiled (chunked) MLP for reduced activation memory: a custom autograd function that runs a SwiGLU MLP over sequence
+# chunks without keeping intermediates, recomputing each chunk in backward, plus monkey-patch helpers that replace the
+# forward of transformers' Llama/Qwen2/Qwen3 MLP classes. Module constant: mapping from model type to (module path, MLP
+# class name); qwen2_5 reuses the Qwen2 MLP.
+
 """
 FSDP2-compatible TiledMLP implementation for memory-efficient MLP computation.
 
@@ -27,6 +33,10 @@ import torch.nn as nn
 
 
 class GradientAccumulator:
+    # [CLASS DOC]
+    # Accumulates parameter gradients across per-chunk backward passes. State: params list, total_shards, accumulation dtype
+    # (default float32), a mapping param -> accumulated gradient tensor, the list of active hook handles, and a lock guarding
+    # accumulation.
     """Gradient accumulator for TiledMLP (FSDP compatible).
 
     This class manages gradient accumulation across multiple shards during
@@ -35,6 +45,11 @@ class GradientAccumulator:
     """
 
     def __init__(self, params: list[torch.nn.Parameter], total_shards: int, dtype: torch.dtype = None):
+        # [FUNCTION DOC]
+        # Behavior: stores params and settings; for each param, moves any existing .grad into the accumulator (cast to the
+        # accumulation dtype) and clears .grad, else starts the accumulator at zeros of the param's shape.
+        # Inputs: params - parameters to track; total_shards - number of chunks; dtype - accumulation dtype or None for float32.
+        # Side effects: clears param.grad of the given params.
         self.params = params
         self.total_shards = total_shards
         self.grad_accumulation_dtype = dtype or torch.float32
@@ -50,11 +65,24 @@ class GradientAccumulator:
                 self.accumulated_grads[param] = torch.zeros_like(param, dtype=self.grad_accumulation_dtype)
 
     def install_hooks(self, is_last_shard: bool):
+        # [FUNCTION DOC]
+        # Behavior: removes previously installed hooks, then registers a gradient hook on every requires-grad param. Each hook,
+        # under the lock, adds the incoming grad (cast to accumulation dtype) into the accumulator. For non-last shards it returns
+        # None (gradient flows unchanged). On the last shard it clears param.grad and returns the full accumulated gradient
+        # cast to the param dtype, so autograd writes the total into .grad exactly once.
+        # Inputs: is_last_shard - whether the current chunk is the final one.
+        # Side effects: registers hooks; mutates accumulator and param.grad.
+        # KNOWN ISSUE: for non-last shards the hook returns None, so autograd also accumulates those chunk grads into param.grad;
+        # correctness relies on the last hook clearing param.grad before the final value is written.
         """Install gradient hooks for the current shard."""
         self._remove_hooks()
 
         def create_hook(param):
+            # [FUNCTION DOC]
+            # HELPER: factory returning the per-parameter hook closure described in install_hooks.
             def hook(grad):
+                # [FUNCTION DOC]
+                # HELPER: the gradient hook; see install_hooks.
                 with self.lock:
                     grad_to_accum_dtype = grad.to(self.grad_accumulation_dtype)
                     self.accumulated_grads[param] += grad_to_accum_dtype
@@ -73,17 +101,23 @@ class GradientAccumulator:
                 self.hooks.append(hook)
 
     def _remove_hooks(self):
+        # [FUNCTION DOC]
+        # HELPER: removes and forgets all registered hook handles.
         """Remove all registered hooks."""
         for hook in self.hooks:
             hook.remove()
         self.hooks.clear()
 
     def cleanup(self):
+        # [FUNCTION DOC]
+        # Side effects: removes all hooks.
         """Cleanup hooks and resources."""
         self._remove_hooks()
 
 
 class TiledMLP(torch.autograd.Function):
+    # [CLASS DOC]
+    # torch autograd Function implementing the tiled computation. Called as apply(fn, module, x, shards, compute_params).
     """TiledMLP implementation for memory-efficient MLP computation.
 
     This autograd function processes MLP forward/backward in tiles (chunks)
@@ -92,6 +126,13 @@ class TiledMLP(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, fn, module, x, shards, compute_params):
+        # [FUNCTION DOC]
+        # Behavior: saves fn, module, shard count and the requires-grad subset of compute_params on ctx, saves x for backward,
+        # splits x into shards chunks along dim -2 (sequence), runs fn(module, chunk) for each chunk under no_grad and
+        # concatenates outputs along dim -2.
+        # Inputs: fn - callable(module, x) computing the MLP; module - MLP module; x - input of shape (..., seq, hidden);
+        # shards - chunk count; compute_params - module params.
+        # Outputs: tensor equal to fn(module, x).
         ctx.fn = fn
         ctx.module = module
         ctx.shards = shards
@@ -107,6 +148,17 @@ class TiledMLP(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
+        # [FUNCTION DOC]
+        # Behavior: restores x, detaches it (preserving requires_grad), flattens x and the incoming gradient to
+        # (tokens, hidden), preallocates a zero input-gradient buffer, and chunks tokens along dim 0. Creates a
+        # GradientAccumulator with dtype of x. For each chunk: set the chunk's .grad to the matching narrowed slice of the buffer
+        # (so input grads land in place), install hooks (last flag when index+1 equals shards), recompute fn with grad enabled,
+        # and backprop the matching slice of the incoming gradient. Cleans up hooks afterwards.
+        # Outputs: tuple (None, None, input gradient reshaped to original shape or None if x did not require grad, None, None).
+        # Side effects: writes parameter .grad via hooks.
+        # KNOWN ISSUE: the accumulator dtype is x.dtype (e.g. bf16) rather than the float32 default, reducing accumulation
+        # precision. Also, chunking can produce fewer chunks than shards (short inputs), in which case the last-shard hook never
+        # fires and a param's pre-existing gradient (moved into the accumulator) is dropped.
         fn = ctx.fn
         (x,) = ctx.saved_tensors
         module = ctx.module
@@ -157,6 +209,8 @@ class TiledMLP(torch.autograd.Function):
 
 
 def _mlp_forward_fn(module, x):
+    # [FUNCTION DOC]
+    # HELPER: SwiGLU MLP forward: down_proj(act_fn(gate_proj(x)) * up_proj(x)).
     """Forward function for LlamaMLP / Qwen2MLP / Qwen3MLP style."""
     return module.down_proj(module.act_fn(module.gate_proj(x)) * module.up_proj(x))
 
@@ -178,6 +232,14 @@ def apply_tiled_mlp_monkey_patch(
     num_shards: int = 4,
     model_type: Optional[str] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: chooses model types to patch (all supported if model_type is None, else just the given one). For each, imports
+    # the transformers module, fetches the MLP class and patches its forward with the tiled version; Import/Attribute errors
+    # print a warning and are skipped. Prints a summary of patched classes.
+    # Inputs: num_shards - chunk count (default 4); model_type - optional model type key.
+    # Outputs: list of unique patched class names.
+    # Exceptions: ValueError for an unsupported model_type.
+    # Side effects: globally replaces MLP class forward methods (must run before model instantiation); prints to stdout.
     """Apply TiledMLP monkey patch based on model_type.
 
     This function MUST be called BEFORE model instantiation to take effect.
@@ -227,9 +289,16 @@ def apply_tiled_mlp_monkey_patch(
 
 
 def _patch_mlp_class(mlp_class: type[nn.Module], forward_fn, num_shards: int):
+    # [FUNCTION DOC]
+    # HELPER: Behavior: replaces mlp_class.forward with a function that collects the module's requires-grad params and calls
+    # TiledMLP.apply(forward_fn, self, x, num_shards, params).
+    # Inputs: mlp_class - class to patch; forward_fn - callable(module, x); num_shards - chunk count.
+    # Side effects: mutates the class.
     """Patch a single MLP class to use TiledMLP."""
 
     def tiled_forward(self, x):
+        # [FUNCTION DOC]
+        # HELPER: the patched forward; see _patch_mlp_class.
         compute_params = [p for p in self.parameters() if p.requires_grad]
         return TiledMLP.apply(forward_fn, self, x, num_shards, compute_params)
 

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# GPU Ray test that colocated worker groups (create_colocated_worker_cls + spawn) produce the same results as
+# separately created worker groups sharing one resource pool.
+
 import ray
 
 from verl import DataProto
@@ -28,28 +32,45 @@ from verl.utils.device import get_device_name
 
 @ray.remote
 class Actor(Worker):
+    # [CLASS DOC]
+    # HELPER: Ray worker whose add method adds its rank to field "a".
     def __init__(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls base Worker init only.
         super().__init__()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def add(self, data: DataProto):
+        # [FUNCTION DOC]
+        # HELPER: DP_COMPUTE_PROTO; adds self.rank to batch "a" in place and returns the DataProto.
         data.batch["a"] += self.rank
         return data
 
 
 @ray.remote
 class Critic(Worker):
+    # [CLASS DOC]
+    # HELPER: Ray worker configured with a dict; its async sub method subtracts config["b"] from field "a".
     def __init__(self, config) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls base Worker init and stores config (a mapping that must contain "b").
         super().__init__()
         self.config = config
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     async def sub(self, data: DataProto):
+        # [FUNCTION DOC]
+        # HELPER: Async DP_COMPUTE_PROTO; subtracts config["b"] from batch "a" in place and returns the DataProto.
         data.batch["a"] -= self.config["b"]
         return data
 
 
 def test_colocated_workers():
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, builds a 10-element DataProto of zeros and a 2-process pool, runs add/sub on separate actor
+    # and critic groups to get expected outputs, then builds a colocated class from {"actor","critic"}, spawns per-role
+    # groups and checks their outputs match exactly.
+    # Exceptions: AssertionError from torch.testing.assert_close. Side effects: starts/stops Ray, uses accelerator devices.
     ray.init()
 
     import torch

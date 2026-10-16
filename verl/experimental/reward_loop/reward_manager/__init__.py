@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Reward manager package for the reward loop. Importing it registers the built-in managers ("dapo", "gdpo", "naive",
+# "rate_limited"/limited, "remote") in the registry, and re-exports them with register and get_reward_manager_cls.
+# The registry import must come first (import order matters).
+
 from .registry import get_reward_manager_cls, register  # noqa: I001
 from .dapo import DAPORewardManager
 from .gdpo import GDPORewardManager

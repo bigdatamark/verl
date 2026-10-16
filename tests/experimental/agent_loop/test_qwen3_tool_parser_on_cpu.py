@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests run without tokenizer or network; the parser is constructed with tokenizer None.
+
 """CPU tests for ``Qwen3XMLToolParser`` parameter-value conversion.
 
 These exercise ``_parse_xml_function_call`` directly (no tokenizer / network
@@ -31,6 +34,11 @@ from verl.tools.schemas import (
 
 
 def _make_tool(param_name: str, param_type: str) -> OpenAIFunctionToolSchema:
+    # [FUNCTION DOC]
+    # HELPER: Builds an OpenAI function tool schema named "list_tool" with one property param_name of JSON type
+    # param_type and no required parameters.
+    # Inputs: param_name - property name; param_type - JSON schema type string (e.g. "array", "string").
+    # Outputs: an OpenAIFunctionToolSchema.
     return OpenAIFunctionToolSchema(
         type="function",
         function=OpenAIFunctionSchema(
@@ -46,6 +54,11 @@ def _make_tool(param_name: str, param_type: str) -> OpenAIFunctionToolSchema:
 
 
 def _parse_single_param(param_type: str, raw_value: str):
+    # [FUNCTION DOC]
+    # HELPER: Creates a Qwen3XMLToolParser, builds a tool with property "items" of the given type, and parses the
+    # string "list_tool><parameter=items>RAW</parameter>" (the inner form extracted from a function tag).
+    # Inputs: param_type - schema type for "items"; raw_value - raw parameter text.
+    # Outputs: the parsed FunctionCall (or None if the parser rejects it).
     parser = Qwen3XMLToolParser(tokenizer=None)
     tool = _make_tool("items", param_type)
     # The string fed to _parse_xml_function_call is exactly what _get_function_calls
@@ -56,6 +69,10 @@ def _parse_single_param(param_type: str, raw_value: str):
 
 
 def test_array_literal_is_parsed():
+    # [FUNCTION DOC]
+    # Behavior: parses "[1, 2, 3]" as an array parameter and asserts the arguments JSON string is exactly
+    # {"items": [1, 2, 3]}.
+    # Side effects: none.
     """A legitimate array literal is still parsed into its Python value."""
     result = _parse_single_param("array", "[1, 2, 3]")
     # arguments is a JSON string; the list literal round-trips to a JSON array.
@@ -63,6 +80,12 @@ def test_array_literal_is_parsed():
 
 
 def test_array_param_does_not_execute_arbitrary_code(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: security regression; feeds an os.system expression that would create a marker file under tmp_path
+    # as an array value, then asserts the marker was never created and that the value falls back to the raw
+    # payload string in the arguments JSON.
+    # Inputs: tmp_path - pytest temporary directory fixture.
+    # Side effects: none if the parser is safe (would write a file otherwise).
     """An ``array`` parameter must never execute code from model output.
 
     Regression test: the value used to be passed to ``eval()``, allowing
@@ -82,6 +105,9 @@ def test_array_param_does_not_execute_arbitrary_code(tmp_path):
 
 
 def test_malformed_parameter_is_skipped_but_valid_parameter_is_preserved():
+    # [FUNCTION DOC]
+    # Behavior: parses a call with one valid parameter followed by a truncated unclosed parameter tag and asserts
+    # a result is returned whose arguments decode to only {"items": "valid"}.
     """A truncated parameter must not discard preceding valid parameters."""
     parser = Qwen3XMLToolParser(tokenizer=None)
     tool = _make_tool("items", "string")
@@ -94,6 +120,8 @@ def test_malformed_parameter_is_skipped_but_valid_parameter_is_preserved():
 
 
 def test_malformed_function_header_returns_none():
+    # [FUNCTION DOC]
+    # Behavior: asserts parsing a bare "list_tool" (no closing ">") with no tools returns None without raising.
     """A truncated function header must be ignored without raising."""
     parser = Qwen3XMLToolParser(tokenizer=None)
 
@@ -101,6 +129,9 @@ def test_malformed_function_header_returns_none():
 
 
 def test_missing_tools_defaults_to_empty_list():
+    # [FUNCTION DOC]
+    # Behavior: passes tools=None and asserts parsing still succeeds, with arguments decoding to {"items": "value"}
+    # (unknown params are kept as strings).
     """Tool-call parsing must tolerate the public API's default tools value."""
     parser = Qwen3XMLToolParser(tokenizer=None)
 

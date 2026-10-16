@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Distributed (torchrun, >= 2 GPUs, ideally 8) tests for Ulysses sequence parallelism with verl's monkey-patched HF
+# attention: forward/backward of SP-sliced packed inputs must match a non-SP forward. Configs whose head counts are
+# incompatible with the SP size must raise AssertionError.
+
 import contextlib
 import copy
 from dataclasses import dataclass
@@ -47,12 +52,18 @@ elif get_device_name() == "npu":
 
 @dataclass
 class SequenceParallelConfig:
+    # [CLASS DOC]
+    # HELPER: Dataclass bundling a model config, the SP size, and whether the combination is expected to be valid.
     config: PretrainedConfig
     sp_size: int
     is_valid: bool
 
 
 def test_configs():
+    # [FUNCTION DOC]
+    # HELPER: Returns the parametrization list: Llama (32 heads) sp 8, Qwen2 (28 heads / 4 KV, hidden 3584) sp 4 valid
+    # and sp 8 invalid, Qwen2 (32 heads / 4 KV) sp 4 and 8, plus Apertus sp 8 when transformers >= 4.56.
+    # KNOWN ISSUE: named test_* so pytest also collects it as a test function (returning a non-None value).
     configs = [
         SequenceParallelConfig(
             LlamaConfig(num_hidden_layers=2, num_attention_heads=32, num_key_value_heads=32), sp_size=8, is_valid=True
@@ -90,6 +101,9 @@ def test_configs():
 
 
 def sync_model_parameters_global(layer):
+    # [FUNCTION DOC]
+    # HELPER: Broadcasts every parameter of the module from rank 0 so all ranks share weights.
+    # Side effects: collective communication; in-place parameter overwrite.
     # synchronize weights
     for p in layer.parameters():
         torch.distributed.broadcast(tensor=p.data, src=0)
@@ -97,6 +111,9 @@ def sync_model_parameters_global(layer):
 
 @pytest.mark.parametrize("test_config", test_configs())
 def test_hf_casual_fwd_bwd(test_config):
+    # [FUNCTION DOC]
+    # Behavior: initializes the global process group if needed and runs _hf_casual_fwd_bwd with dp = world_size / sp,
+    # expecting AssertionError for invalid configs. Process group is intentionally not destroyed.
     if not torch.distributed.is_initialized():
         initialize_global_process_group()
 
@@ -110,6 +127,13 @@ def test_hf_casual_fwd_bwd(test_config):
 
 
 def _hf_casual_fwd(config, sp_size, dp_size):
+    # [FUNCTION DOC]
+    # HELPER: Forward-only variant: builds a dp x sp device mesh and Ulysses sharding manager, creates a bf16
+    # flash-attention model, applies the monkey patch for sp_size, syncs weights, builds a random right-only-padded batch
+    # (1 x 128), and inside the sharding manager preprocesses (all-gathers across SP group) the data, unpads, pads and
+    # slices ids for SP, runs the model and gathers/unpads logits. Then disables the SP group and runs a full packed
+    # forward, asserting mean logits match (rtol 1e-2). Currently unused by any test.
+    # Exceptions: AssertionError if fewer than 2 devices.
     assert get_torch_device().device_count() >= 2, "need at least 2 gpus for test"
 
     ulysses_device_mesh = init_device_mesh(
@@ -189,6 +213,11 @@ def _hf_casual_fwd(config, sp_size, dp_size):
 
 
 def _hf_casual_fwd_bwd(config, sp_size, dp_size):
+    # [FUNCTION DOC]
+    # HELPER: Same setup as _hf_casual_fwd; the non-SP reference forward uses deep copies of the inputs and model. After
+    # computing both logit means it backpropagates each and asserts mean logits match (rtol 1e-2, atol 3e-5) and that the
+    # first layer q_proj weight gradients of the SP model and the reference model match (rtol 1e-2, atol 1e-3).
+    # Exceptions: AssertionError on device count, invalid head/SP combinations (from the patch), or mismatches.
     assert get_torch_device().device_count() >= 2, "need at least 2 gpus for test"
 
     ulysses_device_mesh = init_device_mesh(

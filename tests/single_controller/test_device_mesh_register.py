@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Multi-GPU Ray test for registering multiple named device meshes on a worker and dispatching/collecting DataProto,
+# TensorDict and jagged nested tensors via make_nd_compute_dataproto_dispatch_fn. Assumes the GPU count is divisible by 4.
 
 import numpy as np
 import ray
@@ -27,7 +30,13 @@ from verl.utils.device import get_device_name, get_nccl_backend
 
 @ray.remote
 class TestActor(Worker):
+    # [CLASS DOC]
+    # HELPER: Worker that builds an "infer" mesh (dp=2, tp=n/2) and a "train" mesh (pp=2, dp=2, tp=n/4) and registers
+    # dispatch info: infer collects from tp rank 0; train collects from tp rank 0 on pp rank 1.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Calls base init, initializes the process group with the device's collective backend, creates both device
+        # meshes and registers dispatch/collect info for "infer" and "train". Side effects: global distributed init.
         super().__init__()
 
         import torch.distributed
@@ -55,6 +64,8 @@ class TestActor(Worker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="infer"))
     def generate_data_proto(self, data: DataProto):
+        # [FUNCTION DOC]
+        # HELPER: infer-mesh dispatch; adds (tp_rank+1)*dp_rank to DataProto batch "a" in place and returns it.
         tp_rank = self.infer_device_mesh["tp"].get_local_rank()
         dp_rank = self.infer_device_mesh["dp"].get_local_rank()
         data.batch["a"] += (tp_rank + 1) * dp_rank
@@ -62,6 +73,8 @@ class TestActor(Worker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="infer"))
     def generate_tensordict(self, data: TensorDict):
+        # [FUNCTION DOC]
+        # HELPER: Same as generate_data_proto but on a TensorDict field "a".
         tp_rank = self.infer_device_mesh["tp"].get_local_rank()
         dp_rank = self.infer_device_mesh["dp"].get_local_rank()
         data["a"] += (tp_rank + 1) * dp_rank
@@ -69,6 +82,8 @@ class TestActor(Worker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"))
     def train_data_proto(self, data: DataProto):
+        # [FUNCTION DOC]
+        # HELPER: train-mesh dispatch; adds (tp_rank+1)*(dp_rank+2)*(pp_rank+3) to DataProto batch "a" and returns it.
         tp_rank = self.train_device_mesh["tp"].get_local_rank()
         dp_rank = self.train_device_mesh["dp"].get_local_rank()
         pp_rank = self.train_device_mesh["pp"].get_local_rank()
@@ -79,6 +94,8 @@ class TestActor(Worker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"))
     def train_tensordict(self, data: TensorDict):
+        # [FUNCTION DOC]
+        # HELPER: Same as train_data_proto on a TensorDict field "a".
         tp_rank = self.train_device_mesh["tp"].get_local_rank()
         dp_rank = self.train_device_mesh["dp"].get_local_rank()
         pp_rank = self.train_device_mesh["pp"].get_local_rank()
@@ -89,6 +106,8 @@ class TestActor(Worker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="infer"))
     def generate_nested_tensor(self, data: TensorDict):
+        # [FUNCTION DOC]
+        # HELPER: infer-mesh dispatch; asserts the local shard has 8 rows, adds tp_rank+dp_rank to jagged "input_ids", prints and returns it.
         tp_rank = self.infer_device_mesh["tp"].get_local_rank()
         dp_rank = self.infer_device_mesh["dp"].get_local_rank()
         assert data.shape[0] == 8
@@ -103,6 +122,12 @@ def test_dist_global_info_wg():
     # register a infer dist info with tp=4, dp=2
     # register a train dist info with tp=2, dp=2, pp=2
     # test the correctness of data dispatch and computation
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, creates a group on all GPUs, and checks: the infer dispatch info is each dp index repeated
+    # infer_tp times and outputs [1,3]; the train dispatch info is [dp indices each repeated train_tp] repeated twice
+    # (once per pp) and outputs [11,16]; both for DataProto and TensorDict; then sends 16 random-length jagged input_ids
+    # and checks the collected result equals the two halves shifted by 0 and 1.
+    # Exceptions: AssertionError. Side effects: starts/stops Ray, prints.
     from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 
     ray.init()

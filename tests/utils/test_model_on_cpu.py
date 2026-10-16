@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU test for verl.utils.model.update_model_config, which applies override kwargs to a config object, recursing
+# into nested attribute objects for dict overrides.
+
 from types import SimpleNamespace  # Or use a mock object library
 
 import pytest
@@ -28,6 +32,12 @@ from verl.utils.model import update_model_config
     ],
 )
 def test_update_model_config(override_kwargs):
+    # [FUNCTION DOC]
+    # Parametrized over a plain override and a nested override. Builds a fresh namespace config, applies the
+    # overrides, and checks nested attributes: for the nested case sub_param_x is updated, sub_param_y unchanged and
+    # sub_param_z added; for the plain case nested params are untouched.
+    # KNOWN ISSUE: the top-level overrides (param_a, new_param) and other_param are never asserted, so a failure to
+    # apply plain overrides would go unnoticed.
     """
     Tests that update_model_config correctly updates attributes,
     handling both plain and nested overrides via parametrization.

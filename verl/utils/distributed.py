@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Distributed-training setup helpers: NUMA/CPU affinity, torch.distributed process group init/teardown (torchrun-style and Ray-style), TCPStore creation from a pre-bound socket, and stateless NCCL/HCCL group creation for weight sync with vLLM workers.
+
 """Utilities for distributed training."""
 
 import ctypes
@@ -28,6 +31,10 @@ from verl.utils.net_utils import is_ipv6
 
 
 def set_numa_affinity():
+    # [FUNCTION DOC]
+    # Behavior: no-op on NPU. Otherwise loads libnuma; if NUMA is available, initializes NVML, determines the local GPU index (from Ray's assigned accelerator ids for the platform resource when Ray is initialized, else LOCAL_RANK env), and binds the process CPU affinity to that GPU's NUMA node.
+    # Exceptions: none raised; ImportError and other exceptions are printed as warnings.
+    # Side effects: changes process CPU affinity; NVML init/shutdown; prints.
     if is_npu_available:
         # TODO (FightingZhen) libnuma.so is not available in e2e_ascend CI image, remove this code after image update.
         return
@@ -60,6 +67,11 @@ def set_numa_affinity():
 
 
 def initialize_global_process_group(timeout_second=36000):
+    # [FUNCTION DOC]
+    # Behavior: initializes the default process group with a mixed backend "cpu:gloo,<device>:<backend>", the given timeout and optional DIST_INIT_METHOD, reads LOCAL_RANK/RANK/WORLD_SIZE from env, and sets the current device to local_rank.
+    # Inputs: timeout_second - collective timeout in seconds.
+    # Outputs: tuple (local_rank, rank, world_size).
+    # Exceptions: KeyError if env vars missing; init errors propagate.
     backend = f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}"
     torch.distributed.init_process_group(
         backend=backend,
@@ -76,6 +88,8 @@ def initialize_global_process_group(timeout_second=36000):
 
 
 def destroy_global_process_group():
+    # [FUNCTION DOC]
+    # Destroys the default process group if initialized.
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
@@ -83,6 +97,9 @@ def destroy_global_process_group():
 def initialize_global_process_group_ray(timeout_second=None, backend=None):
     # in current ray environment, LOCAL_RANK is always zero.
 
+    # [FUNCTION DOC]
+    # Behavior: if not already initialized, initializes the default process group using RANK/WORLD_SIZE env (defaults 0/1), optional timeout, backend (default mixed gloo + device backend), and DIST_INIT_METHOD. Does not set the device.
+    # Inputs: timeout_second - optional seconds; backend - optional backend string.
     import torch.distributed
 
     timeout = timedelta(seconds=timeout_second) if timeout_second is not None else None
@@ -105,6 +122,11 @@ def create_tcp_store(
     listen_socket: socket.socket | None = None,
     **kwargs: Any,
 ) -> TCPStore:
+    # [FUNCTION DOC]
+    # Behavior: creates a torch TCPStore; when listen_socket is given, detaches its fd and passes it as master_listen_fd so the store takes ownership; on construction failure closes the fd and re-raises.
+    # Inputs: host, port, listen_socket (optional), extra TCPStore kwargs.
+    # Outputs: TCPStore.
+    # Side effects: detaches (invalidates) listen_socket object.
     """Create a TCPStore, optionally taking ownership of ``listen_socket``."""
     if listen_socket is None:
         return TCPStore(host_name=host, port=port, **kwargs)
@@ -123,6 +145,10 @@ def create_tcp_store(
 
 
 def stateless_init_process_group(master_address, master_port, rank, world_size, device):
+    # [FUNCTION DOC]
+    # Behavior: creates a vLLM StatelessProcessGroup (independent of the global torch group) at master_address:master_port, then wraps it with PyNcclCommunicator (or vllm_ascend PyHcclCommunicator on NPU) bound to device.
+    # Inputs: master_address, master_port, rank, world_size, device.
+    # Outputs: the communicator object.
     """
     vLLM provides `StatelessProcessGroup` to create a process group
     without considering the global process group in torch.distributed.
@@ -154,6 +180,11 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
         store_timeout: int = 300,
         listen_socket: socket.socket | None = None,
     ) -> "StatelessProcessGroup":
+        # [FUNCTION DOC]
+        # HELPER: IPv6-capable copy of vLLM StatelessProcessGroup.create. Rank 0 creates, binds and listens on a TCP socket (AF_INET6 if master_address is IPv6, else AF_INET, with SO_REUSEADDR) unless one is provided; other ranks use none. For vLLM >= 0.19 the store is built via create_tcp_store (socket ownership transferred) and the group without a socket argument; for older vLLM a TCPStore is built with master_listen_fd and the socket is passed to the group. Store uses is_master for rank 0, timeout store_timeout, use_libuv False.
+        # Inputs: host, port, rank, world_size, data_expiration_seconds, store_timeout, listen_socket.
+        # Outputs: StatelessProcessGroup.
+        # Note: decides IPv6 from the enclosing master_address rather than host.
         """
         This is copied from vllm/distributed/utils.py:StatelessProcessGroup.create
         Modified to support ipv6 stateless communication groups."""

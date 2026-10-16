@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Single-GPU closed-loop script (see module docstring) applying a sparse weight delta to a real sglang engine via
+# verl's custom delta weight loader and then running a dense verify flush that must report zero mismatches.
+# At import time prepends VERL_PATH (default a developer-specific path) to sys.path and reads MODEL_KIND (qwen2 or nemotron_h).
+# KNOWN ISSUE: the default VERL_PATH "/home/changyi/verl_ab_pre" is developer-specific.
+
 """Closed-loop delta apply test against a REAL sglang engine on tiny models.
 
 randomize -> perturb -> sparse delta flush -> engine.update_weights_from_tensor
@@ -39,6 +46,13 @@ MODEL_KIND = os.environ.get("MODEL_KIND", "qwen2")
 
 
 def _build_tiny_hf_dir() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Ensures a tiny random bf16 checkpoint exists at /tmp/tiny_<MODEL_KIND>_delta_loop_v2 and returns the path.
+    # Behavior: builds a small qwen2 config (2 layers, hidden 256, real Qwen vocab size) or, for nemotron_h, first stubs
+    # transformers hub-kernel loaders to no-ops and builds a small hybrid Mamba config; raises ValueError for other kinds.
+    # If model.safetensors is absent, instantiates and saves the model and saves the Qwen2.5-7B-Instruct tokenizer into the directory.
+    # Side effects: monkey-patches transformers (nemotron_h), writes files, may download a tokenizer.
+    # KNOWN ISSUE: the cache check is existence-only, so a stale directory from a different config is reused.
     from transformers import AutoConfig
 
     cfg_dir = f"/tmp/tiny_{MODEL_KIND}_delta_loop_v2"
@@ -102,16 +116,28 @@ def _build_tiny_hf_dir() -> str:
 
 
 def _load_named(cfg_dir: str) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Loads model.safetensors from the directory and returns a mapping name to bf16 CUDA tensor.
     from safetensors.torch import load_file
 
     return {k: v.to(torch.bfloat16).cuda() for k, v in load_file(f"{cfg_dir}/model.safetensors").items()}
 
 
 def _spec_tensor(spec: dict) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Serializes a mapping to JSON and returns its UTF-8 bytes as a uint8 tensor.
     return torch.frombuffer(bytearray(json.dumps(spec).encode()), dtype=torch.uint8)
 
 
 def _sparse_flush(old: dict, new: dict):
+    # [FUNCTION DOC]
+    # HELPER: Builds the "indices" delta wire payload (see docstring) from old and new name-to-tensor mappings.
+    # Behavior: for each new tensor computes changed flat indices/values relative to old; skips unchanged tensors; records a
+    # DeltaParam with byte offsets into a positions buffer (4 bytes per int32 index) and element offsets into a values
+    # buffer. Concatenates int32 indices viewed as bytes and the values, computes a checksum, and builds a spec
+    # (encoding "indices", params as dicts, checksum).
+    # Outputs: list of (name, tensor) pairs: "__delta_spec__", "__positions__", "__values__".
+    # Exceptions: errors from concatenating empty lists if no tensor changed.
     """Encode changed elements exactly like the sender's indices wire."""
     from verl.checkpoint_engine.delta_sync import DeltaParam, checksum
     from verl.checkpoint_engine.delta_sync.sparse_gather import shard_delta_indices
@@ -150,6 +176,10 @@ def _sparse_flush(old: dict, new: dict):
 
 
 def _verify_flush(expected: dict):
+    # [FUNCTION DOC]
+    # HELPER: Builds a dense "verify" payload containing every expected tensor's full flattened values with value offsets,
+    # no positions, flags verify and is_last, and a checksum over empty positions and the values.
+    # Outputs: list of ("__delta_spec__", spec tensor) and ("__values__", values).
     from verl.checkpoint_engine.delta_sync import DeltaParam, checksum
 
     params, pieces, val_off = [], [], 0
@@ -181,6 +211,12 @@ def _verify_flush(expected: dict):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: builds/loads the tiny checkpoint, starts an sglang Engine with the delta loader registered (no CUDA graphs or
+    # radix cache, seed 1234), perturbs ~1% of elements of each tensor (seed 11, noise std 0.05), sends the sparse delta from
+    # the original to the perturbed weights, then the verify flush against the perturbed weights (the loader fails on any
+    # mismatch), prints a pass message and shuts the engine down.
+    # Side effects: GPU engine startup, prints.
     import sglang as sgl
 
     from verl.workers.rollout.sglang_rollout.delta_loader import LOADER_FQN

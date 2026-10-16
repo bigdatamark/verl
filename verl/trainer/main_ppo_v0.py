@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Legacy (deprecated) PPO task runner built on RayPPOTrainer. Sets up role-to-worker mappings, resource pools,
+# datasets and the trainer, then trains.
+
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
 """
@@ -28,11 +33,21 @@ from verl.utils.config import validate_config
 
 
 class BaseTaskRunner:
+    # [CLASS DOC]
+    # Base class assembling role_worker_mapping (Role to Ray remote worker class) and mapping (Role to resource pool
+    # id); subclass implements run. Helper methods are meant to be overridden by recipes.
     def __init__(self):
+        # [FUNCTION DOC]
+        # Initializes empty role_worker_mapping and mapping.
         self.role_worker_mapping = {}
         self.mapping = {}
 
     def add_actor_rollout_worker(self, config):
+        # [FUNCTION DOC]
+        # Behavior: registers the unified ActorRolloutRefWorker on "global_pool". LoRA rank comes from model.lora.rank, or
+        # model.lora_rank if not positive; ref is considered "in actor" when LoRA rank > 0 or a LoRA adapter path is set. Uses
+        # role ActorRolloutRef when a reference policy is needed and not ref-in-actor, else ActorRollout.
+        # Inputs: config. Outputs: (worker class, RayWorkerGroup class). Side effects: mutates both mappings.
         """Add actor rollout worker using the unified model engine implementation."""
         from verl.single_controller.ray import RayWorkerGroup
         from verl.trainer.ppo.ray_trainer import Role
@@ -55,6 +70,9 @@ class BaseTaskRunner:
         return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
+        # [FUNCTION DOC]
+        # Registers the unified TrainingWorker as Critic on "global_pool". Side effects: mutates both mappings.
+        # Note: registers the critic unconditionally, even if no critic is needed.
         """Add critic worker to role mapping using the unified model engine implementation."""
         from verl.trainer.ppo.ray_trainer import Role
         from verl.workers.engine_workers import TrainingWorker
@@ -65,6 +83,12 @@ class BaseTaskRunner:
         self.mapping[Role.Critic] = "global_pool"
 
     def init_resource_pool_mgr(self, config):
+        # [FUNCTION DOC]
+        # Behavior: builds the resource pool spec: "global_pool" of n_gpus_per_node repeated nnodes times; if the reward model
+        # has its own pool, validates its gpus/nodes are positive and adds "reward_pool", else overwrites reward model
+        # nnodes/gpus with trainer values; if distillation is enabled, validates and adds "teacher_pool". Returns a
+        # ResourcePoolManager with the spec and self.mapping.
+        # Exceptions: ValueError for non-positive sizes. Side effects: may mutate config.reward.reward_model.
         """Initialize resource pool manager."""
 
         global_pool_id = "global_pool"
@@ -100,6 +124,9 @@ class BaseTaskRunner:
         return resource_pool_manager
 
     def add_reward_model_resource_pool(self, config):
+        # [FUNCTION DOC]
+        # Behavior: when the reward model is enabled, maps Role.RewardModel to "reward_pool" (if separate pool) or
+        # "global_pool"; no worker class is registered. Side effects: mutates mapping.
         """Add reward model worker if enabled."""
         from verl.trainer.ppo.ray_trainer import Role
 
@@ -112,6 +139,8 @@ class BaseTaskRunner:
                 self.mapping[Role.RewardModel] = "global_pool"
 
     def add_teacher_model_resource_pool(self, config):
+        # [FUNCTION DOC]
+        # Behavior: when distillation is enabled maps Role.TeacherModel to "teacher_pool" (no worker class). Side effects: mutates mapping.
         """Add teacher model worker if enabled."""
         from verl.trainer.ppo.ray_trainer import Role
 
@@ -121,6 +150,8 @@ class BaseTaskRunner:
             self.mapping[Role.TeacherModel] = "teacher_pool"
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
+        # [FUNCTION DOC]
+        # No-op kept for backward compatibility; returns None.
         """Ref policy is fused into ActorRolloutRefWorker in the unified model engine.
 
         Kept for backward compatibility with subclasses that still invoke it; the method
@@ -130,11 +161,15 @@ class BaseTaskRunner:
         return
 
     def run(self, config):
+        # [FUNCTION DOC]
+        # Abstract placeholder; does nothing.
         pass
 
 
 @ray.remote
 class TaskRunner(BaseTaskRunner):
+    # [CLASS DOC]
+    # Ray actor implementing the legacy end-to-end PPO training workflow.
     """Ray remote class for executing distributed PPO training tasks.
 
     This class encapsulates the main training logic and runs as a Ray remote actor
@@ -146,9 +181,17 @@ class TaskRunner(BaseTaskRunner):
     """
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Calls the base initializer.
         super().__init__()
 
     def run(self, config):
+        # [FUNCTION DOC]
+        # Behavior: prints host/PID and resolved config, resolves config; registers actor/rollout and critic workers, reward
+        # and teacher pools, calls the no-op ref hook; validates config; builds HFModelConfig to get tokenizer and optional
+        # processor; builds the resource pool manager; creates train and val RL datasets (max samples from config, default
+        # -1) and the train sampler; constructs RayPPOTrainer with the collate function; initializes workers and runs fit.
+        # Inputs: config. Outputs: None. Side effects: stdout, config resolution, spawning workers, training.
         """Execute the main PPO training workflow.
 
         This method sets up the distributed training environment, initializes

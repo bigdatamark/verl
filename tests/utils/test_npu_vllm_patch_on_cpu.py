@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU test for verl/utils/vllm/npu_vllm_patch.py (loaded by file path): apply_npu_vllm_patches must work when vLLM
+# exposes the modular FusedMoEFactory API and must apply the rotary-embedding patch.
+
 import importlib.util
 import sys
 from pathlib import Path
@@ -20,6 +24,9 @@ from unittest.mock import Mock
 
 
 def _load_npu_vllm_patch_module():
+    # [FUNCTION DOC]
+    # HELPER: Loads npu_vllm_patch.py as a fresh module named "test_npu_vllm_patch" from its file path.
+    # Outputs: the module. Exceptions: AssertionError if no import spec can be built. Side effects: executes the file.
     module_path = Path(__file__).parents[2] / "verl" / "utils" / "vllm" / "npu_vllm_patch.py"
     spec = importlib.util.spec_from_file_location("test_npu_vllm_patch", module_path)
     assert spec is not None and spec.loader is not None
@@ -29,6 +36,10 @@ def _load_npu_vllm_patch_module():
 
 
 def test_apply_npu_vllm_patches_accepts_modular_fused_moe(monkeypatch):
+    # [FUNCTION DOC]
+    # Patches NPU availability to True and the rotary patch to a Mock, installs fake vllm modules exposing only
+    # fused_moe.FusedMoEFactory in sys.modules, calls apply_npu_vllm_patches, and asserts the rotary patch was called
+    # once with no arguments (and no error was raised).
     npu_vllm_patch = _load_npu_vllm_patch_module()
     monkeypatch.setattr(npu_vllm_patch, "is_torch_npu_available", lambda check_device=False: True)
     rotary_patch = Mock()

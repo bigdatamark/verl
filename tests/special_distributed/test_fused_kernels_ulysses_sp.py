@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# 2-GPU pytest (run under torchrun) regression for fused kernels combined with Ulysses sequence parallelism (see module
+# docstring): fused-kernel log_probs with SP=2 and engine-provided shift_labels must match an SP=1 reference.
+
 """End-to-end regression test for issue #6068 (use_fused_kernels=True + ulysses_sp>1).
 
 Construction:
@@ -45,6 +50,9 @@ from verl.utils.ulysses import (
 
 
 def _make_model(seed: int = 0):
+    # [FUNCTION DOC]
+    # HELPER: Seeds torch and builds a tiny bf16 Llama causal LM (vocab 256, hidden 64, 2 layers, 8 heads) using flash
+    # attention 2. Inputs: seed (default 0). Outputs: (model, config).
     config = LlamaConfig(
         vocab_size=256,
         hidden_size=64,
@@ -61,18 +69,29 @@ def _make_model(seed: int = 0):
 
 
 def _broadcast_params(model):
+    # [FUNCTION DOC]
+    # HELPER: Broadcasts every parameter's data from rank 0 in place so all ranks hold identical weights.
     for p in model.parameters():
         torch.distributed.broadcast(p.data, src=0)
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _init_dist():
+    # [FUNCTION DOC]
+    # HELPER: Module-scoped autouse fixture that initializes the global process group if not already initialized; no teardown.
     if not torch.distributed.is_initialized():
         initialize_global_process_group()
     yield
 
 
 def test_fused_kernels_log_probs_match_under_sp():
+    # [FUNCTION DOC]
+    # Behavior: builds and monkey-patches the model (SP=2, remove padding, fused kernels with torch backend), moves it to
+    # the device, broadcasts weights; broadcasts 32 random tokens from rank 0 with positions 0..31. Computes reference
+    # log_probs on rank 0 with no SP group and broadcasts them. Then builds a (dp, sp) mesh, and inside the Ulysses sharding
+    # manager rolls the ids left by one as labels, pads/slices ids, positions and rolled labels per SP rank, runs the fused
+    # forward with shift_labels, gathers and unpads log_probs across SP ranks and asserts closeness (atol/rtol 1e-3).
+    # Exceptions: AssertionError if fewer than 2 devices or world size not divisible by 2, or mismatch.
     """log_probs from fused-kernel + SP=2 must equal fused-kernel + SP=1.
 
     This is the direct regression test for #6068. The bug was that the

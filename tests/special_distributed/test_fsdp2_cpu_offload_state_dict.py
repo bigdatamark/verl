@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# torchrun regression script (see module docstring) for FSDP2 + CPUOffloadPolicy state_dict behavior: builds a tiny
+# bf16 Qwen2 sharded over a 1-D "dp" mesh and verifies state_dict without a manual GPU load works and its DTensors
+# materialise on the accelerator.
+
 """Regression for verl#5995: FSDP2 + CPUOffloadPolicy state_dict crash inside
 FSDPEngine.get_per_tensor_param.
 
@@ -45,6 +50,10 @@ from verl.utils.fsdp_utils import MixedPrecisionPolicy, apply_fsdp2, load_fsdp_m
 
 
 def _build_fsdp2_cpu_offload_module(device_mesh):
+    # [FUNCTION DOC]
+    # HELPER: Builds a 2-layer, 128-hidden, vocab-512 Qwen2 causal LM in bf16 on the accelerator, then applies FSDP2 with
+    # the given mesh, bf16 params / fp32 reduce mixed precision with forward-input casting, and a pinned-memory
+    # CPUOffloadPolicy. Inputs: device_mesh. Outputs: the wrapped model (wrapped in place).
     """Wrap a tiny Qwen2 with FSDP2 + CPUOffloadPolicy, mirroring FSDPEngine."""
     config = Qwen2Config(
         num_hidden_layers=2,
@@ -70,6 +79,10 @@ def _build_fsdp2_cpu_offload_module(device_mesh):
 
 
 def _assert_fixed_path_succeeds(device_mesh, rank):
+    # [FUNCTION DOC]
+    # HELPER: Builds the module, calls state_dict and asserts it is non-empty; finds the first DTensor entry, moves it to
+    # the current device id non-blocking, gathers the full tensor and asserts it lives on the accelerator device type.
+    # Inputs: device_mesh; rank (rank 0 prints). Exceptions: AssertionError if empty, wrong device, or no DTensor found.
     """Replay FSDPEngine.get_per_tensor_param's post-fix sequence."""
     module = _build_fsdp2_cpu_offload_module(device_mesh)
 
@@ -95,6 +108,11 @@ def _assert_fixed_path_succeeds(device_mesh, rank):
 
 
 def _probe_pre_fix_crash(device_mesh, rank):
+    # [FUNCTION DOC]
+    # HELPER: Informational probe: builds the module, calls load_fsdp_model_to_gpu, then state_dict; catches RuntimeError
+    # and flags it as the known device-mismatch crash if the lowercased message contains "cpu", "cuda" and "storage".
+    # Rank 0 prints the outcome. Never fails. Currently not called from main (commented out).
+    # Exceptions: non-RuntimeError errors propagate.
     """Reproduce the pre-fix sequence and report whether it still crashes."""
     module = _build_fsdp2_cpu_offload_module(device_mesh)
     load_fsdp_model_to_gpu(module)
@@ -119,6 +137,9 @@ def _probe_pre_fix_crash(device_mesh, rank):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: asserts at least one device, initializes the global process group, builds a world-sized "dp" mesh, runs
+    # the fixed-path check, then barriers and destroys the process group; rank 0 prints success.
     assert get_torch_device().device_count() >= 1, "need at least 1 gpu for test"
     _, rank, world_size = initialize_global_process_group()
     device_mesh = init_device_mesh(get_device_name(), mesh_shape=(world_size,), mesh_dim_names=("dp",))

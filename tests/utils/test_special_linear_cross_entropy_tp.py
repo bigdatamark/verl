@@ -28,6 +28,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Standalone torchrun script (not a pytest module; needs at least 2 CUDA ranks with
+# NCCL) validating the fused linear_cross_entropy kernel in vocab tensor-parallel
+# mode against a pure-PyTorch reference autograd function. For each of up to
+# MAX_TEST_CASES model shapes it optionally checks the TP reference against a
+# single-device reference, then compares kernel vs reference forward (logprobs,
+# entropy) and backward (hidden and weight grads) values, latency and peak memory.
+# Hidden states, labels and upstream gradients are broadcast from rank 0; each rank
+# holds its own vocab shard of the weight. Env knobs: MAX_TEST_CASES (default 5),
+# VERIFY_TORCH_SELF, LOW_MEMORY, LOW_MEMORY_DIV_FACTOR (default 16).
+# KNOWN ISSUE: env-var knobs are read as raw strings when set, so a set
+# MAX_TEST_CASES breaks range() and the "<= 5" assert, LOW_MEMORY_DIV_FACTOR breaks
+# the division, and any non-empty VERIFY_TORCH_SELF/LOW_MEMORY (even "0") is truthy.
 
 import os
 
@@ -57,6 +70,18 @@ LOW_MEMORY_DIV_FACTOR = os.environ.get("LOW_MEMORY_DIV_FACTOR", 16)
 def run_torch_entropy(
     hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, temperature: float, reduction="none"
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Single-device reference for logprobs and entropy of a linear head.
+    # Behavior: flattens hidden to 2-D tokens-by-hidden and labels to 1-D; computes
+    # float32 logits as hidden times weight, using weight as-is if its first dim equals
+    # the hidden size, else its transpose; divides by temperature; entropy is
+    # logsumexp of logits minus the softmax-weighted sum of logits; logprobs is the
+    # negated cross-entropy against labels with the given reduction.
+    # Inputs: hidden [.., hidden]; weight [vocab, hidden] or [hidden, vocab]; labels;
+    # temperature; reduction - cross-entropy reduction, default "none".
+    # Outputs: tuple (logprobs, entropy), float32, per token when reduction is none.
+    # KNOWN ISSUE: annotated as returning a list but returns a tuple; the
+    # orientation heuristic is ambiguous when vocab size equals hidden size.
     # [num_tokens, vocab_size]
     if len(hidden.shape) > 2:
         hidden = hidden.view(-1, hidden.shape[-1])  # [num_tokens, hidden_size]
@@ -77,6 +102,10 @@ def run_torch_entropy(
 
 
 class TorchEntropyTP(torch.autograd.Function):
+    # [CLASS DOC]
+    # HELPER: Reference autograd function for vocab-parallel logprobs/entropy; each rank
+    # holds a [local_vocab, hidden] weight shard. Correctness reference only, not
+    # efficient (materializes full logits on every rank).
     """
     it is used for testing the correctness of the kernel
     it is not efficient and is not recommended to use in practice
@@ -91,6 +120,16 @@ class TorchEntropyTP(torch.autograd.Function):
         temperature: float,
         dist_process_group: torch.distributed.ProcessGroup,
     ):
+        # [FUNCTION DOC]
+        # Behavior: flattens inputs, computes local float32 logits divided by temperature,
+        # all-gathers them along the vocab dim into a full [tokens, vocab*world] buffer
+        # (rank i's shard in column block i), then computes entropy and negated
+        # cross-entropy logprobs over the full logits exactly like run_torch_entropy.
+        # Inputs: ctx; hidden; weight shard; labels (global vocab ids); temperature;
+        # dist_process_group. Outputs: (logprobs, entropy) per token.
+        # Side effects: saves hidden, weight, labels, full logits, and the softmax-weighted
+        # logit sum for backward, plus the group, temperature and original hidden shape on
+        # ctx; performs an all-gather collective.
         # weight has shape [vocab_size, hidden_size], hidden has shape [num_tokens, hidden_size]
         ctx.original_hidden_shape = hidden.shape
         if len(hidden.shape) > 2:
@@ -126,6 +165,17 @@ class TorchEntropyTP(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g_logprobs: torch.Tensor, g_entropy: torch.Tensor):
+        # [FUNCTION DOC]
+        # Behavior: recomputes softmax of full logits (max-subtracted); entropy grad wrt
+        # logits is g_entropy times negative probs times (logits minus saved weighted sum);
+        # logprob grad is negated g_logprobs times (probs minus one-hot of labels); sums
+        # both and divides by temperature; slices this rank's vocab column block; returns
+        # grad of hidden as local-dlogits times weight (reshaped to original hidden shape)
+        # and grad of weight as local-dlogits transposed times hidden, both float32.
+        # Inputs: ctx; g_logprobs, g_entropy - upstream grads per token.
+        # Outputs: (d_hidden, d_weight, None, None, None).
+        # Note: d_hidden is only the partial contribution of this shard; callers must
+        # all-reduce (sum) it across ranks.
         hidden, weight, labels, whole_logits, entropy_b = ctx.saved_tensors
         dist_process_group = ctx.dist_process_group
         temperature = ctx.temperature
@@ -179,7 +229,15 @@ run_torch_entropy_tp = TorchEntropyTP.apply
 
 
 class TestLinearCrossEntropy_TensorParallel:
+    # [CLASS DOC]
+    # Driver class (plain class, not collected by pytest) holding distributed state
+    # and per-test-case shapes, with methods for reference self-check, correctness vs
+    # kernel, and peak-memory reporting.
     def __init__(self):
+        # [FUNCTION DOC]
+        # Behavior: initializes the NCCL default process group, records the world group,
+        # rank and world size, binds the CUDA device to the rank, prints rank info.
+        # Side effects: global distributed init and CUDA device selection.
         dist.init_process_group(backend="nccl")
         self.group = dist.group.WORLD
 
@@ -190,13 +248,20 @@ class TestLinearCrossEntropy_TensorParallel:
         print(f"[INFO]: Local rank: {self.local_rank}, World size: {self.world_size}")
 
     def initialize(self, test_case_idx: int, temperature: float = 1.5):
+        # [FUNCTION DOC]
+        # HELPER: Sets the current test case index and softmax temperature (default 1.5).
         self.test_case_idx = test_case_idx
         self.temperature = temperature
 
     def shutdown(self):
+        # [FUNCTION DOC]
+        # HELPER: Destroys the default process group.
         dist.destroy_process_group()
 
     def cleanup(self):
+        # [FUNCTION DOC]
+        # HELPER: Empties CUDA cache, resets peak memory stats, runs garbage collection and
+        # synchronizes the device.
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         import gc
@@ -205,6 +270,13 @@ class TestLinearCrossEntropy_TensorParallel:
         torch.cuda.synchronize()
 
     def generate_hyper(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets dtype bfloat16 and batch size, token count, hidden size and local
+        # vocab size for test case 0..4 (shapes modeled on Qwen2/Qwen2.5/DeepSeek-like
+        # heads; case 4 uses 8192 tokens). When LOW_MEMORY is truthy divides vocab size by
+        # LOW_MEMORY_DIV_FACTOR.
+        # Exceptions: ValueError for an index outside 0..4; AssertionError if
+        # MAX_TEST_CASES exceeds 5.
         global LOW_MEMORY, LOW_MEMORY_DIV_FACTOR, MAX_TEST_CASES
 
         self.dtype = torch.bfloat16
@@ -240,6 +312,11 @@ class TestLinearCrossEntropy_TensorParallel:
         assert MAX_TEST_CASES <= 5, "MAX_TEST_CASES should be less than or equal to 5."
 
     def generate_forward_inputs(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates random inputs on CUDA: hidden [batch, tokens, hidden] and weight
+        # [vocab, hidden] uniform in [-0.5, 0.5] with requires_grad, and integer labels
+        # [batch, tokens] in [0, local vocab).
+        # Outputs: (hidden, weight, labels).
         hidden = (
             torch.empty((self.batch_size, self.num_tokens, self.hidden_size), dtype=self.dtype, device="cuda")
             .uniform_(-0.5, 0.5)
@@ -254,11 +331,23 @@ class TestLinearCrossEntropy_TensorParallel:
         return hidden, weight, labels
 
     def generate_backward_inputs(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates random upstream grads per token: g_entropy uniform in
+        # [-0.5, 0.5], g_logprobs uniform in [-1, 1].
+        # Outputs: (g_entropy, g_logprobs).
         g_entropy = torch.empty((self.num_tokens,), dtype=self.dtype, device="cuda").uniform_(-0.5, 0.5)
         g_logprobs = torch.empty((self.num_tokens,), dtype=self.dtype, device="cuda").uniform_(-1, 1)
         return g_entropy, g_logprobs
 
     def verify_torch_itself(self, iterations: int = 5):
+        # [FUNCTION DOC]
+        # Behavior: for the given number of iterations, broadcasts hidden/labels from rank
+        # 0, all-gathers weight shards into a full weight, and checks TorchEntropyTP
+        # against run_torch_entropy on the full weight: forward outputs at 1e-4 tolerance;
+        # after broadcasting upstream grads, hidden grad (TP grad all-reduced) and this
+        # rank's slice of the full weight grad at atol 1e-2/rtol 1e-4.
+        # Inputs: iterations - default 5. Side effects: collectives; prints PASS on rank 0.
+        # Exceptions: AssertionError from assert_close on mismatch.
         self.cleanup()
         self.generate_hyper()
 
@@ -329,6 +418,10 @@ class TestLinearCrossEntropy_TensorParallel:
             print("[PASS] torch TP correctness is verified")
 
     def check_torch_storage(self):
+        # [FUNCTION DOC]
+        # Behavior: runs one forward and backward of the TP reference with peak memory
+        # stats reset before each phase, all-reduces the hidden grad, and prints forward
+        # and backward peak allocated MB on rank 0.
         self.cleanup()
         self.generate_hyper()
 
@@ -362,6 +455,15 @@ class TestLinearCrossEntropy_TensorParallel:
             print(f"[INFO]: Torch Backward pass peak memory: {backward_max_memory:.2f} MB")
 
     def verify_kernel_correctness(self, iterations: int = 5):
+        # [FUNCTION DOC]
+        # Behavior: for each iteration, times (CUDA events) the TP reference and the
+        # kernel forward (reduction none, with the group), asserts logprobs/entropy close
+        # (atol 1e-1, rtol 1e-2), then times both backward passes with broadcast upstream
+        # grads, all-reduces both hidden grads, and asserts hidden and weight grads close
+        # (atol 2e-2, rtol 4e-2). Drops the first (warm-up) latency of each list and on
+        # rank 0 prints PASS and the four average latencies in ms.
+        # Inputs: iterations - default 5.
+        # Exceptions: AssertionError on mismatch; ZeroDivisionError if iterations is 1.
         self.cleanup()
         self.generate_hyper()
 
@@ -453,6 +555,9 @@ class TestLinearCrossEntropy_TensorParallel:
             )
 
     def check_kernel_storage(self):
+        # [FUNCTION DOC]
+        # Behavior: same as check_torch_storage but for linear_cross_entropy: reports
+        # kernel forward and backward peak memory in MB on rank 0.
         self.cleanup()
         self.generate_hyper()
 

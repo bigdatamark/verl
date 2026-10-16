@@ -13,6 +13,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Legacy (deprecated) Ray single-controller PPO trainer. The driver process builds dataloaders,
+# creates Ray worker groups for the actor/rollout/ref/critic/reward/teacher roles, and runs the
+# PPO loop: generate rollouts via an async agent-loop rollout manager, compute rewards,
+# old/ref log-probs, values, KL penalty and advantages, then update critic and actor, with
+# validation, checkpointing, profiling and metric logging. Also exposes reusable functions for
+# KL penalty, response masks, speculative-decoding metrics and advantage computation.
 """
 PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
@@ -76,6 +84,15 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
+    # [FUNCTION DOC]
+    # Behavior: computes per-token KL between old_log_probs and ref_log_prob using the chosen
+    # estimator, masks it with response_mask, sets token_level_rewards = token_level_scores - beta*KL
+    # (beta = current controller value), computes the batch mean of per-sequence masked mean KL,
+    # and updates the controller with it and the batch size.
+    # Inputs: data with response_mask, token_level_scores, old_log_probs, ref_log_prob; kl_ctrl;
+    # kl_penalty - estimator name.
+    # Outputs: (data, metrics with actor/reward_kl_penalty and actor/reward_kl_penalty_coeff).
+    # Side effects: mutates data.batch and the controller state.
     """Apply KL penalty to the token-level rewards.
 
     This function computes the KL divergence between the reference policy and current policy,
@@ -118,6 +135,9 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
 
 def compute_response_mask(data: DataProto):
+    # [FUNCTION DOC]
+    # Behavior: returns the last responses.size(1) columns of attention_mask.
+    # Inputs: data with responses and attention_mask. Outputs: tensor [batch, response_len].
     """Compute the attention mask for the response part of the sequence.
 
     This function extracts the portion of the attention mask that corresponds to the model's response,
@@ -141,6 +161,13 @@ def compute_spec_decode_metrics(
     spec_verifies,
     non_padding_mask=None,
 ) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: returns empty when all three inputs are None; asserts all are provided otherwise.
+    # Converts inputs to lists, filters by non_padding_mask if given, returns empty if no samples.
+    # Per sample: accept rate = accepted/drafted (0 if no drafts); accept length = 1 +
+    # accepted/verify steps (0 if no verify steps). Returns the unweighted means.
+    # Outputs: dict with rollout/spec_accept_rate and rollout/spec_accept_length.
+    # Exceptions: AssertionError on partial inputs; ValueError on length mismatch with the mask.
     """Aggregate per-request speculative decoding stats.
 
     Ratios are computed per request and then averaged, so long and short
@@ -193,6 +220,19 @@ def compute_advantage(
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
 ) -> DataProto:
+    # [FUNCTION DOC]
+    # Behavior: adds response_mask if missing. GAE: computes advantages/returns from rewards and
+    # values, then optionally applies PF-PPO reweighting (config.use_pf_ppo) which may resample
+    # the data. GRPO: outcome advantage grouped by uid with optional std normalization. Any other
+    # estimator: looks up its function and calls it with rewards, response_mask, config, and
+    # optionally uid index, reward_baselines; GDPO additionally gets the raw batch and non-tensor
+    # batch; optimal-token-baseline variants additionally require sum_pi_squared and receive
+    # old_log_probs and optional rollout_is_weights. Stores advantages and returns in data.batch.
+    # Inputs: see docstring; num_repeat is accepted but unused.
+    # Outputs: the (possibly replaced) DataProto.
+    # Exceptions: AssertionError when sum_pi_squared missing for optimal baselines.
+    # KNOWN ISSUE: config defaults to None but the GAE branch calls config.get, which fails when
+    # config is not supplied.
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -284,6 +324,12 @@ def compute_advantage(
 
 @deprecated("Legacy trainer is deprecated, and wil be removed in v0.9.0. Please use `trainer.use_v1=True` instead.")
 class RayPPOTrainer:
+    # [CLASS DOC]
+    # Deprecated driver-side trainer (use trainer.use_v1). Holds config, tokenizer/processor,
+    # role -> worker class mapping, resource pool manager, flags for which auxiliary roles are
+    # used (reference, teacher, reward model, critic), whether reference is the LoRA-free actor
+    # (ref_in_actor), optional in-reward KL controller, dataloaders, worker groups created in
+    # init_workers, checkpoint manager, and a single-thread executor for dumping generations.
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
     This trainer orchestrates distributed PPO training across multiple nodes and GPUs,
@@ -307,6 +353,14 @@ class RayPPOTrainer:
         train_sampler: Optional[Sampler] = None,
         device_name=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores inputs; asserts hybrid engine is enabled and the mapping contains
+        # ActorRollout or ActorRolloutRef; computes role-usage flags; picks device name (argument or
+        # trainer.device); creates the validation generations logger; sets ref_in_actor when a LoRA rank
+        # > 0 (lora.rank, else legacy lora_rank) or a LoRA adapter path is configured; creates the KL
+        # controller when use_kl_in_reward; reads use_prefix_grouper; builds dataloaders; initializes
+        # the dump executor.
+        # Exceptions: AssertionError for unsupported configurations.
         """
         Initialize distributed PPO trainer with Ray backend.
         Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -372,6 +426,15 @@ class RayPPOTrainer:
         self._init_dump_executor()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
+        # [FUNCTION DOC]
+        # Behavior: creates train/val datasets from config when not supplied (respecting
+        # train_max_samples / val_max_samples), default sampler and collate function when missing;
+        # builds a stateful train dataloader (batch size gen_batch_size or train_batch_size, drop_last,
+        # given sampler) and val dataloader (val_batch_size or whole dataset, validation_shuffle default
+        # true). Asserts both are non-empty, prints sizes, computes total_training_steps (dataloader
+        # length times epochs, overridden by trainer.total_training_steps), and writes it into the
+        # actor and critic optimizer configs when those sections exist (failure only printed).
+        # Side effects: sets dataset/dataloader/total_training_steps attributes; sets config struct mode.
         """
         Creates the train and validation dataloaders.
         """
@@ -452,6 +515,11 @@ class RayPPOTrainer:
 
     @staticmethod
     def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: creates dump_path, writes "<global_steps>.jsonl" with one JSON object per
+        # sample: input, output, gts, score, step, plus each reward extra info whose length matches the
+        # sample count. Non-JSON values serialized as strings. Prints the path.
+        # Side effects: filesystem writes. Runs in the background executor thread.
         """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{global_steps}.jsonl")
@@ -477,6 +545,10 @@ class RayPPOTrainer:
         print(f"Dumped generations to {filename}")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: submits _write_generations for the current global step to the executor,
+        # then prunes finished futures, calling result on each to re-raise any earlier write error.
+        # Exceptions: re-raises failures from completed dump writes.
         """Dump rollout/validation samples as JSONL asynchronously."""
         global_steps = self.global_steps
         future = self._dump_executor.submit(
@@ -500,11 +572,15 @@ class RayPPOTrainer:
         self._dump_futures = still_pending
 
     def _init_dump_executor(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates a single-worker thread pool and an empty list of pending dump futures.
         """Create or recreate the dump executor and futures list."""
         self._dump_executor = ThreadPoolExecutor(max_workers=1)
         self._dump_futures = []
 
     def _shutdown_dump_executor(self):
+        # [FUNCTION DOC]
+        # HELPER: Waits for all pending dumps (re-raising errors), clears them, and shuts the executor down.
         """Drain pending dump futures and shut down the executor."""
         for f in self._dump_futures:
             f.result()
@@ -514,6 +590,11 @@ class RayPPOTrainer:
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: under a "dump_rollout_generations" timer, decodes prompts and responses,
+        # sums token_level_scores per sample, gathers ground truths, converts extra info arrays to
+        # lists, adds request_id when present, and dumps asynchronously to rollout_data_dir.
+        # Side effects: timing entry; async file writes.
         """Log rollout data to disk.
         Args:
             batch (DataProto): The batch containing rollout data
@@ -546,6 +627,10 @@ class RayPPOTrainer:
             )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: no-op when trainer.log_val_generations is 0. Otherwise sorts (input, output,
+        # score) triples by input, shuffles deterministically with seed 42, keeps the first N and logs
+        # them to the configured loggers at the current step.
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -570,6 +655,11 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: pops every non-tensor key except data_source, reward_model, extra_info and
+        # uid from the batch into a generation batch (no tensor keys popped), then copies the remaining
+        # reward-related non-tensor fields into the generation batch too.
+        # Outputs: generation DataProto. Side effects: mutates batch (keys popped).
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
@@ -586,6 +676,9 @@ class RayPPOTrainer:
         return gen_batch
 
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Asserts a reward loop manager exists and returns its reward-model score output for
+        # the batch. Exceptions: AssertionError.
         """
         compute reward use colocate reward model
         """
@@ -594,6 +687,18 @@ class RayPPOTrainer:
         return batch_reward
 
     def _validate(self, merged: bool = False):
+        # [FUNCTION DOC]
+        # Behavior: for each validation batch: assigns uids if missing, repeats each sample val_kwargs.n
+        # times (interleaved), records ground truths, builds the generation batch with validation meta
+        # info (eos/pad ids, no log-prob recompute, do_sample from val_kwargs, validate, global step),
+        # pads to a multiple of the agent worker count, generates, and if a reward model is used and
+        # scores are absent, sleeps rollout replicas, computes reward-model scores, and syncs weights
+        # back to rollout. Unpads, decodes outputs and inputs, unions into the batch, extracts rewards,
+        # and accumulates scores, extra info, turn counts and data sources. Afterwards logs sample
+        # generations, optionally dumps them to validation_data_dir, asserts extra info lengths match.
+        # Inputs: merged - when true, return raw collected results for later merging.
+        # Outputs: raw results mapping (merged) or validation metrics dict.
+        # Exceptions: AssertionError on length mismatch. Side effects: generation, logging, file dumps.
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -719,6 +824,12 @@ class RayPPOTrainer:
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: processes validation metrics per data source, chooses the core variable
+        # ("acc" if present else "reward"), and names metrics val-core/<source>/<var>/<metric> when the
+        # variable is core, the metric starts with mean/maj/best and uses the largest N; otherwise
+        # val-aux/.... Adds val-aux/num_turns/min/max/mean when turn counts exist.
+        # Outputs: flat metrics dict.
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -746,6 +857,13 @@ class RayPPOTrainer:
         return metric_dict
 
     def _merge_validation_results(self, result_a, result_b):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: combines two raw validation results (None treated as empty), returning empty
+        # when neither has data sources; concatenates data sources, uids, turns, and per-key extra info
+        # lists, then computes metrics.
+        # Outputs: metrics dict.
+        # KNOWN ISSUE: per-key lists from only one side are concatenated without padding, so a key
+        # present in only one result yields a list shorter than the total sample count.
         if result_a is None and result_b is None:
             return {}
         if result_a is None:
@@ -770,6 +888,24 @@ class RayPPOTrainer:
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def init_workers(self):
+        # [FUNCTION DOC]
+        # Behavior: creates resource pools; registers the actor-rollout(-ref) worker class (role
+        # ActorRolloutRef if mapped, else ActorRollout) with actor_rollout_ref and distillation config;
+        # if a critic is used, converts the critic config into a TrainingWorkerConfig for a value model
+        # (engine token limits from ppo_*_max_token_len_per_gpu, optional profiler config, extra
+        # context) and registers it; registers a separate reference policy worker when used and mapped.
+        # Builds worker-group kwargs (register-center timeout, profile steps and nsys options, device),
+        # then for each pool with classes creates a colocated worker class and spawns per-role groups.
+        # Critic: reset and set the value loss. Reference: init its own group, or reuse the
+        # ActorRolloutRef group (asserted). Initializes the actor-rollout model last (for KV-cache
+        # memory estimation); ref_in_actor reuses the actor group. Creates the reward loop manager
+        # (reward-model pool when used), the optional multi-teacher manager and distillation config, the
+        # LLM server manager, the agent loop manager (custom class via FQN; reward loop workers passed
+        # for streaming when there is no RM or the RM has its own pool), and the checkpoint engine
+        # manager (custom class via FQN), then puts rollout replicas to sleep.
+        # Exceptions: NotImplementedError without hybrid engine; AssertionError for nsys profiling
+        # without worker_nsight_options or missing ActorRolloutRef group.
+        # Side effects: launches Ray actors and servers; sets many worker/manager attributes.
         """Initialize distributed training workers using Ray backend.
 
         Creates:
@@ -981,6 +1117,13 @@ class RayPPOTrainer:
         self.checkpoint_manager.sleep_replicas()
 
     def _save_checkpoint(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: saves actor (and critic when used) checkpoints to
+        # <default_local_dir>/global_step_<N>/{actor,critic} with optional HDFS remote paths and
+        # max-to-keep limits (forced to 1 by the deprecated remove_previous_ckpt_in_save, with a
+        # warning); saves the train dataloader state to data.pt; unless actor checkpoint async_save
+        # is enabled, writes the step number to latest_checkpointed_iteration.txt.
+        # Side effects: filesystem writes, remote worker calls.
         from verl.utils.fs import local_mkdir_safe
 
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -1050,6 +1193,19 @@ class RayPPOTrainer:
             f.write(str(self.global_steps))
 
     def _load_checkpoint(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: resume_mode "disable" -> return 0. HDFS resume is unsupported. Otherwise
+        # finds the latest global_step folder under default_local_dir (made absolute). Mode "auto" with
+        # no checkpoint -> return 0 (train from scratch); mode "resume_path" uses resume_from_path
+        # (must be a string containing "global_step_", made absolute). Sets global_steps from the folder
+        # name, loads actor and optionally critic checkpoints, and restores the dataloader state from
+        # data.pt unless the step lies on an epoch boundary (saved state would be exhausted) or the
+        # file is missing (warning).
+        # Outputs: 0 when not resuming, otherwise None.
+        # Exceptions: NotImplementedError for HDFS; AssertionError for bad resume path.
+        # KNOWN ISSUE: return value is inconsistent (0 vs None); callers ignore it. Any resume_mode
+        # other than auto/resume_path/disable falls through to loading the latest folder, which may be
+        # None and then fails on string split.
         if self.config.trainer.resume_mode == "disable":
             return 0
 
@@ -1117,6 +1273,10 @@ class RayPPOTrainer:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _start_profiling(self, do_profile: bool) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: when enabled, starts profiling on the actor-rollout group (role "train") and
+        # on reference/critic groups only if they are distinct objects, so aliased groups are driven once.
+        # Side effects: remote profiler start.
         """Start profiling for all worker groups if profiling is enabled."""
         if not do_profile:
             return
@@ -1139,6 +1299,9 @@ class RayPPOTrainer:
             self.critic_wg.start_profile(profile_step=self.global_steps)
 
     def _stop_profiling(self, do_profile: bool, run_command: bool = False) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: when enabled, stops profiling on each distinct worker group (same alias
+        # rule as start), passing run_command through.
         """Stop profiling for all worker groups if profiling is enabled.
 
         ``run_command`` is passed straight to ``stop_profile`` and is True only on the last profiled
@@ -1160,6 +1323,10 @@ class RayPPOTrainer:
             self.critic_wg.stop_profile(run_command=run_command)
 
     def _get_dp_size(self, worker_group, role: str) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: queries (and caches in the group's dispatch info) the DP rank mapping for the
+        # role and returns max rank + 1.
+        # Side effects: populates worker_group._dispatch_info.
         """Get data parallel size from worker group dispatch info.
 
         This method retrieves the data parallel size by querying the dispatch info
@@ -1180,6 +1347,17 @@ class RayPPOTrainer:
         return max(dp_rank_mapping) + 1
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: computes per-sample token counts from attention_mask and workloads; gets
+        # actor DP size. With prefix grouper and uids: requires the number of distinct uids to be
+        # divisible by DP size and computes group-balanced partitions keeping uids together. With
+        # keep_minibatch: balances each consecutive ppo_mini_batch_size slice separately into equal-size
+        # partitions and concatenates per rank. Otherwise equal-size balanced partitions over the whole
+        # batch. Without prefix grouper, each partition is reordered with smallest workloads at both ends
+        # (sorted, then even positions followed by reversed odd positions) to reduce pipeline bubbles.
+        # Reorders the batch by concatenated partitions and records balance stats into metrics.
+        # Inputs: batch; metrics - dict to update; logging_prefix; keep_minibatch.
+        # Exceptions: ValueError for indivisible uid groups. Side effects: reorders batch in place.
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
 
         When use_prefix_grouper is enabled, uses group-level balancing to keep samples with
@@ -1250,6 +1428,10 @@ class RayPPOTrainer:
         metrics.update(global_balance_stats)
 
     def _compute_values(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: converts the batch to a no-padding TensorDict, marks compute_loss false,
+        # runs critic inference, waits for the result, converts values back to padded layout as float.
+        # Outputs: DataProto with "values".
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to nopadding
         batch_td = left_right_2_no_padding(batch_td)
@@ -1264,6 +1446,10 @@ class RayPPOTrainer:
         return values
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: no-padding TensorDict with entropy/loss disabled; when ref_in_actor, asks the
+        # actor group for log-probs with the LoRA adapter disabled, otherwise the reference group.
+        # Converts back to padding. Outputs: DataProto with "ref_log_prob" (float).
         # step 1: convert dataproto to tensordict.
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to nopadding
@@ -1288,6 +1474,12 @@ class RayPPOTrainer:
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: no-padding TensorDict with entropy enabled, optional sum_pi_squared
+        # (actor.calculate_sum_pi_squared), loss disabled; runs actor log-prob computation; converts
+        # entropy, log-probs and sum_pi_squared back to padding. Result contains old_log_probs and
+        # entropys (float), plus routed_experts and sum_pi_squared when present.
+        # Outputs: tuple (DataProto, actor inference MFU from output metrics).
         # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
         # step 1: convert dataproto to tensordict.
         batch_td = batch.to_tensordict()
@@ -1325,6 +1517,14 @@ class RayPPOTrainer:
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: records multi_turn and rollout temperature in meta_info; builds a
+        # no-padding TensorDict annotated with entropy calculation (calculate_entropy or nonzero
+        # entropy_coeff), distillation top-k / distillation-only flags (distillation-only when top-k is
+        # used without task rewards or policy gradient), global/mini batch size =
+        # ppo_mini_batch_size * rollout.n, epochs, seed, shuffle, compute_loss. Calls update_actor,
+        # prefixes metrics with "actor/" and renames actor/mfu to perf/mfu/actor.
+        # Outputs: DataProto with metrics in meta_info. Side effects: mutates batch.meta_info.
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
@@ -1376,6 +1576,10 @@ class RayPPOTrainer:
         return actor_output
 
     def _update_critic(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: like _update_actor for the critic config (mini batch size times rollout.n,
+        # epochs, seed, shuffle); trains, prefixes metrics with "critic/" and renames critic/mfu to
+        # perf/mfu/critic. Outputs: DataProto with metrics in meta_info.
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
         batch_td = left_right_2_no_padding(batch_td)
@@ -1403,6 +1607,31 @@ class RayPPOTrainer:
         return critic_output
 
     def fit(self):
+        # [FUNCTION DOC]
+        # Behavior: recreates the dump executor if shut down; creates the Tracking logger; sets step 0,
+        # loads a checkpoint and pushes weights to rollout; initializes SkipManager; optionally validates
+        # before training (and returns if val_only). Then for each epoch/batch from the starting epoch:
+        # manages profiling windows (continuous or per-step); assigns uids; builds and repeats the
+        # generation batch rollout.n times; for REMAX appends a greedy baseline copy of each prompt in
+        # the same request. Generates, sleeps replicas, merges timing; for REMAX computes baseline
+        # rewards into reward_baselines. Repeats and unions the batch with outputs, adds response_mask,
+        # optionally balances, records global_token_num and image sequence lengths. Computes RM scores
+        # if needed and extracts rewards. Either bypass mode (rollout log-probs as old log-probs) or
+        # recompute old log-probs with entropy metric and debug metrics (raising on conflicting router
+        # replay settings). Adds reference log-probs and values when used. Sets token_level_scores,
+        # merges reward extra info, applies KL penalty or copies scores to rewards, applies rollout
+        # correction (decoupled mode only), computes advantages. Updates critic; after critic warmup
+        # updates actor, saves checkpoints (save_freq, last step, or ESI expiry), and syncs weights to
+        # rollout (during warmup only syncs weights). Dumps rollout data when configured, validates per
+        # test_freq or on the last step, stops profiling (finish command only on the last profiled
+        # step), collects data/GDPO/timing/throughput/variance-proxy/spec-decode metrics, logs, advances
+        # the step, and returns after the last step (finalizing async calls and dumps). Calls the
+        # dataset's on_batch_end hook when present.
+        # Side effects: entire training run - remote calls, checkpoint files, logging.
+        # Exceptions: AssertionError for empty validation metrics or missing old_log_probs; ValueError
+        # on router replay conflict.
+        # KNOWN ISSUE: assumes non_tensor_batch always contains "multi_modal_inputs"; a batch without
+        # it would raise KeyError when collecting image sequence lengths.
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC

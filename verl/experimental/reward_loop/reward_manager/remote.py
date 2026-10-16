@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Registers the "remote" reward manager, which runs synchronous score functions in separate Ray worker processes
+# (avoids thread-pool issues with libraries like math-verify and suits CPU-heavy scoring).
+
 import inspect
 import itertools
 
@@ -25,20 +29,29 @@ from verl.utils.reward_score import default_compute_score
 
 @ray.remote(num_cpus=1)
 class RewardComputeWorker:
+    # [CLASS DOC]
+    # Ray actor (1 CPU) wrapping a synchronous score function; must not have async methods.
     """
     WARNING: This class cannot have async methods.
     """
 
     def __init__(self, compute_score_fn):
+        # [FUNCTION DOC]
+        # Behavior: stores the score function. Inputs: compute_score_fn - sync callable.
         # since the reward function may not be pickleable, we need to init it in the worker
         self.compute_score_fn = compute_score_fn
 
     def compute_score(self, **kwargs) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: calls the score function with the given keyword arguments and returns its result (mapping or float).
         return self.compute_score_fn(**kwargs)
 
 
 @register("remote")
 class RemoteRewardManager(RewardManagerBase):
+    # [CLASS DOC]
+    # Reward manager that dispatches each sample's scoring round-robin to a pool of RewardComputeWorker actors on the
+    # same node.
     """
     The reward manager.
     Some errors exist when using default thread pool to compute reward score, e.g., math-verify.
@@ -48,6 +61,11 @@ class RemoteRewardManager(RewardManagerBase):
     """
 
     def __init__(self, config, tokenizer, compute_score, reward_router_address=None, reward_model_tokenizer=None):
+        # [FUNCTION DOC]
+        # Behavior: base init; uses compute_score or the default; asserts it is not async; stores router address and RM
+        # tokenizer; creates reward.num_workers RewardComputeWorker actors with soft affinity to the current node and a
+        # round-robin cycle over them.
+        # Exceptions: AssertionError for async score functions. Side effects: creates Ray actors.
         super().__init__(config, tokenizer, compute_score)
         self.compute_score = compute_score or default_compute_score
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
@@ -70,9 +88,17 @@ class RemoteRewardManager(RewardManagerBase):
         self.reward_worker_pool = itertools.cycle(self.reward_worker)
 
     def choose_reward_worker(self):
+        # [FUNCTION DOC]
+        # Behavior: returns the next worker from the round-robin cycle.
         return next(self.reward_worker_pool)
 
     async def run_single(self, data: DataProto) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: same input preparation as the naive manager (last item, valid response decode, data_source, ground truth,
+        # extra_info merged with tool fields, num_turns and rollout_reward_scores), then awaits the score on a chosen remote
+        # worker and converts the result (mapping gives score and extra info; scalar gives score and "acc").
+        # Outputs: mapping with reward_score and reward_extra_info.
+        # KNOWN ISSUE: extra_info stored on the sample is mutated in place.
         data = data[-1:]  # for multi-sequence outputs, we only compute reward based on the last sequence
         data_item = data[0]
         response_ids = data_item.batch["responses"]

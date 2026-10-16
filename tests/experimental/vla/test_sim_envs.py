@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Smoke test for VLA simulator environments (Isaac, optionally LIBERO). The whole module is skipped unless
+# VERL_RUN_VLA_TESTS=1, because verl.experimental.vla currently depends on removed legacy worker modules.
+
 import os
 import unittest
 
@@ -35,6 +39,15 @@ from omegaconf import OmegaConf  # noqa: E402
 # @pytest.mark.parametrize("simulator_type", ["libero", "isaac"])
 @pytest.mark.parametrize("simulator_type", ["isaac"])
 def test_sim_env_creation_and_step(simulator_type):
+    # [FUNCTION DOC]
+    # Behavior: builds an 8-env config (libero_10 suite, 512 max steps, agentview camera, video saving under
+    # /tmp/test_sim_env_creation_and_step, seed 0), instantiates IsaacEnv or LiberoEnv for rank 0 of 1, resets all
+    # envs to task 0 state 0, then steps through 8 fixed 7-dim actions (broadcast to all envs), asserting obs/info
+    # are dicts and reward/terminated/truncated have shape (num_envs,), stopping early on any termination or
+    # truncation. Flushes video for task_0, asserts rank_0/task_0/0.mp4 exists, deletes it, and closes the env.
+    # Inputs: simulator_type - parametrized (only "isaac" active).
+    # Exceptions: ValueError for unsupported simulator types; AssertionError on checks.
+    # Side effects: launches a simulator, writes and removes a video file, prints.
     num_envs = 8
     actions = np.array(
         [

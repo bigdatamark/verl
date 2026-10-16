@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for verl.utils.reward_score.sandbox_fusion.utils.check_correctness, which runs generated code against
+# test cases on a Sandbox Fusion service. Integration tests (skipped unless SANDBOX_FUSION_URL is set) cover
+# correct/wrong output, compile error (-4), runtime error (-2), timeout (-3), high concurrency, fn_name (LeetCode
+# style) and assert-case modes, and empty/None stdin. Unit tests mock call_sandbox_api to check result ordering,
+# API errors (-1), input validation, and that a multiprocessing semaphore bounds concurrency across processes.
+# Module constants define sample programs and input/output mappings.
 import multiprocessing
 import os
 import time
@@ -76,6 +83,9 @@ INPUT_OUTPUT_INVALID_MISSING_KEY = {"inputs": ["input1"]}
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_integration_success_correct():
+    # [FUNCTION DOC]
+    # Behavior: runs CODE_SUCCESS on two cases; asserts both True, statuses "success" and stdouts match.
+    # Inputs: none. Outputs: none. Side effects: remote API calls.
     """Integration test: Code is correct, output is correct"""
     results, metadata_list = check_correctness(SANDBOX_URL, INPUT_OUTPUT_VALID, CODE_SUCCESS)
     assert results == [True, True]
@@ -87,6 +97,9 @@ def test_integration_success_correct():
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_integration_success_wrong_output():
+    # [FUNCTION DOC]
+    # Behavior: runs CODE_WRONG_OUTPUT; asserts both results False with status "wrong_answer" and the actual stdout
+    # recorded. Inputs: none. Outputs: none. Side effects: remote API calls.
     """Integration test: Code runs successfully, but output is wrong"""
     results, metadata_list = check_correctness(SANDBOX_URL, INPUT_OUTPUT_VALID, CODE_WRONG_OUTPUT)
     assert results == [False, False]
@@ -97,6 +110,9 @@ def test_integration_success_wrong_output():
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_integration_compile_error():
+    # [FUNCTION DOC]
+    # Behavior: runs an invalid snippet as C++; asserts results are -4 for both with status "compile_error".
+    # Inputs: none. Outputs: none. Side effects: remote API calls.
     """Integration test: Code causes compile error"""
     results, metadata_list = check_correctness(SANDBOX_URL, INPUT_OUTPUT_VALID, CODE_COMPILE_ERROR, language="cpp")
     assert results == [-4, -4]
@@ -106,6 +122,9 @@ def test_integration_compile_error():
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_integration_runtime_error():
+    # [FUNCTION DOC]
+    # Behavior: runs code raising ValueError on one case; asserts result -2 with status "runtime_error".
+    # Inputs: none. Outputs: none. Side effects: remote API calls.
     """Integration test: Code causes runtime error"""
     results, metadata_list = check_correctness(SANDBOX_URL, INPUT_OUTPUT_SINGLE, CODE_RUNTIME_ERROR)
     assert results == [-2]
@@ -115,6 +134,9 @@ def test_integration_runtime_error():
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_integration_runtime_timeout():
+    # [FUNCTION DOC]
+    # Behavior: runs code sleeping 10 s with a 5 s timeout; asserts result -3 with status "timeout".
+    # Inputs: none. Outputs: none. Side effects: remote API calls.
     """Integration test: Code causes runtime timeout"""
     test_timeout = 5  # Set a timeout shorter than the sleep time in CODE_TIMEOUT
     results, metadata_list = check_correctness(SANDBOX_URL, INPUT_OUTPUT_SINGLE, CODE_TIMEOUT, timeout=test_timeout)
@@ -125,6 +147,14 @@ def test_integration_runtime_timeout():
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_integration_concurrency_high_load():
+    # [FUNCTION DOC]
+    # Behavior: builds 100 cases where indices {5,30,60,90} use timeout-triggering inputs (expected -3), indices
+    # {10,25,50} have deliberately wrong expected outputs (expected False) and the rest expect True; runs code that
+    # echoes "output_<n>" or sleeps 20 s on timeout inputs, with 15 s timeout; prints timing. Asserts 100 results,
+    # tallies matches per category and raises AssertionError listing up to 10 unexpected results if any; asserts the
+    # category counts, metadata length, and per-type metadata of the first success (status/stdout), first wrong
+    # answer (status, stdout, expected_output) and first timeout (status).
+    # Inputs: none. Outputs: none. Side effects: many remote calls, prints.
     """Integration test: High concurrency (100 cases) against real API with mixed results (success, wrong
     answer, timeout)"""
     concurrency_level = 100
@@ -252,6 +282,10 @@ else:
 
 @patch("verl.utils.reward_score.sandbox_fusion.utils.call_sandbox_api")
 def test_unit_concurrency_order(mock_call_sandbox_api):
+    # [FUNCTION DOC]
+    # Behavior: with call_sandbox_api mocked, runs three cases where the second response is delayed 0.1 s; asserts all
+    # True, metadata in original case order (case_index 0,1,2, all "success") and exactly 3 API calls.
+    # Inputs: mock_call_sandbox_api - patched mock injected by the decorator. Outputs: none.
     sandbox_url = "mock_url"
     generation = "print(input())"
     language = "python"
@@ -259,6 +293,9 @@ def test_unit_concurrency_order(mock_call_sandbox_api):
     in_outs = {"inputs": ["input1", "input2", "input3"], "outputs": ["output1", "output2", "output3"]}
 
     def side_effect(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Mock API: returns a successful finished run with stdout matching the given stdin ("input1..3", the
+        # second after sleeping 0.1 s), or (None, error string) for unknown input. Outputs: (response, error) tuple.
         stdin = kwargs.get("stdin")
         if stdin == "input1":
             return (
@@ -296,6 +333,10 @@ def test_unit_concurrency_order(mock_call_sandbox_api):
 
 @patch("verl.utils.reward_score.sandbox_fusion.utils.call_sandbox_api")
 def test_unit_api_timeout_error_concurrent(mock_call_sandbox_api):
+    # [FUNCTION DOC]
+    # Behavior: mocked API returns an error string for the second case; asserts results True, -1, True, the second
+    # metadata status "api_error" with api_request_error equal to the message, and 3 API calls.
+    # Inputs: mock_call_sandbox_api. Outputs: none.
     sandbox_url = "mock_url"
     generation = "print(input())"
     language = "python"
@@ -305,6 +346,9 @@ def test_unit_api_timeout_error_concurrent(mock_call_sandbox_api):
     api_error_message = "API Call Failed: Gateway Timeout (504) on attempt 3/3"
 
     def side_effect(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Mock API: successful responses for "input1"/"input3", (None, api_error_message) for "input2_timeout",
+        # and (None, error) otherwise.
         stdin = kwargs.get("stdin")
         if stdin == "input1":
             return (
@@ -361,6 +405,14 @@ def _mock_api_call_for_concurrency_tracking(
     memory_limit_mb,
     language,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Replacement for call_sandbox_api tracking concurrency via shared manager objects: under call_lock,
+    # increments the active counter and raises max_calls_tracker if exceeded; sleeps
+    # SIMULATED_API_CALL_DURATION_TEST; decrements under the lock; returns a successful finished response with stdout
+    # "mock_output_for_<stdin>" and no error.
+    # Inputs: active_calls_counter, max_calls_tracker - shared integer values; call_lock - shared lock; remaining
+    # args mirror call_sandbox_api (url, code, stdin, compile/run timeouts, memory limit, language), used only for stdin.
+    # Outputs: (response dict, None). Side effects: mutates shared counters; sleeps.
     # entry_time = time.time() # For detailed logging
     with call_lock:
         active_calls_counter.value += 1
@@ -400,6 +452,12 @@ def _process_pool_worker_for_concurrency_test(
     max_calls_tracker,
     call_lock,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Runs in a child process. Wraps _mock_api_call_for_concurrency_tracking with the shared trackers bound,
+    # prints the original call_sandbox_api, patches it with the wrapper as side effect, prints the patched object,
+    # and calls check_correctness with the given url, cases, code, timeout, memory limit, language and the shared
+    # semaphore as concurrent_semaphore. Outputs: number of results produced.
+    # Side effects: debug prints with flush; module patch inside the child process only.
     # Corrected lambda to accept keyword arguments matching call_sandbox_api's usage
     curried_mock_api_call = (
         lambda sandbox_fusion_url, code, stdin, compile_timeout, run_timeout, memory_limit_mb, language: (
@@ -456,6 +514,13 @@ def _process_pool_worker_for_concurrency_test(
 
 # --- The actual test case for multiprocess concurrency control ---
 def test_multiprocess_global_concurrency_limit_with_semaphore():
+    # [FUNCTION DOC]
+    # Behavior: creates a multiprocessing Manager with a shared active-call counter, max tracker, lock and a semaphore
+    # of size MAX_GLOBAL_CONCURRENCY_LIMIT_TEST (5). Submits NUM_PROCESSES_TEST (4) workers to a process pool, each
+    # running NUM_TASKS_PER_PROCESS_TEST (3) mocked cases; collects counts and prints stats. Asserts all 12 tasks ran,
+    # the mock was called (max > 0), max concurrency never exceeded 5, and total time is at least 80% of the
+    # theoretical minimum (tasks times call duration divided by the limit).
+    # Inputs: none. Outputs: none. Side effects: spawns processes and a manager server, prints.
     """
     Tests that the global concurrent_semaphore (multiprocessing.Semaphore)
     correctly limits the number of concurrent calls to call_sandbox_api
@@ -554,6 +619,10 @@ def test_multiprocess_global_concurrency_limit_with_semaphore():
 # Ensure there is no more code after this point if these were the last functions.
 # If there was other code, it would follow here.
 def test_unit_invalid_input_format():
+    # [FUNCTION DOC]
+    # Behavior: not skipped (validation happens before any API call); asserts that None, an empty mapping, and a
+    # mapping lacking "outputs" each yield results [-1] with metadata error "Invalid input/output data".
+    # Inputs: none. Outputs: none.
     """Unit test: Invalid in_outs format passed"""
     results, metadata_list = check_correctness(SANDBOX_URL, None, CODE_SUCCESS)
     assert results == [-1]
@@ -570,6 +639,9 @@ def test_unit_invalid_input_format():
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_unit_input_output_mismatch():
+    # [FUNCTION DOC]
+    # Behavior: one input with two outputs; asserts results [-1], one metadata entry, error "Input/output count mismatch".
+    # Although it fails before calling the API, it is skipped without SANDBOX_FUSION_URL. Inputs: none. Outputs: none.
     """Unit test: Mismatch between the number of inputs and outputs"""
     results, metadata_list = check_correctness(SANDBOX_URL, INPUT_OUTPUT_MISMATCH, CODE_SUCCESS)
     assert results == [-1]
@@ -579,6 +651,12 @@ def test_unit_input_output_mismatch():
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_integration_concurrency_all_timeout():
+    # [FUNCTION DOC]
+    # Behavior: runs 100 identical cases of a dynamic-programming program with very large input (324 x 384429 table)
+    # and a 10 s timeout; prints duration, asserts 100 results all -3 (printing non-timeout indices and up to 5
+    # metadata entries on failure) and first metadata status "timeout".
+    # KNOWN ISSUE: the variable is named code_infinite_loop but the program is not infinite; it relies on being slow
+    # enough to exceed the timeout. Inputs: none. Outputs: none. Side effects: remote calls, prints.
     """Integration test: High concurrency (100 cases) against real API, all causing timeout"""
     concurrency_level = 100
     code_infinite_loop = """
@@ -631,6 +709,10 @@ if __name__ == "__main__":
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_fn_name_success_single_case():
+    # [FUNCTION DOC]
+    # Behavior: runs a LeetCode-style Solution class method (fn_name "occurrencesOfElement") on two newline-separated
+    # argument inputs; asserts both True and the first metadata has no error and is not compile/runtime error.
+    # Inputs: none. Outputs: none. Side effects: remote calls.
     """Tests successful execution for a single test case with fn_name.
     from livecodebench/code_generation_lite test 510
     """
@@ -670,6 +752,9 @@ class Solution:
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_none_and_empty_stdin_passed_correctly():
+    # [FUNCTION DOC]
+    # Behavior: runs an echo program with stdin None, "" and "hello"; asserts all True (None treated as empty) and the
+    # first metadata has no error. Inputs: none. Outputs: none. Side effects: remote calls.
     """
     Tests that when stdin data is set to an empty string or None, it is still
     is passed correctly to Sandbox Fusion as an empty string.
@@ -694,6 +779,11 @@ print(f"You said '{sys.stdin.readline().strip()}'")
 
 @pytest.mark.skipif(skip_condition, reason=skip_reason)
 def test_assert_case_success():
+    # [FUNCTION DOC]
+    # Behavior: runs a merge_intervals function with three assert_case strings (the third deliberately wrong), filling
+    # inputs with empty strings and outputs with None; asserts results True, True, -2; first two have status
+    # "success" and no expected_output; the third has no "error" key, no expected_output and status "runtime_error".
+    # Inputs: none. Outputs: none. Side effects: remote calls.
     """Tests successful execution for assert case.
     from KodCode
     """

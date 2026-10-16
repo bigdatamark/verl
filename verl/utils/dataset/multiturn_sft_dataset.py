@@ -12,6 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Multi-turn SFT dataset over parquet conversation data. Each message is tokenized separately with the chat template
+# (stripping the auto-inserted system prompt from later turns), loss is applied to assistant tokens except their
+# generation prompt, and the concatenation is checked against tokenizing the whole conversation. Supports tools,
+# per-sample enable_thinking, images/videos via a processor, Qwen-VL rope position ids, right padding or no padding.
+
 """
 Multi-turn SFT dataset that supports training on conversation data with multiple turns
 """
@@ -43,10 +49,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def once(func):
+    # [FUNCTION DOC]
+    # HELPER: Decorator making the wrapped function run only on its first call (tracked by a "called" attribute on the
+    # wrapper); later calls return None. Inputs: func. Outputs: wrapper function.
     """Decorator to ensure a function runs only once. Subsequent calls do nothing."""
 
     @wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Calls func on first invocation and marks the wrapper as called; otherwise does nothing.
         if not hasattr(wrapper, "called"):
             wrapper.called = True
             return func(*args, **kwargs)
@@ -56,6 +67,10 @@ def once(func):
 
 @once
 def print_assembled_message(tokenizer, message_list, input_ids, loss_mask, attn_mask, tools):
+    # [FUNCTION DOC]
+    # HELPER: Runs once per process: renders the full conversation with the tokenizer's chat template (untokenized) and the
+    # decoded concatenated input_ids, and logs both at debug level for comparison.
+    # Inputs: tokenizer, message_list, input_ids, loss_mask and attn_mask (unused), tools. Outputs: none.
     """
     Print the message after applying the chat template
     """
@@ -71,6 +86,10 @@ def print_assembled_message(tokenizer, message_list, input_ids, loss_mask, attn_
 
 
 class MultiTurnSFTDataset(Dataset):
+    # [CLASS DOC]
+    # Torch Dataset of multi-turn conversations. Config keys: pad_mode ("right"/"no_padding"), truncation
+    # ("error"/"left"/"right"), max_length (1024), messages_key, image_key, video_key, image_patch_size, tools_key,
+    # enable_thinking_key, enable_thinking_default, apply_chat_template_kwargs, shuffle, seed, ignore_input_ids_mismatch.
     """
     Dataset for multi-turn conversations where each assistant response should be trained
 
@@ -90,6 +109,11 @@ class MultiTurnSFTDataset(Dataset):
         processor: Optional[ProcessorMixin] = None,
         max_samples: int = -1,
     ):
+        # [FUNCTION DOC]
+        # Behavior: reads config options with defaults (image_patch_size defaults to the processor's patch size), validates
+        # pad_mode and truncation, normalizes parquet_files to a list, loads a tokenizer from a path string if needed, then
+        # downloads files and reads them. Inputs: parquet_files, tokenizer (object or path), config (may be None), processor,
+        # max_samples (-1 = all). Outputs: none. Exceptions: AssertionError for invalid pad_mode/truncation.
         # Set defaults and extract parameters from config if provided
         config = config or {}
         self.pad_mode = config.get("pad_mode", "right")
@@ -129,11 +153,20 @@ class MultiTurnSFTDataset(Dataset):
         self._read_files_and_process()
 
     def _download(self):
+        # [FUNCTION DOC]
+        # HELPER: Replaces each parquet path with a local copy (downloaded from HDFS if remote). Side effects: file copies.
         for i, parquet_file in enumerate(self.parquet_files):
             self.parquet_files[i] = copy_local_path_from_hdfs(parquet_file, verbose=True)
 
     def _read_files_and_process(self):
+        # [FUNCTION DOC]
+        # HELPER: Reads and concatenates parquet files (pyarrow dtype backend), prints size; if max_samples is positive and
+        # smaller than the total, selects max_samples rows (random without replacement using seed when shuffle, else the first
+        # rows). Extracts messages (nested values converted to lists), optional tools and enable_thinking columns, and the
+        # tokenizer's system prompt and generation prompt token sequences. Side effects: sets attributes, prints.
         def series_to_item(ls):
+            # [FUNCTION DOC]
+            # HELPER: Unwraps single-element Series/ndarrays repeatedly to their inner item. (Unused.)
             import numpy
             import pandas
 
@@ -182,6 +215,8 @@ class MultiTurnSFTDataset(Dataset):
         )
 
     def __len__(self):
+        # [FUNCTION DOC]
+        # Behavior: number of conversations. Outputs: int.
         return len(self.messages)
 
     def _process_single_message(
@@ -192,6 +227,14 @@ class MultiTurnSFTDataset(Dataset):
         tools: Optional[list[dict[str, Any]]] = None,
         enable_thinking: Optional[bool] = None,
     ) -> tuple[list[int], list[int], list[int]]:
+        # [FUNCTION DOC]
+        # HELPER: Tokenizes one message alone with the chat template (processor if available, else tokenizer; adds
+        # enable_thinking to template kwargs when given). For non-first, non-system messages strips the leading system-prompt
+        # tokens. Loss mask is ones for assistant messages with the generation-prompt prefix zeroed, zeros otherwise.
+        # Inputs: index - turn index; message; full_message (unused); tools; enable_thinking.
+        # Outputs: (input_ids, loss_mask, attention_mask, remaining processor outputs dict).
+        # KNOWN ISSUE: return annotation says 3 lists but 4 values (tensors plus dict) are returned; docstring lists images/videos
+        # arguments that do not exist.
         """
         Process a single message and return its tokenized representation.
 
@@ -241,6 +284,11 @@ class MultiTurnSFTDataset(Dataset):
         return input_ids, loss_mask, attention_mask, inputs
 
     def _build_messages(self, example: dict):
+        # [FUNCTION DOC]
+        # HELPER: Converts the row's messages to lists and, for string contents: without image/video columns, wraps text as a
+        # typed text part only when a processor exists; otherwise splits on <image>/<video> placeholders, replacing them in order
+        # with processed image/video parts and the rest with text parts. Asserts every image and video was consumed.
+        # Inputs: example - row dict. Outputs: list of messages. Exceptions: AssertionError (no processor or count mismatch).
         """Replace <image> and <video> placeholder in messages with corresponding image and video
         which is required by processor.apply_chat_template.
         - <image>: {"type": "image", "image": image}
@@ -289,6 +337,18 @@ class MultiTurnSFTDataset(Dataset):
         return messages
 
     def __getitem__(self, item):
+        # [FUNCTION DOC]
+        # Behavior: builds messages, tools and enable_thinking (column value or default, cast to bool) for the row; tokenizes
+        # each message (tools only on first turn), concatenates ids/masks and collects processor outputs; logs once; runs
+        # sanity_check. Drops "mm_token_type_ids" and processor outputs whose trailing shapes differ across turns, concatenates
+        # the rest. Position ids: for Qwen2-VL image processors, a (4, seq) stack of text positions and rope index positions;
+        # otherwise 0..seq-1. RIGHT mode: pads to max_length (pad token or 0, zero masks, zero positions) or truncates
+        # left/right, or raises in "error" mode; returns input_ids, attention_mask, position_ids, loss_mask (+ multi_modal_inputs
+        # if any). NO_PADDING: raises if too long in "error" mode, otherwise right-truncates to max_length; returns input_ids,
+        # position_ids, loss_mask (+ multi_modal_inputs).
+        # Inputs: item - index. Outputs: dict of tensors. Exceptions: ValueError on length/unknown modes; AssertionError on shape
+        # or template mismatch.
+        # KNOWN ISSUE: in no-padding mode truncation="left" still truncates from the right.
         row_dict: dict = self.dataframe.iloc[item].to_dict()
         messages = self._build_messages(row_dict)
         tools = self.tools[item] if self.tools is not None else None
@@ -423,6 +483,12 @@ class MultiTurnSFTDataset(Dataset):
             raise ValueError(f"Unknown pad mode {self.pad_mode}")
 
     def sanity_check(self, input_ids: torch.Tensor, messages: list[dict], tools: list[dict], enable_thinking: bool):
+        # [FUNCTION DOC]
+        # Behavior: tokenizes the full conversation at once with the chat template and compares its input_ids to the
+        # concatenated per-turn ids; on mismatch warns once if ignore_input_ids_mismatch else raises AssertionError.
+        # Inputs: input_ids, messages, tools, enable_thinking. Outputs: none.
+        # KNOWN ISSUE: calls logger.warning_once, which standard logging.Logger does not provide (AttributeError when the
+        # mismatch is ignored).
         """Check concatenated input_ids of apply_chat_template to each turn equals
         apply_chat_template to whole messages.
         """

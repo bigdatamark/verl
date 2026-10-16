@@ -13,6 +13,9 @@
 # limitations under the License.
 
 
+# [MODULE DOC]
+# Dataset collation helpers for SFT: the padding mode enum and a collator producing padded or nested-tensor batches.
+
 from enum import Enum
 
 import torch
@@ -22,6 +25,8 @@ from verl.utils.tensordict_utils import nested_tensor_from_tensor_list
 
 
 class DatasetPadMode(str, Enum):
+    # [CLASS DOC]
+    # String enum of dataset padding modes: RIGHT, LEFT_RIGHT (fixed-length padded) and NO_PADDING (variable length).
     """Padding mode for dataset"""
 
     RIGHT = "right"
@@ -30,6 +35,9 @@ class DatasetPadMode(str, Enum):
 
 
 class SFTTensorCollator:
+    # [CLASS DOC]
+    # Collate function selecting behavior from pad_mode: variable-length nested tensors for NO_PADDING, default_collate
+    # for padded modes.
     """
     A custom collate_fn that handles batching of sequences.
     1. for variable-length sequences, convert them into NestedTensors.
@@ -37,9 +45,14 @@ class SFTTensorCollator:
     """
 
     def __init__(self, pad_mode: DatasetPadMode = DatasetPadMode.LEFT_RIGHT):
+        # [FUNCTION DOC]
+        # Behavior: stores pad_mode (default LEFT_RIGHT). Inputs: pad_mode. Outputs: none.
         self.pad_mode = pad_mode
 
     def __call__(self, batch: list[dict[str, any]]) -> dict[str, any]:
+        # [FUNCTION DOC]
+        # Behavior: NO_PADDING -> collate_variable_batch; RIGHT/LEFT_RIGHT -> torch default_collate.
+        # Inputs: batch - list of sample dicts. Outputs: batched dict. Exceptions: NotImplementedError for other modes.
         if self.pad_mode == DatasetPadMode.NO_PADDING:
             return self.collate_variable_batch(batch)
         elif self.pad_mode in [DatasetPadMode.RIGHT, DatasetPadMode.LEFT_RIGHT]:
@@ -50,6 +63,12 @@ class SFTTensorCollator:
             raise NotImplementedError(f"pad_mode {self.pad_mode} not implemented")
 
     def collate_variable_batch(self, batch: list[dict[str, any]]) -> dict[str, any]:
+        # [FUNCTION DOC]
+        # Behavior: for every key in the union of sample keys: if the first sample's value is a tensor, gathers per-sample
+        # tensors into a nested tensor (helper for >= 2-D tensors, jagged-layout nested tensor for 1-D); otherwise wraps each
+        # sample's value (None if missing) as NonTensorData and stacks them.
+        # Inputs: batch - list of dicts. Outputs: dict of batched values.
+        # KNOWN ISSUE: type check reads batch[0][key], raising KeyError if the first sample lacks a key present in others.
         """
         Collates a list of samples into a single batch.
 

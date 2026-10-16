@@ -12,6 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CPU tests for HFModelConfig.target_modules typing when merged through OmegaConf (simulating CLI
+# overrides): list, None and string are accepted; a list of non-strings is rejected. No model is loaded.
+
 import os
 
 import pytest
@@ -21,9 +26,14 @@ from verl.workers.config.model import HFModelConfig
 
 
 class TestHFModelConfigCPU:
+    # [CLASS DOC]
+    # Test group; class attribute model_path is a plain path string (~/models/Qwen/Qwen2.5-0.5B), never loaded.
     model_path = os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B")  # Just a path string, not loaded
 
     def test_target_modules_accepts_list_via_omegaconf(self):
+        # [FUNCTION DOC]
+        # Builds a structured OmegaConf from HFModelConfig, merges a config with a list of module names, and asserts
+        # the merged target_modules equals that list. Exceptions: OmegaConf validation error if typing rejects lists.
         """
         Test that target_modules field accepts both string and list values
         when merging OmegaConf configs (simulates CLI override behavior).
@@ -53,6 +63,8 @@ class TestHFModelConfigCPU:
         assert list(merged.target_modules) == ["k_proj", "o_proj", "q_proj", "v_proj"]
 
     def test_target_modules_accepts_none_via_omegaconf(self):
+        # [FUNCTION DOC]
+        # Merges target_modules None and asserts it stays None.
         """Test that target_modules still accepts None values."""
 
         cfg_from_dataclass = OmegaConf.structured(HFModelConfig)
@@ -68,6 +80,8 @@ class TestHFModelConfigCPU:
         assert merged.target_modules is None
 
     def test_target_modules_accepts_string_via_omegaconf(self):
+        # [FUNCTION DOC]
+        # Merges target_modules "all-linear" and asserts it is preserved.
         """Test that target_modules still accepts string values."""
 
         cfg_from_dataclass = OmegaConf.structured(HFModelConfig)
@@ -83,6 +97,8 @@ class TestHFModelConfigCPU:
         assert merged.target_modules == "all-linear"
 
     def test_target_modules_raises_on_invalid_type(self):
+        # [FUNCTION DOC]
+        # Merges a list of ints, then asserts converting to the dataclass object (which runs __post_init__) raises TypeError.
         """Test that __post_init__ raises TypeError for invalid target_modules types."""
         base_config = OmegaConf.structured(HFModelConfig)
         invalid_cli_config = OmegaConf.create(

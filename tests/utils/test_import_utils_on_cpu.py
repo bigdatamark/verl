@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for verl.utils.import_utils.load_extern_object, which loads a named attribute from a Python
+# file path. Uses the sibling fixture file _test_module.py (TEST_MODULE_PATH).
+
 import os
 
 import pytest
@@ -23,6 +27,8 @@ TEST_MODULE_PATH = os.path.join(os.path.dirname(__file__), "_test_module.py")
 
 
 def test_load_extern_object_class():
+    # [FUNCTION DOC]
+    # Loads TestClass, checks its name, default value "default", and get_value returning a custom value.
     """Test loading a class from an external file"""
     TestClass = load_extern_object(TEST_MODULE_PATH, "TestClass")
 
@@ -40,6 +46,8 @@ def test_load_extern_object_class():
 
 
 def test_load_extern_object_function():
+    # [FUNCTION DOC]
+    # Loads test_function, checks it is callable and returns "test_function_result".
     """Test loading a function from an external file"""
     test_function = load_extern_object(TEST_MODULE_PATH, "test_function")
 
@@ -53,6 +61,8 @@ def test_load_extern_object_function():
 
 
 def test_load_extern_object_constant():
+    # [FUNCTION DOC]
+    # Loads TEST_CONSTANT and checks it equals "test_constant_value".
     """Test loading a constant from an external file"""
     constant = load_extern_object(TEST_MODULE_PATH, "TEST_CONSTANT")
 
@@ -62,24 +72,33 @@ def test_load_extern_object_constant():
 
 
 def test_load_extern_object_nonexistent_file():
+    # [FUNCTION DOC]
+    # A nonexistent file path raises FileNotFoundError.
     """Test behavior when file doesn't exist"""
     with pytest.raises(FileNotFoundError):
         load_extern_object("/nonexistent/path.py", "SomeType")
 
 
 def test_load_extern_object_nonexistent_type():
+    # [FUNCTION DOC]
+    # A missing attribute name raises AttributeError.
     """Test behavior when type doesn't exist in the file"""
     with pytest.raises(AttributeError):
         load_extern_object(TEST_MODULE_PATH, "NonExistentType")
 
 
 def test_load_extern_object_none_path():
+    # [FUNCTION DOC]
+    # A None path raises AttributeError.
     """Test behavior when file path is None"""
     with pytest.raises(AttributeError):
         load_extern_object(None, "SomeType")
 
 
 def test_load_extern_object_invalid_module():
+    # [FUNCTION DOC]
+    # Writes a temporary .py file with invalid syntax and asserts loading raises RuntimeError; the temp file is
+    # removed in a finally block. Side effects: creates and deletes a temp file.
     """Test behavior when module has syntax errors"""
     # Create a temporary file with syntax errors
     import tempfile

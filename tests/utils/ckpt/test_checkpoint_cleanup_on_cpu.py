@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests for checkpoint-retention logic in BaseCheckpointManager: ensure_checkpoint_capacity (pre-save
+# cleanup that must leave room for one new checkpoint without deleting the only existing one when
+# max_ckpt_to_keep=1) and register_checkpoint (post-save registration that prunes old checkpoints).
+# max_ckpt_to_keep=0 means unlimited retention.
+
 import os
 import shutil
 import tempfile
@@ -20,10 +26,16 @@ import pytest
 
 
 class TestCheckpointCleanupLogic:
+    # [CLASS DOC]
+    # Test suite operating on mock "global_step_N" directories in a per-test temp directory, using a
+    # BaseCheckpointManager built with dummy model/optimizer and torch.distributed rank/world-size patched.
     """Tests for checkpoint cleanup methods in BaseCheckpointManager."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
+        # [FUNCTION DOC]
+        # HELPER: autouse fixture; creates a temp directory in self.test_dir, yields to the test, then removes it
+        # (ignoring errors). Side effects: filesystem temp dir creation/deletion.
         """Set up test fixtures."""
         self.test_dir = tempfile.mkdtemp()
         yield
@@ -31,6 +43,10 @@ class TestCheckpointCleanupLogic:
 
     @pytest.fixture
     def manager(self, monkeypatch):
+        # [FUNCTION DOC]
+        # HELPER: fixture returning a BaseCheckpointManager with placeholder model/optimizer objects, no scheduler,
+        # no processing class and no checkpoint config. Patches torch.distributed.get_rank to 0 and get_world_size
+        # to 1 so no process group is needed. Inputs: monkeypatch fixture. Outputs: the manager instance.
         """Create a minimal BaseCheckpointManager for testing."""
         import torch.distributed
 
@@ -40,9 +56,13 @@ class TestCheckpointCleanupLogic:
         from verl.utils.checkpoint.checkpoint_manager import BaseCheckpointManager
 
         class MockModel:
+            # [CLASS DOC]
+            # HELPER: empty placeholder model class.
             pass
 
         class MockOptimizer:
+            # [CLASS DOC]
+            # HELPER: empty placeholder optimizer class.
             pass
 
         return BaseCheckpointManager(
@@ -54,6 +74,9 @@ class TestCheckpointCleanupLogic:
         )
 
     def _create_checkpoint_dir(self, step: int) -> str:
+        # [FUNCTION DOC]
+        # HELPER: creates directory "global_step_<step>" under the temp dir containing a checkpoint.txt with
+        # "step=<step>". Inputs: step - integer. Outputs: the directory path. Side effects: writes to disk.
         """Create a mock checkpoint directory."""
         path = os.path.join(self.test_dir, f"global_step_{step}")
         os.makedirs(path, exist_ok=True)
@@ -62,6 +85,9 @@ class TestCheckpointCleanupLogic:
         return path
 
     def test_max_ckpt_1_preserves_existing_before_save(self, manager):
+        # [FUNCTION DOC]
+        # Regression: with one tracked checkpoint and max_ckpt_to_keep=1, pre-save capacity check must not delete
+        # it and the tracked list must be unchanged.
         """
         Regression test: max_ckpt_to_keep=1 must NOT delete existing checkpoint before save.
         """
@@ -74,6 +100,9 @@ class TestCheckpointCleanupLogic:
         assert manager.previous_saved_paths == [ckpt_100]
 
     def test_max_ckpt_1_deletes_old_after_save(self, manager):
+        # [FUNCTION DOC]
+        # With max 1, registering a new checkpoint deletes the old directory, keeps the new one, and the tracked list
+        # becomes just the new path.
         """After save succeeds, old checkpoint should be deleted."""
         ckpt_100 = self._create_checkpoint_dir(100)
         manager.previous_saved_paths = [ckpt_100]
@@ -86,6 +115,9 @@ class TestCheckpointCleanupLogic:
         assert manager.previous_saved_paths == [ckpt_200]
 
     def test_max_ckpt_2_keeps_one_before_save(self, manager):
+        # [FUNCTION DOC]
+        # With max 2 and two tracked checkpoints, pre-save cleanup deletes the oldest (step 100), keeps step 200,
+        # and leaves exactly one tracked path.
         """With max_ckpt_to_keep=2, pre-save cleanup keeps 1 checkpoint."""
         ckpt_100 = self._create_checkpoint_dir(100)
         ckpt_200 = self._create_checkpoint_dir(200)
@@ -98,6 +130,8 @@ class TestCheckpointCleanupLogic:
         assert len(manager.previous_saved_paths) == 1
 
     def test_max_ckpt_0_keeps_all(self, manager):
+        # [FUNCTION DOC]
+        # With max 0 (unlimited), neither the capacity check nor registration deletes anything; three paths tracked.
         """max_ckpt_to_keep=0 means unlimited - no deletions."""
         ckpt_100 = self._create_checkpoint_dir(100)
         ckpt_200 = self._create_checkpoint_dir(200)
@@ -113,6 +147,9 @@ class TestCheckpointCleanupLogic:
         assert len(manager.previous_saved_paths) == 3
 
     def test_full_save_cycle_max_ckpt_1(self, manager):
+        # [FUNCTION DOC]
+        # Simulates three consecutive capacity-check/save/register cycles with max 1, asserting after each that the
+        # previous checkpoint survives the pre-save step and is deleted only after the new one is registered.
         """Simulate multiple save cycles with max_ckpt_to_keep=1."""
         # First save
         manager.ensure_checkpoint_capacity(1)

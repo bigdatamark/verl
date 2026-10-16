@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module mooncake_checkpoint_engine: checkpoint engine using Mooncake TransferEngine for one-sided RDMA
+# (or Ascend direct) transfers arranged as a chain pipeline: trainer rank 0 -> rollout 1 -> rollout 2 -> ...
+# Each hop RDMA-reads the previous rank's double buffer, forwards metadata over a StatelessProcessGroup
+# (vLLM, falling back to SGLang), and signals completion by writing a 4-byte magic value into the previous
+# rank's magic slot. Side effects: module logger level from VERL_LOGGING_LEVEL (default INFO).
 import asyncio
 import gc
 import logging
@@ -37,6 +44,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 @CheckpointEngineRegistry.register("mooncake")
 class MooncakeCheckpointEngine(CheckpointEngine):
+    # [CLASS DOC]
+    # CheckpointEngine with p2p chain transfer. Owns a TransferEngine, a 2 x bucket_size registered data buffer,
+    # a 4 KiB buffer holding the magic pattern to write, and an 8-byte magic receive area (two 4-byte slots).
     """Mooncake checkpoint engine with p2p communication using TransferEngine
 
     Args:
@@ -55,6 +65,14 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         is_master: bool = False,
         rebuild_group: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores config; reads RANK env var and sets the local device (rank modulo device count); initializes
+        # the TransferEngine with P2P handshake on the node IP using "ascend_direct" transport for npu else "rdma";
+        # builds session id "host:rpc_port"; allocates and registers the three buffers.
+        # Inputs: bucket_size; device - "cuda"/"npu"/"cpu"; rollout_dtype - cast dtype for sent weights; device_name -
+        # Mooncake NIC filter; is_master, rebuild_group - stored only.
+        # Exceptions: KeyError if RANK unset; AssertionError if initialization or registration fails.
+        # Side effects: device selection, memory registration, logging.
         self.bucket_size = bucket_size
         self.device = device
         self.rollout_dtype = rollout_dtype
@@ -93,6 +111,8 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         logger.info(f"__init__ session_id={self.session_id}")
 
     def prepare(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: logs buffer pointers and picks a free port on this host. Outputs: dict with "addr" and "port".
         """Prepare send and recv buckets"""
         logger.info(
             f"prepare ptr={self.buf.data_ptr():#x} len={2 * self.bucket_size} "
@@ -103,6 +123,9 @@ class MooncakeCheckpointEngine(CheckpointEngine):
 
     @classmethod
     def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadatas: list[dict]):
+        # [FUNCTION DOC]
+        # Behavior: same chain topology as other engines: trainer rank 0 participates (others -1), rollout ranks 1..N,
+        # world size N+1, all receive metadatas[0]. Outputs: (actor kwargs, rollout kwargs) dicts of per-worker lists.
         actor_wg_kwargs = {
             "rank": [0] + [-1] * (actor_wg_world_size - 1),
             "world_size": [rollout_world_size + 1] * actor_wg_world_size,
@@ -116,6 +139,11 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         return actor_wg_kwargs, rollout_kwargs
 
     def init_process_group(self, rank: int, world_size: int, metadata: dict[str, Any]):
+        # [FUNCTION DOC]
+        # Behavior: records rank/world size; ranks < 0 return early. Otherwise creates a StatelessProcessGroup at the
+        # given addr/port, all-gathers each rank's session id and buffer pointer, and stores the previous rank's entry
+        # as buffer_info (None on rank 0).
+        # Inputs: rank, world_size, metadata dict with "addr"/"port". Side effects: network rendezvous, logging.
         self.rank = rank
         self.world_size = world_size
         if rank < 0:
@@ -140,6 +168,9 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         logger.info(f"init_process_group rank={rank} world_size={world_size} buffer_info={self.buffer_info}")
 
     def finalize(self):
+        # [FUNCTION DOC]
+        # Behavior: drops the store, empties device cache, runs garbage collection, logs.
+        # KNOWN ISSUE: docstring says it deregisters memory but no memory is deregistered.
         """Cleanup communication and deregister memory"""
         self.store = None
         get_torch_device().empty_cache()
@@ -147,6 +178,10 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         logger.info(f"finalize rank={self.rank}")
 
     async def wait_for_complete(self, buf: torch.Tensor):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: busy-polls (yielding to the event loop each iteration) until the first 4 bytes of buf equal
+        # the magic pattern AB DC EF 88, then zeroes them. Inputs: buf - uint8 tensor slot. Side effects: mutates buf;
+        # each check is a device sync. Never times out.
         magic = torch.tensor([0xAB, 0xDC, 0xEF, 0x88], dtype=torch.uint8, device=self.device)
         while True:
             if torch.equal(buf[:4], magic):
@@ -160,6 +195,16 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: non-participating ranks drain the generator and return. Rank 0 casts each weight to rollout_dtype and
+        # packs raw bytes into the current half of the double buffer, recording name/shape/dtype/offset. When a weight
+        # would overflow, it synchronizes and sends rank 1 the bucket metadata, data pointer, magic slot pointer, length,
+        # is_last False; switches halves and, from the second switch on, waits for the magic completion on the slot it is
+        # about to reuse. After all weights, sends the final bucket with is_last True and waits for both slots' completion.
+        # Inputs: weights generator; global_steps unused.
+        # Exceptions: AssertionError if a single weight exceeds bucket_size.
+        # Side effects: network sends, logs bandwidth.
+        # KNOWN ISSUE: total_bytes excludes the final bucket, so the logged bandwidth undercounts.
         """Send weights using Mooncake TransferEngine"""
         if self.rank < 0:
             for name, weight in weights:
@@ -240,6 +285,15 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         self,
         global_steps: int | None = None,
     ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        # [FUNCTION DOC]
+        # Behavior: loop: receive metadata from rank-1; when reusing a half (from the third bucket) and not the last rank,
+        # wait until the next rank signaled completion on that slot; RDMA-read len bytes from the previous rank's buffer
+        # into the current half; rewrite pointers to this rank's half and slot and forward to rank+1 unless last; yield
+        # views (name, tensor) for each entry; synchronize; write the magic to the previous rank's magic slot (or, if absent,
+        # to the start of its data buffer); advance halves; stop after the is_last bucket. Non-last ranks then wait for the
+        # outstanding slots' completion. Logs time and bandwidth.
+        # Outputs: async generator of (name, tensor view into the internal buffer; valid only until the half is reused).
+        # Exceptions: AssertionError on failed transfers. Side effects: RDMA, network, logging.
         """Receive weights from the previous rank via RDMA.
 
         Protocol:

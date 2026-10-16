@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Registers the "gdpo" reward manager: like naive scoring but injects the experiment name into extra_info so the score
+# function can use it.
+
 import inspect
 
 from verl import DataProto
@@ -22,9 +26,14 @@ from verl.utils.reward_score import default_compute_score
 
 @register("gdpo")
 class GDPORewardManager(RewardManagerBase):
+    # [CLASS DOC]
+    # Reward manager that scores the last sequence of a sample using the configured or default score function.
     """GDPO Reward Manager."""
 
     def __init__(self, config, tokenizer, compute_score, reward_router_address=None, reward_model_tokenizer=None):
+        # [FUNCTION DOC]
+        # Behavior: base init; chooses compute_score or the default; records whether it is async; stores router address and
+        # RM tokenizer.
         super().__init__(config, tokenizer, compute_score)
         self.compute_score = compute_score or default_compute_score
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
@@ -33,6 +42,13 @@ class GDPORewardManager(RewardManagerBase):
         self.reward_model_tokenizer = reward_model_tokenizer
 
     async def run_single(self, data: DataProto) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: same as the DAPO flow without overlong penalty: takes the last item, decodes valid response, reads
+        # data_source/ground truth/extra_info, sets extra_info "experiment_name" from trainer config, calls the score function
+        # (async or via executor, with router kwargs if a router exists), and converts the result into score and extra info
+        # (mapping entries, or "acc" for scalars).
+        # Outputs: mapping with reward_score and reward_extra_info.
+        # KNOWN ISSUE: extra_info is mutated in place, altering the sample's stored dict; fails if extra_info is present but none.
         data = data[-1:]  # for multi-sequence outputs, we only compute reward based on the last sequence
         data_item = data[0]
         response_ids = data_item.batch["responses"]

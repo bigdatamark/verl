@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module encode: defines the delta-sync wire schema. A flush consists of a uint8 positions blob
+# (absolute element positions encoded as int32, 4 bytes per changed element), a values tensor in the
+# parameter dtype, a manifest list of per-parameter entries, and an integer checksum. Only the "indices"
+# encoding name exists (DeltaEncodingName literal type). No side effects at import beyond torch import.
 """On-wire schema for delta sync: per-parameter manifest, flush container, checksum.
 
 One layout: a uint8 positions blob (``indices`` encoding -- int32 absolute
@@ -33,6 +39,12 @@ DeltaEncodingName = Literal["indices"]
 
 @dataclass
 class DeltaParam:
+    # [CLASS DOC]
+    # Dataclass manifest entry for one parameter inside a flush.
+    # Fields: name - parameter name; dtype - dtype string; shape - full parameter shape;
+    # pos_start/pos_end - byte range in the positions blob; pos_width - bytes per position;
+    # val_start/val_end - element range in the values tensor.
+    # KNOWN ISSUE: pos_width is annotated as "2 or 4", but the module doc states the only encoding uses 4-byte int32 positions.
     """Per-parameter manifest entry for a single chunk / bucket.
 
     Offsets are byte offsets into the surrounding ``__positions__`` blob and
@@ -50,6 +62,12 @@ class DeltaParam:
 
 
 def checksum(positions: torch.Tensor, values: torch.Tensor) -> int:
+    # [FUNCTION DOC]
+    # Behavior: computes a corruption-detection hash of a positions tensor and a values tensor using
+    # torch.hash_tensor (an XOR reduction); an empty tensor contributes 0. Combines as p XOR (v shifted left by 1).
+    # Inputs: positions, values - tensors (any device). Outputs: Python int.
+    # Exceptions: propagates torch errors (e.g. if hash_tensor is unavailable in the installed torch).
+    # Side effects: one device-to-host sync per non-empty argument.
     """Wire-corruption check; sender computes pre-flush, receiver post-recv.
 
     Uses ``torch.hash_tensor`` (XOR-reduce over uint64 bitcast); one reduction
@@ -65,6 +83,9 @@ def checksum(positions: torch.Tensor, values: torch.Tensor) -> int:
 
 @dataclass
 class DeltaFlush:
+    # [CLASS DOC]
+    # Dataclass describing one ready-to-dispatch flush: encoding name, manifest params, positions blob
+    # (positions_cpu, actually may live on GPU), values tensor (values_gpu) and the sender-side checksum.
     """One ready-to-dispatch flush.
 
     * ``positions_cpu`` is a uint8 positions blob. Despite the name it lives on
@@ -84,8 +105,13 @@ class DeltaFlush:
 
     @property
     def nnz(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: number of changed elements in this flush. Outputs: element count of values_gpu. No side effects.
         return self.values_gpu.numel()
 
     @property
     def wire_bytes(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: total payload size on the wire. Outputs: bytes of positions blob plus values element count times
+        # element size. No side effects.
         return self.positions_cpu.numel() + self.values_gpu.numel() * self.values_gpu.element_size()

@@ -15,6 +15,12 @@
 
 # TODO: add unit tests
 
+# [MODULE DOC]
+# Trainer-level checkpoint orchestration for engine-based trainers (e.g. SFT): saves/loads model state through the
+# engine (or Ray worker group), stores StatefulDataLoader state per DP rank, maintains the latest-step tracker file,
+# optional LoRA metadata, optional HDFS copy, and resolves the resume path from resume_mode.
+# Checkpoint folders are named "global_step_<N>" under default_local_dir.
+
 import json
 import logging
 import os
@@ -31,6 +37,9 @@ from verl.workers.engine import BaseEngine
 
 
 def extract_step(path):
+    # [FUNCTION DOC]
+    # HELPER: Extracts N from the first "global_step_<N>" substring in a path. Inputs: path string.
+    # Outputs: int or None if not found.
     match = re.search(r"global_step_(\d+)", path)
     if match:
         return int(match.group(1))
@@ -42,11 +51,17 @@ logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
 
 class OrchestrationMode(Enum):
+    # [CLASS DOC]
+    # How the trainer is orchestrated: SPMD (every process runs the trainer, uses torch.distributed) or RAY (single driver).
     SPMD = 0
     RAY = 1
 
 
 class CheckpointHandler:
+    # [CLASS DOC]
+    # Checkpoint handler for one model. Holds directories, retention, resume settings, the engine/worker group, the train
+    # dataloader, orchestration mode and optional LoRA metadata, plus rank info used to decide which process writes what.
+    # KNOWN ISSUE: docstring says it is expected to be used SPMD style, but OrchestrationMode.RAY is also supported.
     """
     Checkpoint handler handles the path, global_step of a checkpoint folder.
     Currently, it only works with a single model.
@@ -66,6 +81,12 @@ class CheckpointHandler:
         mode=OrchestrationMode.SPMD,
         lora_train_meta=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores all settings. In SPMD mode, reads global rank from torch.distributed and the engine's
+        # is-model-parallel-output-source flag and DP rank; in RAY mode uses rank 0, output source True and DP rank 0.
+        # Inputs: engine - BaseEngine or WorkerGroup; train_dataloader - stateful loader; keyword-only default_local_dir,
+        # max_ckpt_to_keep, default_hdfs_dir, resume_mode ("auto"/"disable"/"resume_path"), resume_from_path, mode,
+        # lora_train_meta - dict or None. Outputs: none. Exceptions: ValueError for unknown mode.
         self.default_local_dir = default_local_dir
         self.max_ckpt_to_keep = max_ckpt_to_keep
         self.default_hdfs_dir = default_hdfs_dir
@@ -88,6 +109,12 @@ class CheckpointHandler:
             raise ValueError(f"Unknown {self.mode=}")
 
     def save_checkpoint(self, step):
+        # [FUNCTION DOC]
+        # Behavior: saves step N to default_local_dir/global_step_N: engine saves model/optimizer with max_ckpt_to_keep;
+        # rank 0 writes lora_train_meta.json if metadata given; each model-parallel output-source rank saves its dataloader
+        # state to data_<dp_rank>.pt; rank 0 atomically updates the latest-step tracker (write temp file then rename) and copies
+        # the folder to HDFS if configured; SPMD mode ends with a barrier.
+        # Inputs: step - int. Outputs: none. Side effects: files, prints, HDFS, collective barrier.
         """Save checkpoint using FSDPCheckpointManager with improved tracking"""
         from verl.utils.fs import local_mkdir_safe
 
@@ -141,6 +168,10 @@ class CheckpointHandler:
             torch.distributed.barrier()
 
     def load_checkpoint(self):
+        # [FUNCTION DOC]
+        # Behavior: resolves resume path; returns 0 if none. Extracts the step from the path (warns and returns 0 if absent),
+        # records resume_global_step, loads engine checkpoint and dataloader state. Inputs: none. Outputs: int resume step.
+        # Exceptions: propagates assertion/ValueError from path resolution and engine load errors.
         # Determine resume path based on configuration
         checkpoint_path = self._determine_resume_path()
 
@@ -168,6 +199,9 @@ class CheckpointHandler:
         return resume_step
 
     def _load_dataloader_state(self, checkpoint_path: str):
+        # [FUNCTION DOC]
+        # HELPER: Loads data_<dp_rank>.pt from the checkpoint into the train dataloader if present (CPU map, full unpickling),
+        # otherwise logs a warning. Inputs: checkpoint_path. Outputs: none.
         """Load dataloader state from checkpoint"""
         dp_rank = self.dp_rank
         dataloader_path = os.path.join(checkpoint_path, f"data_{dp_rank}.pt")
@@ -194,6 +228,11 @@ class CheckpointHandler:
             )
 
     def _determine_resume_path(self):
+        # [FUNCTION DOC]
+        # HELPER: "disable" -> None; "auto" -> resume_from_path if given (asserted to exist and contain "global_step_"), else
+        # the latest checkpoint in default_local_dir; "resume_path" -> resume_from_path with the same assertions.
+        # Outputs: path or None. Exceptions: AssertionError on invalid path; ValueError for unknown mode
+        # (TypeError if resume_path mode with no path, from os.path.exists(None)).
         """Determine the path to resume from based on resume_mode configuration"""
         resume_mode = self.resume_mode
         resume_from_path = self.resume_from_path
@@ -219,6 +258,9 @@ class CheckpointHandler:
             raise ValueError(f"Invalid resume_mode: {resume_mode}. Must be 'auto', 'disable', or 'resume_path'")
 
     def _find_latest_checkpoint(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns None if default_local_dir does not exist; else the latest checkpoint path via the tracker file
+        # (rank 0 prints it). Outputs: path or None.
         """Find the latest checkpoint in the default local directory"""
         checkpoint_dir = self.default_local_dir
 

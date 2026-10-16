@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Registers the "static_fully_async" dynamic scheduling policy: hybrid replicas are never re-activated after
+# being deactivated, giving a static fully-async setup.
+
 """Built-in "static_fully_async" dynamic scheduling policy."""
 
 from .base import DynamicScheduleContext, DynamicSchedulePolicyBase, register_policy
@@ -19,6 +23,11 @@ from .base import DynamicScheduleContext, DynamicSchedulePolicyBase, register_po
 
 @register_policy("static_fully_async")
 class StaticFullyAsyncPolicy(DynamicSchedulePolicyBase):
+    # [CLASS DOC]
+    # Policy that deactivates hybrid replicas whenever they are active, waits zero samples, never adapts, and never
+    # activates after a step.
+    # KNOWN ISSUE: the docstring describes a wait threshold and adaptive ratio updates, but the code returns 0 wait
+    # samples and update_after_step is a no-op; deactivate_ratio is stored but unused.
     """Static fully-async policy: deactivate whenever hybrid is active, with adaptive ratio.
 
     Wait threshold: deactivate_ratio × required_samples × trigger_parameter_sync_step.
@@ -33,6 +42,8 @@ class StaticFullyAsyncPolicy(DynamicSchedulePolicyBase):
     """
 
     def __init__(self, deactivate_ratio: float = 0.3, only_hybrid: bool = False):
+        # [FUNCTION DOC]
+        # Behavior: stores ratio and only_hybrid; in only-hybrid mode forces ratio to 1.0 and logs. Outputs: none.
         self.deactivate_ratio = deactivate_ratio
         self.only_hybrid = only_hybrid
         if only_hybrid:
@@ -40,15 +51,23 @@ class StaticFullyAsyncPolicy(DynamicSchedulePolicyBase):
             self.deactivate_ratio = 1.0
 
     def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: returns is_hybrid_active. Outputs: bool.
         return is_hybrid_active
 
     def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
+        # [FUNCTION DOC]
+        # Behavior: always returns 0 (deactivate immediately). Outputs: int.
         return 0
 
     def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
+        # [FUNCTION DOC]
+        # Behavior: no-op. Outputs: none.
         return
 
     def should_activate_after_step(
         self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext
     ) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: always returns False (never re-activate hybrid replicas). Outputs: bool.
         return False

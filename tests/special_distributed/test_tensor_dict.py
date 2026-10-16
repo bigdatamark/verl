@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Distributed tests (4 ranks, run as a script under torchrun which initializes the global process group first) for
+# DataProto all-gather over a device-mesh dimension and for Megatron vocab-parallel entropy and sum-of-squared-probability
+# helpers versus single-device references. Sets NCCL_DEBUG=WARN on import and applies Ascend patches on NPU.
+
 import os
 
 os.environ["NCCL_DEBUG"] = "WARN"
@@ -30,6 +35,11 @@ if is_npu_available:
 
 
 def test_all_gather_data_proto():
+    # [FUNCTION DOC]
+    # Behavior: builds a 2x2 (dp, tp) mesh; each rank creates a 2-row obs tensor derived from its rank, labels ["a","b"] or
+    # reversed by rank parity, and meta info; all-gathers in place over the dp group (ranks {0,2} and {1,3}) and asserts the
+    # concatenated obs, labels and unchanged meta info for each rank.
+    # KNOWN ISSUE: expected values are only defined for ranks 0-3; other world sizes hit an undefined variable.
     device_mesh = torch.distributed.device_mesh.init_device_mesh(
         get_device_name(), mesh_shape=[2, 2], mesh_dim_names=["dp", "tp"]
     )
@@ -63,6 +73,11 @@ def test_all_gather_data_proto():
 
 
 def test_vocab_parallel_entropy():
+    # [FUNCTION DOC]
+    # Behavior: initializes Megatron TP=2; creates random logits (256 x 155136, requires grad) and targets, broadcasts both
+    # within the TP group, slices this rank's vocab shard as a fresh leaf; computes vocab-parallel entropy, backprops random
+    # grad_output, logs GPU memory; compares against full entropy_from_logits forward and the corresponding slice of its
+    # gradient, and checks the shard equals the original logits slice. Destroys model parallel at the end.
     from megatron.core import parallel_state as mpu
 
     from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy
@@ -125,6 +140,10 @@ def test_vocab_parallel_entropy():
 
 
 def test_vocab_parallel_sum_pi_squared():
+    # [FUNCTION DOC]
+    # Behavior: initializes TP=2 if needed; random logits (128 x 4096) broadcast within TP; computes vocab-parallel sum of
+    # squared softmax probabilities on the local shard and compares to the full reference (atol/rtol 1e-5), asserts the
+    # shard was not mutated and outputs lie in (0, 1]. Destroys model parallel at the end.
     from megatron.core import parallel_state as mpu
 
     from verl.utils.megatron.tensor_parallel import vocab_parallel_sum_pi_squared

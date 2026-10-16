@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Teacher loop package for on-policy distillation: exposes MultiTeacherModelManager, which launches and routes to
+# one or more teacher LLM servers used to compute teacher log-probabilities.
+
 from .teacher_model import MultiTeacherModelManager
 
 __all__ = ["MultiTeacherModelManager"]

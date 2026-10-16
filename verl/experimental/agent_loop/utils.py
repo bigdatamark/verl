@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Module utils: small helpers for agent loops, mainly manual chat formatting for gpt-oss models (whose chat
+# template cannot render tool responses without matching tool calls). Also re-exports resolve_config_path from
+# verl.utils.import_utils for backward compatibility.
+
 from typing import Any
 
 # Moved to verl.utils.import_utils; re-exported for compat.
@@ -22,6 +27,10 @@ from verl.utils.import_utils import resolve_config_path  # noqa: F401
 # Because the chat template requires tool call messages to parse tool response messages
 # so we need to format the tool response manually.
 def format_gpt_oss_tool_response_manually(tool_response: str, tool_call_name: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: wraps a tool response in gpt-oss harmony markup: start token, "functions.<name> to=assistant",
+    # commentary channel, message token, content, end token. Inputs: tool_response text; tool_call_name.
+    # Outputs: formatted string. No side effects.
     """Format tool response for gpt-oss model.
     Args:
         tool_response: Tool response string
@@ -34,6 +43,8 @@ def format_gpt_oss_tool_response_manually(tool_response: str, tool_call_name: st
 
 
 def add_generation_prompt_for_gpt_oss(message_content: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: appends the gpt-oss assistant start marker to the text. Outputs: new string.
     """Add generation prompt for gpt-oss model.
     Args:
         message_content: Message content string
@@ -45,6 +56,11 @@ def add_generation_prompt_for_gpt_oss(message_content: str) -> str:
 
 
 def build_gpt_oss_tool_response_text(messages: list[dict[str, Any]], tool_call_names: list[str]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: formats each tool message's "content" with the tool name at the same index, concatenates
+    # them and appends the assistant generation prompt.
+    # Inputs: messages - list of dicts with "content"; tool_call_names - names aligned by index.
+    # Outputs: string. Exceptions: IndexError if fewer names than messages; KeyError if content missing.
     """Build gpt-oss tool response text (manual formatting + generation prompt)."""
     tool_response_texts: list[str] = []
     for i, tool_msg in enumerate(messages):

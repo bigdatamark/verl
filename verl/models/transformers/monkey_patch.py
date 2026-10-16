@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Entry point for patching HuggingFace models in place for verl training: Ulysses sequence-parallel
+# flash attention (by replacing transformers' _flash_attention_forward), per-model VLM forward and
+# attention replacements (Qwen2/2.5-VL, Qwen3-VL(+MoE), GLM-4V, Kimi-VL, Qwen3.5(+MoE)), VLM input
+# slicing across SP ranks, fused log-prob/entropy forward backends, tiled MLP, PrefixGrouper attention
+# support, and a TRL value-head state_dict fix. All patches mutate classes / modules globally.
+# Module state: a flag recording whether the PrefixGrouper patch was applied and the set of attention
+# implementation names it wraps.
+
 """
 Apply monkey-patch function to models
 """
@@ -38,14 +47,29 @@ _PREFIX_GROUPER_SUPPORTED_ATTENTIONS = {"flash_attention_2", "flash_attention_3"
 
 
 def _create_prefix_grouper_wrapper(original_fn):
+    # [FUNCTION DOC]
+    # HELPER: Wraps an attention-interface function so that a prefix_grouper keyword, when present, is
+    # removed and the call is delegated to prefix_grouper.forward with an inner function that calls the
+    # original and returns only its output; returns (output, None) in that case. Without prefix_grouper
+    # calls the original unchanged.
+    # Inputs: original_fn - attention function (module, q, k, v, mask, ...) returning (out, weights).
+    # Outputs: wrapped function. Side effects: none.
     """Wrap attention function to support prefix_grouper in kwargs."""
 
     def wrapped(module, query, key, value, attention_mask, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: The wrapper described above. Inputs: module, query, key, value, attention_mask, extra args
+        # and kwargs (optionally prefix_grouper). Outputs: (attention output, weights or None).
+        # Side effects: pops prefix_grouper from kwargs.
+        # KNOWN ISSUE: attention_mask is not forwarded to prefix_grouper.forward on the grouped path.
         prefix_grouper = kwargs.pop("prefix_grouper", None)
         if prefix_grouper is None:
             return original_fn(module, query, key, value, attention_mask, *args, **kwargs)
 
         def attn_func(q, k, v, attn_mask, *inner_args, **inner_kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Inner adapter calling the original attention function and discarding attention weights.
+            # Inputs: q, k, v, attn_mask, extra args/kwargs. Outputs: attention output tensor.
             out, _ = original_fn(module, q, k, v, attn_mask, *inner_args, **inner_kwargs)
             return out
 
@@ -55,6 +79,11 @@ def _create_prefix_grouper_wrapper(original_fn):
 
 
 def apply_prefix_grouper_patch():
+    # [FUNCTION DOC]
+    # Behavior: once per process, replaces each supported entry (flash_attention_2/3, sdpa,
+    # flex_attention, eager) of transformers' ALL_ATTENTION_FUNCTIONS with the prefix-grouper wrapper and
+    # prints which were patched.
+    # Inputs: none. Outputs: None. Side effects: mutates the global registry and module flag; prints.
     """Patch ALL_ATTENTION_FUNCTIONS to support prefix_grouper parameter."""
     global _PREFIX_GROUPER_PATCHED
     if _PREFIX_GROUPER_PATCHED:
@@ -73,6 +102,9 @@ def apply_prefix_grouper_patch():
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Repeats KV heads n_rep times along dim 2 for [b, s, kvh, d] layout (returns input when
+    # n_rep is 1). Inputs: hidden_states; n_rep. Outputs: [b, s, kvh*n_rep, d]. Side effects: none.
     """
     This is the equivalent of torch.repeat_interleave(x, dim=2, repeats=n_rep). The hidden states go from (batch,
     seqlen, num_key_value_heads, head_dim) to (batch, seqlen, num_attention_heads, head_dim)
@@ -94,6 +126,16 @@ def _ulysses_flash_attention_forward(
     position_ids: Optional[torch.Tensor] = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Behavior: drop-in replacement for transformers' _flash_attention_forward. When SP > 1 and position
+    # ids are given (vision towers pass none, so they skip SP): repeats KV heads by max(sp/kvh, 1) so they
+    # split across ranks, all-to-alls q/k/v (gather sequence, scatter heads) and all-gathers position ids
+    # along the sequence. Recomputes query_length from the (possibly gathered) query, calls the original
+    # flash attention with position ids, then all-to-alls the output back.
+    # Inputs: query/key/value [b, s/sp, h, d]; attention_mask; query_length (ignored, recomputed); extra
+    # args; position_ids [b, s/sp]; kwargs forwarded.
+    # Outputs: attention output [b, s/sp, h, d].
+    # Side effects: SP collectives.
     """Insert all-to-all before and after flash attention.
     DeepSpeed-Ulysses: https://arxiv.org/pdf/2309.14509
 
@@ -156,13 +198,30 @@ def _ulysses_flash_attention_forward(
 
 
 def patch_vlm_for_ulysses_input_slicing(model_class: type):
+    # [FUNCTION DOC]
+    # Behavior: wraps model_class.forward so that on the outermost call under SP > 1 with inputs_embeds,
+    # inputs_embeds and position_ids (last dim) are sliced to the local SP shard; for Qwen3-VL also slices
+    # visual_pos_masks and the deepstack visual embeddings to the visual tokens falling within this rank's
+    # sequence range (or empty slices to keep gradients). A per-instance flag prevents re-slicing on
+    # nested calls and is restored afterwards.
+    # Inputs: model_class - a text-model class whose forward receives inputs_embeds.
+    # Outputs: None. Side effects: replaces model_class.forward; prints.
     """
     Applies a monkey patch to the forward method of a given model class
     to enable Ulysses sequence parallelism input slicing.
     """
 
     def _create_ulysses_wrapped_decoder_forward(original_forward):
+        # [FUNCTION DOC]
+        # HELPER: Factory creating the SP-slicing forward wrapper around original_forward.
+        # Inputs: original_forward. Outputs: wrapped forward function. Side effects: none.
         def ulysses_wrapped_decoder_forward(self, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: The slicing forward wrapper (see patch_vlm_for_ulysses_input_slicing).
+            # Inputs: self; args; kwargs (inputs_embeds, position_ids, visual_pos_masks, deepstack_visual_embeds).
+            # Outputs: original forward's result. Side effects: toggles self._needs_initial_slice; host syncs.
+            # KNOWN ISSUE: the deepstack slice offsets count visual tokens across the whole batch for columns
+            # before/through the shard boundary, which is only correct for batch size 1 (packed inputs).
             inputs_embeds = kwargs.get("inputs_embeds")
             position_ids = kwargs.get("position_ids")
             visual_pos_masks = kwargs.get("visual_pos_masks")
@@ -236,6 +295,15 @@ def patch_forward_with_backends(
     use_fused_kernels: bool = False,
     fused_kernels_backend: str = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: if fused kernels are enabled with backend triton, torch or liger, selects model-specific
+    # torch/triton fused forwards (Qwen2/2.5-VL, Qwen3-VL(+MoE), GLM-4V, Qwen3.5(+MoE), otherwise the
+    # dense_common ones), records the backend on the model, and replaces model.__class__.forward with the
+    # triton variant (triton) or torch variant (torch or liger). Otherwise prints a skip message.
+    # Inputs: model; use_fused_kernels; fused_kernels_backend.
+    # Outputs: None.
+    # Exceptions: ValueError for an unsupported backend (unreachable after the early return).
+    # Side effects: mutates the model class forward and sets model._verl_fused_kernels_backend; prints.
     """
     Choose the forward function based on the model and backend.
     Args:
@@ -301,6 +369,25 @@ def apply_monkey_patch(
     use_tiled_mlp: bool = False,
     tiled_mlp_shards: int = 4,
 ):
+    # [FUNCTION DOC]
+    # Behavior: orchestrates all patches. Optionally applies tiled MLP (by model type) and the
+    # PrefixGrouper patch. Reads attention / KV head counts (falling back to the text config) and asserts
+    # compatibility with ulysses_sp_size. If TRL is available, overrides
+    # AutoModelForCausalLMWithValueHead.state_dict with plain nn.Module.state_dict. Then per model type:
+    # Qwen2/2.5-VL - patch model and conditional-generation forwards, attention forward when remove
+    # padding or SP (errors on transformers 4.53.x), and SP input slicing; Qwen3-VL(+MoE) - patch forwards,
+    # vision fast_pos_embed_interpolate, MoE block fix for transformers <= 4.57.3, SP slicing; GLM-4V -
+    # patch forwards, attention, SP slicing; Kimi-VL - patch DeepseekV3FlashAttention2 in the model's
+    # module and SP slicing, then return early (no fused kernels); Qwen3.5(+MoE) - patch model, decoder
+    # layer, gated delta net and conditional generation forwards, vision interpolation, SP slicing. Finally,
+    # when remove padding or SP, replaces _flash_attention_forward in the model's module (legacy) or in
+    # transformers.integrations.flash_attention, and applies fused-kernel forwards.
+    # Inputs: model - HF PreTrainedModel; ulysses_sp_size; use_remove_padding; use_fused_kernels;
+    # fused_kernels_backend; use_prefix_grouper; use_tiled_mlp; tiled_mlp_shards.
+    # Outputs: None.
+    # Exceptions: AssertionError on head-count incompatibility; RuntimeError for transformers 4.53.x with
+    # Qwen2-VL; ImportError if model-specific transformers modules are missing.
+    # Side effects: global monkey patches of transformers classes/modules; prints.
     """
     Apply monkey patch to the models for ulysses sequence parallel, fused kernel, tiled MLP and prefix grouper.
 
@@ -356,6 +443,9 @@ def apply_monkey_patch(
             from trl import AutoModelForCausalLMWithValueHead  # type: ignore
 
         def state_dict(self, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Replacement state_dict for the TRL value-head wrapper delegating to nn.Module.state_dict.
+            # Inputs: self; args/kwargs. Outputs: state dict. Side effects: none.
             return torch.nn.Module.state_dict(self, *args, **kwargs)
 
         AutoModelForCausalLMWithValueHead.state_dict = state_dict

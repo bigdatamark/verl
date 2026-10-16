@@ -15,6 +15,12 @@
 # limitations under the License.
 
 
+# [MODULE DOC]
+# Ascend NPU fused-kernel replacements (via torch_npu) for HF Qwen-family models: RMSNorm, SwiGLU MLP,
+# rotary embeddings (full and partial-rotary variants), grouped-matmul MoE expert computation with
+# token permute/unpermute, and replacement Qwen3-VL-MoE sparse blocks. apply_npu_patches installs the
+# per-model patch functions registered in NPU_PATCHES. Importing requires torch_npu.
+
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -26,6 +32,10 @@ logger = logging.get_logger(__name__)
 
 
 def rms_norm_forward_npu(self, x):
+    # [FUNCTION DOC]
+    # Behavior: RMSNorm forward via npu_rms_norm with self.variance_epsilon after casting input to the
+    # weight dtype. Inputs: self - RMSNorm module (weight, variance_epsilon); x. Outputs: normalized tensor
+    # in weight dtype. Side effects: none.
     """NPU optimized implementation for RMSNorm."""
     if x.dtype != self.weight.dtype:
         x = x.to(self.weight.dtype)
@@ -33,12 +43,20 @@ def rms_norm_forward_npu(self, x):
 
 
 def silu_forward_npu(self, hidden_state):
+    # [FUNCTION DOC]
+    # Behavior: MLP forward concatenating gate_proj and up_proj outputs and applying npu_swiglu along the
+    # last dim, then down_proj. Inputs: self - MLP with gate/up/down projections; hidden_state.
+    # Outputs: MLP output. Side effects: none.
     """NPU optimized implementation for SiLU in `forward` func in MLP layer."""
     gate_up = torch.cat((self.gate_proj(hidden_state), self.up_proj(hidden_state)), dim=-1)
     return self.down_proj(torch_npu.npu_swiglu(gate_up, dim=-1))
 
 
 def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # [FUNCTION DOC]
+    # Behavior: applies RoPE with npu_rotary_mul to q and k after unsqueezing cos/sin at unsqueeze_dim,
+    # casting results back to input dtypes. Inputs: q, k; cos, sin; position_ids (unused); unsqueeze_dim.
+    # Outputs: (q_embed, k_embed). Side effects: none.
     """NPU optimized implementation for RoPE."""
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -48,10 +66,18 @@ def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
 
 
 def qwen3_next_rms_norm_forward_npu(self, x):
+    # [FUNCTION DOC]
+    # Behavior: Qwen3-Next style RMSNorm (weight stored as offset from 1) computed in float32 with scale
+    # 1 + weight, cast back to the input dtype. Inputs: self (weight, eps); x. Outputs: tensor like x.
     return torch_npu.npu_rms_norm(x.float(), 1.0 + self.weight.float(), epsilon=self.eps)[0].type_as(x)
 
 
 def qwen3_next_rms_norm_forward_gated_npu(self, hidden_states, gate=None):
+    # [FUNCTION DOC]
+    # Behavior: gated RMSNorm: float32 npu_rms_norm with weight, multiplied by SiLU of the gate, cast back
+    # to the input dtype. Inputs: self (weight, variance_epsilon); hidden_states; gate (required despite
+    # default). Outputs: tensor in input dtype.
+    # Exceptions: fails if gate is None.
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)
     hidden_states = torch_npu.npu_rms_norm(hidden_states, self.weight.float(), epsilon=self.variance_epsilon)[0]
@@ -60,6 +86,10 @@ def qwen3_next_rms_norm_forward_gated_npu(self, hidden_states, gate=None):
 
 
 def qwen3_next_apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # [FUNCTION DOC]
+    # Behavior: partial-rotary RoPE: rotates only the first rotary_dim (cos last-dim size) channels of q and
+    # k with npu_rotary_mul and concatenates the untouched remainder.
+    # Inputs: q, k; cos, sin; position_ids (unused); unsqueeze_dim. Outputs: (q_embed, k_embed).
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
@@ -76,8 +106,17 @@ def qwen3_next_apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqu
 
 
 class NPUGmmFunction(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd function computing grouped (per-expert) matmul with torch_npu.npu_grouped_matmul, where
+    # rows of x are already grouped by expert and group_list gives token counts (type 1) or cumulative
+    # counts (type 0).
     @staticmethod
     def forward(ctx, x, weight, group_list, group_list_type=1):
+        # [FUNCTION DOC]
+        # Behavior: saves x and weight plus group info, returns grouped matmul of x [tokens, in] with
+        # weight [experts, in, out] giving [tokens, out].
+        # Inputs: ctx; x; weight; group_list; group_list_type (default 1). Outputs: output tensor.
+        # Side effects: stores tensors on ctx.
         """
         Grouped Matmul(GMM) for Ascend NPU.
 
@@ -100,6 +139,10 @@ class NPUGmmFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC]
+        # Behavior: dx = grouped matmul of grad_output with transposed weights; dw = grouped matmul of x
+        # transposed with grad_output producing per-expert weight gradients (group_type 2).
+        # Inputs: ctx; grad_output. Outputs: (dx, dw, None, None).
         x, weight = ctx.saved_tensors
         group_list = ctx.group_list
         group_list_type = ctx.group_list_type
@@ -128,6 +171,10 @@ class NPUGmmFunction(torch.autograd.Function):
 
 
 def _qwen3_sparse_moe_uses_legacy_block_api(self) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Detects transformers 4.57-style Qwen3 MoE blocks (gate is nn.Linear and block has top_k and
+    # norm_topk_prob), which must return (hidden, router_logits).
+    # Inputs: self - MoE block. Outputs: bool.
     """Return True for transformers 4.57.x-style Qwen3 MoE blocks."""
     return (
         isinstance(getattr(self, "gate", None), nn.Linear)
@@ -137,6 +184,17 @@ def _qwen3_sparse_moe_uses_legacy_block_api(self) -> bool:
 
 
 def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
+    # [FUNCTION DOC]
+    # HELPER: Shared routed-expert computation. Flattens tokens, runs the gate; if it returns (logits,
+    # weights, indices) uses those, else computes softmax over experts in float32, takes top_k (from gate,
+    # block, num_experts_per_tok or 2) and optionally renormalizes. Casts weights to input dtype. Builds
+    # stacked per-expert weight tensors (from fused gate_up_proj/down_proj parameters, or from per-expert
+    # modules), permutes tokens by expert, counts tokens per expert by histogram, computes up and gate via
+    # NPUGmmFunction, applies npu_swiglu to concatenated [gate, up], projects down, and unpermutes with
+    # routing weights.
+    # Inputs: self - Qwen3Moe/Qwen3Next sparse MoE block; hidden_states [..., hidden].
+    # Outputs: (flattened input [tokens, hidden], routed output [tokens, hidden], router_logits).
+    # Side effects: none.
     """
     Shared NPU routed-expert path for Qwen3Moe/Qwen3Next sparse MoE blocks.
 
@@ -197,6 +255,10 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
 def qwen3_moe_sparse_moe_block_forward_npu(
     self, hidden_states: torch.Tensor
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: Qwen3MoeSparseMoeBlock forward using the shared routed path, reshaped to input shape;
+    # returns (output, router_logits) for legacy block API else just the output.
+    # Inputs: self; hidden_states. Outputs: tensor or tuple.
     """NPU optimized implementation for `forward` in Qwen3MoeSparseMoeBlock."""
     output_shape = hidden_states.shape
     _, routed_hidden_states, router_logits = _qwen3_sparse_moe_routed_forward_npu(self, hidden_states)
@@ -209,6 +271,10 @@ def qwen3_moe_sparse_moe_block_forward_npu(
 def qwen3_next_sparse_moe_block_forward_npu(
     self, hidden_states: torch.Tensor
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: Qwen3NextSparseMoeBlock forward: routed output plus sigmoid(shared_expert_gate) times
+    # shared_expert output, reshaped; tuple with router_logits for legacy API.
+    # Inputs: self; hidden_states. Outputs: tensor or tuple.
     """NPU optimized implementation for `forward` in Qwen3NextSparseMoeBlock."""
     output_shape = hidden_states.shape
     hidden_states, routed_hidden_states, router_logits = _qwen3_sparse_moe_routed_forward_npu(self, hidden_states)
@@ -223,9 +289,16 @@ def qwen3_next_sparse_moe_block_forward_npu(
 
 
 class NPUQwen3VLMoeTextExperts(nn.Module):
+    # [CLASS DOC]
+    # Replacement expert container for Qwen3-VL-MoE with fused gate_up_proj [E, H, 2I] and down_proj
+    # [E, I, H] parameters; uses grouped matmul in training and dense batched matmul in eval.
     """NPU optimized implementation for Qwen3VLMoeTextExperts."""
 
     def __init__(self, config):
+        # [FUNCTION DOC]
+        # Behavior: reads expert count, moe intermediate size, hidden size and activation from config and
+        # allocates uninitialized parameter tensors. Inputs: config. Outputs: none.
+        # Side effects: allocates parameters.
         super().__init__()
         self.num_experts = config.num_experts
         self.intermediate_size = config.moe_intermediate_size
@@ -238,6 +311,18 @@ class NPUQwen3VLMoeTextExperts(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, router_indices: torch.Tensor
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: training: permute tokens by top-k indices, grouped matmul with gate_up_proj, npu_swiglu,
+        # grouped matmul with down_proj, gather each token's selected routing probabilities from the dense
+        # routing weights and unpermute-combine them, reshape to [batch, -1, hidden]. Eval: replicate tokens
+        # for every expert, batched matmul gate_up, up times activation(gate), batched matmul down, weight by
+        # dense routing weights and sum over experts.
+        # Inputs: hidden_states [batch, tokens, hidden] or flattened; routing_weights dense [tokens, E];
+        # router_indices [tokens, top_k].
+        # Outputs: tensor [batch, tokens, hidden].
+        # KNOWN ISSUE: eval path uses act_fn(gate) * up, while training uses npu_swiglu on the concatenation
+        # whose half ordering must match gate-first; behaviors only agree if npu_swiglu treats the first half
+        # as the gate.
         """
         When training it is more efficient to just loop over the experts and compute the output for each expert
         as otherwise the memory would explode.
@@ -286,9 +371,15 @@ class NPUQwen3VLMoeTextExperts(nn.Module):
 
 
 class NPUQwen3VLMoeTextSparseMoeBlock(nn.Module):
+    # [CLASS DOC]
+    # Replacement Qwen3-VL-MoE sparse block: linear router, softmax top-k with renormalization, dense
+    # scattered routing weights, NPU experts.
     """NPU optimized implementation for Qwen3VLMoeTextSparseMoeBlock."""
 
     def __init__(self, config):
+        # [FUNCTION DOC]
+        # Behavior: stores sizes / top_k and creates the bias-free router and NPUQwen3VLMoeTextExperts.
+        # Inputs: config. Side effects: allocates modules.
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
@@ -297,6 +388,11 @@ class NPUQwen3VLMoeTextSparseMoeBlock(nn.Module):
         self.experts = NPUQwen3VLMoeTextExperts(config)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: computes router logits, float32 softmax, top-k, renormalized weights cast to logits dtype,
+        # scatters them into a dense [tokens, E] matrix, and calls the experts.
+        # Inputs: hidden_states [batch, seq, hidden]. Outputs: routed output [batch, seq, hidden].
+        # KNOWN ISSUE: returns only the output, not router logits as the original block may.
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         router_logits = self.gate(hidden_states)
@@ -316,6 +412,13 @@ def qwen3_5_moe_experts_forward_npu(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: Qwen3.5-MoE experts forward: transposes fused gate_up/down parameters to [E, in, out],
+    # permutes tokens by top_k_index, grouped matmuls with SwiGLU in between, unpermutes weighted by
+    # top_k_weights, returns in the input dtype.
+    # Inputs: self (gate_up_proj, down_proj, num_experts); hidden_states [tokens, hidden]; top_k_index;
+    # top_k_weights. Outputs: [tokens, hidden].
+    # Side effects: makes contiguous copies of the weights each call.
     selected_experts = top_k_index
     routing_weights = top_k_weights
     gate_up_proj = self.gate_up_proj.permute(0, 2, 1).contiguous()
@@ -334,6 +437,9 @@ def qwen3_5_moe_experts_forward_npu(
 
 
 def _patch_qwen2():
+    # [FUNCTION DOC]
+    # HELPER: Patches Qwen2 RMSNorm, MLP and module-level apply_rotary_pos_emb with NPU versions.
+    # Exceptions: ImportError if the module is missing. Side effects: global monkey patch.
     from transformers.models.qwen2 import modeling_qwen2
 
     modeling_qwen2.Qwen2RMSNorm.forward = rms_norm_forward_npu
@@ -342,6 +448,9 @@ def _patch_qwen2():
 
 
 def _patch_qwen2_5_vl():
+    # [FUNCTION DOC]
+    # HELPER: Patches Qwen2.5-VL RMSNorm (Qwen2RMSNorm or Qwen2_5_VLRMSNorm depending on version) and MLP.
+    # Side effects: global monkey patch.
     from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl
 
     if hasattr(modeling_qwen2_5_vl, "Qwen2RMSNorm"):
@@ -352,6 +461,8 @@ def _patch_qwen2_5_vl():
 
 
 def _patch_qwen3():
+    # [FUNCTION DOC]
+    # HELPER: Patches Qwen3 RMSNorm, MLP and rotary application. Side effects: global monkey patch.
     from transformers.models.qwen3 import modeling_qwen3
 
     modeling_qwen3.Qwen3RMSNorm.forward = rms_norm_forward_npu
@@ -360,6 +471,9 @@ def _patch_qwen3():
 
 
 def _patch_qwen3_moe():
+    # [FUNCTION DOC]
+    # HELPER: Patches Qwen3-MoE RMSNorm, sparse MoE block forward and rotary application.
+    # Side effects: global monkey patch.
     from transformers.models.qwen3_moe import modeling_qwen3_moe
 
     modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = rms_norm_forward_npu
@@ -368,6 +482,8 @@ def _patch_qwen3_moe():
 
 
 def _patch_qwen3_vl():
+    # [FUNCTION DOC]
+    # HELPER: Patches Qwen3-VL text RMSNorm and MLP. Side effects: global monkey patch.
     from transformers.models.qwen3_vl import modeling_qwen3_vl
 
     modeling_qwen3_vl.Qwen3VLTextRMSNorm.forward = rms_norm_forward_npu
@@ -375,6 +491,9 @@ def _patch_qwen3_vl():
 
 
 def _patch_qwen3_vl_moe():
+    # [FUNCTION DOC]
+    # HELPER: Replaces the Qwen3-VL-MoE sparse block class with the NPU class and patches RMSNorm and
+    # rotary application. Side effects: global monkey patch (affects models constructed afterwards).
     from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
 
     modeling_qwen3_vl_moe.Qwen3VLMoeTextSparseMoeBlock = NPUQwen3VLMoeTextSparseMoeBlock
@@ -383,6 +502,9 @@ def _patch_qwen3_vl_moe():
 
 
 def _patch_qwen3_next():
+    # [FUNCTION DOC]
+    # HELPER: Patches Qwen3-Next sparse MoE block, gated and plain RMSNorm, and partial rotary.
+    # Side effects: global monkey patch.
     from transformers.models.qwen3_next import modeling_qwen3_next
 
     modeling_qwen3_next.Qwen3NextSparseMoeBlock.forward = qwen3_next_sparse_moe_block_forward_npu
@@ -392,6 +514,8 @@ def _patch_qwen3_next():
 
 
 def _patch_qwen3_5():
+    # [FUNCTION DOC]
+    # HELPER: Patches Qwen3.5 gated / plain RMSNorm and partial rotary. Side effects: global monkey patch.
     from transformers.models.qwen3_5 import modeling_qwen3_5
 
     modeling_qwen3_5.Qwen3_5RMSNormGated.forward = qwen3_next_rms_norm_forward_gated_npu
@@ -400,6 +524,9 @@ def _patch_qwen3_5():
 
 
 def _patch_qwen3_5_moe():
+    # [FUNCTION DOC]
+    # HELPER: Patches Qwen3.5-MoE experts forward, gated / plain RMSNorm and partial rotary.
+    # Side effects: global monkey patch.
     from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe
 
     modeling_qwen3_5_moe.Qwen3_5MoeExperts.forward = qwen3_5_moe_experts_forward_npu
@@ -422,6 +549,11 @@ NPU_PATCHES = {
 
 
 def apply_npu_patches():
+    # [FUNCTION DOC]
+    # Behavior: runs every registered patch function, counting successes and failures; ImportError is
+    # treated as model unavailable (debug log) and other errors are logged as warnings. Logging only on
+    # global rank 0 when distributed is initialized.
+    # Inputs: none. Outputs: None. Side effects: global monkey patches; logging.
     """Apply NPU patches for all available models."""
     applied_count = 0
     failed_count = 0

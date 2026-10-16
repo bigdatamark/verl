@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for the temp_env_var context manager, which sets an environment
+# variable for the duration of a block and afterwards restores its previous value
+# or removes it if it did not exist, including when the block raises.
 
 import os
 
@@ -21,6 +25,11 @@ from verl.utils.py_functional import temp_env_var
 
 @pytest.fixture(autouse=True)
 def clean_env():
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture snapshotting the whole environment, deleting TEST_VAR,
+    # TEST_VAR_2 and EXISTING_VAR before each test, then after the test clearing the
+    # environment and restoring the snapshot.
+    # Side effects: mutates the process environment.
     """Fixture to clean up environment variables before and after each test."""
     # Store original environment state
     original_env = dict(os.environ)
@@ -40,6 +49,8 @@ def clean_env():
 
 
 def test_set_new_env_var():
+    # [FUNCTION DOC]
+    # Behavior: a previously absent variable is set inside the block and absent after.
     """Test setting a new environment variable that didn't exist before."""
     # Ensure variable doesn't exist
     assert "TEST_VAR" not in os.environ
@@ -54,6 +65,9 @@ def test_set_new_env_var():
 
 
 def test_restore_existing_env_var():
+    # [FUNCTION DOC]
+    # Behavior: an existing variable takes the temporary value inside and its original
+    # value after.
     """Test restoring an environment variable that already existed."""
     # Set up existing variable
     os.environ["EXISTING_VAR"] = "original_value"
@@ -67,6 +81,9 @@ def test_restore_existing_env_var():
 
 
 def test_env_var_restored_on_exception():
+    # [FUNCTION DOC]
+    # Behavior: a ValueError raised inside the block propagates and the original value
+    # is still restored.
     """Test that environment variables are restored even when exceptions occur."""
     # Set up existing variable
     os.environ["EXISTING_VAR"] = "original_value"
@@ -83,6 +100,9 @@ def test_env_var_restored_on_exception():
 
 
 def test_nested_context_managers():
+    # [FUNCTION DOC]
+    # Behavior: nested blocks on the same variable restore each outer level in turn
+    # (level2 back to level1, then to original).
     """Test nested temp_env_var context managers."""
     # Set up original variable
     os.environ["TEST_VAR"] = "original"
@@ -101,6 +121,9 @@ def test_nested_context_managers():
 
 
 def test_multiple_different_vars():
+    # [FUNCTION DOC]
+    # Behavior: nested blocks on two different variables restore the existing one and
+    # remove the newly created one.
     """Test setting multiple different environment variables."""
     # Set up one existing variable
     os.environ["EXISTING_VAR"] = "existing_value"
@@ -116,6 +139,9 @@ def test_multiple_different_vars():
 
 
 def test_empty_string_value():
+    # [FUNCTION DOC]
+    # Behavior: an empty-string value is set (present but empty) and the variable is
+    # removed afterwards.
     """Test setting environment variable to empty string."""
     with temp_env_var("TEST_VAR", ""):
         assert os.environ["TEST_VAR"] == ""
@@ -126,6 +152,8 @@ def test_empty_string_value():
 
 
 def test_overwrite_with_empty_string():
+    # [FUNCTION DOC]
+    # Behavior: overwriting an existing value with an empty string is restored after.
     """Test overwriting existing variable with empty string."""
     os.environ["EXISTING_VAR"] = "original"
 
@@ -137,6 +165,8 @@ def test_overwrite_with_empty_string():
 
 
 def test_context_manager_returns_none():
+    # [FUNCTION DOC]
+    # Behavior: the context manager yields None while the variable is set.
     """Test that context manager yields None."""
     with temp_env_var("TEST_VAR", "value") as result:
         assert result is None

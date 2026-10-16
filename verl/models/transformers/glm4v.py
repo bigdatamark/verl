@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# verl patches for HF GLM-4V (Glm4vForConditionalGeneration): padding-free 3D (t/h/w) mRoPE position
+# id computation, a flash-attention text attention forward supporting packed sequences (varlen via
+# position ids) and Ulysses sequence parallelism, multimodal input-embedding merging, and forward
+# variants returning logits or fused log_probs/entropy for PPO.
+# Module state: flash-attention feature flags (window size, deterministic, top-left mask) chosen from
+# flash_attn or the NPU flash-attention integration; deterministic mode from env
+# FLASH_ATTENTION_DETERMINISTIC.
+
 import inspect
 import itertools
 import logging
@@ -68,6 +77,21 @@ def get_rope_index(
     video_grid_thw: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: computes mRoPE position ids for one unbatched example. If ids and any grid are given:
+    # classifies each valid (mask==1) token as image (image token outside video markers), video (image
+    # token between begin/end-of-video markers) or text, groups consecutive equal types, and for each
+    # group, starting from previous max position + 1: image -> 3D grid of (t, h/merge, w/merge) indices;
+    # video -> one frame (t index advancing per video group) of (h/merge, w/merge), advancing to the next
+    # video after its frame count; text -> same linear range on all three rows. Results fill positions of
+    # valid tokens; others keep 1. Without grids: cumulative mask positions (masked = 1) or a plain range,
+    # expanded to three rows.
+    # Inputs: processor - with image_processor.merge_size and tokenizer; input_ids 1-D; image_grid_thw /
+    # video_grid_thw [n, 3]; attention_mask 1-D optional.
+    # Outputs: long tensor [3, seq_len].
+    # Side effects: host syncs.
+    # KNOWN ISSUE: video temporal position uses a frame counter reset by any non-video group rather than
+    # the grid's t value.
     """
     Gets the position ids for GLM4V in padding-free format.
     The batch dim has been removed and the input_ids should be a 1D tensor representing a single example.
@@ -184,6 +208,12 @@ def get_rope_index(
 def prepare_fa2_from_position_ids(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, position_ids: torch.Tensor
 ):
+    # [FUNCTION DOC]
+    # HELPER: Flattens batch and sequence of q/k/v to [total, heads, dim] and derives cu_seqlens from
+    # positions where position id equals 0 plus the total length; max length is the max segment length.
+    # Inputs: query, key, value [b, s, h, d]; position_ids [b, s].
+    # Outputs: (q, k, v, (cu_seqlens, cu_seqlens), (max_len, max_len)).
+    # Exceptions: AssertionError if position_ids is not 2-D. Side effects: none.
     assert position_ids.ndim == 2  # (batch_size, seq_length)
     query = query.contiguous().view(-1, query.size(-2), query.size(-1))
     key = key.contiguous().view(-1, key.size(-2), key.size(-1))
@@ -211,6 +241,20 @@ def _custom_flash_attention_forward(
     deterministic: Optional[bool] = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Flash attention wrapper. Sets deterministic flag (argument or env default) and softcap when
+    # supported, casts via PEFT dtype check to bf16, and under Ulysses SP all-to-alls q/k/v (gather
+    # sequence, scatter heads) and all-gathers position ids along the sequence. If position ids are
+    # non-monotonic (packed multiple sequences) and not decoding, runs flash_attn_varlen_func with
+    # cu_seqlens from prepare_fa2_from_position_ids (dropout and softmax_scale taken from kwargs),
+    # otherwise the HF _flash_attention_forward. Under SP, all-to-alls the output back.
+    # Inputs: query/key/value [b, s_local, h, d]; attention_mask; query_length; is_causal; position_ids
+    # [b, s_local]; use_top_left_mask; deterministic; kwargs (dropout, softmax_scale, softcap, others).
+    # Outputs: attention output [b, s_local, h, d].
+    # Exceptions: AssertionError if position_ids is not 2-D; Ulysses config validation errors.
+    # Side effects: SP collectives.
+    # KNOWN ISSUE: docstring mentions 3D mrope position ids but code asserts 2-D; with SP > 1 and
+    # position_ids None the all-gather path fails.
     """
     Patches flash attention forward to handle 3D position ids in mrope. (3, batch_size, seq_length)
     """
@@ -288,6 +332,16 @@ def glm4v_attn_forward(
     position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
     **kwargs,
 ) -> tuple[torch.Tensor, None, None]:
+    # [FUNCTION DOC]
+    # Behavior: replacement for Glm4vTextAttention.forward: projects q/k/v, applies rotary embedding with
+    # the provided cos/sin (mrope sections already folded), repeats KV heads to match query heads, uses
+    # dropout only in training, transposes to [b, s, h, d] and calls the custom flash-attention forward
+    # with position ids, then reshapes to hidden size and applies o_proj.
+    # Inputs: self - attention module; hidden_states [b, s_local, hidden]; attention_mask; position_ids;
+    # position_embeddings (cos, sin); kwargs ignored.
+    # Outputs: (attn_output, None).
+    # Side effects: SP collectives inside attention.
+    # KNOWN ISSUE: return annotation is a 3-tuple but a 2-tuple is returned.
     from transformers.models.glm4v.modeling_glm4v import apply_rotary_pos_emb, repeat_kv
 
     bsz, q_len, _ = hidden_states.size()  # q_len = seq_length / sp_size
@@ -341,6 +395,16 @@ def _get_input_embeds(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Builds input embeddings by embedding tokens and masked-scattering vision encoder outputs into
+    # image-token and video-token positions (after casting pixels to the visual dtype). For text-only
+    # batches runs the vision tower on a dummy 16x1176 input (grid 1x4x4) and adds zero times its mean so
+    # vision parameters stay in the autograd graph (needed by FSDP).
+    # Inputs: model; input_ids; attention_mask; pixel_values; pixel_values_videos; image_grid_thw;
+    # video_grid_thw.
+    # Outputs: (inputs_embeds, attention_mask moved to embeds device or None).
+    # Exceptions: ValueError when number of image/video tokens differs from feature count.
+    # Side effects: vision forward passes; host sync.
     inputs_embeds = model.get_input_embeddings()(input_ids)
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
@@ -391,6 +455,10 @@ def _get_input_embeds(
 
 
 def process_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Validates that position ids have shape [4, batch, seq] (text positions concatenated with the
+    # 3 mRoPE rows) and returns them unchanged.
+    # Inputs: position_ids. Outputs: same tensor. Exceptions: ValueError otherwise.
     if position_ids.ndim != 3 or position_ids.size(0) != 4:
         # we concat the text position ids with the 3D vision position ids by default
         # see https://github.com/huggingface/transformers/pull/39447
@@ -401,6 +469,8 @@ def process_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class Glm4vCausalLMOutputForPPO(Glm4vCausalLMOutputWithPast):
+    # [CLASS DOC]
+    # Dataclass extending Glm4vCausalLMOutputWithPast with optional per-token log_probs and entropy.
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
 
@@ -416,6 +486,12 @@ def glm4v_base_forward(
     video_grid_thw: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Behavior: computes merged multimodal embeddings via _get_input_embeds and runs self.language_model
+    # with input_ids None and inputs_embeds / attention_mask put into kwargs.
+    # Inputs: self - GLM-4V model; input_ids; attention_mask; labels (unused); pixel/grid inputs; kwargs.
+    # Outputs: language model output.
+    # Side effects: mutates kwargs dict.
     kwargs["inputs_embeds"], kwargs["attention_mask"] = _get_input_embeds(
         self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
     )  # avoid lora module having multiple keyword arguments
@@ -436,6 +512,11 @@ def glm4v_forward(
     video_grid_thw: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Calls self.model with validated 4-row position ids and all multimodal arguments.
+    # Inputs: self - Glm4vForConditionalGeneration; input_ids; attention_mask; position_ids; pixel/grid
+    # inputs; kwargs. Outputs: base model output.
+    # Exceptions: ValueError from process_position_ids (including when position_ids is None).
     return self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -455,6 +536,11 @@ def forward_with_normal_backend(
     temperature: float = 1.0,
     **kwargs,
 ) -> "Glm4vCausalLMOutputWithPast":
+    # [FUNCTION DOC]
+    # Behavior: runs the base model and computes full logits with lm_head.
+    # Inputs: self; input_ids; labels and temperature (both unused); kwargs to glm4v_forward.
+    # Outputs: Glm4vCausalLMOutputWithPast with logits and hidden_states.
+    # KNOWN ISSUE: temperature is accepted but not applied to logits.
     outputs = glm4v_forward(self, input_ids, **kwargs)
     hidden_states = outputs[0]
     logits = self.lm_head(hidden_states)
@@ -473,6 +559,13 @@ def forward_with_torch_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple | Glm4vCausalLMOutputForPPO:
+    # [FUNCTION DOC]
+    # Behavior: runs the base model, picks targets (shift_labels, else labels or input_ids rolled left by
+    # one) and computes log_probs/entropy with FusedLinearForPPO (backend from
+    # self._verl_fused_kernels_backend, default torch) at the given temperature.
+    # Inputs: self; input_ids; labels; temperature; shift_labels; kwargs.
+    # Outputs: Glm4vCausalLMOutputForPPO (log_probs, entropy, hidden_states).
+    # Exceptions: RuntimeError when no targets are available.
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
     outputs = glm4v_forward(self, input_ids, **kwargs)
@@ -511,6 +604,10 @@ def forward_with_triton_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple | Glm4vCausalLMOutputForPPO:
+    # [FUNCTION DOC]
+    # Behavior: same as the torch backend but uses the triton linear_cross_entropy kernel (no reduction).
+    # Inputs: same. Outputs: Glm4vCausalLMOutputForPPO.
+    # Exceptions: RuntimeError when no targets are available.
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
     outputs = glm4v_forward(self, input_ids, **kwargs)

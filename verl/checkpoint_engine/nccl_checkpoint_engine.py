@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module nccl_checkpoint_engine: CUDA checkpoint engine broadcasting weight buckets from trainer rank 0 to
+# rollout workers using ray.util.collective NCCL groups, with per-bucket metadata over ZeroMQ PUB/SUB.
+# Optionally (multi-sender) admits trainer workers on rank 0's node as NVLink relays that join each broadcast
+# with dummy buffers so NCCL can widen fan-out. cupy is imported with package-metadata discovery patched out
+# (to avoid slow/erroring entry-point scans). Side effects: module logger level from VERL_LOGGING_LEVEL.
 import asyncio
 import logging
 import os
@@ -42,6 +49,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @dataclass
 class MasterMetadata:
+    # [CLASS DOC]
+    # Dataclass: ZMQ endpoint of the source (zmq_ip, zmq_port) plus the multi_sender flag that build_topology reads.
     """Endpoint of the broadcast source (actor rank 0), handed to every worker in the group."""
 
     zmq_ip: str
@@ -51,6 +60,8 @@ class MasterMetadata:
 
 @dataclass
 class WorkerMetadata:
+    # [CLASS DOC]
+    # Dataclass returned by prepare(): node_id of the worker, and master metadata only on the source.
     """What each worker reports from `prepare()` for `build_topology` to place it in the group.
 
     Only the source rank fills `master`; every worker reports `node_id` so it can be matched
@@ -62,6 +73,9 @@ class WorkerMetadata:
 
 
 class BroadcastOperation:
+    # [CLASS DOC]
+    # Wraps one bucket broadcast executed on the asyncio loop's default thread executor.
+    # KNOWN ISSUE: the docstring describes it as waiting for completion, but as noted in wait_for_complete only enqueue is guaranteed.
     """Async broadcast operation with NCCL in separate thread.
 
     Args:
@@ -82,6 +96,11 @@ class BroadcastOperation:
         socket: zmq.Socket,
         topic: str,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: stores arguments and schedules _run in an executor.
+        # Inputs: rank - group rank (0 publishes metadata); group_name - collective group; bucket - cupy or torch uint8
+        # buffer (sliced to payload length on sender); metadata - dict with bucket_meta, is_last, length (None on receivers);
+        # socket - PUB or SUB socket; topic - topic string. Exceptions: RuntimeError without a running loop.
         self.rank = rank
         self.group_name = group_name
         self.bucket = bucket
@@ -93,6 +112,9 @@ class BroadcastOperation:
         self._task = loop.run_in_executor(None, self._run)
 
     def _run(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: rank 0 publishes topic and pickled metadata; others receive it and truncate their bucket to
+        # metadata length. Then broadcasts the bucket from rank 0 in the named group. Side effects: socket I/O, NCCL enqueue.
         # broadcast tensor meta via zeromq PUB/SUB
         if self.rank == 0:
             self.socket.send_string(self.topic, flags=zmq.SNDMORE)
@@ -106,6 +128,8 @@ class BroadcastOperation:
         collective.broadcast(self.bucket, src_rank=0, group_name=self.group_name)
 
     async def wait_for_complete(self) -> dict[str, TensorMeta]:
+        # [FUNCTION DOC]
+        # Behavior: awaits the executor task. Outputs: metadata dict. Exceptions: propagates errors from _run.
         """Wait for the broadcast operation to complete.
         (This does not guarantee that the NCCL kernel has finished, only that it has been enqueued.)
 
@@ -118,6 +142,9 @@ class BroadcastOperation:
 
 @CheckpointEngineRegistry.register("nccl")
 class NCCLCheckpointEngine(CheckpointEngine):
+    # [CLASS DOC]
+    # CheckpointEngine over NCCL. Group layout: ranks 0..num_senders-1 are trainer-side (0 is the real source,
+    # others relays), ranks num_senders..world_size-1 are rollout consumers; excluded trainer workers have rank -1.
     """NCCL checkpoint engine with collective communication.
 
     Args:
@@ -141,6 +168,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
         rollout_dtype: torch.dtype = torch.bfloat16,
         multi_sender: bool = True,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: stores config; if master, starts the zmq PUB server (sets ip and listen_port).
+        # Inputs: bucket_size, group_name, rebuild_group, is_master, rollout_dtype (stored only), multi_sender.
+        # KNOWN ISSUE: the class docstring says multi_sender defaults to False, but the signature default is True.
         self.bucket_size = bucket_size
         self.group_name = group_name
         self.rebuild_group = rebuild_group
@@ -155,6 +186,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     @staticmethod
     def get_node_id() -> str:
+        # [FUNCTION DOC]
+        # Behavior: returns the Ray node id of the current process. Outputs: string.
         """Identity of the node this GPU belongs to, used as a proxy for NVLink reachability.
 
         GPUs on the same node are NVLink-reachable, and a node never spans more than one NVLink
@@ -163,6 +196,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
         return ray.get_runtime_context().get_node_id()
 
     def prepare(self) -> WorkerMetadata:
+        # [FUNCTION DOC]
+        # Behavior: allocates two zeroed uint8 buffers of bucket_size: cupy arrays on master (to avoid registration
+        # errors with expandable segments), torch CUDA tensors elsewhere. Outputs: WorkerMetadata with node id and
+        # master endpoint (master only). Side effects: device allocation.
         # For master process, use cupy instead of torch to avoid memory register error
         # when `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
         if self.is_master:
@@ -180,6 +217,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
         return WorkerMetadata(node_id=self.get_node_id(), master=master)
 
     def finalize(self):
+        # [FUNCTION DOC]
+        # Behavior: if rebuild_group, destroys the collective group on participating ranks and clears rank/world size;
+        # drops both buffers and empties the CUDA cache.
         """Destroy the NCCL process group if rebuild_group is True."""
         if self.rebuild_group:
             if self.rank >= 0:
@@ -194,11 +234,16 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     @staticmethod
     def _single_sender_ranks(actor_wg_world_size: int) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Outputs: rank list with 0 for the first trainer worker and -1 for the rest.
         """Only actor rank 0 joins the group; every other actor worker sits the broadcast out."""
         return [0] + [-1] * (actor_wg_world_size - 1)
 
     @staticmethod
     def _multi_sender_ranks(actor_wg_world_size: int, metadata: list[WorkerMetadata]) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: walks trainer workers in order assigning contiguous ranks to worker 0 and every worker whose
+        # node_id equals worker 0's; others get -1. Inputs: count and metadata list. Outputs: list of ranks.
         """Actor rank 0 joins, plus every actor worker on its node, which are its NVLink peers.
 
         Those peers carry no data the rollout needs. They join so NCCL has somewhere to fan a
@@ -220,6 +265,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     @classmethod
     def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadata: list[WorkerMetadata]):
+        # [FUNCTION DOC]
+        # Behavior: reads master metadata from metadata[0], picks multi/single sender ranks per master.multi_sender,
+        # counts senders, sets world size = senders + rollout count, logs, and builds kwargs; rollout ranks start at
+        # num_senders. Outputs: (actor kwargs, rollout kwargs) with rank, world_size, master_metadata, num_senders lists.
+        # Exceptions: AssertionError if metadata[0] has no master.
         master = metadata[0].master
         assert master is not None, "actor rank 0 must be the checkpoint engine master"
 
@@ -250,6 +300,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
         return actor_wg_kwargs, rollout_kwargs
 
     def _start_zmq_server(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: resolves node IP, chooses a free port, binds a zmq PUB socket (IPv6-aware).
+        # Side effects: sets ip, listen_port, socket.
         self.ip = ray.util.get_node_ip_address().strip("[]")
         self.listen_port, _ = get_free_port(self.ip)
 
@@ -264,6 +317,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.socket.bind(address)
 
     def _connect_zmq_client(self, metadata: MasterMetadata):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: connects a zmq SUB socket to the master endpoint and subscribes to the topic.
+        # Exceptions: AssertionError on master.
         assert not self.is_master, "Master process should not connect to other processes."
         context = zmq.Context()
         self.socket = context.socket(zmq.SUB)
@@ -277,6 +333,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
 
     def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata, num_senders: int):
+        # [FUNCTION DOC]
+        # Behavior: stores num_senders; rank < 0 records and returns. Otherwise initializes the NCCL collective group if
+        # rebuilding or not yet initialized, else asserts rank/world unchanged; consumers (rank >= num_senders) connect the
+        # zmq client; then a group barrier. Side effects: collective init, logging.
+        # Exceptions: AssertionError on mismatched rank/world size.
         """Initialize the NCCL process group.
 
         Args:
@@ -317,6 +378,16 @@ class NCCLCheckpointEngine(CheckpointEngine):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: rank -1 drains the generator; ranks 1..num_senders-1 delegate to _relay_weights; rank 0 packs chunks
+        # from split_weight_chunks into the send buffer (converted to cupy), and when a chunk would overflow, synchronizes,
+        # optionally waits on the previous op (only when single-sender "pipelined"), starts a broadcast of the filled slice
+        # with metadata (bucket_meta, is_last False, length), and swaps buffers. In multi-sender mode it awaits the
+        # outstanding op after each chunk so kernel enqueue order stays deterministic with the relays. Finally broadcasts the
+        # last bucket with is_last True, awaits it and synchronizes.
+        # Inputs: weights generator; global_steps unused.
+        # Exceptions: AssertionError if called on a consumer rank, on overflow, or duplicate chunk name.
+        # Side effects: NCCL broadcasts, zmq publishes, logging.
         """Send the weights of the model.
 
         Args:
@@ -405,6 +476,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
         logger.info(f"Rank {self.rank} send weights done, time cost: {time.time() - start_time:.2f}s")
 
     async def _relay_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: iterates chunk metadata only (meta_only) with the same bucket-boundary rule as the sender and
+        # issues a matching broadcast of the recv buffer slice (receiving data that is discarded) per bucket, plus one for the
+        # final bucket; then synchronizes and logs. Inputs: weights generator. Side effects: NCCL collectives.
         """Join every broadcast as an NVLink-local relay for rank 0, dropping the payload.
 
         A relay holds nothing the rollout needs, so it only has to match the root bucket for
@@ -438,6 +513,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self,
         global_steps: int | None = None,
     ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        # [FUNCTION DOC]
+        # Behavior: wraps _receive_weight_chunks with merge_weight_chunks to reassemble full tensors; yields (name, tensor).
+        # Inputs: global_steps unused.
         """Receive the weights of the model.
 
         Yields:
@@ -447,6 +525,13 @@ class NCCLCheckpointEngine(CheckpointEngine):
             yield name, weight
 
     async def _receive_weight_chunks(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: double-buffered receive: get first bucket and sync; loop while not last: start next receive
+        # into the other buffer, yield chunk slices of the current buffer, await next metadata, sync, swap. Yield the final
+        # bucket and log total bytes (sum of lengths), param count, time and bandwidth.
+        # Outputs: async generator of (TensorMeta, buffer slice). Exceptions: AssertionError if rank is 0 or below.
+        # KNOWN ISSUE: docstring says it yields the weight name but yields TensorMeta; the guard checks rank > 0 rather
+        # than rank >= num_senders, so a relay rank would not be rejected.
         """Receive the weight chunks of the model.
 
         Yields:

@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Standalone GPU performance script (not a pytest test) comparing vLLM async rollout distributed backends
+# by timing AgentLoopManager.generate_sequences on GSM8K prompts. Requires the GSM8K train parquet under
+# ~/data/gsm8k, 8 GPUs, a Ray cluster and the Qwen2.5-7B-Instruct model. Prints per-step timings to stdout.
+# When run as main, executes 1 step for each of ("async","zeromq") and ("async","ray") on 8 GPUs per node.
+
 """
 Compare vLLM AsyncLLM backend: ExternalRayDistributedExecutor(remote call) vs RayDistributedExecutor(compiled graph)
 
@@ -46,6 +53,12 @@ from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
 
 def init_config(n_gpus_per_node) -> DictConfig:
+    # [FUNCTION DOC]
+    # Composes the ppo_trainer Hydra config (config dir resolved relative to CWD, so must run from repo root)
+    # with dynamic bsz and FSDP param/optimizer offload, then overrides: GPUs per node, train batch 128, raw chat
+    # returned, Qwen2.5-7B-Instruct model, async rollout mode, TP 2, GPU memory utilization 0.9, hermes multi-turn
+    # format, prompt/response lengths 4096, n=16.
+    # Inputs: n_gpus_per_node. Outputs: DictConfig. Side effects: Hydra global init.
     import os
 
     from hydra import compose, initialize_config_dir
@@ -75,6 +88,12 @@ def init_config(n_gpus_per_node) -> DictConfig:
 
 
 def initialize(config, backend) -> tuple[AgentLoopManager | RayWorkerGroup, StatefulDataLoader]:
+    # [FUNCTION DOC]
+    # Starts Ray with env vars (NCCL_DEBUG WARN, VLLM_USE_V1 1, VERL_VLLM_DISTRIBUTED_BACKEND=backend), creates
+    # the agent loop manager (which launches async LLM servers), loads the tokenizer, builds an RLHFDataset from
+    # ~/data/gsm8k/train.parquet and a sequential StatefulDataLoader (batch size gen_batch_size or train_batch_size,
+    # default 8 workers, drop_last, default collate).
+    # Inputs: config; backend name. Outputs: (agent loop manager, dataloader). Side effects: ray.init, GPU servers.
     env_vars = {
         "NCCL_DEBUG": "WARN",
         "VLLM_USE_V1": "1",
@@ -105,6 +124,11 @@ def initialize(config, backend) -> tuple[AgentLoopManager | RayWorkerGroup, Stat
 
 
 def perf_rollout(mode, backend, n_gpus_per_node, num_steps):
+    # [FUNCTION DOC]
+    # Builds config, sets rollout mode, initializes, then for each batch converts it to DataProto, keeps only
+    # input_ids/attention_mask/position_ids plus raw_prompt_ids/raw_prompt, times generate_sequences and prints a
+    # DEBUG line with backend, GPU count, generated batch size, step and elapsed seconds; stops after num_steps.
+    # Inputs: mode, backend, n_gpus_per_node, num_steps. Side effects: prints; shuts down Ray at end.
     config = init_config(n_gpus_per_node)
     config.actor_rollout_ref.rollout.mode = mode
     agent_loop_manager, dataloader = initialize(config, backend)

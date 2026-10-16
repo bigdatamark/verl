@@ -13,6 +13,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script that converts the BytedTsinghua-SIA/DAPO-Math-17k dataset (already in verl RL format)
+# into the multi-turn tool-use format used by the ReTool recipe by adding "code_interpreter"
+# tool kwargs to each row's extra_info. Identical in structure to aime2024_multiturn_w_tool.py.
+# Args: --local_dataset_path, --local_save_dir (default ~/data/retool_dapo), deprecated --local_dir,
+# --hdfs_dir. Outputs: <local_save_dir>/train.parquet (train split only), optional HDFS copy.
+# KNOWN ISSUE: local_save_dir is not tilde-expanded or created before writing parquet.
 """
 Preprocess the DAPO-Math-17k dataset to multiturn format
 """
@@ -47,7 +54,14 @@ if __name__ == "__main__":
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
+        # [FUNCTION DOC]
+        # Builds the per-row mapping function (split arg is unused). Outputs: returns process_fn.
         def process_fn(example, idx):
+            # [FUNCTION DOC]
+            # Pops and shallow-copies the row's extra_info, sets need_tools_kwargs to true and
+            # tools_kwargs.code_interpreter.create_kwargs.ground_truth from reward_model.ground_truth,
+            # reattaches it and returns the example. Inputs: example row dict; idx (unused).
+            # Exceptions: KeyError if fields are missing. Side effects: mutates the example.
             orig_extra_info = example.pop("extra_info")
             extra_info = orig_extra_info.copy()
             extra_info["need_tools_kwargs"] = True

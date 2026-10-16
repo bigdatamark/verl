@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module hccl_checkpoint_engine: Ascend NPU checkpoint engine that streams model weights from trainer
+# rank 0 to all rollout workers via HCCL broadcast (through a vLLM StatelessProcessGroup), with per-bucket
+# tensor metadata published over a ZeroMQ PUB/SUB side channel. Uses double buffering (send/recv buffers of
+# bucket_size bytes) so packing/consumption overlaps with communication.
+# Exceptions: raises ImportError at import time if torch.npu is unavailable.
+# Side effects: configures a module logger whose level comes from VERL_LOGGING_LEVEL (default WARN).
 import logging
 import os
 import time
@@ -42,6 +50,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @dataclass
 class MasterMetadata:
+    # [CLASS DOC]
+    # Dataclass of master endpoints shared with all participants: zmq_ip/zmq_port for the metadata PUB socket,
+    # dist_ip/dist_port for the HCCL rendezvous.
     zmq_ip: str
     zmq_port: int
     dist_ip: str
@@ -49,6 +60,11 @@ class MasterMetadata:
 
 
 class BroadcastOperation:
+    # [CLASS DOC]
+    # Wraps one bucket broadcast. Construction immediately performs the operation synchronously in the calling
+    # thread (despite the docstring's mention of a separate thread): metadata via zmq, then tensor via HCCL.
+    # KNOWN ISSUE: docstring says it runs in a separate thread and documents a group_name argument; the code
+    # runs synchronously and takes process_group instead.
     """Async broadcast operation with HCCL in separate thread.
 
     Args:
@@ -69,6 +85,12 @@ class BroadcastOperation:
         socket: zmq.Socket,
         topic: str,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: stores arguments and runs the broadcast immediately.
+        # Inputs: rank - this process's rank in the group (0 is sender); process_group - HCCL communicator with a
+        # broadcast method; bucket - uint8 buffer to send (rank 0) or fill (others); metadata - dict to publish
+        # (rank 0) or None; socket - zmq PUB (rank 0) or SUB socket; topic - topic string.
+        # Outputs: none. Side effects: network I/O and an enqueued HCCL broadcast.
         self.rank = rank
         self.pyhccl = process_group
         self.bucket = bucket
@@ -79,6 +101,11 @@ class BroadcastOperation:
         self._run()
 
     def _run(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: rank 0 sends the topic frame then the pickled metadata on the PUB socket; other ranks
+        # read the topic frame and the pickled metadata and store it on self.metadata. Then broadcasts the bucket
+        # from source rank 0. Inputs/outputs: none (uses instance state). Side effects: socket I/O, overwrites
+        # bucket contents on receivers, mutates self.metadata.
         # broadcast tensor meta via zeromq PUB/SUB
         if self.rank == 0:
             self.socket.send_string(self.topic, flags=zmq.SNDMORE)
@@ -91,6 +118,9 @@ class BroadcastOperation:
         self.pyhccl.broadcast(self.bucket, src=0)
 
     async def wait_for_complete(self) -> dict[str, TensorMeta]:
+        # [FUNCTION DOC]
+        # Behavior: returns the metadata (received or sent). Outputs: dict with "bucket_meta" (name to TensorMeta)
+        # and "is_last" flag. Side effects: none; does not wait for the kernel.
         """Wait for the broadcast operation to complete.
         (This does not guarantee that the HCCL kernel has finished, only that it has been enqueued.)
 
@@ -102,6 +132,11 @@ class BroadcastOperation:
 
 @CheckpointEngineRegistry.register("nccl")
 class HCCLCheckpointEngine(CheckpointEngine):
+    # [CLASS DOC]
+    # CheckpointEngine implementation for NPUs. Holds bucket size, group options, the HCCL communicator,
+    # the zmq socket, and rank/world size. Master (trainer rank 0) hosts the zmq server and HCCL rendezvous port.
+    # KNOWN ISSUE: it is registered under the name "nccl", the same key the CUDA NCCL engine uses; registering
+    # both would collide (it presumably relies on only one module being importable per platform, but "hccl" seems intended).
     """HCCL checkpoint engine with collective communication.
 
     Args:
@@ -121,6 +156,12 @@ class HCCLCheckpointEngine(CheckpointEngine):
         is_master: bool = False,
         rollout_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: records configuration, sets device to current NPU, and if master, starts the zmq PUB server
+        # and picks a free port for HCCL rendezvous.
+        # Inputs: bucket_size - bytes per bucket; group_name - unused label; rebuild_group - recreate communicator every
+        # update; is_master - whether this is the trainer rank 0; rollout_dtype - stored dtype hint.
+        # Outputs: none. Side effects: binds a socket on master.
         self.bucket_size = bucket_size
         self.group_name = group_name
         self.rebuild_group = rebuild_group
@@ -136,6 +177,9 @@ class HCCLCheckpointEngine(CheckpointEngine):
             self.dist_port, _ = get_free_port(self.ip)
 
     def prepare(self) -> MasterMetadata:
+        # [FUNCTION DOC]
+        # Behavior: allocates two zeroed uint8 NPU buffers of bucket_size bytes. Outputs: MasterMetadata on master,
+        # else None. Side effects: device memory allocation.
         self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="npu")
         self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="npu")
 
@@ -146,6 +190,9 @@ class HCCLCheckpointEngine(CheckpointEngine):
         )
 
     def finalize(self):
+        # [FUNCTION DOC]
+        # Behavior: if rebuild_group, destroys the communicator on participating ranks (rank >= 0) and resets
+        # rank/world size; always drops both buffers and empties the NPU cache. Outputs: none.
         """Destroy the HCCL process group if rebuild_group is True."""
         if self.rebuild_group:
             if self.rank >= 0:
@@ -160,6 +207,11 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
     @classmethod
     def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadata: list[dict]):
+        # [FUNCTION DOC]
+        # Behavior: builds per-worker init kwargs. Trainer workers: rank 0 for the first, -1 (non-participant) for the
+        # rest; rollout workers get ranks 1..N. All get world_size N+1 and the master metadata (metadata[0]).
+        # Inputs: actor_wg_world_size, rollout_world_size - worker counts; metadata - list of prepare() results.
+        # Outputs: tuple (actor kwargs dict of lists, rollout kwargs dict of lists).
         actor_wg_kwargs = {
             "rank": [0] + [-1] * (actor_wg_world_size - 1),
             "world_size": [rollout_world_size + 1] * actor_wg_world_size,
@@ -173,6 +225,9 @@ class HCCLCheckpointEngine(CheckpointEngine):
         return actor_wg_kwargs, rollout_kwargs
 
     def _start_zmq_server(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: resolves this node's IP (stripping IPv6 brackets), picks a free port, creates a zmq PUB
+        # socket (enabling IPv6 when needed) and binds it. Side effects: sets self.ip, self.zmq_port, self.socket.
         self.ip = ray.util.get_node_ip_address().strip("[]")
         self.zmq_port, _ = get_free_port(self.ip)
 
@@ -187,6 +242,10 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.socket.bind(address)
 
     def _connect_zmq_client(self, metadata: MasterMetadata):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: creates a zmq SUB socket, connects to the master's address (IPv6-aware) and subscribes to
+        # the topic. Inputs: metadata - MasterMetadata. Exceptions: AssertionError if called on master.
+        # Side effects: sets self.socket.
         assert not self.is_master, "Master process should not connect to other processes."
         context = zmq.Context()
         self.socket = context.socket(zmq.SUB)
@@ -200,6 +259,12 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
 
     def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata):
+        # [FUNCTION DOC]
+        # Behavior: ranks below 0 just record rank/world size and return. Otherwise creates the HCCL communicator
+        # when rebuild_group is set or none exists (else asserts rank/world size unchanged), connects the zmq client on
+        # ranks > 0, and performs an all-reduce barrier on a 1-element tensor.
+        # Inputs: rank, world_size, master_metadata. Exceptions: AssertionError on rank/world mismatch.
+        # Side effects: network setup, logging.
         """Initialize the HCCL process group.
 
         Args:
@@ -239,6 +304,15 @@ class HCCLCheckpointEngine(CheckpointEngine):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: trainer side. Non-participating ranks (-1) drain the generator and return. Rank 0 iterates
+        # chunks produced by split_weight_chunks; when the next chunk would overflow the bucket it synchronizes the
+        # device, waits on the previous operation, broadcasts the current buffer with its metadata (is_last False),
+        # swaps buffers and resets. Each chunk gets its offset recorded and is copied into the send buffer. Finally
+        # broadcasts the last bucket with is_last True and synchronizes.
+        # Inputs: weights - generator of (name, tensor); global_steps - unused.
+        # Exceptions: AssertionError if rank > 0, on bucket overflow, or duplicate chunk names in a bucket.
+        # Side effects: collective communication, logging of elapsed time.
         """Send the weights of the model.
 
         Args:
@@ -316,6 +390,9 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self,
         global_steps: int | None = None,
     ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        # [FUNCTION DOC]
+        # Behavior: rollout side; reassembles full tensors from received chunks via merge_weight_chunks and yields
+        # (name, tensor). Inputs: global_steps - unused. Outputs: async generator.
         """Receive the weights of the model.
 
         Yields:
@@ -325,6 +402,16 @@ class HCCLCheckpointEngine(CheckpointEngine):
             yield name, weight
 
     async def _receive_weight_chunks(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: receives the first bucket into the recv buffer, syncs, swaps buffers; then while the
+        # latest metadata is not last, starts receiving the next bucket into the other buffer, yields slices of the
+        # current buffer for each chunk in its metadata, gets the next metadata, syncs and swaps. Finally yields
+        # the last bucket's chunks and logs total time and bandwidth (counting full bucket_size per bucket).
+        # Outputs: async generator of (TensorMeta, uint8 slice view of the buffer).
+        # Exceptions: AssertionError if rank is 0 or below.
+        # KNOWN ISSUE: docstring says it yields the weight name, but it yields the TensorMeta object.
+        # Note: since the "next" broadcast runs synchronously at construction, the yielded slices of the previous buffer
+        # are consumed after that broadcast completes; consumers must copy before the next swap.
         """Receive the weight chunks of the model.
 
         Yields:

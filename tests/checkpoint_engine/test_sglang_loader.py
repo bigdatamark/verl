@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CPU bit-identity tests for SGLang delta_loader.apply_delta, which consumes a
+# flush given as named tensors: "__delta_spec__" (UTF-8 JSON as uint8 bytes with
+# encoding, per-param DeltaParam ranges, checksum, optional verify/is_last),
+# optional "__positions__" (int32 flat indices as bytes) and "__values__".
+
 """Bit-identity tests for the SGLang custom-weight-loader delta apply.
 
 Builds sparse ``indices``-encoding flushes exactly as the sharded engines
@@ -32,17 +39,26 @@ from verl.workers.rollout.sglang_rollout.delta_loader import apply_delta
 
 
 class _FakeModel:
+    # [CLASS DOC]
+    # HELPER: stand-in SGLang model holding cloned live params by name.
     """Holds live params; load_weights lands on param.copy_(loaded), like SGLang."""
 
     def __init__(self, named: list[tuple[str, torch.Tensor]]):
+        # [FUNCTION DOC]
+        # HELPER: clones each (name, tensor) into the params mapping.
         self.params = {n: t.clone() for n, t in named}
 
     def load_weights(self, chunk):
+        # [FUNCTION DOC]
+        # HELPER: copies each loaded tensor in place into the matching live param (KeyError if unknown).
         for name, tensor in chunk:
             self.params[name].copy_(tensor)
 
 
 def _make_named(dtype=torch.bfloat16) -> list[tuple[str, torch.Tensor]]:
+    # [FUNCTION DOC]
+    # HELPER: seeds torch RNG with 0 and returns two random named tensors (64x32, 32x16) of dtype (default bf16).
+    # Side effects: resets the global torch RNG.
     torch.manual_seed(0)
     return [
         ("layer.0.weight", torch.randn(64, 32, dtype=dtype)),
@@ -51,6 +67,13 @@ def _make_named(dtype=torch.bfloat16) -> list[tuple[str, torch.Tensor]]:
 
 
 def _sparse_indices_flush(old_named, new_named):
+    # [FUNCTION DOC]
+    # HELPER: per param pair (same order), flattens both, marks elements whose raw
+    # bytes differ, and for params with changes appends int32 indices and new values
+    # plus a DeltaParam with dtype name (without "torch."), shape, byte range in the
+    # positions stream (4 bytes per index) and element range in the values stream.
+    # Outputs: (list of DeltaParam, positions as a uint8 byte tensor, concatenated values).
+    # Exceptions: ValueError from strict zip on length mismatch; torch error if no param changed (empty concatenation).
     """Assemble one indices-encoding flush from a bytewise old/new diff --
     the same layout the sharded engines' ``_assemble_flush`` produces."""
     params, idx_pieces, val_pieces = [], [], []
@@ -84,6 +107,10 @@ def _sparse_indices_flush(old_named, new_named):
 
 
 def _named_tensors(params, positions, values, encoding="indices"):
+    # [FUNCTION DOC]
+    # HELPER: builds the flush list: JSON spec (encoding, params as dicts, checksum
+    # of positions+values) as a uint8 tensor, then positions (only if non-empty),
+    # then a clone of values. Outputs: list of (name, tensor).
     spec = {
         "encoding": encoding,
         "params": [vars(p) for p in params],
@@ -97,6 +124,9 @@ def _named_tensors(params, positions, values, encoding="indices"):
 
 
 def test_masked_apply_bit_identical():
+    # [FUNCTION DOC]
+    # Behavior: perturbs 4 positions per param by +0.5, applies the sparse delta and
+    # asserts each live param is bit-identical (compared as int16) to the target.
     named = _make_named()
     model = _FakeModel(named)
 
@@ -116,6 +146,10 @@ def test_masked_apply_bit_identical():
 
 
 def test_untouched_positions_preserved():
+    # [FUNCTION DOC]
+    # Behavior: sets a sentinel value in the live model at an unchanged position,
+    # applies a delta changing only position 7, asserts the sentinel survives and
+    # position 7 got the new value.
     """Positions absent from the delta must keep the model's LIVE values (not the
     trainer snapshot's) -- proves the apply is masked, not a full overwrite."""
     named = _make_named()
@@ -138,6 +172,9 @@ def test_untouched_positions_preserved():
 
 
 def test_checksum_mismatch_raises():
+    # [FUNCTION DOC]
+    # Behavior: flips one byte of the values tensor (index 2 in the flush) and
+    # asserts apply_delta raises RuntimeError mentioning "checksum".
     import pytest
 
     named = _make_named()
@@ -149,6 +186,10 @@ def test_checksum_mismatch_raises():
 
 
 def test_dense_flush_applies_full_tensors():
+    # [FUNCTION DOC]
+    # Behavior: builds a dense-encoding flush (no positions, full flattened values
+    # with zero-width position ranges), applies it to a zero-initialized model and
+    # asserts bit-identity with the source tensors.
     """Dense (first-sync) flushes carry values only; the loader must apply them verbatim."""
     named = _make_named()
     model = _FakeModel([(n, torch.zeros_like(t)) for n, t in named])  # dummy init
@@ -181,6 +222,9 @@ def test_dense_flush_applies_full_tensors():
 
 
 def _dense_verify_flush(named, is_last=True, verify=True):
+    # [FUNCTION DOC]
+    # HELPER: builds a dense flush like test_dense_flush_applies_full_tensors but the
+    # spec also sets "verify" and "is_last" flags. Outputs: list of (name, tensor).
     params, pieces, val_off = [], [], 0
     for name, t in named:
         flat = t.contiguous().view(-1)
@@ -211,6 +255,8 @@ def _dense_verify_flush(named, is_last=True, verify=True):
 
 
 def test_verify_sweep_passes_on_identical_state():
+    # [FUNCTION DOC]
+    # Behavior: a verify flush against an identical model must not raise.
     """A verify flush against a bit-identical model reports zero mismatches."""
     named = _make_named()
     model = _FakeModel([(n, t.clone()) for n, t in named])
@@ -218,6 +264,8 @@ def test_verify_sweep_passes_on_identical_state():
 
 
 def test_verify_sweep_fails_loud_on_divergence():
+    # [FUNCTION DOC]
+    # Behavior: one diverged element in the live model makes the verify flush raise RuntimeError mentioning "verification FAILED".
     """A single flipped element in the server state must fail the sweep."""
     import pytest
 

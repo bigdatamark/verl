@@ -13,6 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Script that merges a Megatron-trained LoRA adapter into the base model and
+# exports merged HuggingFace weights. Reuses the Hydra ppo_megatron_trainer config;
+# spins up Ray actor workers that build the actor engine (which loads base
+# weights and applies the adapter), then writes HF weights to a "huggingface"
+# directory that is a sibling of the adapter directory.
+# Side effects at import: sets NCCL_DEBUG=WARN and TOKENIZERS_PARALLELISM=true.
+
 """LoRA merger for the Megatron backend, built on the unified model engine.
 
 The legacy :mod:`verl.workers.megatron_workers` module was removed in favour of
@@ -40,6 +48,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 
 class CustomSaveWorker(ActorRolloutRefWorker):
+    # [CLASS DOC]
+    # Ray worker subclass adding one RPC that dumps the LoRA-merged actor weights to HF format.
     """Extends the unified :class:`ActorRolloutRefWorker` with a merge RPC.
 
     The actor ``TrainingWorker`` built by ``init_model`` already loads the base
@@ -51,6 +61,14 @@ class CustomSaveWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_merged_weights(self, hf_ckpt_path):
+        # [FUNCTION DOC]
+        # Behavior: runs on every rank (ONE_TO_ALL dispatch). Reloads actor params to
+        # the accelerator if param offload is enabled, barriers across ranks, prints a
+        # rank-tagged message, then exports through the engine's bridge: save_weights
+        # (distributed fs, memory efficient) when vanilla_bridge, else save_hf_weights.
+        # Inputs: hf_ckpt_path - output directory. Outputs: True.
+        # Exceptions: bridge/distributed errors propagate.
+        # Side effects: device memory movement, collective barrier, file writes, prints.
         engine = self.actor.engine
 
         # Reload model parameters to the accelerator if they were offloaded.
@@ -73,6 +91,12 @@ class CustomSaveWorker(ActorRolloutRefWorker):
 
 @hydra.main(config_path="../verl/trainer/config", config_name="ppo_megatron_trainer", version_base=None)
 def main(config):
+    # [FUNCTION DOC]
+    # Behavior: Hydra entry point. Asserts lora.adapter_path is set; if the actor
+    # optimizer's lr_decay_steps is None or < 1, overwrites it with 100000 to pass
+    # scheduler validation; then calls run_merge.
+    # Inputs: config - composed Hydra DictConfig. Exceptions: AssertionError if no adapter path.
+    # Side effects: mutates config.
     assert config.actor_rollout_ref.model.lora.adapter_path is not None, "adapter_path must be specified"
 
     if (
@@ -86,6 +110,11 @@ def main(config):
 
 
 def run_merge(config) -> None:
+    # [FUNCTION DOC]
+    # Behavior: initializes Ray if not already running, merging default runtime env
+    # vars (TOKENIZERS_PARALLELISM, NCCL_DEBUG) with config.ray_kwargs.ray_init.runtime_env
+    # and passing the remaining ray_init kwargs; then blocks on the remote main_task.
+    # Inputs: config. Outputs: none. Side effects: Ray init, prints the init kwargs.
     if not ray.is_initialized():
         # this is for local ray cluster
         default_runtime_env = {"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}}
@@ -101,6 +130,13 @@ def run_merge(config) -> None:
 
 @ray.remote(num_cpus=1)
 def main_task(config):
+    # [FUNCTION DOC]
+    # Behavior: Ray remote task (1 CPU). Prints and resolves the config in place,
+    # creates a resource pool of n_gpus_per_node x nnodes, a worker group of
+    # CustomSaveWorker with role "actor", initializes models, computes the output
+    # path as parent-of(normalized adapter_path)/huggingface, creates it and calls
+    # save_merged_weights on all workers.
+    # Inputs: config. Outputs: none. Side effects: allocates GPUs, writes files.
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
 

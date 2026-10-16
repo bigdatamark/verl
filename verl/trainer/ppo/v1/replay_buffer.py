@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Replay buffers for the v1 trainer that sample finished rollout groups from TransferQueue
+# (TQ). ReplayBuffer implements synchronous (on-policy) sampling with optional DAPO group
+# filtering and failed-group refill; ReplayBufferAsync implements async sampling with
+# off-policy staleness control (drop or wait). Both poll TQ metadata, evict unwanted terminal
+# groups, request replacement prompts through an injected refill function, and return a
+# KVBatchMeta of trajectory keys/tags for the selected prompt groups. The uid of a trajectory
+# key is the text before the first underscore.
 import logging
 import os
 import time
@@ -33,6 +42,13 @@ FILTER_GROUPS_REWARD_METRIC = "reward"
 
 
 def _accumulate_eviction_metrics(acc: dict, new: dict, stale_count: int) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: merges one poll's eviction metrics into the accumulator. Staleness means
+    # are combined as a weighted average (weights = previously accumulated evicted-sample count and
+    # stale_count); staleness max/min take the max/min; the DAPO reward-count dictionary is merged
+    # by summing counts; all other keys are summed.
+    # Inputs: acc - accumulator mapping (mutated); new - this poll's metrics; stale_count.
+    # Outputs: none.
     """Merge one poll iteration's eviction metrics into ``acc`` in place.
 
     ``stale_count`` weights the staleness mean so it stays a true per-sample average across iterations.
@@ -62,6 +78,12 @@ def _accumulate_eviction_metrics(acc: dict, new: dict, stale_count: int) -> None
 
 
 class ReplayBuffer:
+    # [CLASS DOC]
+    # State: config values from the constructor; per-partition snapshots rebuilt from TQ on each
+    # poll - trajectory key -> tag, sets of prompt uids by status (pending, running, finished,
+    # failure), prompt uid -> global step it was sampled at; plus a persistent per-partition cache
+    # of DAPO classification per finished uid (shared metric value when the group is uniform, else
+    # None).
     """ReplayBuffer is used by trainer to sample trajectories produced during rollout.
 
     We use [TransferQueue](https://github.com/Ascend/TransferQueue) as kv store to store trajectories.
@@ -149,6 +171,13 @@ class ReplayBuffer:
         max_inflight_gen_batches: int = 1,
         sync_refill_failed_groups: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores all arguments; validates max_off_policy_threshold (positive int or None,
+        # logging when disabled) and strategy (drop or wait); requires refill_fn when DAPO filtering
+        # or sync failed-group refill is enabled; runs mode-specific validation; initializes the
+        # empty snapshots and cache.
+        # Exceptions: AssertionError for invalid threshold/strategy; ValueError for missing refill_fn
+        # or invalid mode config.
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
         self.max_off_policy_threshold = max_off_policy_threshold
@@ -192,6 +221,10 @@ class ReplayBuffer:
         self._dapo_classification_cache: dict[str, dict[str, float | None]] = defaultdict(dict)
 
     def _validate_mode_config(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sync-mode validation: with DAPO enabled, max_inflight_gen_batches must be a positive
+        # int; sync failed-group refill requires gen_batch_size == 1.
+        # Exceptions: ValueError.
         if self.filter_groups_metric is not None:
             if not isinstance(self.max_inflight_gen_batches, int) or self.max_inflight_gen_batches <= 0:
                 raise ValueError("max_inflight_gen_batches must be a positive integer")
@@ -199,6 +232,11 @@ class ReplayBuffer:
             raise ValueError("sync_refill_failed_groups requires gen_batch_size=1")
 
     def _sync_metadata_from_transfer_queue(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: clears all snapshots (not the DAPO cache) and rebuilds them from tq.kv_list.
+        # Tags with is_prompt are prompt records: their global_steps is stored and the uid is added to
+        # the set for its status. Other entries are trajectory tags merged into the partition map.
+        # Exceptions: ValueError for an unknown prompt status. Side effects: TQ metadata read.
         """Sync the metadata from TransferQueue."""
         self.partitions.clear()
         self.pending_keys.clear()
@@ -236,9 +274,16 @@ class ReplayBuffer:
 
     @staticmethod
     def _metrics_prefix(partition_id: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns metric prefix "training" for partition "train", else "validation".
         return "training" if partition_id == "train" else "validation"
 
     def _clear_groups(self, partition_id: str, uids: set[str]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: no-op for empty uids. Deletes the prompt records and all their trajectory
+        # keys from TQ, then removes them from the local snapshots and the DAPO cache so later
+        # decisions in the same poll are consistent.
+        # Side effects: TQ deletes; mutates state.
         """Remove prompt groups from TransferQueue and the active metadata snapshot."""
         if not uids:
             return
@@ -259,6 +304,15 @@ class ReplayBuffer:
             self._dapo_classification_cache[partition_id].pop(uid, None)
 
     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: returns nothing for val or when DAPO is disabled. Prunes cache entries no
+        # longer finished; for newly finished uids fetches either rm_scores (metric "reward": sum of the
+        # score tensor) or extra_fields (reward_extra_info[metric]) for every trajectory. A group is
+        # classified as uniform (cached value = shared metric) when it has more than one value and zero
+        # standard deviation; otherwise None.
+        # Outputs: (filtered uids, counter of shared value -> group count) over all cached uids.
+        # Exceptions: RuntimeError when finished groups have no trajectories or lack the metric.
+        # Side effects: TQ reads; cache updates.
         """Finished groups whose configured DAPO metric is identical across all trajectories.
 
         Returns the filtered uids and a ``{shared_metric_value: group_count}`` breakdown built in the
@@ -317,6 +371,11 @@ class ReplayBuffer:
     def _terminal_eviction_reasons(
         self, global_steps: int, partition_id: str
     ) -> tuple[set[str], set[str], set[str], Counter]:
+        # [FUNCTION DOC]
+        # HELPER: Sync policy: for val returns empty sets. Otherwise stale set is always empty (sync is
+        # on-policy), DAPO uids from _dapo_filtered_keys, and failed uids = failed groups with no stored
+        # trajectories, only when sync_refill_failed_groups is enabled.
+        # Outputs: (stale, dapo, failed, dapo_counts).
         """Return stale, DAPO-filtered, and failed groups (plus the DAPO value->count breakdown).
 
         The three sets may overlap. Callers clear and refill their union, so one prompt is never handled
@@ -338,6 +397,8 @@ class ReplayBuffer:
         partition_id: str,
         eviction_reasons: tuple[set[str], set[str], set[str], Counter],
     ) -> set[str]:
+        # [FUNCTION DOC]
+        # HELPER: Returns finished-or-failed uids minus any uid selected for eviction.
         terminal_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
         stale_uids, dapo_uids, failed_uids, _dapo_counts = eviction_reasons
         return terminal_uids - (stale_uids | dapo_uids | failed_uids)
@@ -348,6 +409,12 @@ class ReplayBuffer:
         partition_id: str,
         eviction_reasons: tuple[set[str], set[str], set[str], Counter],
     ) -> tuple[set[str], int, int, dict]:
+        # [FUNCTION DOC]
+        # Behavior: if any uids are selected for eviction, builds metrics: stale count with staleness
+        # span (global_steps - prompt step + 1) mean/max/min under <prefix>/off_policy/...; DAPO
+        # evicted count and the reward-count diagnostic; failure evicted count. Clears the union once.
+        # Outputs: (evicted uids, stale count, dapo count, metrics); empty values when nothing evicted.
+        # Side effects: TQ deletes.
         """Evict terminal groups selected by any active policy exactly once."""
         stale_uids, dapo_uids, failed_uids, dapo_counts = eviction_reasons
         evicted_uids = stale_uids | dapo_uids | failed_uids
@@ -383,6 +450,10 @@ class ReplayBuffer:
     def _select_prompt_uids(
         self, partition_id: str, sampleable_keys: set[str], batch_size: int
     ) -> tuple[list[str], dict[str, dict], dict[str, int]]:
+        # [FUNCTION DOC]
+        # HELPER: Snapshots prompt global steps and partition tags, sorts sampleable uids by their
+        # sampled global step ascending (oldest first, missing as 0), and takes the first batch_size.
+        # Outputs: (selected uids, partition snapshot, global-steps snapshot).
         prompt_global_steps_snapshot = dict(self.prompt_global_steps[partition_id])
         partition_snapshot = dict(self.partitions[partition_id])
         ordered_keys = sorted(
@@ -394,6 +465,10 @@ class ReplayBuffer:
     def _materialize_batch(
         self, partition_id: str, selected_prompt_uids: list[str], partition_snapshot: dict[str, dict]
     ) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # HELPER: Deletes the selected prompt records from TQ (trajectories remain for training), then
+        # collects all trajectory keys/tags in the snapshot belonging to those uids.
+        # Outputs: KVBatchMeta for the partition. Side effects: TQ delete.
         tq.kv_clear(partition_id=partition_id, keys=selected_prompt_uids)
 
         keys, tags = [], []
@@ -406,6 +481,9 @@ class ReplayBuffer:
         return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
     def _wait_for_next_poll(self, partition_id: str, last_debug_time: float) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Sleeps poll_interval seconds; logs status-set sizes when more than the debug interval
+        # has passed since the last log. Outputs: updated last-log time.
         time.sleep(self.poll_interval)
         now = time.time()
         if now - last_debug_time > VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS:
@@ -420,6 +498,21 @@ class ReplayBuffer:
 
     @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
     def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:
+        # [FUNCTION DOC]
+        # Behavior: polling loop. Each iteration syncs metadata, computes and applies evictions
+        # (accumulating metrics), and computes sampleable uids and the inflight count (pending +
+        # running). Without DAPO: if failed groups were evicted and there are not enough samples, refill
+        # exactly that many and repoll. With DAPO: once enough samples exist, stop dispatching and drain
+        # (wait until inflight is 0); otherwise add 2 refill credits per DAPO-evicted group plus 1 per
+        # failed group, and dispatch refills limited by free inflight slots
+        # (max_inflight_gen_batches * train_batch_size minus inflight) rounded down to a multiple of
+        # gen_batch_size. Selection happens when enough samples exist (and inflight is 0 under DAPO);
+        # with DAPO surplus sampleable groups are cleared and counted as discarded_surplus_samples.
+        # After selection, for training raises if no selected group has stored trajectories.
+        # Inputs: see docstring. Outputs: (KVBatchMeta, eviction metrics).
+        # Exceptions: RuntimeError as above; errors from TQ/refill_fn.
+        # Side effects: TQ reads/deletes, refill calls, sleeping, logging; the decorator lets
+        # SkipManager intercept the sampling.
         """Sample a batch using synchronous rollout semantics.
 
         NOTE: user can customize sampling strategy by setting:
@@ -512,12 +605,21 @@ class ReplayBuffer:
 
 
 class ReplayBufferAsync(ReplayBuffer):
+    # [CLASS DOC]
+    # Async policy: stale finished groups are dropped (drop strategy) or sampling waits for
+    # near-stale in-flight prompts (wait strategy); all failed groups are evicted; every eviction
+    # is refilled one-for-one.
     """Async sampling policy over the shared TransferQueue and dynamic-filter implementation."""
 
     def _validate_mode_config(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Disables the sync-mode config validation (no-op).
         pass
 
     def _stale_terminal_keys(self, global_steps: int, partition_id: str) -> set[str]:
+        # [FUNCTION DOC]
+        # HELPER: For training with a threshold and drop strategy, returns finished uids whose
+        # staleness span (global_steps - sampled step + 1) exceeds the threshold; otherwise empty.
         if partition_id == "val" or self.max_off_policy_threshold is None or self.max_off_policy_strategy != "drop":
             return set()
         prompt_global_steps = self.prompt_global_steps[partition_id]
@@ -531,6 +633,9 @@ class ReplayBufferAsync(ReplayBuffer):
     def _terminal_eviction_reasons(
         self, global_steps: int, partition_id: str
     ) -> tuple[set[str], set[str], set[str], Counter]:
+        # [FUNCTION DOC]
+        # HELPER: Async policy: empty for val; otherwise (stale uids, DAPO uids, all failed uids,
+        # DAPO counts).
         if partition_id == "val":
             return set(), set(), set(), Counter()
 
@@ -545,6 +650,10 @@ class ReplayBufferAsync(ReplayBuffer):
         batch_size: int,
         sampleable_keys: set[str],
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Under the wait strategy returns false while any pending or running prompt has span
+        # >= threshold; otherwise returns whether enough sampleable uids exist.
+        # Exceptions: KeyError if an in-flight prompt has no recorded global step.
         # Dropless off-policy control: block sampling while any in-flight prompt has reached the staleness
         # threshold, so it can finish and be trained on instead of dropped.
         if self.max_off_policy_threshold is not None and self.max_off_policy_strategy == "wait":
@@ -556,12 +665,20 @@ class ReplayBufferAsync(ReplayBuffer):
         return len(sampleable_keys) >= batch_size
 
     def get_sampleable_count(self, global_steps: int, partition_id: str) -> int:
+        # [FUNCTION DOC]
+        # Behavior: syncs metadata and returns the number of sampleable groups without evicting.
+        # Side effects: TQ metadata read.
         """Return the current number of terminal groups eligible for sampling."""
         self._sync_metadata_from_transfer_queue()
         eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
         return len(self._sampleable_terminal_keys(partition_id, eviction_reasons))
 
     def wait_for_sampleable(self, global_steps: int, partition_id: str, target_count: int) -> tuple[set[str], dict]:
+        # [FUNCTION DOC]
+        # Behavior: loop: sync metadata, evict; if anything was evicted accumulate metrics, refill the
+        # same number (when refill_fn exists) and repoll immediately; otherwise return when enough
+        # samples (see _has_enough_samples), else sleep and repoll.
+        # Outputs: (sampleable uids, eviction metrics). Side effects: TQ, refill calls, sleeping.
         """Poll until ``target_count`` groups are sampleable, evicting and refilling meanwhile.
 
         Returns the sampleable uids and the eviction metrics accrued while waiting.
@@ -591,6 +708,10 @@ class ReplayBufferAsync(ReplayBuffer):
 
     @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
     def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:
+        # [FUNCTION DOC]
+        # Behavior: waits for batch_size sampleable groups, selects the oldest, asserts (training, drop
+        # strategy) that no selected group exceeds the staleness threshold, and materializes the batch.
+        # Outputs: (KVBatchMeta, eviction metrics). Exceptions: AssertionError on stale selection.
         """Sample a batch while evicting and replacing stale, DAPO-filtered, or failed groups."""
         sampleable_keys, eviction_metrics = self.wait_for_sampleable(global_steps, partition_id, batch_size)
         selected_prompt_uids, partition_snapshot, prompt_global_steps_snapshot = self._select_prompt_uids(

@@ -1,4 +1,7 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
+# [PACKAGE DOC]
+# Platform abstraction package: re-exports PlatformBase, PlatformRegistry, get_platform and set_platform so callers can
+# obtain a hardware-specific (CUDA / ROCm / NPU / ...) platform singleton. See the module docstring for usage.
 """Unified platform abstraction for multi-chip support.
 
 Usage::

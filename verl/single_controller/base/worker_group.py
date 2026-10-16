@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Backend-agnostic worker-group abstractions: ResourcePool (process counts per node), ClassWithInitArgs (deferred
+# construction), a worker-liveness monitor loop, and the WorkerGroup base which binds register-decorated worker methods
+# onto the group as driver-side methods that dispatch, execute and collect.
+
 """
 the class of WorkerGroup
 """
@@ -25,6 +30,9 @@ from .decorator import MAGIC_ATTR, Dispatch, get_predefined_dispatch_fn, get_pre
 
 
 class ResourcePool:
+    # [CLASS DOC]
+    # Resource description. State: list of process counts per node (_store), max_colocate_count (max worker groups sharing
+    # the pool), n_gpus_per_node.
     """
     Manages a pool of resources across multiple nodes, tracking process counts and GPU allocations.
     The class provides methods to calculate world size, local world sizes, and local ranks
@@ -32,6 +40,9 @@ class ResourcePool:
     """
 
     def __init__(self, process_on_nodes=None, max_colocate_count: int = 10, n_gpus_per_node=8) -> None:
+        # [FUNCTION DOC]
+        # Inputs: process_on_nodes - list of per-node process counts (None = empty; list is stored by reference, not copied);
+        # max_colocate_count (default 10); n_gpus_per_node (default 8). Side effects: none.
         """Initialize the ResourcePool with node processes and GPU configuration.
 
         Args:
@@ -46,21 +57,31 @@ class ResourcePool:
         self.n_gpus_per_node = n_gpus_per_node  # this is left for future huawei GPU that contains 16 GPUs per node
 
     def add_node(self, process_count):
+        # [FUNCTION DOC]
+        # Side effects: appends a node's process count.
         self._store.append(process_count)
 
     @property
     def world_size(self):
+        # [FUNCTION DOC]
+        # Outputs: total processes (sum of per-node counts).
         """Total number of processes across all nodes in the pool."""
         return sum(self._store)
 
     def __call__(self) -> Any:
+        # [FUNCTION DOC]
+        # Outputs: the per-node process count list itself.
         return self._store
 
     @property
     def store(self):
+        # [FUNCTION DOC]
+        # Outputs: the per-node process count list itself.
         return self._store
 
     def local_world_size_list(self) -> list[int]:
+        # [FUNCTION DOC]
+        # Outputs: flat list, one entry per process, of that process's node-local world size.
         """Returns a flat list where each process has its local world size."""
         nested_local_world_size_list = [
             [local_world_size for _ in range(local_world_size)] for local_world_size in self._store
@@ -68,12 +89,16 @@ class ResourcePool:
         return [item for row in nested_local_world_size_list for item in row]
 
     def local_rank_list(self) -> list[int]:
+        # [FUNCTION DOC]
+        # Outputs: flat list, one entry per process, of its node-local rank (0..count-1 per node).
         """Returns a flat list of local ranks for all processes across all nodes."""
         nested_local_rank_list = [[i for i in range(local_world_size)] for local_world_size in self._store]
         return [item for row in nested_local_rank_list for item in row]
 
 
 class ClassWithInitArgs:
+    # [CLASS DOC]
+    # Deferred-construction wrapper storing cls, args, kwargs and a fused_worker_used flag (default False).
     """
     Wrapper class that stores constructor arguments for deferred instantiation.
     This class is particularly useful for remote class instantiation where
@@ -81,6 +106,8 @@ class ClassWithInitArgs:
     """
 
     def __init__(self, cls, *args, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Inputs: cls - class to build later; args/kwargs - constructor arguments. Side effects: none.
         """Initialize the ClassWithInitArgs instance.
 
         Args:
@@ -95,11 +122,18 @@ class ClassWithInitArgs:
         self.fused_worker_used = False
 
     def __call__(self) -> Any:
+        # [FUNCTION DOC]
+        # Outputs: a new instance of cls built with the stored arguments.
         """Instantiate the stored class with the stored arguments."""
         return self.cls(*self.args, **self.kwargs)
 
 
 def check_workers_alive(workers: list, is_alive: Callable, gap_time: float = 1) -> None:
+    # [FUNCTION DOC]
+    # Behavior: infinite loop: for each worker, if is_alive returns False, log a warning and raise SIGABRT in the process;
+    # sleep gap_time seconds between passes. Never returns.
+    # Inputs: workers - list of handles; is_alive - predicate; gap_time - seconds (default 1).
+    # Side effects: signals the process; logging.
     """Continuously monitors worker processes and raises SIGABRT if any worker dies.
 
     Args:
@@ -121,6 +155,12 @@ def check_workers_alive(workers: list, is_alive: Callable, gap_time: float = 1) 
 
 
 class WorkerGroup:
+    # [CLASS DOC]
+    # Base worker group. Class attribute fused_worker_execute_fn_name names the fused-worker routing method. State: whether
+    # created from detached workers (no pool), fused_worker_used flag, the pool's per-node process list (dispatch config),
+    # worker handles and names, caches of per-mesh dispatch and collect info (used by lazy N-D dispatch), master addr/port,
+    # and the liveness checker thread. Subclasses must implement _is_worker_alive and the execute_all / execute_rank_zero
+    # methods referenced by execute modes.
     """
     Base class for managing a group of workers in a distributed system.
     The class provides methods for worker management, aliveness checking, and method binding.
@@ -129,6 +169,9 @@ class WorkerGroup:
     fused_worker_execute_fn_name = "_fuw_execute"
 
     def __init__(self, resource_pool: ResourcePool, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Inputs: resource_pool - ResourcePool or None (None means attaching to existing detached workers); kwargs ignored.
+        # Side effects: initializes state described in the class doc.
         self._is_init_with_detached_workers = resource_pool is None
 
         self.fused_worker_used = False
@@ -151,10 +194,14 @@ class WorkerGroup:
         self._checker_thread: threading.Thread = None
 
     def _is_worker_alive(self, worker):
+        # [FUNCTION DOC]
+        # Abstract hook. Exceptions: always NotImplementedError in the base class.
         """Check if a worker is alive. Must be implemented by derived classes."""
         raise NotImplementedError("WorkerGroup._is_worker_alive called, should be implemented in derived class.")
 
     def _block_until_all_workers_alive(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: poll every second until _is_worker_alive is true for all workers. Side effects: blocks.
         """Blocks until all workers in the group are alive."""
         while True:
             all_state = [self._is_worker_alive(worker) for worker in self._workers]
@@ -164,6 +211,9 @@ class WorkerGroup:
                 break
 
     def start_worker_aliveness_check(self, every_n_seconds=1) -> None:
+        # [FUNCTION DOC]
+        # Behavior: wait until all workers are alive, then start a (non-daemon) thread running the liveness monitor loop.
+        # Inputs: every_n_seconds - check interval. Side effects: spawns a thread.
         """Starts a background thread to monitor worker aliveness.
 
         Args:
@@ -179,10 +229,23 @@ class WorkerGroup:
 
     @property
     def world_size(self):
+        # [FUNCTION DOC]
+        # Outputs: number of workers.
         """Number of workers in the group."""
         return len(self._workers)
 
     def _bind_worker_method(self, user_defined_cls, func_generator):
+        # [FUNCTION DOC]
+        # Behavior: iterate over all attribute names of user_defined_cls, skipping those that cannot be fetched or are not
+        # callable. For methods carrying the register magic attribute, read dispatch_mode, execute_mode and blocking; resolve
+        # dispatch/collect functions from the predefined registry (Dispatch member) or from the dict itself; resolve the execute
+        # method name and fetch it from self; build a group-level method via func_generator(self, method_name, dispatch_fn=...,
+        # collect_fn=..., execute_fn=..., blocking=...) and set it as an attribute on self.
+        # Inputs: user_defined_cls - worker class; func_generator - factory producing the bound method.
+        # Outputs: list of bound method names.
+        # Exceptions: AssertionError on malformed attributes; re-raises if the execute function is missing (after printing);
+        # ValueError if setting the attribute fails.
+        # Side effects: adds attributes to self.
         """Binds worker methods to the WorkerGroup based on registered attributes.
 
         Args:

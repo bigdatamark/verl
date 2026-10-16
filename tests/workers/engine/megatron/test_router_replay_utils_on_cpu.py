@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for verl.utils.megatron.router_replay_utils (MoE router replay for Megatron): mapping the
+# global RouterReplay registry or a forwarded model's routers to the local pipeline / virtual-pipeline
+# stage's MoE layers, recording top-k indices (merge_router_topk_indices) and injecting replay targets
+# (set_router_replay_data). Megatron-dependent primitives (layer info, sequence-parallel gather/scatter,
+# packed-seq pre/post processing, router iteration) are monkeypatched with identity / fake versions.
+# Skipped entirely when megatron.core is unavailable. Pipeline parallel size is fixed at 2 by _config.
+
 from types import SimpleNamespace
 
 import pytest
@@ -24,19 +32,31 @@ from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAc
 
 
 class _FakeRouter:
+    # [CLASS DOC]
+    # HELPER: minimal stand-in for a Megatron RouterReplay instance holding recorded top-k indices, a replay
+    # action, and the replay targets set on it.
     def __init__(self, recorded_topk_idx=None, router_replay_action=None):
+        # [FUNCTION DOC]
+        # HELPER: stores recorded_topk_idx and router_replay_action (both optional) and initializes
+        # target_topk_idx and target_replay_mask to None.
         self.recorded_topk_idx = recorded_topk_idx
         self.router_replay_action = router_replay_action
         self.target_topk_idx = None
         self.target_replay_mask = None
 
     def set_target_indices(self, topk_indices, replay_mask=None):
+        # [FUNCTION DOC]
+        # HELPER: records the given top-k indices and optional replay mask as the router's replay targets.
+        # Side effects: mutates target_topk_idx / target_replay_mask.
         self.target_topk_idx = topk_indices
         self.target_replay_mask = replay_mask
 
 
 @pytest.fixture(autouse=True)
 def _restore_router_registry():
+    # [FUNCTION DOC]
+    # HELPER: autouse fixture that saves the class-level RouterReplay.router_instances list, replaces it with
+    # an empty list for the test, and restores the original afterwards. Side effects: mutates global class state.
     old_instances = RouterReplay.router_instances
     RouterReplay.router_instances = []
     yield
@@ -44,6 +64,11 @@ def _restore_router_registry():
 
 
 def _config(num_layers=48, moe_layer_freq=1, virtual_pipeline_model_parallel_size=None):
+    # [FUNCTION DOC]
+    # HELPER: builds a lightweight transformer-config namespace for routing tests.
+    # Inputs: num_layers (default 48); moe_layer_freq (int or per-layer 0/1 list); virtual_pipeline_model_parallel_size.
+    # Outputs: namespace with top-k 2, pipeline parallel size 2, no fp8, no custom layout or first/last stage
+    # overrides, and embedding/loss not accounted in the pipeline split.
     return SimpleNamespace(
         fp8=None,
         moe_layer_freq=moe_layer_freq,
@@ -60,6 +85,9 @@ def _config(num_layers=48, moe_layer_freq=1, virtual_pipeline_model_parallel_siz
 
 
 def test_get_micro_batch_router_list_supports_local_only_registry(monkeypatch):
+    # [FUNCTION DOC]
+    # Registry holds exactly the 24 local MoE layers (patched count to build = 24); asserts the helper returns
+    # the registry unchanged.
     RouterReplay.router_instances = list(range(24))
     tf_config = _config()
 
@@ -68,6 +96,9 @@ def test_get_micro_batch_router_list_supports_local_only_registry(monkeypatch):
 
 
 def test_empty_registry_is_a_noop_for_replay_disabled_engine():
+    # [FUNCTION DOC]
+    # With an empty registry, asserts the router list is empty and all action queries (R2 record, replay
+    # forward, replay backward) return False.
     tf_config = _config()
 
     assert rr_utils.RouterReplayHelper.get_micro_batch_router_list(tf_config) == []
@@ -77,6 +108,9 @@ def test_empty_registry_is_a_noop_for_replay_disabled_engine():
 
 
 def test_action_queries_use_forwarded_model_instead_of_global_registry(monkeypatch):
+    # [FUNCTION DOC]
+    # Registry holds a stale router in REPLAY_FORWARD; the patched model router iterator yields a live RECORD
+    # router. Asserts action queries passed model= consult the model's routers (record True, replay forward False).
     stale_router = _FakeRouter(router_replay_action=RouterReplayAction.REPLAY_FORWARD)
     live_router = _FakeRouter(router_replay_action=RouterReplayAction.RECORD)
     RouterReplay.router_instances = [stale_router]
@@ -90,6 +124,9 @@ def test_action_queries_use_forwarded_model_instead_of_global_registry(monkeypat
 
 
 def test_get_micro_batch_router_list_supports_local_only_vpp_registry(monkeypatch):
+    # [FUNCTION DOC]
+    # With VPP size 2, 4 local registry entries, 2 layers per chunk and patched layer ranges; asserts vp_rank 1
+    # selects the second pair of entries.
     RouterReplay.router_instances = list(range(4))
     tf_config = _config(num_layers=8, virtual_pipeline_model_parallel_size=2)
 
@@ -104,6 +141,8 @@ def test_get_micro_batch_router_list_supports_local_only_vpp_registry(monkeypatc
 
 
 def test_get_micro_batch_router_list_rejects_short_nonempty_registry(monkeypatch):
+    # [FUNCTION DOC]
+    # Registry with a single entry but 2 expected local layers; asserts RuntimeError "registry does not cover".
     RouterReplay.router_instances = [object()]
     tf_config = _config(num_layers=4)
 
@@ -118,14 +157,25 @@ def test_get_micro_batch_router_list_rejects_short_nonempty_registry(monkeypatch
 @pytest.mark.parametrize("pp_rank", [0, 1])
 @pytest.mark.parametrize("registry_layout", ["local", "global"])
 def test_registry_layouts_select_exact_moe_layers(monkeypatch, frequency, vpp_size, pp_rank, registry_layout):
+    # [FUNCTION DOC]
+    # Parametrized over MoE layer frequency patterns, VPP size, pipeline rank and registry layout (global list
+    # of all MoE layers vs local list of this rank's MoE layers). Patches layer range and layer-count functions
+    # consistent with an 8-layer model split over 2 PP ranks (and VPP chunks), then asserts for every vp_rank the
+    # helper returns exactly the MoE layer indices of that stage.
+    # Inputs: monkeypatch, frequency, vpp_size, pp_rank, registry_layout.
     config = _config(num_layers=8, moe_layer_freq=frequency, virtual_pipeline_model_parallel_size=vpp_size)
 
     def layer_range(vp_rank):
+        # [FUNCTION DOC]
+        # HELPER: computes the start/end layer range for a vp_rank given interleaved layout (chunk index times PP
+        # size plus pp_rank, times per-chunk width). Outputs: mapping with start and end.
         width = 8 // (2 * (vpp_size or 1))
         start = ((vp_rank or 0) * 2 + pp_rank) * width
         return {"start": start, "end": start + width}
 
     def stage_layers(vp_rank):
+        # [FUNCTION DOC]
+        # HELPER: lists layer indices in layer_range(vp_rank) that are MoE layers according to the config.
         bounds = layer_range(vp_rank)
         return [idx for idx in range(bounds["start"], bounds["end"]) if rr_utils.is_moe_layer(config, idx)]
 
@@ -145,6 +195,8 @@ def test_registry_layouts_select_exact_moe_layers(monkeypatch, frequency, vpp_si
 
 @pytest.mark.parametrize("registry_size", [1, 3, 5, 9])
 def test_registry_rejects_incomplete_or_extra_model_layout(monkeypatch, registry_size):
+    # [FUNCTION DOC]
+    # Parametrized registry sizes (1, 3, 5, 9) that match neither the local (4) nor global layout; asserts RuntimeError.
     config = _config(num_layers=8, virtual_pipeline_model_parallel_size=2)
     RouterReplay.router_instances = list(range(registry_size))
     monkeypatch.setattr(rr_utils, "get_moe_num_layers_to_build", lambda _config, vp_rank=None: 2)
@@ -155,6 +207,8 @@ def test_registry_rejects_incomplete_or_extra_model_layout(monkeypatch, registry
 
 @pytest.mark.parametrize("vp_rank", [-1, 2])
 def test_registry_rejects_invalid_vp_rank(vp_rank):
+    # [FUNCTION DOC]
+    # Parametrized vp_rank -1 and 2 with VPP size 2; asserts ValueError "outside the configured VPP size".
     RouterReplay.router_instances = list(range(4))
     config = _config(num_layers=8, virtual_pipeline_model_parallel_size=2)
     with pytest.raises(ValueError, match="outside the configured VPP size"):
@@ -164,6 +218,12 @@ def test_registry_rejects_invalid_vp_rank(vp_rank):
 @pytest.mark.parametrize("registry_layout", ["local", "global"])
 @pytest.mark.parametrize("frequency", [1, [0, 1, 0, 0, 1, 0, 1, 1]])
 def test_positional_record_and_replay_use_the_same_routers(monkeypatch, registry_layout, frequency):
+    # [FUNCTION DOC]
+    # End-to-end record then replay on vp_rank 1 (layers 6..7) with routers keyed by layer index carrying
+    # recorded indices of value 256+idx. Patches device to CPU and parallel/packing helpers to identity. Asserts
+    # recording produces an int16 tensor equal to the stacked recordings of layers 6 and 7, and that replaying a
+    # global routes tensor sets targets only on layers 6 and 7 (equal to their recordings), leaving others None.
+    # Inputs: registry_layout, frequency parametrizations.
     config = _config(num_layers=8, moe_layer_freq=frequency, virtual_pipeline_model_parallel_size=2)
     global_layers = [idx for idx in range(8) if rr_utils.is_moe_layer(config, idx)]
     local_layers = [idx for idx in global_layers if idx in (2, 3, 6, 7)]
@@ -201,6 +261,12 @@ def test_positional_record_and_replay_use_the_same_routers(monkeypatch, registry
 
 
 def test_merge_router_topk_indices_uses_forwarded_model_with_leftover_vpp_recordings(monkeypatch):
+    # [FUNCTION DOC]
+    # Registry contains stale recordings from another chunk; the patched model iterator yields (layer 2, router 5)
+    # and (layer 1, router 2). Asserts merge uses only the model's routers, ordered by layer number, producing
+    # one tensor of shape (1, 3, 2, 2) whose layer slots match recorded_a then recorded_b.
+    # KNOWN ISSUE: compares against tensors cast to uint8 while another test asserts the merged dtype is int16;
+    # the comparison relies on torch.equal semantics across dtypes.
     stale_a = torch.tensor([[12, 13], [14, 15], [16, 17]], dtype=torch.int64)
     stale_b = torch.tensor([[18, 19], [20, 21], [22, 23]], dtype=torch.int64)
     recorded_a = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int64)
@@ -254,6 +320,10 @@ def test_merge_router_topk_indices_uses_forwarded_model_with_leftover_vpp_record
 
 @pytest.mark.parametrize("nested", [False, True])
 def test_merge_router_topk_indices_emits_zero_layer_map_for_dense_stage(monkeypatch, nested):
+    # [FUNCTION DOC]
+    # Parametrized over nested (jagged) vs padded inputs; with no routers and zero MoE layers expected, asserts
+    # a single int16 output with zero layer dimension and top-k 2 (shape (1, 3, 0, 2) padded or nested with
+    # per-sample shape (3, 0, 2)).
     tf_config = _config(num_layers=2)
     if nested:
         input_ids = torch.nested.as_nested_tensor([torch.ones(3, dtype=torch.int64)], layout=torch.jagged)
@@ -286,6 +356,8 @@ def test_merge_router_topk_indices_emits_zero_layer_map_for_dense_stage(monkeypa
 
 
 def test_merge_router_topk_indices_requires_bshd_attention_mask(monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts merge with a router present but no attention mask raises RuntimeError "RECORD requires attention_mask".
     router = _FakeRouter(torch.ones(3, 2, dtype=torch.int64))
     tf_config = _config(num_layers=1)
 
@@ -304,6 +376,8 @@ def test_merge_router_topk_indices_requires_bshd_attention_mask(monkeypatch):
 
 
 def test_empty_model_does_not_hide_missing_moe_routers(monkeypatch):
+    # [FUNCTION DOC]
+    # Model yields no routers while 2 MoE layers are expected; asserts RuntimeError "stage that expects MoE layers".
     monkeypatch.setattr(rr_utils, "iter_model_routers", lambda _model: iter(()))
     monkeypatch.setattr(rr_utils, "get_moe_num_layers_to_build", lambda *_args: 2)
     with pytest.raises(RuntimeError, match="stage that expects MoE layers"):
@@ -313,6 +387,8 @@ def test_empty_model_does_not_hide_missing_moe_routers(monkeypatch):
 
 
 def test_record_rejects_duplicate_layer_numbers(monkeypatch):
+    # [FUNCTION DOC]
+    # Model yields two routers with the same layer number; asserts RuntimeError "duplicate layer numbers".
     routers = [(1, _FakeRouter()), (1, _FakeRouter())]
     monkeypatch.setattr(rr_utils, "iter_model_routers", lambda _model: iter(routers))
     with pytest.raises(RuntimeError, match="duplicate layer numbers"):
@@ -322,6 +398,10 @@ def test_record_rejects_duplicate_layer_numbers(monkeypatch):
 
 
 def test_merge_router_topk_indices_hard_fails_when_record_count_mismatches(monkeypatch):
+    # [FUNCTION DOC]
+    # Router list of two where only the first has a recording (PP rank 0, layers 0..2); asserts RuntimeError
+    # "router replay RECORD did not capture all local routers" whose message lists missing position 1 and
+    # recorded position 0.
     RouterReplay.router_instances = [
         _FakeRouter(torch.tensor([[1, 2]], dtype=torch.int64)),
         _FakeRouter(),
@@ -352,6 +432,10 @@ def test_merge_router_topk_indices_hard_fails_when_record_count_mismatches(monke
 
 
 def test_set_router_replay_data_uses_forwarded_vp_model(monkeypatch):
+    # [FUNCTION DOC]
+    # Six registry routers; model iterator yields layers 3 and 4 mapped to routers 2 and 5. Replays a (1,3,4,2)
+    # routed-experts tensor on vp_rank 1 and asserts routers 2 and 5 get layer slots 2 and 3 (layer number minus 1)
+    # while all other routers stay untouched.
     routers = [
         _FakeRouter(),
         _FakeRouter(),
@@ -399,11 +483,15 @@ def test_set_router_replay_data_uses_forwarded_vp_model(monkeypatch):
 
 
 def test_set_router_replay_data_rejects_missing_routes():
+    # [FUNCTION DOC]
+    # Asserts replay with routed_experts None raises RuntimeError "requires routed_experts".
     with pytest.raises(RuntimeError, match="requires routed_experts"):
         rr_utils.set_router_replay_data(None, torch.ones(1, 1, dtype=torch.bool), _config())
 
 
 def test_set_router_replay_data_requires_bshd_attention_mask():
+    # [FUNCTION DOC]
+    # Asserts replay with no attention mask raises RuntimeError "REPLAY requires attention_mask".
     routes = torch.ones(1, 3, 1, 2, dtype=torch.int16)
 
     with pytest.raises(RuntimeError, match="REPLAY requires attention_mask"):
@@ -411,6 +499,9 @@ def test_set_router_replay_data_requires_bshd_attention_mask():
 
 
 def test_set_router_replay_data_rejects_incomplete_model_routes(monkeypatch):
+    # [FUNCTION DOC]
+    # Routes cover only 2 layers but the model router is at layer 4; asserts RuntimeError
+    # "does not cover every forwarded MoE layer".
     router = _FakeRouter()
     tf_config = _config(num_layers=4)
     routed_experts = torch.ones(1, 3, 2, 1, dtype=torch.int64)

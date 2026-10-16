@@ -14,6 +14,12 @@
 # limitations under the License.
 
 # VANILLA_MBRIDGE
+
+# [MODULE DOC]
+# Thin import shim for the external mbridge package: applies verl's mbridge patch, then re-exports AutoBridge and the
+# post-creation callbacks make_value_model and freeze_moe_router.
+# Side effects on import: patches mbridge; on ImportError prints an installation hint and re-raises.
+
 try:
     from verl.models.mcore.patch import apply_patch_mbridge
 

@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Megatron-LM checkpoint manager using the v2 split layout: model/dist_ckpt, model/huggingface, optimizer/dist_ckpt,
+# extra/dist_ckpt, transformer_config.json and a ckpt_contents.json manifest. Model weights go through Megatron
+# dist_checkpointing and/or an mbridge/Megatron-Bridge HF export; optimizer, LR scheduler and RNG always use
+# dist_checkpointing (or a combined DTensor checkpoint under Megatron-FSDP). Supports async saves with a deferred
+# finalize step, PEFT adapter shards, and detection of the legacy v1 layout. At import it computes mcore_ge_014
+# (megatron.core >= 0.14) and warns if older. _SKIP_CONFIG_VALUE is a sentinel for values dropped during JSON conversion.
+
 import inspect
 import json
 import logging
@@ -61,6 +69,11 @@ _SKIP_CONFIG_VALUE = object()
 
 
 def _to_json_safe_config_value(value, seen):
+    # [FUNCTION DOC]
+    # HELPER: Recursively converts a config value to JSON-safe form: primitives as-is; torch dtypes and Enums to strings;
+    # numpy scalars to Python scalars; callables skipped; lists/tuples to lists and dicts to string-keyed dicts with
+    # skipped entries omitted; cycles (tracked by object id in seen) skipped; any other type skipped.
+    # Inputs: value; seen - set of container ids on the current path (mutated, restored). Outputs: value or sentinel.
     if value is None or isinstance(value, str | int | float | bool):
         return value
     if type(value) is torch.dtype or isinstance(value, Enum):
@@ -98,6 +111,8 @@ def _to_json_safe_config_value(value, seen):
 
 
 def _to_json_safe_config_dict(config_dict):
+    # [FUNCTION DOC]
+    # HELPER: Converts each top-level value of a mapping with a fresh seen set, dropping skipped ones. Outputs: dict.
     json_safe_config = {}
     for key, value in config_dict.items():
         converted = _to_json_safe_config_value(value, set())
@@ -107,12 +122,19 @@ def _to_json_safe_config_dict(config_dict):
 
 
 def _config_to_shallow_dict(config):
+    # [FUNCTION DOC]
+    # HELPER: Shallow dict of a config: dataclass fields present on the object, else the object's attribute dict.
     if is_dataclass(config):
         return {field.name: getattr(config, field.name) for field in fields(config) if hasattr(config, field.name)}
     return vars(config)
 
 
 class MegatronCheckpointManager(BaseCheckpointManager):
+    # [CLASS DOC]
+    # Megatron checkpoint manager. Holds parallel configs, role (critic/reward mark a value model), HF config, bridge and
+    # provider (vanilla_bridge when provider is None, i.e. mbridge vs Megatron-Bridge APIs), PEFT class, and flags for
+    # distributed optimizer, opt-param-scheduler restore, dist checkpointing and Megatron-FSDP.
+    # MANIFEST_SCHEMA_VERSION (2) is written into the manifest.
     """Checkpoint manager for Megatron-LM distributed training.
 
     * ``use_dist_checkpointing`` -- when ``True``, Megatron sharded weights for
@@ -177,6 +199,15 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         peft_cls=None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: base init with optimizer_scheduler as lr scheduler; stores all inputs; model_path from config.model.path.
+        # Validates that a bridge exists whenever HF weights are to be saved or loaded (explicit hf_model contents, or model
+        # contents without dist checkpointing).
+        # Inputs: config (role config with model.path), checkpoint_config, model_config, transformer_config, role,
+        # model (list of VPP model chunks), arch, hf_config, param_dtype, share_embeddings_and_output_weights,
+        # processing_class, optimizer, optimizer_scheduler, use_distributed_optimizer, use_checkpoint_opt_param_scheduler,
+        # use_dist_checkpointing, use_megatron_fsdp, bridge, provider, peft_cls, kwargs (ignored).
+        # Exceptions: ValueError when HF weights are requested without a bridge.
         super().__init__(
             model,
             optimizer=optimizer,
@@ -243,6 +274,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
     @property
     def should_save_hf_model(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "hf_model" is in save contents, or "model" is and dist checkpointing is off.
         """True when this save must emit HF-format model weights via bridge."""
         return "hf_model" in self.checkpoint_save_contents or (
             "model" in self.checkpoint_save_contents and not self.use_dist_checkpointing
@@ -250,11 +283,15 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
     @property
     def should_save_dist_ckpt_model(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "model" is in save contents and dist checkpointing is on.
         """True when this save must emit Megatron sharded model weights."""
         return "model" in self.checkpoint_save_contents and self.use_dist_checkpointing
 
     @property
     def should_load_hf_model(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "hf_model" is in load contents, or "model" is and dist checkpointing is off.
         """True when model weights must be loaded from an HF-format checkpoint via bridge."""
         return "hf_model" in self.checkpoint_load_contents or (
             "model" in self.checkpoint_load_contents and not self.use_dist_checkpointing
@@ -262,10 +299,19 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
     @property
     def should_load_dist_ckpt_model(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if "model" is in load contents and dist checkpointing is on.
         """True when model weights must be loaded from a Megatron sharded checkpoint."""
         return "model" in self.checkpoint_load_contents and self.use_dist_checkpointing
 
     def get_rng_state(self, use_dist_ckpt: bool = True, data_parallel_random_init: bool = False):
+        # [FUNCTION DOC]
+        # Behavior: overrides base RNG capture: collects Python random, numpy, torch CPU and Megatron CUDA RNG tracker states,
+        # plus "<device>_rng_state" when an accelerator is available. If data_parallel_random_init and DP size > 1, all-gathers
+        # the states across the DP group into a list, else a one-element list. Under Megatron-FSDP returns a dict keyed by
+        # "(pp_rank, tp_rank)". Otherwise, if use_dist_ckpt, wraps the list in a ShardedObject "rng_state" with global shape
+        # (pp_size, tp_size), offset (pp_rank, tp_rank) and replica id = DP rank including context parallel.
+        # Inputs: use_dist_ckpt, data_parallel_random_init. Outputs: ShardedObject, list or dict.
         """collect rng state across data parallel ranks"""
         rng_state = {
             "random_rng_state": random.getstate(),
@@ -319,6 +365,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         return_base_dir=True,
         basename="model.pt",
     ):
+        # [FUNCTION DOC]
+        # Behavior: builds a per-rank directory name under checkpoints_path: "mp_rank_TT" (tensor rank, 2 digits) or with
+        # "_PPP" pipeline rank (3 digits) when pipeline parallel, plus "_EEE" expert rank when expert parallel; missing
+        # arguments are filled from mpu. Creates the directory. Returns it, or the path to basename inside it when
+        # return_base_dir is False. Context-parallel rank is unused. Side effects: makes directories.
         """Determine the directory name for this rank's checkpoint."""
         # Use both the tensor and pipeline MP rank.
         if pipeline_parallel is None:
@@ -359,6 +410,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
     # one monolithic dict every time.
 
     def _build_model_sharded_state_dict(self, metadata: dict) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Builds the model sharded state dict across VPP chunks: key "model" for one chunk, else "model<i>" (setting
+        # the virtual pipeline rank for each). Uses state_dict_for_save_checkpoint under Megatron-FSDP; otherwise unwraps
+        # ".module" and calls sharded_state_dict with the metadata plus the DP+CP group under "dp_cp_group".
+        # Inputs: metadata dict. Outputs: dict.
         """Build the model's sharded state dict for all VPP ranks.
 
         This is used both for persisting model weights (dist_ckpt backend) and
@@ -393,6 +449,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         metadata: dict,
         is_loading: bool = False,
     ) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Barrier, then builds {"optimizer": optimizer sharded state dict (using the model sharded state dict, with
+        # is_loading and, for mcore >= 0.14, metadata)} plus "lr_scheduler" state when a scheduler exists.
+        # Inputs: model_sharded_state_dict, metadata, is_loading. Outputs: dict.
         """Build the optimizer (+ LR scheduler) sharded state dict.
 
         ``model_sharded_state_dict`` is required because Megatron's optimizer
@@ -413,11 +473,18 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         return state_dict
 
     def _build_extra_state_dict(self) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Barrier, then returns {"rng_state": get_rng_state()}.
         """Build the extra state dict (RNG states)."""
         torch.distributed.barrier()
         return {"rng_state": self.get_rng_state()}
 
     def _build_sharded_state_dict_metadata(self) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Builds sharded-state-dict metadata. mcore < 0.14: only "fully_sharded_model_space" sharding type when using
+        # the distributed optimizer. Otherwise: "fsdp_dtensor" under Megatron-FSDP; with distributed optimizer, reads the role's
+        # megatron config (falls back to config itself) and uses "fully_reshardable" (plus its mem_efficient flag) or
+        # "dp_reshardable"; always sets singleton_local_shards False and chained_optim_avoid_prefix True. Outputs: dict.
         """Builds metadata used for sharded_state_dict versioning.
 
 
@@ -478,6 +545,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         global_step: int,
         saved_any_dist_ckpt: bool,
     ) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Builds the manifest dict (paths relative to local_path): "contents" entries for model (HF path when HF save
+        # and not also dist shards; dist path when dist shards), hf_model, peft_adapters, optimizer, lr_scheduler, rng_state,
+        # transformer_config, hf_config and tokenizer as applicable; "directories" descriptions; plus schema version,
+        # framework, role, arch, global_step, world_size, backend flags, save_contents and saved_any_dist_ckpt.
+        # Inputs: local_path, global_step, saved_any_dist_ckpt. Outputs: dict.
+        # KNOWN ISSUE: the hf_model "note" value has a trailing comma inside parentheses, so it is serialized as a
+        # one-element list rather than a string.
         """Compose the ``ckpt_contents.json`` payload for this save.
 
         All paths in the returned mapping are relative to ``local_path`` so
@@ -489,6 +564,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         """
 
         def _rel(abs_path: str) -> str:
+            # [FUNCTION DOC]
+            # HELPER: Path relative to local_path.
             return os.path.relpath(abs_path, local_path)
 
         model_dist_rel = _rel(get_model_dist_checkpoint_path(local_path))
@@ -612,6 +689,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         global_step: int,
         saved_any_dist_ckpt: bool,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Rank 0 only: writes the manifest JSON (indented, sorted keys) to a temp file, fsyncs, atomically replaces the
+        # manifest path, logs. Inputs: local_path, global_step, saved_any_dist_ckpt. Side effects: file write.
         """Rank-0 writes the ``ckpt_contents.json`` manifest.
 
         Written last so its presence signals a fully-completed save (useful
@@ -637,6 +717,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
     # -- Load ------------------------------------------------------------------
 
     def _load_model_as_hf_via_bridge(self, hf_model_path: str):
+        # [FUNCTION DOC]
+        # HELPER: Loads HF weights into the model chunks via bridge.load_weights (mbridge) or bridge.load_hf_weights.
         """Load model weights through megatron-bridge."""
         if self.vanilla_bridge:
             self.bridge.load_weights(self.model, hf_model_path)
@@ -645,10 +727,15 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
     @staticmethod
     def _has_checkpoint_files(path: str) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if path is a directory with at least one entry.
         return os.path.isdir(path) and any(os.scandir(path))
 
     @staticmethod
     def _raise_for_old_layout(local_path: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If local_path is a directory without any v2 subdirectory (model/optimizer/extra) but with a non-empty legacy
+        # root-level dist_ckpt/ or huggingface/, raises RuntimeError pointing at the migration script; otherwise returns.
         """Fail fast with a pointer to the migration script for pre-v2 layouts.
 
         The v2 layout nests dist_ckpt under ``model/``, ``optimizer/``,
@@ -682,6 +769,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         )
 
     def _raise_for_unsupported_peft_checkpoint_layout(self, local_path: str, model_dist_path: str):
+        # [FUNCTION DOC]
+        # HELPER: With PEFT and model loading, and an empty model dist path, raises RuntimeError if a legacy
+        # "adapter_checkpoint" directory or an exported HF adapter (adapter_config.json) exists, explaining the expected
+        # location. Inputs: local_path, model_dist_path.
         if self.peft_cls is None or not self.should_load_model or self._has_checkpoint_files(model_dist_path):
             return
 
@@ -703,6 +794,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             )
 
     def _maybe_filter_peft_state_dict(self, state_dict: dict):
+        # [FUNCTION DOC]
+        # HELPER: Returns state_dict unchanged without PEFT; else filters to adapter entries via Megatron-Bridge's
+        # apply_peft_adapter_filter_to_state_dict.
         if self.peft_cls is None:
             return state_dict
 
@@ -711,6 +805,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         return apply_peft_adapter_filter_to_state_dict(state_dict, self.peft_cls)
 
     def _load_megatron_fsdp_checkpoint(self, local_path: str, del_local_after_load=False):
+        # [FUNCTION DOC]
+        # HELPER: Loads a combined Megatron-FSDP DTensor checkpoint from the model dist path. Requires ".metadata" there.
+        # Builds a full template (model + optimizer + extra) regardless of load flags, adds the unwrapped first chunk under
+        # "_model", loads via load_fsdp_dtensor_checkpoint, then applies model (strict), optimizer, lr scheduler (asserted
+        # present when use_checkpoint_opt_param_scheduler) and RNG states according to load flags. Optionally removes the
+        # local path if it is non-local (errors logged).
+        # Exceptions: FileNotFoundError without metadata; AssertionError for missing scheduler state.
+        # KNOWN ISSUE: os.remove is called on a checkpoint directory, which always fails (the error is swallowed and logged).
         # Megatron-FSDP writes a single combined DTensor checkpoint at the
         # model dist path (see ``_save_megatron_fsdp_checkpoint``); load it
         # back from the same location under the v2 layout.
@@ -774,6 +876,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 )
 
     def _save_megatron_fsdp_checkpoint(self, dist_checkpoint_path: str):
+        # [FUNCTION DOC]
+        # HELPER: Builds model (if saving model or optimizer; included only when saving model), optimizer and extra state dicts
+        # and writes them with save_fsdp_dtensor_checkpoint using the unwrapped first model chunk. Inputs: dist path.
+        # Outputs: None (synchronous).
         """Save a Megatron-FSDP (DTensor) checkpoint.
 
         Composes the state dict from the same builders used by the
@@ -811,6 +917,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         return None
 
     def load_rng_states(self, rng_states, data_parallel_random_init=False, use_dist_ckpt=True):
+        # [FUNCTION DOC]
+        # Behavior: restores RNG states. Under Megatron-FSDP, selects the "(pp, tp)" entry (falls back to the first value with a
+        # log). Picks the DP-rank entry if data_parallel_random_init else entry 0; restores random, numpy, torch CPU, device
+        # (if available and present) and CUDA RNG tracker states. Inputs: rng_states, data_parallel_random_init,
+        # use_dist_ckpt (unused). Exceptions: KeyError (no message) if tracker states are empty.
         if self.use_megatron_fsdp:
             pp_rank = mpu.get_pipeline_model_parallel_rank()
             tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -845,6 +956,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         tensor_parallel.get_cuda_rng_tracker().set_states(rng_states["rng_tracker_states"])
 
     def _load_content_metadata(self, ckpt_dir: str) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Reads MCore content metadata from a dist_ckpt dir when the API exists and the dir has files; otherwise falls
+        # back to "fully_sharded_model_space" (distributed optimizer) or freshly built metadata. Outputs: dict.
         """Fetch MCore's content_metadata for a dist_ckpt dir with a fallback."""
         load_content_metadata = getattr(dist_checkpointing, "load_content_metadata", None)
         metadata = None
@@ -858,6 +972,17 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         return metadata
 
     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
+        # [FUNCTION DOC]
+        # Behavior: asserts the path exists (if not None), rejects the legacy layout, registers AdamW and TE FusedAdam as
+        # torch-serialization safe globals (best effort). Megatron-FSDP delegates to its loader. Otherwise resolves the three
+        # dist paths, rejects unsupported PEFT layouts, loads content metadata from the first non-empty subtree, builds the
+        # model sharded state dict if needed, then: loads model shards (PEFT-filtered, non-strict with PEFT) for dist-ckpt or
+        # HF+PEFT loads, per VPP chunk; or loads HF weights via bridge; loads optimizer (and LR scheduler when
+        # use_checkpoint_opt_param_scheduler) from optimizer/dist_ckpt; loads RNG from extra/dist_ckpt; optionally removes a
+        # non-local path. Inputs: local_path, hdfs_path (unused), del_local_after_load. Outputs: none.
+        # Exceptions: AssertionError, RuntimeError (layout), loader errors.
+        # KNOWN ISSUE: with HF+PEFT loading, base HF weights are not loaded via the bridge, only adapter shards (base weights are
+        # expected to come from model initialization). os.remove on a directory always fails (logged).
         """Load a Megatron checkpoint in the v2 split layout.
 
         Each dist_checkpointing subtree (``model/dist_ckpt/``,
@@ -991,6 +1116,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
     # -- Save ------------------------------------------------------------------
 
     def _get_bridge_extended_args(self):
+        # [FUNCTION DOC]
+        # HELPER: Collects kwargs for bridge.save_weights from checkpoint_config.mbridge_config, keeping only parameter names
+        # of save_weights other than weights_path and models. Outputs: dict.
         """Build extra kwargs for ``bridge.save_weights`` from checkpoint config."""
         extended_args = {}
         mbridge_config = getattr(self.checkpoint_config, "mbridge_config", None) or {}
@@ -1002,6 +1130,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         return extended_args
 
     def _save_model_as_hf_via_bridge(self, hf_ckpt_path: str):
+        # [FUNCTION DOC]
+        # HELPER: Saves HF weights: mbridge save_weights with extended args; with Megatron-Bridge, saves only the HF PEFT
+        # adapter under "adapter" when PEFT is used, else save_hf_weights with checkpoint_config.strict.
         """Save model weights through megatron-bridge."""
         if self.vanilla_bridge:
             self.bridge.save_weights(self.model, hf_ckpt_path, **self._get_bridge_extended_args())
@@ -1019,6 +1150,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 self.bridge.save_hf_weights(self.model, hf_ckpt_path, strict=self.checkpoint_config.strict)
 
     def _save_hf_config_and_tokenizer(self, local_path: str):
+        # [FUNCTION DOC]
+        # HELPER: Rank 0 only: saves processing class, HF config, and (best effort) generation config from name_or_path into the
+        # HF model path; logs.
         """Rank-0 saves HF config, tokenizer, and generation config."""
         if self.rank != 0:
             return
@@ -1040,6 +1174,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         )
 
     def _save_transformer_config(self, local_path: str):
+        # [FUNCTION DOC]
+        # HELPER: Rank 0 only: prints the transformer config and writes its JSON-safe shallow dict to the transformer config
+        # path (objects with to_dict serialized via it).
         """Rank-0 serialises the Megatron TransformerConfig to JSON."""
         if self.rank != 0:
             return
@@ -1056,6 +1193,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             )
 
     def _save_dist_checkpoint(self, dist_checkpoint_path: str, state_dict: dict):
+        # [FUNCTION DOC]
+        # HELPER: Saves a state dict via save_dist_checkpointing with content metadata and the configured async flag. For sync
+        # saves asserts no request is returned and barriers. Outputs: async request or None.
         """Persist ``state_dict`` via Megatron dist_checkpointing.
 
         Writes one self-contained ``torch_dist`` directory under
@@ -1083,6 +1223,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         return async_save_request
 
     def _schedule_dist_checkpoint_saves(self, items: list[tuple[str, dict]]) -> list:
+        # [FUNCTION DOC]
+        # HELPER: Saves each non-empty (path, state dict) pair in order, collecting non-None async requests. Outputs: list.
         """Schedule one dist_checkpointing save per non-empty state dict.
 
         ``items`` is an ordered list of ``(path, state_dict)`` pairs.  Empty
@@ -1109,6 +1251,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         max_ckpt_to_keep,
         saved_any_dist_ckpt: bool,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Post-save bookkeeping: logs; writes manifest (rank 0); rank 0 uploads the whole directory to HDFS when
+        # hdfs_path is given; for async saves rank 0 writes the step to latest_checkpointed_iteration.txt two directory levels
+        # above local_path; registers the checkpoint for retention (on every rank).
+        # Inputs: keyword-only local_path, hdfs_path, global_step, max_ckpt_to_keep, saved_any_dist_ckpt.
         """Run post-write bookkeeping: manifest, HDFS upload, tracker, retention.
 
         This is invoked either immediately after synchronous saves, or via
@@ -1148,6 +1295,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         self.register_checkpoint(local_path, max_ckpt_to_keep)
 
     def _dispatch_finalize(self, async_requests: list, finalize_save_fn) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If async saving with pending requests, attaches the finalize callback to the last request and schedules all
+        # requests on Megatron's async calls queue; otherwise calls the callback immediately.
         """Run ``finalize_save_fn`` now, or after all async writes complete.
 
         When ``async_save`` is enabled and at least one dist_checkpointing
@@ -1171,6 +1321,15 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             finalize_save_fn()
 
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+        # [FUNCTION DOC]
+        # Behavior: records previous step; for sync saves prunes old checkpoints first. Creates local_path. Megatron-FSDP:
+        # writes the combined DTensor checkpoint to the model dist path. Otherwise builds metadata and (when needed) the model
+        # sharded state dict, composing model content (full shards when dist ckpt model saving; PEFT-filtered shards when HF
+        # saving with PEFT) and optimizer content. Extra (RNG) content is added unless FSDP saved. Schedules dist saves in order
+        # model, optimizer, extra. When HF saving: writes HF config/tokenizer (rank 0) and barriers, then saves HF weights via
+        # bridge. When extra saving: writes transformer config. Finally dispatches finalize (manifest, HDFS, tracker,
+        # retention) now or after async writes.
+        # Inputs: local_path, hdfs_path, global_step, max_ckpt_to_keep. Outputs: none. Side effects: files, collectives.
         """Save a Megatron checkpoint under ``local_path`` (layout schema v2).
 
         Contents are split across three sibling directories so each piece can

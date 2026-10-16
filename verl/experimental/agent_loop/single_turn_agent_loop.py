@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module single_turn_agent_loop: the simplest agent loop: one prompt, one generation, no tools. Registered
+# under "single_turn_agent". Side effects: module logger keyed by file path, level from VERL_LOGGING_LEVEL.
 import logging
 import os
 from typing import Any
@@ -27,15 +31,34 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @register("single_turn_agent")
 class SingleTurnAgentLoop(AgentLoopBase):
+    # [CLASS DOC]
+    # Agent loop that tokenizes the raw prompt (with optional multimodal data), performs one generation request
+    # and returns an AgentLoopOutput with num_turns 2 (user + assistant).
     """Naive agent loop that only do single turn chat completion."""
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: initializes the base loop and caches prompt_length and response_length from the rollout config.
+        # Inputs: forwarded positional/keyword args of AgentLoopBase.
         super().__init__(*args, **kwargs)
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
+        # [FUNCTION DOC]
+        # Behavior: (traced by rollout_trace_op) 1) coerces priority to int and copies raw_prompt messages;
+        # 2) extracts images/videos/audios, builds mm processor kwargs and asserts multimodal is supported;
+        # 3) builds prompt token ids via the continuous-token path, collecting mm processor inputs, and builds the SGLang
+        # video payload; 4) generates via server_manager with a deterministic request id "det-<priority>" when
+        # full_determinism is enabled else a random hex id, timing it into metrics; records num_preempted (-1 if unknown);
+        # 5) merges assistant tokens with the prompt to get final token ids, response mask and logprobs; splits prompt
+        # and response ids; 6) builds AgentLoopOutput truncating response ids/mask/logprobs to response_length and routed
+        # experts to prompt length plus response_length; adds empty turn_scores and tool_rewards to extra_fields.
+        # Inputs: sampling_params dict; priority; kwargs must contain raw_prompt (list of messages).
+        # Outputs: AgentLoopOutput.
+        # Exceptions: KeyError if raw_prompt missing; errors from multimodal assertion or the server.
+        # Side effects: network request to the rollout server; mutates output.extra_fields.
         # priority may arrive as np.int64 from non_tensor_batch; normalize to Python int.
         priority = int(priority)
         messages = list(kwargs["raw_prompt"])

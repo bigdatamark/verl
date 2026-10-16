@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Controller that toggles hybrid rollout replicas (replicas co-located with trainer GPUs) between serving
+# rollout traffic and being asleep so the GPUs return to training. Re-exports the policy base, the default and
+# static policies, and the policy registry helpers.
+# Side effects on import: none beyond importing policy modules (which register policies).
+
 """Dynamic resource controller for fully-async training.
 
 State machine:  STANDALONE_ONLY  <->  HYBRID_ACTIVE
@@ -49,6 +55,9 @@ __all__ = [
 
 
 class DynamicResourceController:
+    # [CLASS DOC]
+    # Holds handles to the rollouter actor and the hybrid checkpoint manager, tracks whether hybrid replicas are
+    # active, counts activations/deactivations, and owns a scheduling policy that decides when to switch.
     """Manages hybrid rollout replica lifecycle (STANDALONE_ONLY <-> HYBRID_ACTIVE).
 
     FullyAsyncTrainer drives transitions via activate_hybrid_replicas /
@@ -71,6 +80,13 @@ class DynamicResourceController:
         num_hybrid_replicas: int,
         policy: DynamicSchedulePolicyBase | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores handles and replica counts; marks hybrid inactive; sets only-hybrid mode when there are zero
+        # standalone replicas; uses the given policy or builds a default policy (passing only-hybrid flag).
+        # Inputs: rollouter - Ray actor handle; hybrid_checkpoint_manager - manager exposing replicas, abort/resume/sleep
+        # and update_weights; replica counts (ints); optional policy.
+        # Outputs: none. Exceptions: none.
+        # Side effects: injects the rollouter handle into the policy as a private attribute so it can rebalance requests.
         self.rollouter = rollouter
         self.hybrid_checkpoint_manager = hybrid_checkpoint_manager
         self.num_standalone = num_standalone_replicas
@@ -87,14 +103,24 @@ class DynamicResourceController:
 
     @property
     def is_hybrid_active(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: returns whether hybrid replicas are currently marked active. Outputs: bool. Side effects: none.
         return self._hybrid_active
 
     @property
     def has_hybrid_replicas(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: true when the hybrid checkpoint manager has a non-empty replica collection. Outputs: bool.
         """Whether any hybrid replica has been registered with the hybrid checkpoint manager."""
         return bool(self.hybrid_checkpoint_manager.replicas)
 
     async def sync_hybrid_weights(self, global_steps: int) -> None:
+        # [FUNCTION DOC]
+        # Behavior: if no hybrid replicas registered, logs and returns. Otherwise awaits, in order: abort in-flight
+        # requests on hybrid replicas, push weights tagged with global_steps, resume generation.
+        # Inputs: global_steps - parameter version. Outputs: none.
+        # Exceptions: propagates errors from the checkpoint manager calls.
+        # Side effects: network/weight transfer to replicas; prints.
         """Push the latest trainer weights to hybrid rollout replicas (naive backend).
 
         Wraps the weight sync with abort/resume of in-flight requests so that
@@ -115,6 +141,13 @@ class DynamicResourceController:
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
 
     async def activate_hybrid_replicas(self, global_steps: int) -> None:
+        # [FUNCTION DOC]
+        # Behavior: fetches the hybrid replica mapping from the rollouter (blocking get), takes its keys as resource ids;
+        # if empty logs and returns without changing state. Otherwise asks rollouter to add these replicas to the load
+        # balancer, resumes generation on them, marks active, increments activate_count, logs elapsed time.
+        # Inputs: global_steps - only used in logs. Outputs: none.
+        # Side effects: remote actor calls, state mutation, prints.
+        # KNOWN ISSUE: uses a blocking ray.get inside an async method, which blocks the event loop while waiting.
         """Add hybrid replicas to the LB and resume generation (weight sync must be done first)."""
         print(f"[DynamicResourceController] Activating hybrid replicas at step {global_steps}")
         start = time.time()
@@ -136,6 +169,13 @@ class DynamicResourceController:
         )
 
     async def deactivate_hybrid_replicas(self, global_steps: int) -> None:
+        # [FUNCTION DOC]
+        # Behavior: fetches hybrid replica ids from the rollouter; if none, marks inactive and returns. Otherwise in strict
+        # order: remove replicas from the load balancer, abort in-flight requests, sleep replicas (free KV cache and
+        # offload weights). Then marks inactive, increments deactivate_count, logs elapsed time.
+        # Inputs: global_steps - only for logs. Outputs: none.
+        # Side effects: remote actor calls, state mutation, GPU memory release, prints.
+        # KNOWN ISSUE: blocking ray.get inside an async method.
         """Remove hybrid replicas from LB, abort in-flight requests, release GPU memory."""
         print(f"[DynamicResourceController] Deactivating hybrid replicas at step {global_steps}")
         start = time.time()

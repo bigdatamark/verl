@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# GPU/Ray integration tests for rollout servers: a standalone rollout (no trainer worker group, weights loaded
+# from disk) queried through the OpenAI-compatible API, and a local-only hybrid rollout with expert parallelism.
+# Requires ROLLOUT_NAME env var, local models under ~/models, and multiple GPUs/nodes.
+
 import os
 
 import pytest
@@ -26,6 +31,12 @@ from verl.workers.rollout.llm_server import LLMServerManager
 
 @pytest.fixture
 def init_config() -> DictConfig:
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture composing the ppo_trainer Hydra config from verl/trainer/config (relative to cwd) and
+    # overriding it for 2 nodes x 4 GPUs, dynamic batch size, Qwen2.5-1.5B-Instruct model, async rollout mode with
+    # backend taken from ROLLOUT_NAME, tokenizer init enabled, and load_format "auto".
+    # Outputs: the DictConfig.
+    # Exceptions: KeyError if ROLLOUT_NAME is unset; Hydra errors if run from the wrong directory.
     from hydra import compose, initialize_config_dir
 
     with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
@@ -47,6 +58,13 @@ def init_config() -> DictConfig:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tp_size", [2, 4])
 async def test_standalone_rollout(init_config, tp_size):
+    # [FUNCTION DOC]
+    # Behavior: restarts Ray with logging/NCCL env vars (P2P disabled), sets rollout nnodes and tensor parallel
+    # size, creates an LLMServerManager with no worker group/resource pool, asserts the number of server addresses
+    # equals total GPUs / tp_size, removes HTTP(S)_PROXY / NO_PROXY env vars (both cases) so local addresses are
+    # reachable, sends one chat completion to the first server via AsyncOpenAI, prints it, and shuts Ray down.
+    # Inputs: init_config fixture; tp_size parametrized 2 or 4.
+    # Side effects: starts/stops Ray cluster, launches inference servers, mutates os.environ, prints output.
     """Test standalone rollout single node and multi nodes."""
     ray.shutdown()
     ray.init(
@@ -98,6 +116,12 @@ async def test_standalone_rollout(init_config, tp_size):
 
 @pytest.mark.skip(reason="local test only")
 def test_hybrid_rollout_with_ep(init_config):
+    # [FUNCTION DOC]
+    # Behavior: skipped by default (local only). Restarts Ray, switches to Qwen3-30B-A3B MoE model, sets TP=2, DP=4,
+    # EP=8, builds an agent loop manager (hybrid FSDP + rollout workers), creates a CheckpointEngineManager to put
+    # replicas to sleep and push weights, then makes a synchronous chat completion to the first server and prints it.
+    # Inputs: init_config fixture.
+    # Side effects: Ray cluster lifecycle, GPU workers, prints.
     """Test hybrid rollout with expert parallelism, DP=2, TP=4, EP=8."""
     ray.shutdown()
     ray.init(

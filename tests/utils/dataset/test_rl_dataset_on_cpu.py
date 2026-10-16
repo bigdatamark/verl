@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for RLHFDataset (verl.utils.dataset.rl_dataset): loading gsm8k / geo3k / video data into batches via
+# collate_fn and DataProto, max_samples truncation, multimodal message building from image/video paths,
+# overlong-prompt filtering with images, and non-blocking async multimodal processing.
+# Several tests require local models under ~/models and data under ~/data (not truly CPU-only/self-contained).
 import asyncio
 import json
 import os
@@ -30,6 +35,11 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 
 
 def _mock_rlhf_dataset():
+    # [FUNCTION DOC]
+    # HELPER: Creates an RLHFDataset instance without running its constructor (bypasses __init__) and sets only
+    # the attributes needed by _build_messages: prompt_key "prompt", image_key "images", video_key "videos",
+    # audio_key "audios", and a placeholder non-None processor (a bare object) so multimodal paths are taken.
+    # Inputs: none. Outputs: the partially-initialized dataset. Side effects: none.
     dataset = RLHFDataset.__new__(RLHFDataset)
     dataset.prompt_key = "prompt"
     dataset.image_key = "images"
@@ -40,6 +50,10 @@ def _mock_rlhf_dataset():
 
 
 def get_gsm8k_data():
+    # [FUNCTION DOC]
+    # HELPER: Returns the expected path ~/data/gsm8k/train.parquet (user-expanded), creating the folder if missing.
+    # Does not download the data; the file must already exist for callers to succeed.
+    # Inputs: none. Outputs: path string. Side effects: creates directory ~/data/gsm8k/ if absent.
     # prepare test dataset
     local_folder = os.path.expanduser("~/data/gsm8k/")
     local_path = os.path.join(local_folder, "train.parquet")
@@ -48,6 +62,13 @@ def get_gsm8k_data():
 
 
 def test_rl_dataset():
+    # [FUNCTION DOC]
+    # Behavior: loads the deepseek-coder-1.3b-instruct tokenizer from ~/models, builds an RLHFDataset over gsm8k
+    # train parquet with prompt_key "prompt", max_prompt_length 256 and overlong filtering (2 workers); takes one
+    # shuffled batch of 16 via DataLoader with collate_fn; splits the batch into tensor and non-tensor dicts,
+    # builds a DataProto and asserts its length is 16 and "raw_prompt" is in non_tensor_batch.
+    # Inputs: none. Outputs: none.
+    # Exceptions: fails if model/data are missing. Side effects: reads local files, creates ~/data/gsm8k dir.
     tokenizer = hf_tokenizer(os.path.expanduser("~/models/deepseek-ai/deepseek-coder-1.3b-instruct"))
     local_path = get_gsm8k_data()
     config = OmegaConf.create(
@@ -79,6 +100,10 @@ def test_rl_dataset():
 
 
 def test_rl_dataset_with_max_samples():
+    # [FUNCTION DOC]
+    # Behavior: same dataset setup as test_rl_dataset but with max_samples 5 (both in config and as a constructor
+    # argument); asserts the dataset length is exactly 5.
+    # Inputs: none. Outputs: none. Side effects: reads local model/data files.
     tokenizer = hf_tokenizer(os.path.expanduser("~/models/deepseek-ai/deepseek-coder-1.3b-instruct"))
     local_path = get_gsm8k_data()
     config = OmegaConf.create(
@@ -95,6 +120,11 @@ def test_rl_dataset_with_max_samples():
 
 
 def test_build_messages_accepts_image_path():
+    # [FUNCTION DOC]
+    # Behavior: with a mock dataset, builds messages for a prompt "Describe <image>" with one image path string
+    # (file URI); asserts the user content is split into a text part "Describe " followed by an image part whose
+    # "image" value is the original path string (paths are passed through, not loaded).
+    # Inputs: none. Outputs: none. Side effects: none.
     dataset = _mock_rlhf_dataset()
     image_path = "file:///tmp/image.jpg"
     example = {
@@ -119,6 +149,13 @@ def test_build_messages_accepts_image_path():
     ],
 )
 def test_build_messages_accepts_video_path_or_frame_list(videos, expected_video):
+    # [FUNCTION DOC]
+    # Behavior: parametrized; builds messages for "Describe <video>" with the given videos field and asserts the
+    # content becomes a text part "Describe " followed by a video part whose "video" equals expected_video.
+    # Cases: a single video path string passes through; a list of frame path strings passes through as a list;
+    # a list of pathlib Path frames is converted to a list of plain strings.
+    # Inputs: videos - the "videos" field value; expected_video - expected video entry value.
+    # Outputs: none. Side effects: none.
     dataset = _mock_rlhf_dataset()
     example = {
         "prompt": [{"role": "user", "content": "Describe <video>"}],
@@ -134,21 +171,44 @@ def test_build_messages_accepts_video_path_or_frame_list(videos, expected_video)
 
 
 def test_maybe_filter_out_long_prompts_accepts_image_path(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: verifies maybe_filter_out_long_prompts works when images are given as paths. Defines a fake
+    # dataframe (a list with a filter method keeping docs where the predicate is true), a fake processor whose chat
+    # template returns a fixed string and whose call asserts images equal ["processed-image"] and returns 3 token ids;
+    # monkeypatches RLHFDataset._process_multi_modal_info with a classmethod that records a deep copy of the
+    # messages and returns ["processed-image"] with no videos/audios. Configures the mock dataset (no tokenizer,
+    # filtering on, max_prompt_length 10, no workers etc.), filters a one-row dataframe, and asserts the row is kept
+    # (3 tokens <= 10) and the captured messages had content split into a text part and an image-path part.
+    # Inputs: monkeypatch - pytest fixture. Outputs: none. Side effects: monkeypatches RLHFDataset for the test.
     class FakeDataFrame(list):
+        # [CLASS DOC]
+        # HELPER: Minimal list subclass emulating a HuggingFace datasets object's filter method.
         def filter(self, fn, num_proc=None, desc=None):
+            # [FUNCTION DOC]
+            # HELPER: Returns a new FakeDataFrame of the elements for which fn returns truthy; num_proc and desc ignored.
             return FakeDataFrame([doc for doc in self if fn(doc)])
 
     class FakeProcessor:
+        # [CLASS DOC]
+        # HELPER: Fake multimodal processor used by the filtering test.
         def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Ignores all arguments and returns the fixed string "formatted prompt".
             return "formatted prompt"
 
         def __call__(self, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Asserts kwargs "images" equals ["processed-image"] and returns a mapping with input_ids [[1, 2, 3]].
+            # Exceptions: AssertionError if images differ.
             assert kwargs["images"] == ["processed-image"]
             return {"input_ids": [[1, 2, 3]]}
 
     captured = {}
 
     def fake_process_multi_modal_info(cls, messages, image_patch_size, config):
+        # [FUNCTION DOC]
+        # HELPER: Replacement for _process_multi_modal_info; stores a deep copy of messages in captured["messages"]
+        # and returns (["processed-image"], None, None) for images, videos, audios. Side effects: mutates captured.
         captured["messages"] = deepcopy(messages)
         return ["processed-image"], None, None
 
@@ -190,10 +250,20 @@ def test_maybe_filter_out_long_prompts_accepts_image_path(monkeypatch):
 
 
 def test_process_multi_modal_info_keeps_event_loop_responsive(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: checks that the async RLHFDataset.process_multi_modal_info offloads the (blocking) synchronous
+    # _process_multi_modal_info so the event loop keeps running. Monkeypatches the sync method to set a
+    # "processing_started" event then block up to 0.2 s waiting for an "observer_ran" event. Inside an asyncio
+    # run, schedules an observer task that yields once then sets observer_ran, awaits the async processing call,
+    # records whether observer_ran was set by then, awaits the observer, and returns that flag. Asserts the flag is
+    # true (event loop progressed during processing) and that processing actually started.
+    # Inputs: monkeypatch fixture. Outputs: none. Side effects: patches RLHFDataset; uses threads/events.
     processing_started = threading.Event()
     observer_ran = threading.Event()
 
     def blocking_process_multi_modal_info(cls, messages, image_patch_size, config):
+        # [FUNCTION DOC]
+        # HELPER: Blocking stand-in; sets processing_started, waits up to 0.2 s for observer_ran, returns (None, None, None).
         processing_started.set()
         observer_ran.wait(timeout=0.2)
         return None, None, None
@@ -205,7 +275,11 @@ def test_process_multi_modal_info_keeps_event_loop_responsive(monkeypatch):
     )
 
     async def run():
+        # [FUNCTION DOC]
+        # HELPER: Coroutine driving the test; returns True if the observer task ran while processing was in progress.
         async def observe_event_loop():
+            # [FUNCTION DOC]
+            # HELPER: Yields control to the event loop once, then sets observer_ran.
             await asyncio.sleep(0)
             observer_ran.set()
 
@@ -220,6 +294,13 @@ def test_process_multi_modal_info_keeps_event_loop_responsive(monkeypatch):
 
 
 def test_image_rl_data():
+    # [FUNCTION DOC]
+    # Behavior: loads the Qwen2-VL-2B-Instruct tokenizer and processor from ~/models, builds an RLHFDataset on
+    # ~/data/geo3k/train.parquet (max_prompt_length 1024, filtering on with no workers to avoid a CI hang), takes
+    # one batch of 16, builds a DataProto and asserts length 16, no "images" key in non_tensor_batch, and that every
+    # raw_prompt is a single user message with two content parts: an image part holding a PIL Image and then a text
+    # part holding a string. Prints the first raw_prompt.
+    # Inputs: none. Outputs: none. Side effects: reads local model/data files; prints to stdout.
     tokenizer = hf_tokenizer(os.path.expanduser("~/models/Qwen/Qwen2-VL-2B-Instruct"))
     processor = hf_processor(os.path.expanduser("~/models/Qwen/Qwen2-VL-2B-Instruct"))
     config = OmegaConf.create(
@@ -268,6 +349,11 @@ def test_image_rl_data():
 
 @pytest.fixture
 def video_data_file():
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture writing 30 copies of one multiple-choice video QA record (prompt content with a video
+    # path from LLaVA-Video-178K and a question text) as indented JSON to test_data/test_video.json.
+    # Inputs: none. Outputs: the relative file path string.
+    # Side effects: creates directory test_data and writes the JSON file in the current working directory (not cleaned up).
     data = [
         {
             "problem_id": 17,
@@ -303,6 +389,12 @@ def video_data_file():
 
 
 def test_video_rl_data(video_data_file):
+    # [FUNCTION DOC]
+    # Behavior: loads the Qwen2-VL-2B-Instruct tokenizer/processor, builds an RLHFDataset over the video JSON file
+    # with filtering disabled, takes one batch of 16, builds a DataProto and asserts length 16 and that "images" is
+    # not in non_tensor_batch; prints the first raw_prompt.
+    # Inputs: video_data_file - path from the fixture. Outputs: none.
+    # Exceptions: fails if model or referenced video files are unavailable. Side effects: file reads, stdout print.
     tokenizer = hf_tokenizer(os.path.expanduser("~/models/Qwen/Qwen2-VL-2B-Instruct"))
     processor = hf_processor(os.path.expanduser("~/models/Qwen/Qwen2-VL-2B-Instruct"))
     config = OmegaConf.create(

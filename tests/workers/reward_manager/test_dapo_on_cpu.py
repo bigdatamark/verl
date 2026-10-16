@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for the DAPO reward manager (legacy workers version and experimental reward-loop version),
+# focusing on overlong-buffer configuration validation and the overlong length penalty.
+
 import numpy as np
 import pytest
 import torch
@@ -23,21 +27,34 @@ from verl.workers.reward_manager.dapo import DAPORewardManager
 
 
 class _DummyTokenizer:
+    # [CLASS DOC]
+    # HELPER: fake tokenizer with eos_token "</s>" whose decode joins integer token ids with spaces.
     eos_token = "</s>"
 
     def decode(self, token_ids, skip_special_tokens=True):
+        # [FUNCTION DOC]
+        # HELPER: returns the token ids converted to ints and joined by single spaces; skip_special_tokens ignored.
         return " ".join(str(int(token_id)) for token_id in token_ids)
 
 
 def _constant_compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: scoring function stub that ignores all inputs and returns 0.5.
     return 0.5
 
 
 def _overlong_buffer_cfg(enable: bool, length: int = 128):
+    # [FUNCTION DOC]
+    # HELPER: builds an OmegaConf overlong buffer config. Inputs: enable flag; length (default 128).
+    # Outputs: config with enable, len, penalty_factor 1.0, log False.
     return OmegaConf.create({"enable": enable, "len": length, "penalty_factor": 1.0, "log": False})
 
 
 def _make_data(batch_size: int = 2, seq_len: int = 4) -> DataProto:
+    # [FUNCTION DOC]
+    # HELPER: builds a DataProto with all-ones prompts and responses of shape (batch_size, seq_len), an all-ones
+    # attention mask of twice that length, and non-tensor reward_model (ground truth "1") and data_source fields.
+    # Inputs: batch_size (default 2), seq_len (default 4). Outputs: DataProto.
     return DataProto.from_dict(
         tensors={
             "prompts": torch.ones(batch_size, seq_len, dtype=torch.long),
@@ -52,6 +69,8 @@ def _make_data(batch_size: int = 2, seq_len: int = 4) -> DataProto:
 
 
 def test_construct_with_overlong_buffer_disabled():
+    # [FUNCTION DOC]
+    # Asserts construction succeeds with max_resp_len None when the overlong buffer is disabled (issue #5858).
     """max_resp_len is not required when the overlong penalty is disabled. See issue #5858."""
     reward_manager = DAPORewardManager(
         tokenizer=_DummyTokenizer(),
@@ -64,6 +83,8 @@ def test_construct_with_overlong_buffer_disabled():
 
 
 def test_construct_with_overlong_buffer_enabled_requires_max_resp_len():
+    # [FUNCTION DOC]
+    # Asserts an AssertionError "max_resp_len must be provided" when the buffer is enabled without max_resp_len.
     with pytest.raises(AssertionError, match="max_resp_len must be provided"):
         DAPORewardManager(
             tokenizer=_DummyTokenizer(),
@@ -75,6 +96,8 @@ def test_construct_with_overlong_buffer_enabled_requires_max_resp_len():
 
 
 def test_construct_with_overlong_buffer_enabled_rejects_short_max_resp_len():
+    # [FUNCTION DOC]
+    # Asserts AssertionError "max_resp_len must be larger" when max_resp_len (64) is not larger than buffer len (128).
     with pytest.raises(AssertionError, match="max_resp_len must be larger"):
         DAPORewardManager(
             tokenizer=_DummyTokenizer(),
@@ -86,6 +109,8 @@ def test_construct_with_overlong_buffer_enabled_rejects_short_max_resp_len():
 
 
 def test_call_without_overlong_buffer_cfg():
+    # [FUNCTION DOC]
+    # Asserts that calling a manager built with default (None) overlong config works and the last-token reward is 0.5.
     """The default overlong_buffer_cfg=None must not crash at __call__ time."""
     reward_manager = DAPORewardManager(
         tokenizer=_DummyTokenizer(),
@@ -97,6 +122,9 @@ def test_call_without_overlong_buffer_cfg():
 
 
 def test_call_with_overlong_buffer_enabled_applies_penalty():
+    # [FUNCTION DOC]
+    # With max_resp_len 4, buffer len 2 and 4-token responses, the penalty is minus exceed length over buffer
+    # length times factor, i.e. -1.0; asserts last-token reward equals 0.5 - 1.0.
     reward_manager = DAPORewardManager(
         tokenizer=_DummyTokenizer(),
         num_examine=0,
@@ -110,6 +138,9 @@ def test_call_with_overlong_buffer_enabled_applies_penalty():
 
 
 def test_reward_loop_construct_with_overlong_buffer_disabled():
+    # [FUNCTION DOC]
+    # Asserts the experimental reward-loop DAPO manager built from a config with reward.reward_kwargs
+    # (disabled buffer, max_resp_len None) constructs with max_resp_len None.
     """The experimental reward loop manager accepts a disabled overlong buffer without max_resp_len."""
     config = OmegaConf.create(
         {

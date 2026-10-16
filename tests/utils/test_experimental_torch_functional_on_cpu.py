@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for verl/utils/experimental/torch_functional.py, loaded directly by file path (avoiding the
+# verl package import) into the module object experimental_F. Tests FusedLinearForPPO: the chunked torch
+# fallback against a reference log-prob/entropy computation (forward and gradients), dispatch to a
+# (faked) Liger fused linear scaled cross-entropy kernel, the torch backend not dispatching to Liger,
+# rejection of unknown backends, and that chunk_size is respected.
+# Side effects at import: executes the target module file.
+
 import importlib.util
 from pathlib import Path
 
@@ -27,6 +35,12 @@ _SPEC.loader.exec_module(experimental_F)
 
 @pytest.mark.parametrize("hidden_shape", [(7, 5), (2, 7, 5)])
 def test_fused_linear_for_ppo_chunked_fallback_matches_torch(monkeypatch, hidden_shape):
+    # [FUNCTION DOC]
+    # Parametrized over 2-D and 3-D hidden shapes. With Liger and flash-attn CE disabled, runs
+    # FusedLinearForPPO with temperature 0.7, backpropagates random upstream gradients, and compares log_probs,
+    # entropy, and hidden/weight gradients to a reference: logits = hidden times weight transposed divided by
+    # temperature (in float32), log_probs = log-softmax gathered at labels, entropy = logsumexp minus
+    # sum(prob * logit).
     monkeypatch.setattr(experimental_F, "_LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY", None)
     monkeypatch.setattr(experimental_F, "_FLASH_ATTN_CROSS_ENTROPY_AVAILABLE", False)
     torch.manual_seed(42)
@@ -60,11 +74,21 @@ def test_fused_linear_for_ppo_chunked_fallback_matches_torch(monkeypatch, hidden
 
 
 def test_fused_linear_for_ppo_dispatches_to_liger(monkeypatch):
+    # [FUNCTION DOC]
+    # Patches in a fake Liger kernel and runs FusedLinearForPPO with backend "liger" on a (2,3,5) input.
+    # Asserts the kernel was called once with flattened hidden (6,5), the same weight object, int64 flattened
+    # labels, temperature 0.8, ignore_index -100, one tile, and entropy requested; and that returned log_probs
+    # are the negated NLL and entropy are reshaped back to (2,3).
     calls = []
 
     class FakeLigerFusedLinearScaledCrossEntropyFunction:
+        # [CLASS DOC]
+        # HELPER: Fake Liger autograd function recording its call arguments.
         @staticmethod
         def apply(*args):
+            # [FUNCTION DOC]
+            # HELPER: Appends args to the outer calls list and returns NLL = 0..N-1 (float32) and entropy = 10..N+9 in the
+            # hidden dtype, where N is the number of tokens (first dim of hidden).
             calls.append(args)
             hidden_states = args[0]
             token_count = hidden_states.shape[0]
@@ -98,9 +122,16 @@ def test_fused_linear_for_ppo_dispatches_to_liger(monkeypatch):
 
 
 def test_fused_linear_for_ppo_torch_backend_does_not_dispatch_to_liger(monkeypatch):
+    # [FUNCTION DOC]
+    # With a Liger kernel patched in that raises if called, the default (torch) backend must not use it; its
+    # outputs are compared to a reference log-prob and entropy computation with temperature 1.
     class UnexpectedLigerFusedLinearScaledCrossEntropyFunction:
+        # [CLASS DOC]
+        # HELPER: Fake Liger function that must never be called.
         @staticmethod
         def apply(*args):
+            # [FUNCTION DOC]
+            # HELPER: Always raises AssertionError.
             raise AssertionError("The torch backend must not dispatch to Liger")
 
     monkeypatch.setattr(
@@ -125,17 +156,24 @@ def test_fused_linear_for_ppo_torch_backend_does_not_dispatch_to_liger(monkeypat
 
 
 def test_fused_linear_for_ppo_rejects_unknown_backend():
+    # [FUNCTION DOC]
+    # Asserts constructing FusedLinearForPPO with impl_backend "unknown" raises ValueError.
     with pytest.raises(ValueError, match="Unsupported FusedLinearForPPO backend"):
         experimental_F.FusedLinearForPPO(impl_backend="unknown")
 
 
 def test_fused_linear_for_ppo_fallback_preserves_chunking(monkeypatch):
+    # [FUNCTION DOC]
+    # Wraps the private forward function to record each chunk's token count, runs FusedLinearForPPO with
+    # chunk_size 3 on 7 tokens, and asserts chunks of sizes [3, 3, 1].
     monkeypatch.setattr(experimental_F, "_LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY", None)
     monkeypatch.setattr(experimental_F, "_FLASH_ATTN_CROSS_ENTROPY_AVAILABLE", False)
     original_forward = experimental_F._fused_linear_for_ppo_fwd
     chunk_sizes = []
 
     def record_chunk_size(hidden_states, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Records the first dimension of hidden_states into chunk_sizes and delegates to the original forward.
         chunk_sizes.append(hidden_states.shape[0])
         return original_forward(hidden_states, *args, **kwargs)
 

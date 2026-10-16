@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for the timeout_limit decorator (imported as timeout) in both modes:
+# the default multiprocessing mode (runs the function in a child process, raises
+# TimeoutError with a "timed out after N seconds" message if it exceeds the limit,
+# re-raises the child's exception otherwise) and the deprecated signal mode
+# (SIGALRM interval timer in the calling thread). Uses a 1.5 s timeout and 2.0 s
+# "slow" duration, so the suite takes several seconds.
+# KNOWN ISSUE: the in-file note claims use_signals=True falls back to
+# multiprocessing on POSIX; the decorator actually uses SIGALRM in that mode.
 
 import multiprocessing
 import sys
@@ -28,6 +37,9 @@ LONG_TASK_DURATION = TEST_TIMEOUT_SECONDS + 0.5  # Duration slightly longer than
 
 @timeout(seconds=TEST_TIMEOUT_SECONDS)  # Keep global decorator for mp tests
 def quick_task(x):
+    # [FUNCTION DOC]
+    # HELPER: Module-level decorated task (pickleable for multiprocessing) that sleeps
+    # 0.1 s and returns "quick_ok". Inputs: x - ignored.
     """A task that completes quickly."""
     time.sleep(0.1)
     return "quick_ok"
@@ -35,6 +47,9 @@ def quick_task(x):
 
 @timeout(seconds=TEST_TIMEOUT_SECONDS)  # Keep global decorator for mp tests
 def slow_task(x):
+    # [FUNCTION DOC]
+    # HELPER: Module-level decorated task that sleeps longer than the timeout and would
+    # return "slow_finished" if not interrupted. Inputs: x - ignored.
     """A task that takes longer than the timeout."""
     time.sleep(LONG_TASK_DURATION)
     return "slow_finished"  # This return value indicates it didn't time out
@@ -42,6 +57,8 @@ def slow_task(x):
 
 # REMOVE global decorator here
 def task_raises_value_error():  # Now truly not globally decorated
+    # [FUNCTION DOC]
+    # HELPER: Undecorated task that always raises ValueError with a fixed message.
     """A task that intentionally raises a ValueError."""
     raise ValueError("Specific value error from task")
 
@@ -50,6 +67,9 @@ def task_raises_value_error():  # Now truly not globally decorated
 # Keep this decorated globally for the specific subprocess test case
 @timeout(seconds=TEST_TIMEOUT_SECONDS, use_signals=True)
 def top_level_decorated_quick_task_signal():
+    # [FUNCTION DOC]
+    # HELPER: Signal-mode decorated task sleeping 0.1 s and returning
+    # "quick_ok_signal_subprocess". Currently unused by any test.
     """A pickleable top-level function decorated with signal timeout."""
     # Assuming this calls the logic of quick_task directly for the test purpose
     time.sleep(0.1)
@@ -60,6 +80,8 @@ def top_level_decorated_quick_task_signal():
 # Keep this decorated globally for the specific subprocess test case
 @timeout(seconds=TEST_TIMEOUT_SECONDS, use_signals=True)
 def top_level_decorated_slow_task_signal():
+    # [FUNCTION DOC]
+    # HELPER: Signal-mode decorated task sleeping past the timeout. Currently unused.
     """A pickleable top-level function decorated with signal timeout."""
     time.sleep(LONG_TASK_DURATION)
     return "slow_finished"
@@ -67,6 +89,9 @@ def top_level_decorated_slow_task_signal():
 
 # --- NEW: Top-level helper function to run target in process ---
 def run_target_and_put_in_queue(target_func, q):
+    # [FUNCTION DOC]
+    # HELPER: Process target that calls target_func with no args and puts
+    # ("success", result) or ("error", exception) on queue q. Currently unused.
     """
     Top-level helper function to run a target function and put its result or exception into a queue.
     This function is pickleable and can be used as the target for multiprocessing.Process.
@@ -81,6 +106,10 @@ def run_target_and_put_in_queue(target_func, q):
 # Use a module-level fixture to set the start method on macOS
 @pytest.fixture(scope="module", autouse=True)  # Changed scope to module
 def set_macos_start_method():
+    # [FUNCTION DOC]
+    # HELPER: Module-scoped autouse fixture that, on macOS only, forces the
+    # multiprocessing start method to fork (ignoring RuntimeError if already fixed) so
+    # decorated functions need not be pickled. No-op elsewhere.
     if sys.platform == "darwin":
         # Force fork method on macOS to avoid pickling issues with globally decorated functions
         # when running tests via pytest discovery.
@@ -95,6 +124,8 @@ def set_macos_start_method():
 
 
 def test_quick_task():  # Renamed from test_multiprocessing_quick_task
+    # [FUNCTION DOC]
+    # Behavior: the quick multiprocessing-mode task returns its value.
     """Tests timeout handles a quick task correctly."""
     # Call the globally decorated function directly
     result = quick_task(1)
@@ -102,6 +133,9 @@ def test_quick_task():  # Renamed from test_multiprocessing_quick_task
 
 
 def test_slow_task_timeout():  # Renamed from test_multiprocessing_slow_task_timeout
+    # [FUNCTION DOC]
+    # Behavior: the slow task raises TimeoutError whose message contains
+    # "timed out after 1.5 seconds".
     """Tests timeout correctly raises TimeoutError for a slow task."""
     # Call the globally decorated function directly within pytest.raises
     with pytest.raises(TimeoutError) as excinfo:  # Use pytest.raises
@@ -111,6 +145,9 @@ def test_slow_task_timeout():  # Renamed from test_multiprocessing_slow_task_tim
 
 
 def test_internal_exception():  # Renamed from test_multiprocessing_internal_exception
+    # [FUNCTION DOC]
+    # Behavior: decorating the raising task at runtime and calling it re-raises the
+    # ValueError with its original message.
     """Tests timeout correctly propagates internal exceptions."""
     # Apply the default timeout decorator dynamically to the undecorated function
     decorated_task = timeout(seconds=TEST_TIMEOUT_SECONDS)(task_raises_value_error)  # Apply decorator dynamically
@@ -125,10 +162,14 @@ def test_internal_exception():  # Renamed from test_multiprocessing_internal_exc
 
 
 def test_signal_quick_task_main_process():  # Removed self
+    # [FUNCTION DOC]
+    # Behavior: a signal-mode wrapped quick closure returns its value in the main thread.
     """Tests signal timeout handles a quick task correctly in the main process."""
 
     # Apply the signal decorator dynamically
     def plain_quick_task_logic():
+        # [FUNCTION DOC]
+        # HELPER: Sleeps 0.1 s and returns "quick_ok_signal".
         time.sleep(0.1)
         return "quick_ok_signal"
 
@@ -137,10 +178,15 @@ def test_signal_quick_task_main_process():  # Removed self
 
 
 def test_signal_slow_task_main_process_timeout():  # Removed self
+    # [FUNCTION DOC]
+    # Behavior: a signal-mode wrapped slow closure raises TimeoutError containing
+    # "timed out after 1.5 seconds" in the main thread.
     """Tests signal timeout correctly raises TimeoutError for a slow task in the main process."""
 
     # Apply the signal decorator dynamically
     def plain_slow_task_logic():
+        # [FUNCTION DOC]
+        # HELPER: Sleeps past the timeout; returns "slow_finished_signal" if not interrupted.
         time.sleep(LONG_TASK_DURATION)
         return "slow_finished_signal"
 
@@ -153,6 +199,12 @@ def test_signal_slow_task_main_process_timeout():  # Removed self
 
 @pytest.mark.skip(reason="this test won't pass. Just to show why use_signals should not be used")
 def test_signal_in_thread_does_not_timeout():
+    # [FUNCTION DOC]
+    # Skipped demonstration that signal mode does not work from a non-main thread:
+    # runs a signal-decorated slow task in a thread, joins, and asserts exactly one
+    # TimeoutError was recorded and no result.
+    # KNOWN ISSUE: in a worker thread installing the SIGALRM handler raises ValueError,
+    # which thread_target records, so the TimeoutError assertion fails (hence skip).
     """
     Tests that signal-based timeout does NOT work reliably in a child thread.
     The TimeoutError from the signal handler is not expected to be raised.
@@ -162,6 +214,10 @@ def test_signal_in_thread_does_not_timeout():
 
     @timeout(seconds=TEST_TIMEOUT_SECONDS, use_signals=True)
     def slow_task_in_thread():
+        # [FUNCTION DOC]
+        # HELPER: Signal-decorated slow task; prints progress, returns
+        # "slow_finished_in_thread", or records any exception raised inside it into the
+        # exception list and returns None.
         try:
             print("Thread: Starting slow task...")
             time.sleep(LONG_TASK_DURATION)
@@ -174,6 +230,9 @@ def test_signal_in_thread_does_not_timeout():
             return None  # Indicate failure
 
     def thread_target():
+        # [FUNCTION DOC]
+        # HELPER: Thread body calling the decorated task, appending a non-None result to
+        # the result list or any raised exception to the exception list; prints errors.
         try:
             # Run the decorated function inside the thread
             res = slow_task_in_thread()
@@ -198,11 +257,20 @@ def test_signal_in_thread_does_not_timeout():
 
 
 def test_in_thread_timeout():
+    # [FUNCTION DOC]
+    # Behavior: in multiprocessing mode, a decorated slow closure called from a worker
+    # thread times out; the TimeoutError is raised by the wrapper in the thread and
+    # recorded, with no result recorded. Relies on the fork start method since the
+    # closure is not pickleable.
     result_container = []  # Use a list to store result from thread
     exception_container = []  # Use a list to store exception from thread
 
     @timeout(seconds=TEST_TIMEOUT_SECONDS, use_signals=False)
     def slow_task_in_thread():
+        # [FUNCTION DOC]
+        # HELPER: Multiprocessing-decorated slow task executed in the child process;
+        # prints, sleeps past the timeout, returns "slow_finished_in_thread" (exceptions
+        # inside it are appended to the child's copy of the list, not visible to parent).
         try:
             print("Thread: Starting slow task...")
             time.sleep(LONG_TASK_DURATION)
@@ -215,6 +283,8 @@ def test_in_thread_timeout():
             return None  # Indicate failure
 
     def thread_target():
+        # [FUNCTION DOC]
+        # HELPER: Same thread body as in the skipped signal test.
         try:
             # Run the decorated function inside the thread
             res = slow_task_in_thread()

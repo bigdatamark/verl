@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script that builds SFT, reward-model, or RL parquet datasets from Dahoas/full-hh-rlhf.
+# --split (required: sft|rm|rl) selects which generator runs; output goes to
+# <local_save_dir>/<split> (default base ~/data/full_hh_rlhf, deprecated --local_dir overrides);
+# --hdfs_dir optionally receives copies; --local_dataset_path loads a local copy instead of the hub.
 """
 - Preprocess data and split the training set into 75% for training RM and 25% for validting RM.
 - All the training data is used to train SFT and RL.
@@ -28,6 +33,17 @@ from verl.utils.fs import copy, makedirs
 
 
 def generate_sft_dataset(target_hdfs_path_dir, local_dir="~/data/full_hh_rlh/sft", local_dataset_path=None):
+    # [FUNCTION DOC]
+    # Builds an SFT dataset where every training example contributes two rows: (prompt, chosen)
+    # and (prompt, rejected), both with column names prompt/response.
+    # Inputs: target_hdfs_path_dir - HDFS dir or None; local_dir - output dir (tilde-expanded,
+    # created); local_dataset_path - optional local dataset path.
+    # Outputs: none; writes <local_dir>/train.parquet.
+    # Side effects: downloads the dataset, writes files, shows a tqdm progress bar, and if an HDFS
+    # dir is given creates "<hdfs>/train.parquet" as a directory and copies the file there.
+    # KNOWN ISSUE: makedirs is called on the destination file path itself rather than its parent,
+    # so the HDFS target becomes a directory named train.parquet.
+    # KNOWN ISSUE: training on rejected responses as SFT targets is intentional per the module docstring but unusual.
     if local_dataset_path is not None:
         dataset = load_dataset(local_dataset_path)
     else:
@@ -59,6 +75,12 @@ def generate_sft_dataset(target_hdfs_path_dir, local_dir="~/data/full_hh_rlh/sft
 
 
 def generate_rm_dataset(target_hdfs_path_dir, local_dir="~/data/full_hh_rlh/rm", local_dataset_path=None):
+    # [FUNCTION DOC]
+    # Builds pairwise reward-model data: first 75% of the train split becomes "train", last 25%
+    # becomes "test"; each row has prompt, chosen, rejected columns.
+    # Inputs: same as generate_sft_dataset (default local_dir ~/data/full_hh_rlh/rm).
+    # Outputs: none; writes <local_dir>/train.parquet and test.parquet, optional HDFS copies
+    # (same makedirs-on-file-path behavior as the SFT generator).
     if local_dataset_path is not None:
         train_dataset = load_dataset(local_dataset_path, split="train[:75%]")
         test_dataset = load_dataset(local_dataset_path, split="train[-25%:]")
@@ -91,6 +113,13 @@ def generate_rm_dataset(target_hdfs_path_dir, local_dir="~/data/full_hh_rlh/rm",
 
 
 def generate_rl_dataset(target_hdfs_path_dir, local_dir="~/data/full_hh_rlhf/rl", local_dataset_path=None):
+    # [FUNCTION DOC]
+    # Builds an RL prompt dataset from the train split: each row becomes verl RL format with
+    # data_source "Dahoas/full-hh-rlhf", a single user-message prompt, ability "alignment",
+    # reward_model style "model" with the dataset's "response" as an unused ground_truth, and
+    # extra_info {split, index}.
+    # Inputs: same as the other generators. Outputs: writes <local_dir>/train.parquet; optional HDFS copy.
+    # KNOWN ISSUE: local_dir is tilde-expanded but not created before writing, unlike the other generators.
     if local_dataset_path is not None:
         dataset = load_dataset(local_dataset_path)
     else:
@@ -101,7 +130,12 @@ def generate_rl_dataset(target_hdfs_path_dir, local_dir="~/data/full_hh_rlhf/rl"
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
+        # [FUNCTION DOC]
+        # Returns a process_fn closure bound to the given split name.
         def process_fn(example, idx):
+            # [FUNCTION DOC]
+            # Pops prompt and response from the example and returns the new RL-format record described
+            # above, with the given idx as extra_info.index. Exceptions: KeyError if fields missing.
             prompt = example.pop("prompt")
             response = example.pop("response")
 

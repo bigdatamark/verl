@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Ulysses sequence-parallel replacements for HF Llama attention forward: a legacy flash-attention
+# version for transformers 4.45-4.47 and an attention-interface based version for transformers >= 4.48.
+# Both all-to-all q/k/v from [b, heads, s/sp, d] to [b, heads/sp, s, d] before attention and back
+# afterwards; KV heads are not repeated before the all-to-all.
+
 import sys
 from typing import Callable, Optional
 
@@ -51,6 +57,21 @@ def llama_flash_attn_forward(
     position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    # [FUNCTION DOC]
+    # Behavior: projects q/k/v into heads, applies Ulysses all-to-all when SP > 1 (after validating head
+    # divisibility), computes rotary cos/sin from position_ids via self.rotary_emb if position_embeddings
+    # is missing (with a deprecation warning) else uses the given ones, applies RoPE, updates the KV cache
+    # when given, transposes to [b, s, h, d], casts float32 inputs back to the autocast / pre-quantization
+    # / q_proj weight dtype (with warning), runs HF _flash_attention_forward over the full length with
+    # position ids, sliding window if present, dropout only in training, then reshapes, all-to-alls back
+    # and applies o_proj.
+    # Inputs: self - LlamaAttention (projections, num_heads, num_key_value_heads, head_dim, rotary_emb,
+    # layer_idx, is_causal, attention_dropout, config); hidden_states [b, s_local, hidden];
+    # attention_mask; position_ids (full-length); past_key_value; output_attentions (forced False);
+    # use_cache (unused); cache_position; position_embeddings; kwargs to flash attention.
+    # Outputs: (attn_output [b, s_local, hidden], None, past_key_value).
+    # Exceptions: Ulysses validation errors.
+    # Side effects: SP collectives, cache update, one-time warnings.
     """
     Adapted from transformers 4.47.1 to support Ulysses sequence parallelism.
 
@@ -176,6 +197,18 @@ def llama_attn_forward(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    # [FUNCTION DOC]
+    # Behavior: same Ulysses scheme for transformers >= 4.48: projects q/k/v, all-to-all when SP > 1,
+    # applies RoPE from the provided (cos, sin), updates cache if given, selects the attention function
+    # (eager; sdpa with output_attentions falls back to eager with a warning; else the registered
+    # implementation), runs it with scaling and train-only dropout, reshapes, all-to-alls back, applies
+    # o_proj.
+    # Inputs: self - LlamaAttention; hidden_states [b, s_local, hidden]; position_embeddings (cos, sin) for
+    # the full sequence; attention_mask; past_key_value; cache_position; kwargs to the attention function.
+    # Outputs: (attn_output [b, s_local, hidden], attention weights or None).
+    # Exceptions: Ulysses validation errors.
+    # Side effects: SP collectives, cache update.
+    # KNOWN ISSUE: return annotation lists three elements but two are returned.
     """
     Adapted from transformers 4.49.0 to support Ulysses sequence parallelism for transformers >= 4.48.0.
 

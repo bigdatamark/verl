@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Sphinx configuration for the verl documentation site. Pure settings module (no functions):
+# sets project metadata, enables MyST markdown (dollarmath/amsmath), autodoc/autosummary/
+# autosectionlabel/napoleon (Google-style only)/viewcode, accepts .rst and .md sources,
+# uses the sphinx_rtd_theme with static assets from _static (custom JS widgets and a
+# full-width CSS), excludes build artifacts and the README files, and silences duplicate-ref
+# and myst warnings. Side effects: none beyond defining module-level variables read by Sphinx.
 
 # Configuration file for the Sphinx documentation builder.
 #

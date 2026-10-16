@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# single_controller package: the driver-side single-controller programming model (workers, worker groups, resource pools).
+# Behavior at import: re-exports everything from the base subpackage, and reads the package version string from the file
+# version/version located in the parent (verl) directory, stripping whitespace, into __version__.
+# Exceptions: import fails with an OS error if the version file is missing.
+# Side effects: file read at import time.
 import os
 
 from . import base

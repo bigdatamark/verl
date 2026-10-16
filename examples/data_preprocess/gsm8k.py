@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script converting openai/gsm8k (config "main", train/test) into verl RL parquet format.
+# Prompt = question + instruction to answer after "####"; ground truth is the numeric answer
+# extracted from the reference solution. extra_info keeps split, index, raw answer and question.
+# Args: --local_dataset_path, --local_save_dir (default ~/data/gsm8k), deprecated --local_dir, --hdfs_dir.
+# KNOWN ISSUE: the save dir is not tilde-expanded or created before writing.
 """
 Preprocess the GSM8k dataset to parquet format
 """
@@ -25,6 +31,11 @@ from verl.utils.hdfs_io import copy, makedirs
 
 
 def extract_solution(solution_str):
+    # [FUNCTION DOC]
+    # HELPER: Extracts the final numeric answer from a GSM8K solution string: finds the first
+    # "#### <number>" occurrence (digits, optional minus, dots, commas), takes the text after
+    # "#### " and removes commas. Inputs: solution_str. Outputs: answer string.
+    # Exceptions: AssertionError if no "####" marker is found.
     solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
     assert solution is not None
     final_solution = solution.group(0)
@@ -58,7 +69,12 @@ if __name__ == "__main__":
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
+        # [FUNCTION DOC]
+        # Returns a process_fn closure bound to the split name.
         def process_fn(example, idx):
+            # [FUNCTION DOC]
+            # Pops question and answer, builds the single-user-message prompt, extracts the ground truth,
+            # and returns the RL record (ability "math", rule reward style).
             question_raw = example.pop("question")
 
             question = question_raw + " " + instruction_following

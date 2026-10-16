@@ -14,6 +14,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# One-step off-policy PPO trainer. Generation for step N+1 is launched as an asyncio task before training on step
+# N, so rollout (on dedicated rollout GPUs via an agent loop) overlaps with training; weights are synced to rollout
+# after each batch is received.
+
 """
 This trainer supports model-agonistic model initialization with huggingface
 """
@@ -47,6 +52,9 @@ from verl.workers.rollout.llm_server import LLMServerManager
 
 
 class OneStepOffRayTrainer(SeparateRayPPOTrainer):
+    # [CLASS DOC]
+    # Trainer subclassing the separated PPO trainer; the pipeline stages (reward, log-probs, advantage, updates,
+    # validation, checkpoint) come from the base class, this class adds the overlapping generation scheduling.
     def __init__(
         self,
         config,
@@ -61,6 +69,14 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         train_sampler: Optional[Sampler] = None,
         device_name=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores tokenizer/processor/config; asserts hybrid engine is off; removes the Rollout role from the
+        # mapping (agent loop creates rollout); determines reference policy, reward model and critic use; sets device and a
+        # validation generations logger; ref_in_actor when a LoRA rank (nested or legacy) is positive or an adapter path is
+        # set; KL controller when KL-in-reward is enabled; prefix-grouper flag; creates dataloaders; initializes step,
+        # profile, metric and reward bookkeeping.
+        # Inputs: see docstring. Exceptions: AssertionError if hybrid engine is on.
+        # Side effects: mutates role_worker_mapping passed in.
         """
         Initialize distributed PPO trainer with Ray backend.
         Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -139,6 +155,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self.reward_extra_infos_dict = {}
 
     def _create_actor_rollout_classes(self):
+        # [FUNCTION DOC]
+        # HELPER: Registers the Actor role worker class (with actor_rollout_ref config and role name) in its resource pool.
         for role in [Role.Actor]:
             resource_pool = self.resource_pool_manager.get_resource_pool(role)
             role_cls = RayClassWithInitArgs(
@@ -149,6 +167,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             self.resource_pool_to_cls[resource_pool][str(role)] = role_cls
 
     def _init_models(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes critic, separate reference policy, and reward model worker groups when used; initializes the
+        # actor worker group and aliases it as actor_rollout_wg; sets rm_wg to none when no reward model.
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
             self.critic_wg.init_model()
@@ -167,6 +188,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self.actor_rollout_wg = self.actor_wg
 
     def _init_async_rollout_manager(self):
+        # [FUNCTION DOC]
+        # HELPER: Decides whether reward workers stream with rollout (no RM, or RM with own pool); asserts rollout mode is
+        # "async"; loads a custom agent loop manager class from config if given, else the default; creates an LLM server
+        # manager and the agent loop manager with its client and reward worker handles.
+        # Exceptions: AssertionError if mode is not async; import errors for a bad class path.
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
@@ -195,6 +221,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         )
 
     def _create_continuous_iterator(self):
+        # [FUNCTION DOC]
+        # HELPER: Generator yielding (epoch, batch) for every batch of each configured epoch.
         """
         Create a continuous data iterator across epoch
         """
@@ -204,6 +232,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 yield epoch, batch_dict
 
     async def _async_gen_next_batch(self, continuous_iterator):
+        # [FUNCTION DOC]
+        # HELPER: Takes the next (epoch, batch) from the iterator, returning none on exhaustion or any error (logged). Builds
+        # a DataProto, assigns a random uuid per row, derives the generation batch, tags it with global_steps, repeats it n
+        # times (interleaved), awaits async generation under a timer, repeats the original batch the same way and unions the
+        # output; adds a response mask if missing, optionally balances the batch, and records per-sample token counts.
+        # Outputs: (metrics, timing, epoch, batch, none future reward) or none.
+        # KNOWN ISSUE: docstring mentions parameter synchronization, which this function does not do.
         """
         Call parameter synchronization and asynchronous sequence generation.
         """
@@ -259,10 +294,19 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     @staticmethod
     @ray.remote
     def _launch_individual_rewards(batch, config, tokenizer):
+        # [FUNCTION DOC]
+        # HELPER: Ray remote static task that extracts the reward tensor and extra info from a batch. Inputs: batch;
+        # config and tokenizer unused. Outputs: (reward tensor, extra info).
         reward_tensor, reward_extra_info = extract_reward(batch)
         return reward_tensor, reward_extra_info
 
     async def fit(self):
+        # [FUNCTION DOC]
+        # Behavior: creates the Tracking logger; resets global_steps to 0; loads checkpoint and syncs weights; optionally
+        # validates before training (asserting metrics are non-empty) and returns early if val_only; creates progress bar;
+        # starts at step 1, sets profile flags; creates the continuous iterator, launches the first generation task, then
+        # repeatedly runs fit_step with the pending future until it returns none or the last step is reached.
+        # Exceptions: AssertionError for empty validation metrics.
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC
@@ -321,6 +365,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 return
 
     async def fit_step(self, batch_data_future, continuous_iterator):
+        # [FUNCTION DOC]
+        # Behavior: resets per-step metrics/timing/reward state, prepares the step and starts profiling; under the "step"
+        # timer awaits the current batch (which also syncs weights and launches the next generation), then runs reward,
+        # old log-prob, ref log-prob, critic values, advantage, critic update, actor update, and data dump, yielding to the
+        # event loop between stages; then validates, saves checkpoint, stops profiling, collects metrics, runs experimental
+        # hooks, and post-processes the step.
+        # Inputs: batch_data_future - task producing the batch; continuous_iterator. Outputs: the next batch task or none.
         """
         Single-step training template method. Handles all logic for one training step.
 
@@ -383,6 +434,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         return batch_data_future
 
     async def _fit_generate(self, batch_data_future, continuous_iterator):
+        # [FUNCTION DOC]
+        # HELPER: Under the "gen" timer awaits the batch future and merges its metrics and timing (including the batch's
+        # own "timing" meta_info, which is then removed), setting the rollout temperature. Then syncs weights to rollout
+        # under a timer. Unless this is the last step, launches the next generation task and yields once.
+        # Outputs: (batch, next future or none).
+        # KNOWN ISSUE: if the iterator is exhausted the awaited future yields none and the tuple unpacking raises a TypeError.
         metrics = self.metrics
         timing_raw = self.timing_raw
 

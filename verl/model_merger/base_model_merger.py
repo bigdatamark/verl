@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Shared infrastructure for the model merger: CLI argument parsing, the ModelMergerConfig dataclass, and the
+# abstract BaseModelMerger which loads the HF config and implements saving HF model/tokenizer/processor, generation
+# config, LoRA adapters, and uploading to the HuggingFace Hub. Backend subclasses implement loading/merging shards.
+
 import argparse
 import os
 import warnings
@@ -32,6 +37,13 @@ AutoModelForVision2Seq = get_auto_model_for_vision2seq()
 
 
 def parse_args():
+    # [FUNCTION DOC]
+    # Behavior: builds an argparse parser with required subcommand "merge" or "test". Shared options: --backend
+    # (fsdp|megatron, required), --local_dir, --tie-word-embedding, --trust-remote-code, --is-value-model,
+    # --use_cpu_initialization (flags). merge adds --target_dir (default "tmp"), --hf_upload_path, --private;
+    # test adds required --test_hf_dir. Parses sys.argv.
+    # Outputs: argparse Namespace (operation holds the subcommand name).
+    # Exceptions: argparse exits the process on invalid arguments.
     parser = argparse.ArgumentParser(description="verl model merger")
     subparsers = parser.add_subparsers(dest="operation", required=True, help="Specify 'merge' or 'test' operation.")
 
@@ -82,6 +94,8 @@ def parse_args():
 
 @dataclass
 class ModelMergerConfig:
+    # [CLASS DOC]
+    # Dataclass holding all merger options (see docstring). hf_upload is derived, not passed to the constructor.
     """Configuration for model merger operations.
 
     Args:
@@ -117,6 +131,10 @@ class ModelMergerConfig:
     use_cpu_initialization: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: sets hf_upload true only for operation "merge" with a non-empty hf_upload_path; for "test" forces
+        # target_dir and hf_upload_path to None and private to False.
+        # Side effects: mutates fields.
         self.hf_upload = self.operation == "merge" and bool(self.hf_upload_path)
         if self.operation == "test":
             self.target_dir = None
@@ -125,6 +143,10 @@ class ModelMergerConfig:
 
 
 def _default_hf_model_config_path(backend: str, local_dir: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the directory holding HF config/tokenizer files: local_dir/model/huggingface for megatron,
+    # otherwise local_dir/huggingface.
+    # Exceptions: TypeError from path joining if local_dir is None.
     """Return the default path to HuggingFace config/tokenizer artifacts.
 
     - FSDP: ``<local_dir>/huggingface`` (unchanged, single-tree layout).
@@ -140,6 +162,13 @@ def _default_hf_model_config_path(backend: str, local_dir: str) -> str:
 
 
 def generate_config_from_args(args: argparse.Namespace) -> ModelMergerConfig:
+    # [FUNCTION DOC]
+    # Behavior: builds a ModelMergerConfig from parsed args, computing hf_model_config_path from backend and local_dir.
+    # For merge, passes target_dir, upload path and private and creates target_dir; for test, passes test_hf_dir and
+    # clears merge-only fields.
+    # Outputs: ModelMergerConfig.
+    # Exceptions: NotImplementedError for an unknown operation.
+    # Side effects: creates target_dir on disk for merge.
     common_config_args = {
         "operation": args.operation,
         "backend": args.backend,
@@ -175,6 +204,9 @@ def generate_config_from_args(args: argparse.Namespace) -> ModelMergerConfig:
 
 
 class BaseModelMerger(ABC):
+    # [CLASS DOC]
+    # Abstract merger. Holds config, hf_model_config_path and the loaded HF model config (AutoConfig). Subclasses must
+    # implement merge_and_save and cleanup.
     """
     Abstract base class for merging distributed model checkpoints into HuggingFace format.
 
@@ -197,6 +229,10 @@ class BaseModelMerger(ABC):
     """
 
     def __init__(self, config: ModelMergerConfig):
+        # [FUNCTION DOC]
+        # Behavior: stores config and loads the AutoConfig from hf_model_config_path honoring trust_remote_code.
+        # Exceptions: propagates HF loading errors if the config is missing.
+        # Side effects: reads config files from disk.
         self.config = config
         self.hf_model_config_path = config.hf_model_config_path
         self.model_config = AutoConfig.from_pretrained(
@@ -204,6 +240,14 @@ class BaseModelMerger(ABC):
         )
 
     def get_transformers_auto_model_class(self):
+        # [FUNCTION DOC]
+        # Behavior: picks the transformers auto class for the model. If the config has auto_map with an entry whose value
+        # contains the first architecture name (remote code), uses that entry's key: AutoModelForCausalLM,
+        # AutoModelForTokenClassification, or the vision2seq class for AutoModelForVision2Seq / AutoModelForImageTextToText.
+        # Otherwise infers from the first architecture name: contains ForTokenClassification, ForCausalLM, or
+        # ForConditionalGeneration (vision2seq class), checked in that order.
+        # Outputs: an auto model class.
+        # Exceptions: NotImplementedError for unknown auto class or architecture.
         has_remote_code = hasattr(self.model_config, "auto_map") and any(
             self.model_config.architectures[0] in val for val in self.model_config.auto_map.values()
         )
@@ -233,6 +277,11 @@ class BaseModelMerger(ABC):
             raise NotImplementedError(f"Unknown architecture {self.model_config.architectures}")
 
     def patch_model_generation_config(self, model):
+        # [FUNCTION DOC]
+        # Behavior: if the model can generate and a generation_config.json exists alongside the HF config, replaces the
+        # model's generation_config with it.
+        # Inputs: model - HF model. Outputs: the same model.
+        # Side effects: mutates model; may print a warning when the file is missing.
         """
         The generation_config created from model config may be different to the pretrained model,
         this may lead to error when generating: https://github.com/verl-project/verl/issues/1246
@@ -246,6 +295,11 @@ class BaseModelMerger(ABC):
         return model
 
     def load_generation_config(self, warn_if_missing: bool = True):
+        # [FUNCTION DOC]
+        # Behavior: returns the GenerationConfig loaded from hf_model_config_path if generation_config.json exists, else
+        # None (printing a warning when warn_if_missing is true).
+        # Inputs: warn_if_missing - whether to print the missing-file warning.
+        # Outputs: GenerationConfig or None.
         """Load the generation config stored alongside the pretrained model config."""
         generation_config_path = os.path.join(self.hf_model_config_path, "generation_config.json")
         if not os.path.isfile(generation_config_path):
@@ -258,6 +312,11 @@ class BaseModelMerger(ABC):
         return GenerationConfig.from_pretrained(self.hf_model_config_path)
 
     def save_generation_config(self, target_dir):
+        # [FUNCTION DOC]
+        # Behavior: writes the source generation config into target_dir; if none exists, deletes any stale
+        # generation_config.json in target_dir.
+        # Inputs: target_dir - output directory.
+        # Side effects: writes or removes files.
         """Preserve the pretrained generation config in a merged model directory."""
         generation_config = self.load_generation_config(warn_if_missing=False)
         if generation_config is not None:
@@ -268,6 +327,13 @@ class BaseModelMerger(ABC):
                 os.remove(stale_config_path)
 
     def _load_lora_train_meta(self) -> Optional[dict[str, object]]:
+        # [FUNCTION DOC]
+        # HELPER: Reads optional LoRA training metadata from local_dir/lora_train_meta.json.
+        # Behavior: returns None if local_dir is unset, the file is missing, or unreadable (warns). Otherwise extracts
+        # "r" and "lora_alpha" coerced to int and "task_type" if a string, warning and skipping invalid values; a null
+        # task_type is silently ignored.
+        # Outputs: dict with any of r, lora_alpha, task_type, or None if empty.
+        # Side effects: reads file; emits warnings.
         if not self.config.local_dir:
             return None
 
@@ -309,6 +375,17 @@ class BaseModelMerger(ABC):
         return result if len(result) > 0 else None
 
     def save_lora_adapter(self, state_dict: dict[str, torch.Tensor]):
+        # [FUNCTION DOC]
+        # Behavior: extracts all state_dict entries whose names contain "lora_" (removing them from state_dict), renames
+        # ".default.weight" to ".weight", collects target module names (the third-to-last dotted component), infers rank
+        # as the minimum dimension of the last LoRA tensor, and overrides rank/alpha/task_type with metadata when present
+        # (positive rank only; warns on rank mismatch). Warns if alpha ends up 0. Builds a peft LoraConfig dict, converts
+        # enum values of task_type/peft_type to plain values and target_modules to a list, writes adapter_config.json and
+        # adapter_model.safetensors under target_dir/lora_adapter. Finally renames remaining base keys by stripping
+        # "base_model.model." and mapping ".base_layer.weight"/".base_layer.bias" to ".weight"/".bias".
+        # Inputs: state_dict - mapping name -> tensor (mutated in place).
+        # Outputs: path of the adapter directory, or None when no LoRA params exist (state_dict untouched in that case).
+        # Side effects: mutates state_dict; writes files; emits warnings.
         """
         Save lora adapter to safetensors.
 
@@ -408,6 +485,14 @@ class BaseModelMerger(ABC):
         return lora_path
 
     def save_hf_model_and_tokenizer(self, state_dict: dict[str, torch.Tensor]):
+        # [FUNCTION DOC]
+        # Behavior: creates the model with empty weights in bfloat16 from the HF config using the chosen auto class,
+        # materializes it on CPU, patches its generation config, saves any LoRA adapter (stripping LoRA keys), drops tied
+        # target keys from the state dict, saves the model with the provided state_dict to target_dir, then saves the
+        # processor and tokenizer (if available) and validates the output directory.
+        # Inputs: state_dict - merged full state dict (mutated).
+        # Exceptions: NotImplementedError from auto class selection; RuntimeError from output validation.
+        # Side effects: writes model/tokenizer/processor/adapter files; prints progress.
         auto_model_class = self.get_transformers_auto_model_class()
         with init_empty_weights():
             model = auto_model_class.from_config(
@@ -439,6 +524,13 @@ class BaseModelMerger(ABC):
         validate_hf_model_output(self.config.target_dir)
 
     def upload_to_huggingface(self):
+        # [FUNCTION DOC]
+        # Behavior: creates (exist_ok) the Hub repo hf_upload_path with the configured privacy, then uploads target_dir as
+        # a model repo.
+        # Exceptions: on repo creation - PermissionError for 401, RepositoryNotFoundError for 404, ConnectionError for other
+        # HTTP errors or network failures; on upload - PermissionError for 401, RuntimeError for other HTTP errors,
+        # ConnectionError on network failures, FileNotFoundError on OSError, RuntimeError for anything else.
+        # Side effects: network calls to the HuggingFace Hub.
         import requests
         from huggingface_hub import HfApi
         from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
@@ -477,8 +569,14 @@ class BaseModelMerger(ABC):
 
     @abstractmethod
     def merge_and_save(self):
+        # [FUNCTION DOC]
+        # Abstract: subclasses load backend shards, merge, and either save (merge) or compare (test).
+        # Exceptions: raises NotImplementedError in the base.
         raise NotImplementedError("Subclasses should implement this method")
 
     @abstractmethod
     def cleanup(self):
+        # [FUNCTION DOC]
+        # Abstract: subclasses release resources (e.g. distributed process groups).
+        # Exceptions: raises NotImplementedError in the base.
         raise NotImplementedError("Subclasses should implement this method to clean up resources if needed")

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests for verl.utils.seqlen_balancing (token-budgeted micro-batch rearrangement, dynamic batch prepare/restore,
+# reverse index mapping, group-balanced partitioning) plus DataProto.split with uneven chunks. Includes spawned
+# 2-process tests: one on GPU/NCCL checking DP-synchronized micro-batch counts and minimum counts, one on CPU/gloo
+# checking that constraint violations raise a synchronized ValueError on all ranks.
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -29,6 +35,10 @@ from verl.utils.seqlen_balancing import (
 
 
 def test_seqlen_balancing():
+    # [FUNCTION DOC]
+    # Builds 20 random sequences with random left padding and valid ratios, rearranges into micro-batches with a 300
+    # token budget, concatenates them, reorders with get_reverse_idx of the flattened index lists, and asserts equality
+    # with the original batch.
     input_ids = torch.randint(low=0, high=10, size=(20, 100))
 
     attention_mask = create_random_mask(
@@ -48,6 +58,8 @@ def test_seqlen_balancing():
 
 
 def test_micro_batches_respect_max_token_len():
+    # [FUNCTION DOC]
+    # 8 fully valid sequences of 7 tokens with budget 8: asserts 8 micro-batches, each with at most 8 valid tokens.
     input_ids = torch.zeros((8, 7), dtype=torch.long)
     attention_mask = torch.ones_like(input_ids)
     dataproto = DataProto.from_single_dict({"input_ids": input_ids, "attention_mask": attention_mask})
@@ -59,6 +71,9 @@ def test_micro_batches_respect_max_token_len():
 
 
 def test_dynamic_batch():
+    # [FUNCTION DOC]
+    # prepare_dynamic_batch on a DataProto with budget 300 then restore_dynamic_batch on the concatenated input_ids must
+    # reproduce the original input_ids order.
     input_ids = torch.randint(low=0, high=10, size=(20, 100))
 
     attention_mask = create_random_mask(
@@ -73,6 +88,12 @@ def test_dynamic_batch():
 
 
 def _worker(rank, world_size, init_method, max_token_len, use_same_dp, min_mb):
+    # [FUNCTION DOC]
+    # HELPER: Per-rank GPU worker. Initializes NCCL via init_method, builds a seeded random batch whose size differs per
+    # rank (20 + 5*rank rows), and calls rearrange_micro_batches with the world DP group, same_micro_num_in_dp and
+    # min_num_micro_batch. Asserts the count is at least max(min(batch size, ceil(total tokens / budget)), min_mb),
+    # every micro-batch is within budget, all ranks agree on the count when use_same_dp (via all_gather), and the
+    # reverse-index reconstruction equals the batch. Side effects: process group lifecycle, GPU memory.
     # 1) init process group & CUDA
     get_torch_device().set_device(rank)
     dist.init_process_group(
@@ -134,6 +155,12 @@ def _worker(rank, world_size, init_method, max_token_len, use_same_dp, min_mb):
 
 
 def _constraint_error_worker(rank, world_size, init_method, scenario):
+    # [FUNCTION DOC]
+    # HELPER: Per-rank CPU/gloo worker. Patches seqlen_balancing.get_device_name to "cpu" and builds per-rank batches for
+    # a scenario: "oversized_group" (a forced group of two 6-token samples on rank 0 exceeds budget 10) or
+    # "insufficient_groups" (rank 0 has fewer samples than the micro-batch count rank 1 needs). Calls
+    # rearrange_micro_batches with same_micro_num_in_dp and the force_group_size; asserts a ValueError containing the
+    # expected message is raised on every rank, otherwise raises AssertionError. Then barriers and destroys the group.
     import verl.utils.seqlen_balancing as seqlen_balancing
 
     dist.init_process_group(backend="gloo", init_method=init_method, world_size=world_size, rank=rank)
@@ -174,6 +201,10 @@ def _constraint_error_worker(rank, world_size, init_method, scenario):
 
 
 def test_dataproto_split_uneven():
+    # [FUNCTION DOC]
+    # Splits a 10-item DataProto by 3 into chunks [3,3,3,1] and concatenates back to equal tensors; split by 10 and by 15
+    # each yields one chunk of 10; repeats the uneven split with an object-dtype non-tensor "labels" array and checks it
+    # survives concatenation.
     """Test DataProto.split with uneven splits"""
     # Create test data with 10 items
     input_ids = torch.randint(low=0, high=10, size=(10, 5))
@@ -228,6 +259,10 @@ def test_dataproto_split_uneven():
 
 
 def test_seqlen_balancing_distributed_params(tmp_path):
+    # [FUNCTION DOC]
+    # Spawns 2 GPU workers twice: once with min_num_micro_batch 4, once with same_micro_num_in_dp.
+    # KNOWN ISSUE: both spawns reuse the same file:// rendezvous file; file-store rendezvous files are not guaranteed to
+    # be reusable after the first group is destroyed, which may cause hangs or failures.
     world_size = 2
     init_file = tmp_path / "dist_init"
     init_file.write_text("")  # empty file
@@ -251,6 +286,8 @@ def test_seqlen_balancing_distributed_params(tmp_path):
 
 
 def test_seqlen_balancing_distributed_constraint_errors(tmp_path):
+    # [FUNCTION DOC]
+    # For each constraint scenario, spawns 2 CPU workers with a fresh rendezvous file.
     world_size = 2
     for scenario in ("oversized_group", "insufficient_groups"):
         init_file = tmp_path / f"dist_init_{scenario}"
@@ -264,6 +301,9 @@ def test_seqlen_balancing_distributed_constraint_errors(tmp_path):
 
 
 def test_group_balanced_partitions():
+    # [FUNCTION DOC]
+    # 4 uid groups of 4 samples with distinct lengths split into 2 partitions: asserts 2 partitions covering all 16
+    # indices and that every uid's samples sit in a single partition.
     """Test group-level balancing keeps same-uid samples together."""
     from verl.utils.seqlen_balancing import get_group_balanced_partitions
 
@@ -296,6 +336,8 @@ def test_group_balanced_partitions():
 
 
 def test_group_balanced_partitions_single_sample_groups():
+    # [FUNCTION DOC]
+    # Six single-sample groups into 2 partitions: asserts 2 partitions covering all 6 indices.
     """Test group balancing with single-sample groups (n=1)."""
     from verl.utils.seqlen_balancing import get_group_balanced_partitions
 
@@ -313,6 +355,8 @@ def test_group_balanced_partitions_single_sample_groups():
 
 
 def test_group_balanced_partitions_equal_size():
+    # [FUNCTION DOC]
+    # Eight 2-sample uid groups into 4 partitions: asserts 4 partitions, full coverage, and uids not split.
     """Test group balancing with equal_size constraint simulation."""
     from verl.utils.seqlen_balancing import get_group_balanced_partitions
 

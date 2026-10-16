@@ -11,6 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI driver around uv for verl's single universal uv.lock (see the long module docstring for
+# the user-facing story). Module-level constants define the extras (inference/training/dev
+# backends and conflict-free add-ons), the mutually exclusive CONFLICT_SETS that must mirror
+# pyproject.toml, the pinned Python version (3.12), supported CPU arches, group shortcuts
+# (all, inference, training, dev, addons, cu130), the checkout dir and default ".venv" path, and
+# the allowed venv-name pattern. Subcommands: lock, sync, run, shell, list, clean, prefetch.
+# Named environments live in ".venv-<name>" with ".venv" kept as a symlink to the most recently
+# synced one; uv is targeted via UV_PROJECT_ENVIRONMENT. VERL_UV_NO_INSTALL lists distributions
+# uv must not install/remove. Errors are reported by exiting the process with a message.
 
 """Universal-lock uv environment driver for verl.
 
@@ -235,6 +245,11 @@ _VENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _resolve_name(cli_name: str | None) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Picks the venv name from the CLI value if given (even empty), otherwise VERL_VENV_NAME.
+    # Strips whitespace; empty or unset yields None. Exits with an error if the name does not match
+    # the safe pattern (alphanumeric first char, then alphanumerics, dot, underscore, dash).
+    # Outputs: name or None.
     """The user-offered suffix for the project venv directory.
 
     ``--name`` / ``-n`` wins; otherwise the ``VERL_VENV_NAME`` env var. Returns
@@ -256,6 +271,9 @@ def _resolve_name(cli_name: str | None) -> str | None:
 
 
 def _venv_dir(name: str | None) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Returns the target venv path: "<checkout>/.venv-<name>" if a name is given; else the
+    # expanded, resolved UV_PROJECT_ENVIRONMENT if set; else the unresolved default ".venv".
     """Resolve the project venv directory for this invocation.
 
     Priority: a user-offered ``name`` -> ``.venv-<name>``; else an explicit
@@ -274,11 +292,17 @@ def _venv_dir(name: str | None) -> Path:
 
 
 def _proj_env(venv_dir: Path) -> dict[str, str | None]:
+    # [FUNCTION DOC]
+    # HELPER: Returns an env-override mapping setting UV_PROJECT_ENVIRONMENT to the venv path string.
     """Env override routing uv at ``venv_dir`` (``UV_PROJECT_ENVIRONMENT``)."""
     return {"UV_PROJECT_ENVIRONMENT": str(venv_dir)}
 
 
 def _detach_symlink_target(venv_dir: Path) -> None:
+    # [FUNCTION DOC]
+    # HELPER: If the path is a symlink, removes the link (not its target) and prints a note naming the
+    # previous target, so a following sync creates a real directory. Otherwise does nothing.
+    # Side effects: filesystem unlink, stdout.
     """Drop ``venv_dir`` if it is currently a symlink, so a subsequent ``uv sync``
     builds a real directory there instead of writing THROUGH the link into the
     named env it points at.
@@ -294,6 +318,13 @@ def _detach_symlink_target(venv_dir: Path) -> None:
 
 
 def _point_default_venv(venv_dir: Path) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Makes the default ".venv" point at the just-synced venv. Returns immediately if the venv
+    # is ".venv" itself or does not exist. If ".venv" is a symlink already resolving to the same place
+    # it returns quietly (resolution OSErrors are ignored); otherwise the old symlink is removed. If
+    # ".venv" is a real directory, prints a warning to stderr and leaves it. Creates the link with a
+    # relative target when the venv lies under the checkout (relative path not starting with ".."),
+    # else an absolute one, and prints the new mapping. Side effects: filesystem changes, output.
     """Point the conventional ``.venv`` at ``venv_dir`` — the composition just
     synced — so ``source .venv/bin/activate``, CI, and the byted wrappers reach
     the latest env even when it lives in ``.venv-<name>``.
@@ -329,6 +360,11 @@ def _point_default_venv(venv_dir: Path) -> None:
 
 
 def _pop_name(tokens: list[str]) -> tuple[str | None, list[str]]:
+    # [FUNCTION DOC]
+    # HELPER: Scans a token list for "--name VALUE", "-n VALUE" or "--name=VALUE" before the first
+    # "--" separator and removes it; everything from "--" on is copied unchanged. The last occurrence
+    # wins. Exits with an error if the flag has no value (end of list or followed by "--").
+    # Outputs: tuple of (name or None, remaining tokens).
     """Pull a ``--name`` / ``-n`` (or ``--name=…``) value out of ``tokens``.
 
     argparse only binds ``--name`` when it precedes the ``REMAINDER`` positional,
@@ -358,11 +394,18 @@ def _pop_name(tokens: list[str]) -> tuple[str | None, list[str]]:
 
 
 def _require_uv() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Exits with an install hint if the uv executable is not on PATH.
     if shutil.which("uv") is None:
         sys.exit("error: uv is not installed. Get it from https://astral.sh/uv")
 
 
 def _expand(items: list[str]) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Expands group shortcuts to their extras and accepts known extra names, exiting with an
+    # error for anything else; returns the result de-duplicated in first-seen order.
+    # KNOWN ISSUE: the error message lists only the all/inference/training/dev shortcuts although
+    # addons and cu130 are also accepted.
     """Expand group shortcuts (all/inference/training/dev) to extras, dedup,
     preserve order."""
     out: list[str] = []
@@ -381,6 +424,9 @@ def _expand(items: list[str]) -> list[str]:
 
 
 def _conflict_in(extras: list[str]) -> tuple[str, str] | None:
+    # [FUNCTION DOC]
+    # HELPER: For each conflict set in order, intersects it with the chosen extras; returns the first
+    # two alphabetically sorted members of the first intersection with more than one element, or None.
     """Return the first conflicting pair found in ``extras`` (or None)."""
     chosen = set(extras)
     for cs in CONFLICT_SETS:
@@ -391,6 +437,9 @@ def _conflict_in(extras: list[str]) -> tuple[str, str] | None:
 
 
 def _validate_combo(extras: list[str]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Exits with an explanatory message (listing all conflict sets) if the extras contain a
+    # mutually exclusive pair; otherwise returns None.
     clash = _conflict_in(extras)
     if clash:
         sys.exit(
@@ -402,6 +451,8 @@ def _validate_combo(extras: list[str]) -> None:
 
 
 def _extra_flags(extras: list[str]) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Converts extras into a flat argument list with "--extra <name>" for each, in order.
     flags: list[str] = []
     for e in extras:
         flags += ["--extra", e]
@@ -409,12 +460,18 @@ def _extra_flags(extras: list[str]) -> list[str]:
 
 
 def _no_install_packages() -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the distribution names from VERL_UV_NO_INSTALL, treating commas and whitespace
+    # as separators; empty list when unset.
     """Distribution names the operator wants uv to leave alone, parsed from the
     ``VERL_UV_NO_INSTALL`` env var (space/comma-separated). Empty by default."""
     return os.environ.get("VERL_UV_NO_INSTALL", "").replace(",", " ").split()
 
 
 def _no_install_flags() -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns no flags if no protected packages are configured; otherwise "--inexact" followed
+    # by "--no-install-package <name>" for each protected package.
     """``uv sync`` flags that keep ``_no_install_packages()`` untouched: skip
     (re)installing each one (``--no-install-package``) and don't remove an
     already-installed build (``--inexact``, since otherwise an exact sync would
@@ -431,6 +488,11 @@ def _no_install_flags() -> list[str]:
 
 
 def _run(cmd: list[str], env_overrides: dict[str, str | None] | None = None) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Prints the command (prefixed by any env overrides shown as KEY=value, None shown empty),
+    # builds the environment from the current one applying overrides (None removes the variable), runs
+    # the command with the checkout as working directory, and returns its exit code.
+    # Side effects: spawns a subprocess, stdout.
     """Run ``cmd`` in VERL_DIR. ``env_overrides`` values that are ``None``
     *unset* the variable (used to drop a stale ``VIRTUAL_ENV`` so uv doesn't
     warn when we target a throwaway env)."""
@@ -449,6 +511,13 @@ def _run(cmd: list[str], env_overrides: dict[str, str | None] | None = None) -> 
 
 
 def _covering_combos(extras: list[str] | None = None) -> list[list[str]]:
+    # [FUNCTION DOC]
+    # HELPER: Computes the extra combinations used to warm the uv cache. From the given extras (default
+    # all), drop add-ons; pair every in-scope inference backend with every in-scope training backend
+    # whenever the pair is conflict-free; every pool member not consumed by a pair becomes a singleton
+    # combo. If there are no combos at all, returns a single combo of all add-ons; otherwise appends all
+    # add-ons to every combo. Outputs: list of extra lists (ordering: pairs by inference then training,
+    # then singletons in pool order). See the docstring for the rationale.
     """Cache-warm combos: one inference engine + one training backend each.
 
     A real RL run syncs exactly ONE inference engine and ONE training backend
@@ -502,12 +571,22 @@ def _covering_combos(extras: list[str] | None = None) -> list[list[str]]:
 
 
 def cmd_lock(args: argparse.Namespace) -> int:
+    # [FUNCTION DOC]
+    # Subcommand "lock": requires uv, then runs uv lock with the pinned Python plus forwarded args.
+    # Outputs: uv's exit code.
     """Regenerate the universal ``uv.lock`` (``uv lock``)."""
     _require_uv()
     return _run(["uv", "lock", "--python", PYTHON_VERSION, *args.uv_args])
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
+    # [FUNCTION DOC]
+    # Subcommand "sync": requires uv; splits args at the first "--" into backend tokens and forwarded
+    # uv args; recovers a stray --name from the backend tokens (the parsed --name takes precedence);
+    # exits if no backends; expands and validates the extras; resolves the venv dir and detaches it if
+    # it is a symlink; runs uv sync with the Python pin, extra flags, no-install flags and forwarded
+    # args targeted at that venv. On success repoints ".venv" and prints activation instructions.
+    # Outputs: uv's exit code. Side effects: creates or modifies the venv, filesystem symlinks, output.
     """Materialize ``.venv`` for one conflict-free extra combination.
 
     Runs ``uv sync --extra <a> --extra <b> ...`` against the universal
@@ -552,6 +631,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    # [FUNCTION DOC]
+    # Subcommand "run": requires uv; demands a "--" separator (exits otherwise); extras (with a stray
+    # --name recovered) come before it and the command after; exits if either is empty; validates the
+    # combo. Builds uv run with Python pin and extra flags. If protected packages are configured, adds
+    # --no-sync and does no symlink handling; otherwise detaches the default ".venv" symlink when
+    # targeting it. Appends the command after "--" and runs it targeted at the venv; on success with
+    # syncing enabled, repoints ".venv". Outputs: the command's exit code.
     """``uv run --extra ... -- <command>`` for a conflict-free combination.
 
     Everything after ``--`` is the command. uv ensures ``.venv`` matches the
@@ -592,6 +678,12 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
+    # [FUNCTION DOC]
+    # Subcommand "shell": requires uv; resolves name and extras like sync, validates, detaches a symlink,
+    # runs uv sync (with no-install flags) and returns its code on failure. Then repoints ".venv" and
+    # launches $SHELL (default /bin/bash) with VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT set to the venv, its
+    # bin dir prepended to PATH and a PS1 prefix "(verl:<extras joined by +>)". Outputs: the shell's exit code.
+    # KNOWN ISSUE: if only a --name token is given as backends, the extras list is empty and an extras-less sync runs.
     """Sync the requested combination, then spawn a shell with ``.venv`` active."""
     _require_uv()
     stray_name, backends = _pop_name(list(args.backends))
@@ -620,6 +712,11 @@ def cmd_shell(args: argparse.Namespace) -> int:
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
+    # [FUNCTION DOC]
+    # Subcommand "clean": resolves the target venv; if it is a symlink, unlinks it, else if it exists
+    # removes the directory tree. Then if the default ".venv" is a different path and is a symlink that
+    # pointed at the removed env (or is broken/unresolvable), removes it. Also removes the legacy ".venvs"
+    # directory if present. Prints each removal or a no-op message. Outputs: always 0.
     """Remove the resolved project venv (``.venv`` or ``.venv-<name>``), then the
     ``.venv`` pointer if it now dangles, plus the legacy ``.venvs/`` dir."""
     venv_dir = _venv_dir(_resolve_name(args.name))
@@ -656,6 +753,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    # [FUNCTION DOC]
+    # Subcommand "list": prints extras by category (and the deferred cu129 set), whether the host
+    # OS/arch is covered by the lock (Linux on a supported arch), the conflict sets, the target venv
+    # (with symlink target) and whether its Python exists (querying its version, "?" on failure), other
+    # ".venv*" entries on the checkout that contain a Python (annotated as pointer, named, or default),
+    # and the prefetch plan as uv sync commands. Outputs: 0. Side effects: stdout, may spawn the venv Python.
     """Show available extras, conflict rules, venv state, and prefetch plan."""
     print("extras (one universal uv.lock; cu130/torch-2.11 + cpu):")
     print(f"  inference (cu130/torch-2.11) : {', '.join(INFERENCE_BACKENDS)}")
@@ -719,6 +822,15 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_prefetch(args: argparse.Namespace) -> int:
+    # [FUNCTION DOC]
+    # Subcommand "prefetch": requires uv; splits args at "--" into scope extras and forwarded uv args;
+    # expands the scope (default all extras) and computes covering combos; prints the plan. Step 1 runs
+    # uv lock (with VIRTUAL_ENV unset) and returns its code on failure with an error message. Step 2,
+    # for each combo, creates a fresh temporary directory and runs uv sync --frozen
+    # --no-install-project for that combo into "<tmp>/.venv" (VIRTUAL_ENV unset), dropping any duplicate
+    # --frozen/--no-install-project from forwarded args; stops and returns the code on the first failure.
+    # The temp env is deleted after each combo. Outputs: 0 on success. Side effects: rewrites uv.lock,
+    # fills the uv cache, network and build activity; never touches the project venv.
     """Generate ``uv.lock`` and warm the uv cache — first-time / Docker only.
 
     Two steps. (1) Resolve the universal ``uv.lock`` from ``pyproject.toml``
@@ -828,6 +940,11 @@ def cmd_prefetch(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    # [FUNCTION DOC]
+    # HELPER: Builds the argparse parser (description = module docstring, raw formatting) with required
+    # subcommands: lock (remainder uv_args), sync and run (--name/-n plus remainder "rest"), shell
+    # (--name plus one-or-more backends), list and clean (--name), and prefetch (remainder "rest"), each
+    # bound to its command function via a func default. Outputs: the parser.
     parser = argparse.ArgumentParser(
         prog="manage_envs.py",
         description=__doc__,
@@ -924,6 +1041,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # [FUNCTION DOC]
+    # Parses argv (default sys.argv), strips a leading "--" from lock's forwarded uv_args, and dispatches
+    # to the selected subcommand function. Outputs: its integer exit code.
     args = _build_parser().parse_args(argv)
     if hasattr(args, "uv_args") and args.uv_args and args.uv_args[0] == "--":
         args.uv_args = args.uv_args[1:]

@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Memory-efficient fused "LM head + log-prob + entropy" computation for PPO. Computes, per token, the log probability of a target id and the entropy of the temperature-scaled softmax without materializing full-vocab logits for the whole sequence, by processing tokens in chunks with a hand-written backward. Optionally uses Liger's fused linear scaled cross entropy kernel (_LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY, None if liger_kernel is not installed; other import errors propagate) and flash-attn's Triton cross entropy (_FLASH_ATTN_CROSS_ENTROPY_AVAILABLE) for the forward log-prob.
+
 from typing import Optional
 
 import torch
@@ -39,6 +42,11 @@ def _fused_linear_for_ppo_fwd(
     input_ids: torch.LongTensor,
     temperature: float = 1.0,
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    # [FUNCTION DOC]
+    # HELPER: Forward for one chunk. logits = hidden @ W^T / temperature, upcast to fp32; entropy = logsumexp(logits) - sum(softmax * logits); token log prob = negative flash-attn cross entropy if available, else gather from log_softmax.
+    # Inputs: hidden_states (T, D); vocab_weights (V, D); input_ids (T); temperature.
+    # Outputs: (fp32 token log probs (T), entropy (T) in the original logits dtype).
+    # Exceptions: AssertionError if log probs are not fp32.
     logits = (hidden_states @ vocab_weights.t()) / temperature
     orig_dtype = logits.dtype
     logits = logits.to(torch.float32)
@@ -66,6 +74,11 @@ def _fused_linear_for_ppo_bwd(
     input_ids: torch.LongTensor,
     temperature: float = 1.0,
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    # [FUNCTION DOC]
+    # HELPER: Backward for one chunk; recomputes logits/probs in fp32. Gradient w.r.t. logits accumulates dlog_probs * (one_hot(target) - probs) and, for entropy, -dentropy * probs * (log_probs + entropy). The result is cast to the original dtype, divided by temperature, then dhidden = dlogits @ W and dW = dlogits^T @ hidden.
+    # Inputs: dlog_probs, dentropy - optional upstream grads (T); hidden_states, vocab_weights, input_ids, temperature.
+    # Outputs: (dhidden_states (T, D), dvocab_weights (V, D)).
+    # Note: if both upstream grads are None, dlogits remains the integer 0 and the cast fails; the caller asserts at least one is given.
     logits = (hidden_states @ vocab_weights.t()) / temperature
     orig_dtype = logits.dtype
     logits = logits.to(torch.float32)
@@ -94,6 +107,8 @@ def _fused_linear_for_ppo_bwd(
 
 
 class FusedLinearForPPOFunction(torch.autograd.Function):
+    # [CLASS DOC]
+    # Custom autograd function wrapping the chunked forward/backward; grads are not materialized for unused outputs (None allowed in backward).
     @staticmethod
     def forward(
         ctx,
@@ -103,6 +118,11 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
         temperature: float = 1.0,
         chunk_size: int = 512,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        # [FUNCTION DOC]
+        # Behavior: accepts 2-D (T, D) or 3-D (B, S, D) hidden states (3-D flattened to 2-D, input_ids flattened accordingly, preserving requires_grad). Allocates fp32 log_probs and entropy (hidden dtype) outputs, computes each chunk_size slice with the forward helper, reshapes outputs back to (B, S) for 3-D inputs, and saves flattened hidden states, weights and ids plus shape/temperature/chunk_size on ctx.
+        # Inputs: ctx; hidden_states; vocab_weights (V, D); input_ids; temperature; chunk_size.
+        # Outputs: (log_probs, entropy).
+        # Exceptions: AssertionError for invalid ranks/mismatched input_ids.
         ctx.set_materialize_grads(False)
 
         # Cast to a 2D tensor of the shape [T, D] for ease of working
@@ -154,6 +174,10 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dlog_probs: Optional[torch.FloatTensor], dentropy: Optional[torch.FloatTensor]):
+        # [FUNCTION DOC]
+        # Behavior: flattens upstream grads for 3-D inputs, allocates zero gradients only for inputs requiring grad, iterates chunks calling the backward helper, writing chunk dhidden slices and summing dW across chunks, and reshapes dhidden back to 3-D when needed.
+        # Outputs: (dhidden_states or None, dvocab_weights or None, None, None, None).
+        # Exceptions: AssertionError if both upstream grads are None.
         assert dlog_probs is not None or dentropy is not None
 
         hidden_states, vocab_weights, input_ids = ctx.saved_tensors
@@ -218,7 +242,12 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
 
 
 class FusedLinearForPPO(torch.nn.Module):
+    # [CLASS DOC]
+    # nn.Module front end selecting between the torch chunked implementation and the Liger kernel.
     def __init__(self, chunk_size: int = 512, impl_backend: str = "torch"):
+        # [FUNCTION DOC]
+        # Stores chunk_size and impl_backend.
+        # Exceptions: ValueError if impl_backend is not "torch" or "liger".
         super().__init__()
 
         if impl_backend not in ("torch", "liger"):
@@ -233,6 +262,11 @@ class FusedLinearForPPO(torch.nn.Module):
         input_ids: torch.LongTensor,
         temperature: float = 1.0,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        # [FUNCTION DOC]
+        # Behavior: casts input_ids to int64. Uses FusedLinearForPPOFunction when backend is "torch" or Liger is unavailable (silent fallback). Otherwise validates shapes, flattens to 2-D/1-D, calls the Liger function (ignore_index -100, scale 1, return entropy True) and returns negated NLL as log probs and entropy reshaped to input_ids' shape.
+        # Inputs: hidden_states (T, D) or (B, S, D); vocab_weights; input_ids; temperature.
+        # Outputs: (log_probs, entropy) shaped like input_ids.
+        # Exceptions: ValueError for bad ranks or shape mismatch in the Liger path.
         input_ids = input_ids.to(torch.int64)
         if self.impl_backend == "torch" or _LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY is None:
             return FusedLinearForPPOFunction.apply(

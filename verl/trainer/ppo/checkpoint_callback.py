@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Driver-side checkpoint callback hook for the v1 PPO trainer (see module docstring): a no-op base class and a
+# factory that instantiates the class named by trainer.checkpoint_callback_class.
+
 """Driver-side checkpoint callback hook for the v1 PPO trainer.
 
 Users plug in a custom callback by setting ``trainer.checkpoint_callback_class``
@@ -31,6 +36,8 @@ from verl.utils.import_utils import load_class_from_fqn
 
 
 class CheckpointCallback:
+    # [CLASS DOC]
+    # No-op base callback storing the trainer config; subclasses override on_save.
     """No-op base class for trainer checkpoint callbacks.
 
     Subclass and override :meth:`on_save`. The hook is invoked with keyword
@@ -39,6 +46,8 @@ class CheckpointCallback:
     """
 
     def __init__(self, config=None):
+        # [FUNCTION DOC]
+        # Stores config (may be None) on self.config.
         """Store the full trainer config for use by subclass hooks.
 
         Args:
@@ -47,6 +56,9 @@ class CheckpointCallback:
         self.config = config
 
     def on_save(self, trainer, global_step: int, checkpoint_dir: str, async_save: bool = False, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Hook called after each checkpoint save; base implementation does nothing and returns None.
+        # Inputs: trainer, global_step, checkpoint_dir, async_save flag, extra keyword context.
         """Event called after a checkpoint save.
 
         Not called when a save step raises. With ``async_save=True`` (Megatron
@@ -64,6 +76,10 @@ class CheckpointCallback:
 
 
 def build_checkpoint_callback(config) -> CheckpointCallback:
+    # [FUNCTION DOC]
+    # Behavior: reads trainer.checkpoint_callback_class; if falsy returns a base CheckpointCallback; otherwise loads the
+    # class by fully qualified name (expected base CheckpointCallback) and instantiates it with config.
+    # Exceptions: import/type errors from loading. Outputs: callback instance.
     """Instantiate the callback named by ``trainer.checkpoint_callback_class``.
 
     Returns a no-op :class:`CheckpointCallback` when the key is unset or null, so

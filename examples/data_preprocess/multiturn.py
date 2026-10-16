@@ -1,4 +1,8 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
+# [MODULE DOC]
+# Creates a tiny hand-written multi-turn chat dataset (three conversations) for testing SFT
+# pipelines: two conversations go to train.parquet and one to test.parquet, each row having a
+# single "messages" column.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +26,12 @@ import pandas as pd
 
 
 def main():
+    # [FUNCTION DOC]
+    # Entry point: parses --local_dir (default ~/data/multiturn) and --hdfs_dir, builds the three
+    # fixed conversations (system/user/assistant turns), expands and creates the output dir,
+    # writes the two parquet files with pandas, optionally copies to HDFS (skipping with a warning
+    # if verl's hdfs_io cannot be imported), and prints dataset sizes and the output path.
+    # Outputs: none. Side effects: file writes, optional HDFS copy, stdout prints.
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_dir", default="~/data/multiturn")
     parser.add_argument("--hdfs_dir", default=None)

@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests how the engine-based TrainingWorker marks mini-batches in profiler traces: the update loop opens a
+# record_function range named "mini_batch<i>" and advances the profiler once per mini-batch, while forward-only
+# inference does not advance it. Uses namespace fakes for worker and engine.
+
 """How mini-batches show up in a trace of the engine workers.
 
 The update loop names each iteration ``mini_batch<i>`` and advances the profiler once per
@@ -34,6 +39,9 @@ from verl.workers.engine_workers import TrainingWorker
 
 
 def _engine(**overrides):
+    # [FUNCTION DOC]
+    # HELPER: Builds a namespace fake engine with no-op train/eval mode contexts, an infer_batch returning {}, not the
+    # output-holding rank, DP rank 0 and DP size 1; keyword overrides replace or add attributes. Outputs: the engine.
     engine = SimpleNamespace(
         train_mode=lambda **kwargs: nullcontext(),
         eval_mode=lambda **kwargs: nullcontext(),
@@ -48,6 +56,9 @@ def _engine(**overrides):
 
 
 def _worker(engine):
+    # [FUNCTION DOC]
+    # HELPER: Builds a namespace fake worker around the given engine with a non-dynamic-batch engine config (micro-batch 1,
+    # token limits 128), empty model config, a no-op loss function and a MagicMock profiler.
     return SimpleNamespace(
         engine=engine,
         engine_config=SimpleNamespace(
@@ -66,10 +77,15 @@ def _worker(engine):
 
 
 def _record_names(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Monkeypatches torch.profiler.record_function with a fake that appends each range name to a list and returns a
+    # null context. Outputs: the list (filled as the code under test runs).
     """Collect the names of the record_function ranges the worker opens."""
     names = []
 
     def fake_record_function(name):
+        # [FUNCTION DOC]
+        # HELPER: Records name and returns a null context manager.
         names.append(name)
         return nullcontext()
 
@@ -78,6 +94,9 @@ def _record_names(monkeypatch):
 
 
 def test_update_loop_names_each_mini_batch(monkeypatch):
+    # [FUNCTION DOC]
+    # With make_iterator patched to yield three mini-batches and train_batch mocked, train_mini_batch returns None (not the
+    # output rank), opens ranges mini_batch0..2, and calls profiler.step three times.
     mini_batches = [TensorDict({}, batch_size=[]) for _ in range(3)]
     monkeypatch.setattr(tu, "make_iterator", lambda data, **kwargs: iter(mini_batches))
     names = _record_names(monkeypatch)
@@ -97,6 +116,8 @@ def test_update_loop_names_each_mini_batch(monkeypatch):
 
 
 def test_forward_only_stage_is_not_a_profiler_step():
+    # [FUNCTION DOC]
+    # infer_batch returns None and never advances the profiler.
     data = TensorDict({}, batch_size=[])
     tu.assign_non_tensor(data, global_token_num=[4])
     worker = _worker(_engine())

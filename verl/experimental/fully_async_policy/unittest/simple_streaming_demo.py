@@ -12,15 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Self-contained asyncio demo of the streaming pattern used by the fully-async rollouter: a producer feeds items into
+# a queue, a submitter launches bounded-concurrency processing tasks, and a consumer reads results. Runnable as a
+# script; no external dependencies.
+
 import asyncio
 import random
 import time
 
 
 class SimpleStreamingSystem:
+    # [CLASS DOC]
+    # Demo system holding the concurrency limit, an input queue, a result queue and a consumed-result counter.
     """Simplified streaming system demonstration"""
 
     def __init__(self, max_concurrent_tasks: int = 4):
+        # [FUNCTION DOC]
+        # Behavior: stores the concurrency limit, creates both queues, sets counter to 0. Inputs: max_concurrent_tasks.
         self.max_concurrent_tasks = max_concurrent_tasks
         self.data_queue = asyncio.Queue()
         self.result_queue = asyncio.Queue()
@@ -28,6 +37,9 @@ class SimpleStreamingSystem:
 
     # Data stream coroutine
     async def data_stream(self):
+        # [FUNCTION DOC]
+        # Behavior: enqueues 8 test items (with spacing), waits 3 s, enqueues 5 more, waits 1 s, then enqueues the "DONE"
+        # sentinel. Side effects: prints.
         # Add initial data
         # Prepare test data
         test_data = [{"id": f"task_{i}", "content": f"data_{i}"} for i in range(8)]
@@ -45,6 +57,9 @@ class SimpleStreamingSystem:
         print("Sending termination signal")
 
     async def add_data_stream(self, data_list: list[dict]):
+        # [FUNCTION DOC]
+        # Behavior: puts each item into the input queue, sleeping 0.8 s between items (not after the last). Prints progress.
+        # Inputs: data_list - list of mappings with "id".
         """Simulate data stream"""
         print("Starting to add data stream...")
 
@@ -59,6 +74,9 @@ class SimpleStreamingSystem:
         print("Initial data stream added successfully")
 
     async def _process_data_async(self, data_item: dict):
+        # [FUNCTION DOC]
+        # HELPER: Sleeps a random 1-3 s then puts a result mapping (id, processed content, rounded time, completion timestamp)
+        # into the result queue. Inputs: data_item with "id" and "content".
         """Asynchronously process a single data item"""
         data_id = data_item["id"]
         content = data_item["content"]
@@ -83,6 +101,9 @@ class SimpleStreamingSystem:
         print(f"    {data_id} processing completed! (took {processing_time:.1f}s) -> Added to result queue")
 
     async def _submit_worker(self):
+        # [FUNCTION DOC]
+        # HELPER: Loop: take next item; on "DONE" gather remaining tasks and exit. While at the concurrency limit, wait for at
+        # least one task and await finished ones (logging failures). Then create a processing task and add it to the set.
         """Stream submission worker coroutine"""
         active_tasks = set()
 
@@ -118,6 +139,9 @@ class SimpleStreamingSystem:
             print(f"Submitted task {data_item['id']}, current concurrency: {len(active_tasks)}")
 
     async def _consumer_worker(self):
+        # [FUNCTION DOC]
+        # HELPER: Forever: wait up to 2 s for a result, increment counter and print; on timeout print and sleep 0.5 s. Runs
+        # until cancelled.
         """Result consumer coroutine"""
         print("Consumer started...")
 
@@ -138,6 +162,9 @@ class SimpleStreamingSystem:
                 await asyncio.sleep(0.5)
 
     async def run_demo(self):
+        # [FUNCTION DOC]
+        # Behavior: starts producer, submitter and consumer tasks; awaits producer then submitter; finally cancels submitter
+        # and consumer and gathers them; prints the consumed count.
         """Run demonstration"""
         print("=" * 60)
         print(f"Maximum concurrency: {self.max_concurrent_tasks}")
@@ -167,6 +194,8 @@ class SimpleStreamingSystem:
 
 
 async def main():
+    # [FUNCTION DOC]
+    # Behavior: builds a system with concurrency 3 and runs the demo.
     """Main function"""
     system = SimpleStreamingSystem(max_concurrent_tasks=3)
     await system.run_demo()

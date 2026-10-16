@@ -11,4 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Distillation package. Star-re-exports everything public from the losses submodule (the loss registry
+# and backend-agnostic distillation loss helpers).
+
 from .losses import *  # noqa: F401, E402

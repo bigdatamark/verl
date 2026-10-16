@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# torchrun script (gloo backend, expects exactly 4 ranks) checking allgather_dict_into_dict: each rank contributes a list
+# "loss" and a scalar "grad_norm" dependent on its rank, and the result must map each key to the per-rank values in rank
+# order. All logic runs under the main guard; reads LOCAL_RANK, RANK, WORLD_SIZE env vars and prints the result.
+
 import os
 
 import torch

@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Typed dataclass configs for the RL algorithm section: KL control, DAPO-style group filtering, rollout (off-policy) correction with named presets, and the top-level AlgoConfig. No runtime logic beyond the preset constructors; validation is inherited from BaseConfig.
+
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -22,6 +25,8 @@ __all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrec
 
 @dataclass
 class KLControlConfig(BaseConfig):
+    # [CLASS DOC]
+    # KL penalty controller settings: type (fixed or adaptive), initial kl_coef, horizon and target_kl for the adaptive controller. Plain fields, no validation.
     """Configuration for KL control.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -41,6 +46,8 @@ class KLControlConfig(BaseConfig):
 
 @dataclass
 class FilterGroupsConfig(BaseConfig):
+    # [CLASS DOC]
+    # Group-filter settings for DAPO-style dynamic sampling: enable flag, metric name used for filtering, cap on generation batches (non-positive means unlimited), max in-flight generation batches. Plain fields.
     """Configuration for filter groups (used in DAPO and Entropy).
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -62,6 +69,8 @@ class FilterGroupsConfig(BaseConfig):
 
 @dataclass
 class RolloutCorrectionConfig(BaseConfig):
+    # [CLASS DOC]
+    # Rollout correction settings: IS aggregation level, IS threshold (float for truncation or 'lower_upper' string for IcePop), batch-normalize flag, comma-separated rejection-sampling modes and thresholds, bypass_mode, and bypass loss_type. Classmethod presets construct common combinations; fields are not validated here (interpretation happens in the rollout correction helper).
     """Configuration for Rollout Correction (addresses off-policy issues in RL training).
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -186,6 +195,8 @@ class RolloutCorrectionConfig(BaseConfig):
 
     @classmethod
     def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is token, rollout_is_threshold threshold, rollout_rs None (decoupled mode, ppo_clip default loss); all unspecified fields keep their defaults. No exceptions or side effects.
         """Decoupled Mode with Token-level Importance Sampling.
 
         IS weight correction at token level in decoupled mode (three policies).
@@ -200,6 +211,8 @@ class RolloutCorrectionConfig(BaseConfig):
 
     @classmethod
     def decoupled_seq_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is sequence, rollout_is_threshold threshold, rollout_rs None (decoupled); all unspecified fields keep their defaults. No exceptions or side effects.
         """Decoupled Mode with Sequence-level Importance Sampling.
 
         IS weight correction at sequence level in decoupled mode (three policies).
@@ -218,6 +231,8 @@ class RolloutCorrectionConfig(BaseConfig):
         threshold: float = 5.0,
         threshold_lower: float = 0.5,
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is token, rollout_is_threshold the string 'lower_upper' built from threshold_lower and threshold (IcePop), rollout_rs None (decoupled); all unspecified fields keep their defaults. No exceptions or side effects.
         """Decoupled Mode with exact token-level IcePop.
 
         Keeping response_mask unchanged and
@@ -239,6 +254,8 @@ class RolloutCorrectionConfig(BaseConfig):
         is_threshold: float = 2.0,
         rs_threshold: Optional[str | float] = "0.5_2.0",
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is sequence with is_threshold, rollout_rs seq_sum_k1 with rs_threshold (decoupled). Note docstring calls rs_threshold an upper threshold but the default is a lower_upper ratio-bound string; all unspecified fields keep their defaults. No exceptions or side effects.
         """Decoupled Mode with Sequence-level IS + Rejection Sampling.
 
         Sequence-level IS with sequence-level rejection sampling in decoupled mode.
@@ -263,6 +280,8 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         rs_threshold: Optional[str | float] = "0.999_1.001",
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is None, rollout_rs seq_mean_k1 with rs_threshold (decoupled geometric-mean RS); all unspecified fields keep their defaults. No exceptions or side effects.
         """Decoupled Mode with Geometric Mean Rejection Sampling (ratio-based).
 
         Uses geometric mean IS ratio E[log(r)] for rejection sampling at sequence level.
@@ -283,6 +302,8 @@ class RolloutCorrectionConfig(BaseConfig):
 
     @classmethod
     def bypass_ppo_clip(cls) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is None, rollout_rs None, bypass_mode True, loss_type ppo_clip; all unspecified fields keep their defaults. No exceptions or side effects.
         """Bypass mode with PPO-clip loss.
 
         PPO clipped objective in bypass mode. The PPO ratio = π_θ/π_rollout
@@ -305,6 +326,8 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         rs_threshold: Optional[str | float] = "0.999_1.001",
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is None, rollout_rs seq_mean_k1 with rs_threshold, bypass_mode True, loss_type ppo_clip; all unspecified fields keep their defaults. No exceptions or side effects.
         """Bypass mode with PPO-clip loss and Geometric Mean RS (ratio-based).
 
         PPO clipped objective in bypass mode with geometric mean IS ratio RS.
@@ -329,6 +352,8 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         rs_threshold: float = 0.01,
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is None, rollout_rs seq_mean_k3 with rs_threshold, bypass_mode True, loss_type ppo_clip; all unspecified fields keep their defaults. No exceptions or side effects.
         """Bypass mode with PPO-clip loss and K3 Rejection Sampling.
 
         PPO clipped objective in bypass mode with K3 KL estimator RS to mask outliers.
@@ -351,6 +376,8 @@ class RolloutCorrectionConfig(BaseConfig):
 
     @classmethod
     def bypass_pg_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is sequence with threshold, rollout_rs None, bypass_mode True, loss_type reinforce; all unspecified fields keep their defaults. No exceptions or side effects.
         """Bypass mode with REINFORCE loss and IS Correction.
 
         Uses REINFORCE loss with explicit IS correction in bypass mode.
@@ -376,6 +403,8 @@ class RolloutCorrectionConfig(BaseConfig):
         threshold: float = 5.0,
         threshold_lower: float = 0.5,
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is token with 'lower_upper' IcePop threshold string, rollout_rs None, bypass_mode True, loss_type reinforce; all unspecified fields keep their defaults. No exceptions or side effects.
         """Bypass mode with REINFORCE loss and exact token-level IcePop.
 
         Uses explicit IS weights in bypass mode and zeroes out token weights
@@ -401,6 +430,8 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         rs_threshold: Optional[str | float] = "0.999_1.001",
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is None, rollout_rs seq_mean_k1 with rs_threshold, bypass_mode True, loss_type reinforce; all unspecified fields keep their defaults. No exceptions or side effects.
         """Bypass mode with REINFORCE loss and Geometric Mean RS (ratio-based).
 
         REINFORCE with geometric mean IS ratio rejection sampling in bypass mode.
@@ -426,6 +457,8 @@ class RolloutCorrectionConfig(BaseConfig):
         is_threshold: float = 2.0,
         rs_threshold: Optional[str | float] = "0.999_1.001",
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is sequence with is_threshold, rollout_rs seq_mean_k1 with rs_threshold (decoupled); all unspecified fields keep their defaults. No exceptions or side effects.
         """Decoupled mode with Geometric Mean RS and Sequence-level Truncated IS (ratio-based).
 
         Combines the Geometric Mean Filter (ratio-based validity check) with
@@ -451,6 +484,8 @@ class RolloutCorrectionConfig(BaseConfig):
         is_threshold: float = 2.0,
         rs_threshold: Optional[str | float] = "0.999_1.001",
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is token with is_threshold, rollout_rs seq_mean_k1 with rs_threshold (decoupled); all unspecified fields keep their defaults. No exceptions or side effects.
         """Decoupled mode with Geometric Mean RS and Token-level Truncated IS (ratio-based).
 
         Combines the Geometric Mean Filter (ratio-based validity check) with
@@ -476,6 +511,8 @@ class RolloutCorrectionConfig(BaseConfig):
         is_threshold: float = 2.0,
         rs_threshold: Optional[str | float] = "0.999_1.001",
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is sequence with is_threshold, rollout_rs seq_mean_k1 with rs_threshold, bypass_mode True, loss_type reinforce; all unspecified fields keep their defaults. No exceptions or side effects.
         """Bypass mode with REINFORCE loss, Geo-RS, and Sequence-level IS.
 
         Combines geometric mean IS ratio rejection with sequence-level IS
@@ -504,6 +541,8 @@ class RolloutCorrectionConfig(BaseConfig):
         is_threshold: float = 2.0,
         rs_threshold: Optional[str | float] = "0.999_1.001",
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is token with is_threshold, rollout_rs seq_mean_k1 with rs_threshold, bypass_mode True, loss_type reinforce; all unspecified fields keep their defaults. No exceptions or side effects.
         """Bypass mode with REINFORCE loss, Geo-RS, and Token-level IS.
 
         Combines geometric mean IS ratio rejection with token-level IS weights
@@ -533,6 +572,8 @@ class RolloutCorrectionConfig(BaseConfig):
         cls,
         rs_threshold: float = 0.01,
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is None, rollout_rs seq_mean_k3 with rs_threshold (decoupled); all unspecified fields keep their defaults. No exceptions or side effects.
         """Decoupled mode with K3 KL Estimator Rejection Sampling.
 
         Uses K3 KL estimator at sequence level for rejection sampling.
@@ -560,6 +601,8 @@ class RolloutCorrectionConfig(BaseConfig):
         is_threshold: float = 2.0,
         rs_threshold: float = 0.01,
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is sequence with is_threshold, rollout_rs seq_mean_k3 with rs_threshold (decoupled); all unspecified fields keep their defaults. No exceptions or side effects.
         """Decoupled mode with K3 RS and Sequence-level Truncated IS.
 
         Combines K3 KL estimator rejection with sequence-level IS weights.
@@ -585,6 +628,8 @@ class RolloutCorrectionConfig(BaseConfig):
         is_threshold: float = 2.0,
         rs_threshold: float = 0.01,
     ) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is token with is_threshold, rollout_rs seq_mean_k3 with rs_threshold (decoupled); all unspecified fields keep their defaults. No exceptions or side effects.
         """Decoupled mode with K3 RS and Token-level Truncated IS.
 
         Combines K3 KL estimator rejection with token-level IS weights.
@@ -607,6 +652,8 @@ class RolloutCorrectionConfig(BaseConfig):
 
     @classmethod
     def disabled(cls) -> "RolloutCorrectionConfig":
+        # [FUNCTION DOC]
+        # Preset constructor. Returns a new instance with rollout_is None, rollout_rs None (metrics only; other fields default); all unspecified fields keep their defaults. No exceptions or side effects.
         """Disabled - Metrics Only Mode.
 
         Computes and logs off-policy metrics without applying correction.
@@ -619,6 +666,9 @@ class RolloutCorrectionConfig(BaseConfig):
 
 @dataclass
 class AlgoConfig(BaseConfig):
+    # [CLASS DOC]
+    # Top-level algorithm config: discount gamma, GAE lambda, advantage estimator name, GRPO std-normalization flag, in-reward KL flag and estimator, nested KL controller, preference-feedback PPO flag/settings, optional filter groups, optional rollout correction, and GDPO reward keys/weights. Plain fields.
+    # KNOWN ISSUE: the docstring lists presets decoupled_k1_rs, bypass_ppo_clip_k1_rs and bypass_pg_k1_rs that do not exist on RolloutCorrectionConfig, and claims dict input is auto-converted although this class has no conversion logic (relies on BaseConfig/hydra instantiation, if any).
     """Configuration for the algorithm.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.

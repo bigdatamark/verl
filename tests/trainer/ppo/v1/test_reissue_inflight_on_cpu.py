@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module-level state: _REAL_TQ_SUPPORTS_CHECKPOINT keeps the unpatched compatibility guard;
+# requires_tq_checkpoint is a skip marker for tests needing real save/load support. Prompt entries are
+# stored under key "<uid>" with tag {is_prompt: True, status, global_steps}; trajectories under
+# "<uid>_<session>_<index>" with is_prompt False.
 """Unit tests for :meth:`PPOTrainer._reissue_inflight_prompts` (checkpoint recovery).
 
 These run against a real (CPU-only) TransferQueue, mirroring
@@ -58,6 +64,9 @@ requires_tq_checkpoint = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def tq_init():
+    # [FUNCTION DOC]
+    # HELPER: module-scoped fixture that initializes TransferQueue, yields, then closes it.
+    # Side effects: starts/stops the TransferQueue runtime.
     tq.init()
     yield
     tq.close()
@@ -65,6 +74,9 @@ def tq_init():
 
 @pytest.fixture(autouse=True)
 def _force_tq_checkpoint_supported(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: autouse fixture patching trainer_base._tq_supports_checkpoint to always return True so re-issue
+    # logic runs regardless of the installed TransferQueue version.
     """Force the compatibility guard open so the re-issue logic itself is exercised, not the guard.
 
     The locally installed TransferQueue may not support checkpointing, which short-circuits re-issue.
@@ -75,14 +87,21 @@ def _force_tq_checkpoint_supported(monkeypatch):
 
 @pytest.fixture
 def partition_id():
+    # [FUNCTION DOC]
+    # HELPER: fixture returning a unique partition name "test-<hex uuid>" to isolate state per test.
     """A unique partition per test to isolate TransferQueue state across tests."""
     return f"test-{uuid.uuid4().hex}"
 
 
 def test_tq_checkpoint_guard_checks_version_and_api_capabilities(monkeypatch):
+    # [FUNCTION DOC]
+    # With dummy save/load APIs patched onto tq: version 0.1.8 -> guard False; 0.1.9 -> True; load API set to
+    # None -> False. Uses the real (captured) guard. Inputs: monkeypatch.
     """Checkpoint support requires TransferQueue 0.1.9 or newer and both callable APIs."""
 
     def checkpoint_api(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: dummy callable accepting anything and returning None.
         return None
 
     monkeypatch.setattr(tq, "save_checkpoint", checkpoint_api, raising=False)
@@ -99,21 +118,33 @@ def test_tq_checkpoint_guard_checks_version_and_api_capabilities(monkeypatch):
 
 
 def _uid() -> str:
+    # [FUNCTION DOC]
+    # HELPER: returns a random hex uuid (no underscores, since underscores delimit trajectory keys).
     # uid must not contain "_" because trajectory keys are "{uid}_{session}_{index}".
     return uuid.uuid4().hex
 
 
 class FakeAgentLoopManager:
+    # [CLASS DOC]
+    # HELPER: fake agent loop manager that records every batch passed to generate_sequences.
     """Records every batch handed to ``generate_sequences`` so re-issues can be asserted."""
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: initializes an empty batches list.
         self.batches: list[TensorDict] = []
 
     def generate_sequences(self, batch: TensorDict) -> None:
+        # [FUNCTION DOC]
+        # HELPER: appends the batch to batches; returns None.
         self.batches.append(batch)
 
 
 def _make_trainer_stub(trainer_mode: str = "separate_async", global_steps: int = 8):
+    # [FUNCTION DOC]
+    # HELPER: creates a bare object with trainer_mode, global_steps, a FakeAgentLoopManager and the real
+    # _reissue_inflight_prompts bound to it. Inputs: trainer_mode ("separate_async"), global_steps (8).
+    # Outputs: the stub.
     """Bind the real ``_reissue_inflight_prompts`` to a stub exposing only what it uses
     (``agent_loop_manager``, ``trainer_mode``, and ``global_steps``)."""
     stub = type("Stub", (), {})()
@@ -125,6 +156,10 @@ def _make_trainer_stub(trainer_mode: str = "separate_async", global_steps: int =
 
 
 def _submit_prompt(partition_id: str, uid: str, status: str, global_steps: int) -> None:
+    # [FUNCTION DOC]
+    # HELPER: stores a single-row prompt (uid, raw_prompt "prompt-for-<uid>", index 0) under key uid in the
+    # partition with a prompt tag carrying the given status and global_steps.
+    # Side effects: writes to TransferQueue.
     """Mirror async prompt submission: store the per-row prompt data as fields
     plus the status tag under the ``{uid}`` key (a single-row batch).
 
@@ -143,6 +178,9 @@ def _submit_prompt(partition_id: str, uid: str, status: str, global_steps: int) 
 
 
 def _add_trajectory(partition_id: str, uid: str, session_id: int, global_steps: int) -> str:
+    # [FUNCTION DOC]
+    # HELPER: stores a finished trajectory under "<uid>_<session_id>_0" with input_ids [1,2,3] and a non-prompt
+    # tag (seq_len 3, global_steps). Outputs: the key. Side effects: writes to TransferQueue.
     """Attach one finished trajectory to a prompt (composite key), as the rollout would."""
     key = f"{uid}_{session_id}_0"
     tq.kv_put(
@@ -155,17 +193,23 @@ def _add_trajectory(partition_id: str, uid: str, session_id: int, global_steps: 
 
 
 def _prompt_status(partition_id: str, uid: str) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: looks up the uid's tag in the partition listing; returns its status or None if absent.
     tag = tq.kv_list(partition_id=partition_id).get(partition_id, {}).get(uid)
     return None if tag is None else tag.get("status")
 
 
 def _clear_partition(partition_id: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: clears all keys currently listed in the partition (no-op if empty). Side effects: TransferQueue deletes.
     keys = list(tq.kv_list(partition_id=partition_id).get(partition_id, {}).keys())
     if keys:
         tq.kv_clear(keys=keys, partition_id=partition_id)
 
 
 def test_count_tq_prompt_groups_includes_every_prompt_status(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Four prompts with statuses pending/running/finished/failure plus one trajectory: counter returns 4.
     """Prompt groups occupy the prefetch window whatever their status; trajectories are not prompts."""
     uids = {status: _uid() for status in ("pending", "running", "finished", "failure")}
     for status, uid in uids.items():
@@ -179,6 +223,11 @@ def test_count_tq_prompt_groups_includes_every_prompt_status(tq_init, partition_
 
 
 def test_async_submission_persists_reissuable_prompt_fields(monkeypatch):
+    # [FUNCTION DOC]
+    # Binds the real _submit_batch_to_rollout to a stub in separate_async mode with kv_batch_put patched to
+    # record calls; a 2-row batch with a broadcast global_steps value is submitted. Asserts it returns 2, one
+    # put happened with only uid/raw_prompt/index fields (global_steps excluded), and the batch was passed to
+    # generation. Inputs: monkeypatch.
     stub = type("Stub", (), {})()
     stub.trainer_mode = "separate_async"
     stub.global_steps = 4
@@ -202,6 +251,9 @@ def test_async_submission_persists_reissuable_prompt_fields(monkeypatch):
 
 
 def test_add_prompts_to_generate_uses_exact_count():
+    # [FUNCTION DOC]
+    # Binds _add_prompts_to_generate with stubbed _next_train_batch and _submit_batch_to_rollout; asserts
+    # requesting 3 fetches exactly 3 prompts once, submits that batch, and returns 3.
     stub = type("Stub", (), {})()
     batch = tu.get_tensordict(
         {
@@ -222,6 +274,9 @@ def test_add_prompts_to_generate_uses_exact_count():
 
 
 def test_next_train_batch_coalesces_gen_batches():
+    # [FUNCTION DOC]
+    # With train size 4 and gen size 2, _next_train_batch concatenates two fetched chunks into one batch with
+    # uids a..d, indices 0..3 and global_steps 5.
     stub = type("Stub", (), {})()
     stub.config = OmegaConf.create({"data": {"train_batch_size": 4, "gen_batch_size": 2}})
     stub.global_steps = 5
@@ -247,6 +302,9 @@ def test_next_train_batch_coalesces_gen_batches():
 
 
 def test_reissue_resubmits_only_inflight_prompts(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Pending and running prompts (each with a trajectory) are resubmitted (count 2), reset to "pending", and
+    # their trajectories deleted; the finished prompt and its trajectory are untouched.
     """In-flight groups restart cleanly; finished groups and their trajectories remain untouched."""
     pending = _uid()
     running = _uid()
@@ -282,6 +340,9 @@ def test_reissue_resubmits_only_inflight_prompts(tq_init, partition_id):
 
 
 def test_reissue_preserves_prompt_data_and_resets_global_steps(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # A running prompt from step 7 is resubmitted with original uid and raw_prompt, batch global_steps 8, and its
+    # stored tag updated to global_steps 8.
     """A restarted group keeps its prompt fields but uses the resumed dispatch step."""
     uid = _uid()
     _submit_prompt(partition_id, uid, "running", global_steps=7)
@@ -302,6 +363,8 @@ def test_reissue_preserves_prompt_data_and_resets_global_steps(tq_init, partitio
 
 
 def test_reissue_combines_original_steps_under_resumed_step(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Prompts from steps 2 and 5 are resubmitted together in a single batch at resumed step 6 (count 3).
     """All restarted groups belong to the resumed attempt, regardless of their original step."""
     step2 = [_uid(), _uid()]
     step5 = [_uid()]
@@ -324,6 +387,8 @@ def test_reissue_combines_original_steps_under_resumed_step(tq_init, partition_i
 
 
 def test_reissue_noop_without_inflight(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Only finished/failure prompts: returns 0 and submits nothing.
     """With only terminal prompts, nothing is re-issued."""
     finished = _uid()
     failure = _uid()
@@ -339,6 +404,8 @@ def test_reissue_noop_without_inflight(tq_init, partition_id):
 
 
 def test_reissue_noop_on_empty_partition(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Empty partition: returns 0, submits nothing, does not raise.
     """An empty (never-written) partition re-issues nothing and does not raise."""
     stub = _make_trainer_stub()
     assert stub._reissue_inflight_prompts(partition_id) == 0
@@ -346,6 +413,8 @@ def test_reissue_noop_on_empty_partition(tq_init, partition_id):
 
 
 def test_reissue_noop_for_sync_mode(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # In sync mode re-issue returns 0 even with a pending prompt.
     """Sync mode never persists prompts, so re-issue is a guarded no-op even with in-flight prompts."""
     _submit_prompt(partition_id, _uid(), "pending", global_steps=1)
 
@@ -369,6 +438,10 @@ def test_reissue_noop_for_sync_mode(tq_init, partition_id):
 
 @requires_tq_checkpoint
 def test_save_load_roundtrip_restores_prompts(tq_init, partition_id, tmp_path):
+    # [FUNCTION DOC]
+    # Saves the queue to <tmp>/transfer_queue, clears the partition (asserting empty), loads the checkpoint, and
+    # asserts statuses are restored verbatim, prompt fields are readable, and the trajectory key exists.
+    # Skipped without real checkpoint support. Side effects: writes checkpoint files under tmp_path.
     """save_checkpoint then load_checkpoint (into a cleared queue) restores prompt status and data."""
     pending = _uid()
     running = _uid()
@@ -408,6 +481,8 @@ def test_save_load_roundtrip_restores_prompts(tq_init, partition_id, tmp_path):
 
 @requires_tq_checkpoint
 def test_save_load_then_reissue_only_inflight(tq_init, partition_id, tmp_path):
+    # [FUNCTION DOC]
+    # After a save/clear/load round-trip, only the pending prompt is re-issued, at resumed step 5.
     """End-to-end recovery: after a save/load round-trip, only in-flight prompts are re-issued."""
     pending = _uid()
     finished = _uid()
@@ -433,6 +508,9 @@ def test_save_load_then_reissue_only_inflight(tq_init, partition_id, tmp_path):
 
 @requires_tq_checkpoint
 def test_save_load_terminal_only_counts_prompts_without_reissue(tq_init, partition_id, tmp_path):
+    # [FUNCTION DOC]
+    # Terminal-only checkpoint: after round-trip the prompt group count is 2 yet re-issue returns 0 and submits
+    # nothing (so warmup gating must use the prompt count).
     """A terminal-only checkpoint re-issues nothing, yet its groups still fill the prefetch window,
     so warmup must be gated on the prompt count rather than on the re-issue count."""
     finished = _uid()
@@ -456,6 +534,8 @@ def test_save_load_terminal_only_counts_prompts_without_reissue(tq_init, partiti
 
 
 def test_reissue_short_circuits_when_checkpoint_unsupported(tq_init, partition_id, monkeypatch):
+    # [FUNCTION DOC]
+    # Overrides the guard to False; re-issue returns 0 and submits nothing even for a running prompt.
     """The defensive gate: when TransferQueue lacks checkpoint support, re-issue is a no-op.
 
     This overrides the autouse fixture (which forces the gate open) to assert the real guard, so

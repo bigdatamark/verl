@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests for vLLM rollout CLI helpers: build_cli_args_from_config (config dict -> vLLM serve argv list), round-trip
+# through vLLM's real serve parser, and the colocated-worker weight-sync rank / ZMQ IPC handle resolution under data
+# parallelism. Skipped when vllm is not installed.
+
 import json
 from dataclasses import make_dataclass
 from types import SimpleNamespace
@@ -31,63 +36,90 @@ from verl.workers.rollout.vllm_rollout.utils import (
 
 
 class TestBuildCliArgsFromConfig:
+    # [CLASS DOC]
+    # Serialization rules: strings/numbers become "--key value"; True becomes a bare flag; False becomes "--no-key" only
+    # for Optional[bool] engine args (otherwise omitted); None and empty lists omitted; lists expand to multiple values;
+    # dicts are JSON-encoded; key spelling and order are preserved.
     """Tests for CLI argument serialization from config dictionaries."""
 
     def test_string_value(self):
+        # [FUNCTION DOC]
+        # A string value yields ["--model", "gpt2"].
         """String values become '--key value'."""
         config = {"model": "gpt2"}
         result = build_cli_args_from_config(config)
         assert result == ["--model", "gpt2"]
 
     def test_integer_value(self):
+        # [FUNCTION DOC]
+        # An integer value is stringified.
         """Integer values are converted to strings."""
         config = {"tensor-parallel-size": 4}
         result = build_cli_args_from_config(config)
         assert result == ["--tensor-parallel-size", "4"]
 
     def test_float_value(self):
+        # [FUNCTION DOC]
+        # A float value is stringified.
         """Float values are converted to strings."""
         config = {"temperature": 0.7}
         result = build_cli_args_from_config(config)
         assert result == ["--temperature", "0.7"]
 
     def test_bool_true(self):
+        # [FUNCTION DOC]
+        # True yields only the flag.
         """Bool True adds flag without value."""
         config = {"enable-prefix-caching": True}
         result = build_cli_args_from_config(config)
         assert result == ["--enable-prefix-caching"]
 
     def test_bool_false(self):
+        # [FUNCTION DOC]
+        # False on an Optional[bool] engine arg yields "--no-<key>".
         """Optional[bool] args emit '--no-key' for an explicit False."""
         config = {"enable-prefix-caching": False}
         result = build_cli_args_from_config(config)
         assert result == ["--no-enable-prefix-caching"]
 
     def test_bool_false_plain_bool_omitted(self):
+        # [FUNCTION DOC]
+        # False on a plain bool arg defaulting to False is omitted.
         """Bool False on a plain-bool arg is skipped (parser default is False)."""
         config = {"enforce_eager": False}
         result = build_cli_args_from_config(config)
         assert result == []
 
     def test_bool_false_union_str_arg_omitted(self):
+        # [FUNCTION DOC]
+        # False on a bool-or-string arg (hf_token) is omitted.
         """Bool False on a `bool | str | None` arg is skipped (string flag, no --no- form)."""
         config = {"hf_token": False}
         result = build_cli_args_from_config(config)
         assert result == []
 
     def test_bool_false_underscore_key(self):
+        # [FUNCTION DOC]
+        # The negative flag keeps the underscore spelling of the key.
         """Underscore keys emit the negative flag in the key's own spelling."""
         config = {"enable_prefix_caching": False}
         result = build_cli_args_from_config(config)
         assert result == ["--no-enable_prefix_caching"]
 
     def test_bool_false_non_engine_arg_omitted(self):
+        # [FUNCTION DOC]
+        # False on a key unknown to AsyncEngineArgs is omitted.
         """Bool False on args unknown to AsyncEngineArgs is omitted."""
         config = {"disable-log-requests": False}
         result = build_cli_args_from_config(config)
         assert result == []
 
     def test_delayed_and_true_plain_bool_defaults(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Replaces AsyncEngineArgs with a synthetic dataclass (clearing the cached optional-bool lookup before and after) and
+        # checks that False emits "--no-" for bool fields defaulting to None or True and for Optional[bool], but not for a
+        # bool defaulting to False, a bool-or-str field, or an unknown key.
+        # Side effects: monkeypatches vllm's arg_utils module attribute; clears the lru cache.
         import vllm.engine.arg_utils as arg_utils
 
         args_class = make_dataclass(
@@ -111,30 +143,40 @@ class TestBuildCliArgsFromConfig:
             _optional_bool_vllm_args.cache_clear()
 
     def test_none_value(self):
+        # [FUNCTION DOC]
+        # None values are omitted.
         """None values are skipped."""
         config = {"lora-path": None}
         result = build_cli_args_from_config(config)
         assert result == []
 
     def test_list_values(self):
+        # [FUNCTION DOC]
+        # A list expands to the flag followed by each stringified element.
         """List values are expanded into multiple arguments."""
         config = {"cudagraph-capture-sizes": [1, 2, 4, 8]}
         result = build_cli_args_from_config(config)
         assert result == ["--cudagraph-capture-sizes", "1", "2", "4", "8"]
 
     def test_empty_list(self):
+        # [FUNCTION DOC]
+        # An empty list is omitted.
         """Empty lists are skipped (vLLM nargs='+' requires at least one value)."""
         config = {"cudagraph-capture-sizes": []}
         result = build_cli_args_from_config(config)
         assert result == []
 
     def test_list_with_strings(self):
+        # [FUNCTION DOC]
+        # A list of strings expands in order.
         """List of strings is properly expanded."""
         config = {"allowed-origins": ["http://localhost", "http://example.com"]}
         result = build_cli_args_from_config(config)
         assert result == ["--allowed-origins", "http://localhost", "http://example.com"]
 
     def test_dict_value(self):
+        # [FUNCTION DOC]
+        # A dict value becomes the flag followed by its JSON encoding (compared after decoding).
         """Dict values are JSON serialized."""
         config = {"extra-config": {"key": "value", "nested": True}}
         result = build_cli_args_from_config(config)
@@ -143,6 +185,8 @@ class TestBuildCliArgsFromConfig:
         assert json.loads(result[1]) == {"key": "value", "nested": True}
 
     def test_mixed_config(self):
+        # [FUNCTION DOC]
+        # A realistic mixed config contains expected flags/values and omits False non-engine and None entries.
         """Test a realistic mixed configuration."""
         config = {
             "tensor-parallel-size": 4,
@@ -169,18 +213,24 @@ class TestBuildCliArgsFromConfig:
         assert "--lora-path" not in result
 
     def test_preserves_order(self):
+        # [FUNCTION DOC]
+        # Output follows the dict insertion order.
         """Arguments should preserve dictionary order (Python 3.7+)."""
         config = {"first": "a", "second": "b", "third": "c"}
         result = build_cli_args_from_config(config)
         assert result == ["--first", "a", "--second", "b", "--third", "c"]
 
     def test_empty_config(self):
+        # [FUNCTION DOC]
+        # An empty dict yields an empty list.
         """Empty config returns empty list."""
         config = {}
         result = build_cli_args_from_config(config)
         assert result == []
 
     def test_single_element_list(self):
+        # [FUNCTION DOC]
+        # A one-element list yields the flag and that single value.
         """Single element list works correctly."""
         config = {"sizes": [42]}
         result = build_cli_args_from_config(config)
@@ -188,10 +238,15 @@ class TestBuildCliArgsFromConfig:
 
 
 class TestCliArgsVllmParserRoundTrip:
+    # [CLASS DOC]
+    # Tests that serialized args parse back to the same AsyncEngineArgs values.
     """Serialized args must round-trip through vLLM's serve CLI parser."""
 
     @staticmethod
     def _build_parser():
+        # [FUNCTION DOC]
+        # HELPER: Builds a FlexibleArgumentParser with vLLM's serve subcommands registered (optional subparser named
+        # "subparser", each with its dispatch function default). Outputs: the parser.
         import vllm.entrypoints.cli.serve as serve_mod
         from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -202,6 +257,9 @@ class TestCliArgsVllmParserRoundTrip:
         return parser
 
     def test_explicit_false_survives_parsing(self):
+        # [FUNCTION DOC]
+        # Serializes a mix of True/False engine flags, parses "serve dummy-model" plus the args, converts via
+        # AsyncEngineArgs.from_cli_args and asserts each field keeps its configured value.
         """Explicit False survives parse_args and AsyncEngineArgs.from_cli_args."""
         from vllm.engine.arg_utils import AsyncEngineArgs
 
@@ -227,6 +285,9 @@ class TestCliArgsVllmParserRoundTrip:
     @pytest.mark.parametrize("spelling", ["enable_flashinfer_autotune", "enable-flashinfer-autotune"])
     @pytest.mark.parametrize("enabled", [False, True])
     def test_autotune_explicit_value_survives_parser(self, spelling, enabled):
+        # [FUNCTION DOC]
+        # For both underscore and dash spellings and both True/False, enable_flashinfer_autotune survives parsing; skipped if
+        # the installed vLLM lacks that field.
         from vllm.engine.arg_utils import AsyncEngineArgs
 
         if "enable_flashinfer_autotune" not in AsyncEngineArgs.__dataclass_fields__:
@@ -239,7 +300,11 @@ class TestCliArgsVllmParserRoundTrip:
 
 
 class TestVllmColocateZmqHandle:
+    # [CLASS DOC]
+    # Tests the TP-local weight-sync rank (dp_local_rank x tp_size + local_rank mod tp_size) and the ZMQ socket name.
     def test_dp_local_rank_offsets_tensor_parallel_rank(self):
+        # [FUNCTION DOC]
+        # With tp=2 and local DP rank 1, local ranks 1 and 3 both resolve to 3.
         """DP workers on the same node must not reuse the same TP-local socket."""
         parallel_config = SimpleNamespace(
             tensor_parallel_size=2,
@@ -252,6 +317,8 @@ class TestVllmColocateZmqHandle:
         assert _resolve_vllm_weight_sync_local_rank(3, parallel_config) == 3
 
     def test_single_dp_keeps_local_rank(self):
+        # [FUNCTION DOC]
+        # With a single DP rank the local rank is returned unchanged.
         """The old single-DP handle layout remains unchanged."""
         parallel_config = SimpleNamespace(
             tensor_parallel_size=2,
@@ -263,6 +330,8 @@ class TestVllmColocateZmqHandle:
         assert _resolve_vllm_weight_sync_local_rank(1, parallel_config) == 1
 
     def test_uses_global_dp_rank_when_local_rank_is_unset(self):
+        # [FUNCTION DOC]
+        # When data_parallel_rank_local is None, the global DP rank modulo the local DP size is used (3 -> 1, giving 2 for rank 0).
         parallel_config = SimpleNamespace(
             tensor_parallel_size=2,
             data_parallel_size=4,
@@ -274,6 +343,9 @@ class TestVllmColocateZmqHandle:
         assert _resolve_vllm_weight_sync_local_rank(0, parallel_config) == 2
 
     def test_zmq_handle_uses_resolved_dp_rank(self, monkeypatch):
+        # [FUNCTION DOC]
+        # _get_zmq_handle on a fake worker builds "ipc:///tmp/rl-colocate-zmq-<job>-replica-<replica>-rank-<resolved>.sock"
+        # from VERL_RAY_JOB_ID and VERL_REPLICA_RANK env vars (set via monkeypatch) and the resolved rank 3.
         parallel_config = SimpleNamespace(
             tensor_parallel_size=2,
             data_parallel_size=4,

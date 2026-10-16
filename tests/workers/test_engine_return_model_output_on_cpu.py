@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for the return_model_output flag: the Tinker training worker must request model outputs from the engine,
+# and FSDPEngine.forward_backward_batch must include model_output in its result only when the flag is set on the data.
+
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -25,9 +29,16 @@ from verl.workers.engine_workers_tinker import TinkerTrainingWorker
 
 
 def test_tinker_forward_backward_requests_model_output():
+    # [FUNCTION DOC]
+    # Calls TinkerTrainingWorker.forward_backward unbound on a namespace worker whose fake engine records the
+    # return_model_output non-tensor flag; asserts the flag is True and that the result is None because the fake engine
+    # reports it is not the output-holding rank.
     captured = {}
 
     def forward_backward_batch(data, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake engine batch call; stores the return_model_output non-tensor value (default None) into captured and
+        # returns an empty dict.
         captured["return_model_output"] = tu.get_non_tensor_data(data, key="return_model_output", default=None)
         return {}
 
@@ -57,6 +68,10 @@ def test_tinker_forward_backward_requests_model_output():
 
 @pytest.mark.parametrize(("return_model_output", "expected"), [(False, False), (True, True)])
 def test_fsdp_forward_backward_honors_return_model_output(monkeypatch, return_model_output, expected):
+    # [FUNCTION DOC]
+    # With distributed all_reduce, device lookup, micro-batch preparation (single micro-batch) and post-processing (first
+    # output) patched, calls forward_backward_batch on a namespace engine whose forward_step returns a fixed loss and
+    # output dict; asserts model_output is present exactly when return_model_output was set, with unchanged log_probs.
     data = TensorDict({"loss_mask": torch.ones(1)}, batch_size=[1])
     if return_model_output:
         tu.assign_non_tensor(data, return_model_output=True)

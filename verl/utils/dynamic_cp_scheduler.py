@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Adapter between verl TensorDict batches (jagged NestedTensor input_ids) and Megatron-Core's DefaultDynamicCPScheduler, which groups samples into micro-batches and assigns each to a dynamically sized context-parallel (CP) sub-group within the DPxCP group. Defines non-tensor metadata keys DCP_GROUP_LEADER, DCP_LOCAL_NUM_TOKENS, DCP_PADDING_MASK, DCP_SAMPLE_IDS attached to each scheduled micro-batch, and a post-processing step that gathers outputs from group leaders and restores original sample order.
+
 """Thin TensorDict adapter for Megatron-Core's Dynamic CP scheduler."""
 
 import math
@@ -30,6 +33,9 @@ DCP_SAMPLE_IDS = "_dcp_sample_ids"
 
 
 def get_megatron_dynamic_cp_scheduler_cls() -> type:
+    # [FUNCTION DOC]
+    # Returns Megatron-Core's DefaultDynamicCPScheduler class.
+    # Exceptions: RuntimeError (chained) if the import fails because Megatron-Core lacks the feature.
     """Return the scheduler implementation owned by Megatron-Core."""
     try:
         from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler
@@ -49,6 +55,12 @@ def _local_padding_mask(
     cp_layout: str = "zigzag",
     min_local_rows: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Builds a boolean mask (True = padding) for this rank's local shard of a packed THD batch.
+    # Behavior: each sequence is padded up to a multiple of tp_size*cp_size*(2 if zigzag and cp_size>1 else 1). If min_local_rows is given, the last sequence's padded length is increased so total padded rows reach at least cp_size*min_local_rows. Contiguous layout: the concatenated padded stream is split evenly across cp ranks; positions overlapping each sequence's valid tokens in this rank's slice are False. Zigzag layout: each padded sequence is split into 2*cp_size chunks; this rank owns front chunk cp_rank and back chunk (2*cp_size-1-cp_rank); valid tokens in each chunk are False; per-sequence masks are concatenated. With cp_size 1, first seq_len positions of each sequence are False.
+    # Inputs: seq_lens - valid lengths; cp_size, cp_rank, tp_size; cp_layout - "zigzag" or "contiguous"; min_local_rows - optional positive minimum rows per rank.
+    # Outputs: 1-D bool tensor of local padded length.
+    # Exceptions: ValueError for unsupported layout or non-positive min_local_rows.
     """Build the MCore router padding mask for one local THD shard."""
     if cp_layout not in ("zigzag", "contiguous"):
         raise ValueError(f"Unsupported context parallel layout: {cp_layout}")
@@ -103,6 +115,9 @@ def _local_padding_mask(
 
 
 def _cp_members(rank_assignments: list[list[int]], rank: int) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the list of ranks whose sample-id assignment equals that of the given rank (its CP group).
+    # Exceptions: RuntimeError if the rank's assignment is empty.
     rank_sample_ids = rank_assignments[rank]
     if not rank_sample_ids:
         raise RuntimeError("Megatron-Core Dynamic CP returned an empty rank assignment")
@@ -110,6 +125,8 @@ def _cp_members(rank_assignments: list[list[int]], rank: int) -> list[int]:
 
 
 class DynamicCPScheduler:
+    # [CLASS DOC]
+    # Validates sizes and turns a replicated batch into this rank's list of micro-batches with per-micro-batch CP metadata. Attributes: max_seqlen_per_dp_cp_rank, dp_size, cp_size, total_ranks (dp*cp).
     """Apply Megatron-Core scheduling to the replicated batch used by verl #5057."""
 
     def __init__(
@@ -118,6 +135,9 @@ class DynamicCPScheduler:
         dp_size: int,
         cp_size: int,
     ):
+        # [FUNCTION DOC]
+        # Stores sizes and total_ranks.
+        # Exceptions: ValueError unless all three are positive plain ints (bool rejected via exact type check).
         if any(type(value) is not int or value <= 0 for value in (max_seqlen_per_dp_cp_rank, dp_size, cp_size)):
             raise ValueError("Dynamic CP scheduler sizes must be positive integers")
 
@@ -135,6 +155,11 @@ class DynamicCPScheduler:
         cp_layout: str = "zigzag",
         min_local_rows: int | None = None,
     ) -> list[TensorDict]:
+        # [FUNCTION DOC]
+        # Behavior: validates input_ids is a jagged nested tensor, batch is non-empty, and dcp_group size equals total_ranks; computes per-sample lengths from nested offsets (all must be >0) and checks the longest sequence fits in total_ranks * max_seqlen_per_dp_cp_rank. Instantiates the Megatron scheduler and obtains, for each micro-batch, a per-rank list of sample ids. For each micro-batch: verifies all ranks have non-empty assignments; finds this rank's CP members (ranks sharing identical ids), which must be contiguous and start at a multiple of the group size; selects the samples from the batch; builds the local padding mask; attaches non-tensor data local_cp_size, sample ids, group-leader flag (first member), padding mask and number of valid local tokens (mask size minus padding count).
+        # Inputs: batch - TensorDict; dcp_group - process group over DPxCP; tp_size; cp_layout; min_local_rows.
+        # Outputs: list of TensorDict micro-batches for this rank.
+        # Exceptions: ValueError for invalid input; RuntimeError for invalid scheduler output.
         """Return this rank's scheduled micro-batches without rerouting batch data."""
         input_ids = batch.get("input_ids", None)
         if not isinstance(input_ids, torch.Tensor) or not input_ids.is_nested:
@@ -209,6 +234,11 @@ class DynamicCPScheduler:
 
 
 def _detach_model_output(model_output: dict, sample_ids: list[int]) -> dict[str, list[torch.Tensor]]:
+    # [FUNCTION DOC]
+    # HELPER: Splits each tensor value of a model-output dict into per-sample tensors (unbind for nested, unbind along dim 0 otherwise), detaches and moves them to CPU.
+    # Inputs: model_output - dict of tensors; sample_ids - ids expected (used for count check).
+    # Outputs: dict key -> list of CPU tensors.
+    # Exceptions: TypeError for non-tensor values; ValueError if sample count mismatches.
     detached = {}
     for key, value in model_output.items():
         if not isinstance(value, torch.Tensor):
@@ -223,6 +253,12 @@ def _detach_model_output(model_output: dict, sample_ids: list[int]) -> dict[str,
 def postprocess_dynamic_cp_batch(
     output_lst: list[dict], batch_size: int, dcp_group, include_model_output: bool = True
 ) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: picks the device of the first tensor found in any output's model_output. Keeps only outputs flagged as group leader, recording sample ids, loss, metrics and detached per-sample model outputs; all-gathers these records across dcp_group; checks the union of ids is exactly 0..batch_size-1 each once; sorts records by min sample id; collects non-None losses in order, merges metrics with append_to_dict, and maps per-key sample id to tensor. If include_model_output, rebuilds each key as a jagged nested tensor in original sample order and moves it back to the original device.
+    # Inputs: output_lst - per-micro-batch output dicts; batch_size; dcp_group; include_model_output.
+    # Outputs: dict with model_output (dict, empty if excluded), loss (list), metrics (dict of lists).
+    # Exceptions: RuntimeError on duplicated/missing ids or missing per-key samples.
+    # Side effects: collective all_gather_object over dcp_group.
     """Collect one output per CP group and restore the original sample order."""
     output_device = next(
         (

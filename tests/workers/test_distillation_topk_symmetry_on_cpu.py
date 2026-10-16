@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Regression tests for top-k distillation outputs in the FSDP LM-head engine (verl#6293) and for the top-k forward-KL
+# overlap metrics. Sets KMP_DUPLICATE_LIB_OK=TRUE (if unset) at import. Constants: vocab size 8 and the four
+# distillation output keys expected in model_output.
+
 """Regression guard for verl#6293.
 
 The use_remove_padding=False branch of
@@ -52,6 +58,9 @@ _DISTILLATION_KEYS = ("distillation_losses", "student_mass", "overlap_count", "o
 
 
 def _make_engine_stub():
+    # [FUNCTION DOC]
+    # HELPER: Creates an FSDPEngineWithLMHead without running __init__, with Ulysses sequence parallelism disabled and an
+    # engine config whose entropy_checkpointing is False. Outputs: the stub engine.
     """Bypass FSDPEngineWithLMHead.__init__; set only attributes that
     prepare_model_outputs touches in this test path (no SP, no fused kernels,
     no entropy)."""
@@ -59,6 +68,8 @@ def _make_engine_stub():
     eng.use_ulysses_sp = False
 
     class _EngineCfg:
+        # [CLASS DOC]
+        # HELPER: Minimal engine config with entropy_checkpointing = False.
         entropy_checkpointing = False
 
     eng.engine_config = _EngineCfg()
@@ -66,6 +77,9 @@ def _make_engine_stub():
 
 
 def _make_logits_processor(keys):
+    # [FUNCTION DOC]
+    # HELPER: Returns a fake distillation logits processor. Inputs: keys - sequence of output names.
+    # Outputs: a callable producing, for each key i, a (1, n) tensor filled with i+1 where n is the student logits' dim 1.
     """Fake top-k distillation processor: returns one (1, total_nnz) tensor per key.
 
     The real processor (verl/trainer/distillation/losses.py) returns
@@ -73,6 +87,8 @@ def _make_logits_processor(keys):
     """
 
     def _proc(student_logits, data):
+        # [FUNCTION DOC]
+        # HELPER: The fake processor; ignores data and returns the mapping described above.
         n = student_logits.shape[1]
         return {k: torch.full((1, n), float(i + 1)) for i, k in enumerate(keys)}
 
@@ -82,6 +98,11 @@ def _make_logits_processor(keys):
 @pytest.mark.parametrize("use_remove_padding", [True, False])
 @pytest.mark.parametrize("distillation_only", [False, True])
 def test_distillation_outputs_emitted_in_both_padding_modes(use_remove_padding, distillation_only):
+    # [FUNCTION DOC]
+    # For both remove-padding modes and both distillation_only values: builds packed sequences of lengths 3 and 2 (nested
+    # input_ids), fake logits shaped per branch, output_args per branch, and a micro-batch with distillation_use_topk=True
+    # non-tensor flags; patches logprobs_from_logits to return zeros; calls prepare_model_outputs on the stub engine.
+    # Asserts log_probs is present iff distillation_only is False, and every distillation key is present as a nested tensor.
     """distillation_use_topk=True must populate distillation outputs into
     model_output regardless of use_remove_padding. See verl#6293.
 
@@ -99,6 +120,8 @@ def test_distillation_outputs_emitted_in_both_padding_modes(use_remove_padding, 
     input_ids_rmpad_rolled = torch.randint(0, _VOCAB_SIZE, (total_nnz,))
 
     class _Output:
+        # [CLASS DOC]
+        # HELPER: Bare object to carry a logits attribute like a model output.
         pass
 
     output = _Output()
@@ -175,12 +198,19 @@ def test_distillation_outputs_emitted_in_both_padding_modes(use_remove_padding, 
 
 
 def _nested_from_rows(rows):
+    # [FUNCTION DOC]
+    # HELPER: Builds a jagged nested tensor containing a single sequence whose rows are the given list of rows.
+    # Inputs: rows - list of equal-length lists. Outputs: nested tensor with one component of shape [len(rows), row_len].
     values = torch.tensor(rows)
     offsets = torch.tensor([0, len(rows)], dtype=torch.int64)
     return torch.nested.nested_tensor_from_jagged(values, offsets=offsets)
 
 
 def test_forward_kl_topk_emits_overlap_metrics():
+    # [FUNCTION DOC]
+    # With three tokens and hand-crafted logits/teacher top-2 ids, compute_forward_kl_topk (thd format, no clamp) reports
+    # overlap counts [2, 1, 0] between student and teacher top-k, and overlap_token_advantage equal to the mean of
+    # -p_teacher x (log p_teacher - log p_student) over overlapping ids (0 when no overlap).
     logits = torch.tensor(
         [
             [0.0, 9.0, 8.0, 1.0, 0.0, 0.0],
@@ -221,6 +251,9 @@ def test_forward_kl_topk_emits_overlap_metrics():
 
 
 def test_forward_kl_topk_metric_aggregation_for_overlap_outputs():
+    # [FUNCTION DOC]
+    # The metric collector aggregates over response-masked tokens: overlap ratio = mean(overlap_count)/topk = 0.75 and
+    # mean overlap token advantage = -0.3.
     data = TensorDict(
         {
             "prompts": torch.tensor([[101]]),

@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# GPU integration test (also runnable as a script) for TensorRT-LLM abort_all_requests, resume_generation,
+# partial-rollout continuation and clear_kv_cache on a TRTLLMHttpServer Ray actor. Configured via env vars
+# TRTLLM_TEST_MODEL_PATH_ROOT (default ~/models, uses Qwen2.5-1.5B-Instruct), TRTLLM_TEST_TP_SIZE (default 2)
+# and TRTLLM_TEST_GPUS_PER_NODE (default 2). Prints progress extensively.
+
 """
 Test TRT-LLM abort_all_requests and resume_generation functionality.
 
@@ -30,6 +37,22 @@ from uuid import uuid4
 
 
 def test_trtllm_abort():
+    # [FUNCTION DOC]
+    # Starts a local Ray cluster, composes ppo_trainer (verl/verl/trainer/config or verl/trainer/config relative to
+    # CWD) for async trtllm rollout with the configured GPUs/TP and 512 prompt/response lengths, then launches a
+    # TRTLLMHttpServer actor pinned to the node of the first bundle (COLOCATED mode, bundles 0..TP-1).
+    # Tokenizes 8 chat prompts via the model's chat template and runs four phases with temperature 1 sampling:
+    # 1) submit 8 concurrent generations, wait 0.5 s, call abort_all_requests and collect results with 10 s
+    #    timeouts; asserts no timeouts, every request either aborted or completed, abort took < 1 s, and if any
+    #    were aborted at least one has partial tokens.
+    # 2) call resume_generation and submit 2 fresh requests; asserts each returns within 60 s, not aborted, with tokens.
+    # 3) for up to 2 aborted requests with partial tokens, resubmit prompt plus partial tokens and assert the
+    #    continuation is not aborted and yields new tokens (skipped if nothing was aborted mid-flight).
+    # 4) call clear_kv_cache, then assert a new generation still succeeds with tokens.
+    # Exceptions: AssertionError on any check (timeouts are converted to AssertionError in phases 3 and 4).
+    # Side effects: GPU server launch, env var default TLLM_RAY_FORCE_LOCAL_CLUSTER, ray.shutdown and "ray stop".
+    # KNOWN ISSUE: in phases 3 and 4 the "output is not None" assertions run after output attributes were already
+    # accessed, so they can never fire meaningfully.
     # ==================== Configuration ====================
     model_root = os.path.expanduser(os.getenv("TRTLLM_TEST_MODEL_PATH_ROOT", "~/models"))
     MODEL_PATH = os.path.join(model_root, "Qwen/Qwen2.5-1.5B-Instruct")

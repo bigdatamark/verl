@@ -12,6 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Hydra entry point for one-step off-policy PPO. Defines the Ray task runner that builds tokenizer, datasets and the
+# OneStepOffRayTrainer, then runs its async fit loop.
+
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
@@ -32,7 +36,16 @@ from verl.utils.device import auto_set_device
 
 @ray.remote(num_cpus=10, max_concurrency=100)  # please make sure main_task is not scheduled on head
 class OneStepTaskRunner:
+    # [CLASS DOC]
+    # Ray actor (10 CPUs, up to 100 concurrent calls) that sets up and runs one-step off-policy training.
     def run(self, config):
+        # [FUNCTION DOC]
+        # Behavior: logs host/pid and prints the resolved config, resolves it in place; builds role-worker mapping and
+        # worker group class; validates config (reference policy and critic usage); copies the model to local (optionally
+        # shared memory); builds tokenizer and optional processor; creates a resource pool manager for all roles; builds
+        # train/val datasets and the train sampler; constructs OneStepOffRayTrainer, initializes workers, and runs fit in a
+        # new event loop until done.
+        # Inputs: config. Outputs: none. Exceptions: config validation and training errors propagate.
         # Print the initial configuration. `resolve=True` will evaluate symbolic values.
         from pprint import pprint
 
@@ -108,6 +121,10 @@ class OneStepTaskRunner:
 
 @hydra.main(config_path="config", config_name="one_step_off_ppo_trainer", version_base=None)
 def main(config):
+    # [FUNCTION DOC]
+    # Behavior: Hydra main. Auto-sets device; copies rollout nnodes and gpus-per-node from the top-level rollout section
+    # into actor_rollout_ref.rollout; runs the PPO launcher with OneStepTaskRunner; prints total time.
+    # Inputs: config. Outputs: none.
     from time import time
 
     from verl.trainer.main_ppo import run_ppo

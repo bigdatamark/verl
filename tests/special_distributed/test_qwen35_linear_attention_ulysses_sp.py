@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# torchrun pytest (skipped unless LOCAL_RANK is set; needs fla and transformers Qwen3.5) checking that verl's patched
+# Qwen3.5 linear-attention (gated delta net) decoder layer gives the same outputs and input gradients under packed
+# Ulysses sequence parallelism as an unsharded forward, for several packed-sequence layouts.
+
 """Qwen3.5 linear-attention regression test for packed Ulysses SP.
 
 Run on GPUs, for example:
@@ -43,12 +49,17 @@ PROBE_HEAD_DIM = 128
 
 
 def _err_ratio(ref: torch.Tensor, actual: torch.Tensor) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Returns RMS of (ref - actual) divided by RMS of ref (plus 1e-8), computed in float32 as a Python float.
     err = (ref.detach() - actual.detach()).flatten().float().square().mean().sqrt().item()
     base = ref.detach().flatten().float().square().mean().sqrt().item()
     return err / (base + 1e-8)
 
 
 def _make_layer(device: torch.device) -> Qwen3_5DecoderLayer:
+    # [FUNCTION DOC]
+    # HELPER: Builds a single bf16 Qwen3.5 linear-attention decoder layer (hidden 512, head dim 128, 2 key / 4 value linear
+    # heads, conv kernel 4) with seed 1234 on the device in eval mode.
     config = Qwen3_5TextConfig(
         vocab_size=128,
         hidden_size=PROBE_HIDDEN_SIZE,
@@ -72,11 +83,15 @@ def _make_layer(device: torch.device) -> Qwen3_5DecoderLayer:
 
 
 def _broadcast_params(model: torch.nn.Module):
+    # [FUNCTION DOC]
+    # HELPER: Broadcasts all parameter data from rank 0 in place.
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
 
 
 def _all_gather_seq(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: All-gathers a tensor from every rank and concatenates along dim 1 (sequence) in rank order.
     world_size = dist.get_world_size()
     gathered = [torch.empty_like(x) for _ in range(world_size)]
     dist.all_gather(gathered, x.contiguous())
@@ -84,6 +99,10 @@ def _all_gather_seq(x: torch.Tensor) -> torch.Tensor:
 
 
 def _cases_for_world_size(world_size: int) -> list[tuple[str, list[int]]]:
+    # [FUNCTION DOC]
+    # HELPER: Returns named lists of packed sequence lengths for world sizes 2, 4 and 8 (aligned with shard boundaries,
+    # cut across shards, single sequence, many short sequences); for other sizes a single sequence of 8 x world_size.
+    # All totals are divisible by the world size.
     total = 8 * world_size
     if world_size == 2:
         return [
@@ -110,6 +129,13 @@ def _cases_for_world_size(world_size: int) -> list[tuple[str, list[int]]]:
 
 
 def _run_case(case_name: str, lengths: list[int], layer: Qwen3_5DecoderLayer, device: torch.device):
+    # [FUNCTION DOC]
+    # HELPER: Runs one layout. Raises RuntimeError if total tokens are not divisible by the world size. Builds cu_seqlens
+    # (device and CPU), empty position embeddings and a seeded random (1, total, hidden) bf16 input. Reference: with no SP
+    # group, forward the full input, backprop the sum, keep the input grad and zero layer grads. SP: set the world as the
+    # Ulysses group, forward this rank's contiguous sequence slice, backprop, all-gather outputs and input grads. Rank 0
+    # prints max diffs and error ratios. Asserts outputs close (atol/rtol 2e-2) and grad error ratio < 2e-3.
+    # Side effects: changes the global Ulysses group (left set to WORLD) and accumulates parameter grads from the SP pass.
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     total_tokens = sum(lengths)
@@ -170,6 +196,12 @@ def _run_case(case_name: str, lengths: list[int], layer: Qwen3_5DecoderLayer, de
     ids=["causal_conv1d_fn", "torch_conv1d_fallback"],
 )
 def test_qwen35_linear_attention_matches_full_forward_under_ulysses_sp(use_causal_conv1d_fn: bool):
+    # [FUNCTION DOC]
+    # Behavior: parametrized on whether the causal_conv1d kernel is used. Asserts CUDA, inits NCCL if needed, sets the
+    # device from LOCAL_RANK, replaces the Qwen3.5 decoder-layer and gated-delta-net forward methods with verl's patched
+    # versions, builds the layer (disabling causal_conv1d_fn on each gated delta net for the fallback case), broadcasts
+    # params, runs all cases for the world size and finally resets the Ulysses group.
+    # Side effects: permanently monkey-patches the transformers Qwen3.5 classes for the process.
     assert torch.cuda.is_available(), "CUDA is required"
     if not dist.is_initialized():
         dist.init_process_group("nccl")

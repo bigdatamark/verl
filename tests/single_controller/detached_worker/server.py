@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Detached-worker demo server script (not a pytest test). Sets Megatron/NCCL env vars at import time, defines a
+# Ray-remote Megatron Trainer worker wrapping a small parallel Llama model, and when run as main creates a
+# detached 2-process worker group named with prefix "trainer", initializes the model and prints worker names
+# so client.py can reattach.
+# Side effects: mutates os.environ on import; as main, connects to an existing Ray cluster and spawns detached actors.
+
 """
 Server starts a Trainer. Client sends data to the server to train.
 """
@@ -42,7 +50,19 @@ from verl.utils.megatron_utils import get_model, mcore_model_parallel_config
 
 @ray.remote
 class Trainer(Worker):
+    # [CLASS DOC]
+    # Ray actor Worker hosting a Megatron tensor-parallel (TP=2, PP=1) Llama causal LM with a Megatron optimizer.
+    # Registers a "train" dispatch mesh so DataProto batches are split by data-parallel rank and collected only from
+    # TP rank 0 / last PP rank / CP rank 0.
     def __init__(self):
+        # [FUNCTION DOC]
+        # Behavior: calls Worker init; if torch.distributed is not yet initialized, reads LOCAL_RANK, inits an NCCL process
+        # group, sets the CUDA device, initializes Megatron model parallel (TP=2, PP=1, CP=1, EP=1), seeds the TP CUDA RNG
+        # with 10, and registers dispatch/collect info for mesh "train" using the DP rank and the collect predicate above.
+        # Inputs: none (reads LOCAL_RANK env var).
+        # Exceptions: KeyError if LOCAL_RANK missing; distributed init errors propagate.
+        # Side effects: global process-group and Megatron parallel-state initialization, CUDA device selection.
+        # KNOWN ISSUE: dispatch info is registered only inside the not-initialized branch, so if distributed was already initialized the "train" mesh is never registered.
         super().__init__()
 
         if not torch.distributed.is_initialized():
@@ -72,6 +92,12 @@ class Trainer(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        # [FUNCTION DOC]
+        # Behavior (ONE_TO_ALL dispatch): builds a small LlamaConfig (vocab 256, hidden 2048, 24 layers, 16 heads), creates a
+        # Megatron model-parallel config (sequence parallel, bf16), builds the model via get_model with DDP wrapping and a
+        # local provider, wraps it in a ModuleList, creates a Megatron optimizer (lr 1e-6, grad clip 1.0).
+        # Inputs: none. Outputs: none.
+        # Side effects: stores megatron_config, optimizer_config, model (first chunk) and optimizer on self; allocates GPU memory.
         actor_model_config = LlamaConfig(
             vocab_size=256,
             hidden_size=2048,
@@ -88,6 +114,11 @@ class Trainer(Worker):
             # vpp is not supported yet because it will hang for some reason. Need debugging
             # this_megatron_config = copy.deepcopy(megatron_config)
             # this_megatron_config.virtual_pipeline_model_parallel_rank = vpp_rank
+            # [FUNCTION DOC]
+            # HELPER: Model provider callback for get_model.
+            # Inputs: pre_process / post_process - booleans telling whether this pipeline stage holds the embedding / output head.
+            # Outputs: a ParallelLlamaForCausalLMRmPadPP built from the enclosing Llama and Megatron configs, moved to CUDA.
+            # Side effects: GPU allocation.
             parallel_model = ParallelLlamaForCausalLMRmPadPP(
                 config=actor_model_config,
                 megatron_config=megatron_config,
@@ -115,6 +146,14 @@ class Trainer(Worker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"))
     def train_model(self, data: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # Behavior (nd-compute dispatch over mesh "train"): runs one training iteration on the local shard: zero optimizer
+        # grads and the DDP grad buffer (buffer zeroed only when not using the distributed optimizer), forward with
+        # input_ids/attention_mask/position_ids, backprop the mean of the logits, optimizer step with Megatron timers.
+        # Inputs: data - DataProto whose batch has input_ids, attention_mask, position_ids.
+        # Outputs: DataProto with a single "loss" entry holding the detached logits (not a scalar loss), batch size = first dim.
+        # Side effects: updates model parameters.
+        # KNOWN ISSUE: the returned "loss" is actually the full detached logits tensor; optimizer step results are ignored.
         input_ids = data.batch["input_ids"]
         attention_mask = data.batch["attention_mask"]
         position_ids = data.batch["position_ids"]

@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Deterministic, message-level mock conversations used by the chat-template checker and related
+# tests. Text part: four deterministic FunctionTools (get_weather, estimate_travel, reserve_room,
+# lookup_incident) in TOOLS; one single-turn trajectory (singleturnchat) and four tool-agent
+# trajectories (multiturnsingletool, multiturnmultitool, multiturnretryuser, multiturnretrysystem)
+# collected in TRAJECTORIES plus by-name lookup tables. VL part: lazily built (Pillow imported only
+# when building) trajectories with solid-color images in prompts and tool responses
+# (vl_singleturnchat, vl_multiturnsingletool, vl_multiturnmultitool), whose assistant tool-call
+# turns embed parser-specific raw tool-call text as content.
 """Structured mock trajectories for the chat-template checker."""
 
 from __future__ import annotations
@@ -34,6 +43,9 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class TrajectoryStep:
+    # [CLASS DOC]
+    # Immutable record of one assistant message (OpenAI-style dict, may include tool_calls) and the
+    # tuple of environment messages (tool/user/system) appended after it.
     """One assistant generation followed by optional environment messages."""
 
     assistant: dict[str, Any]
@@ -42,6 +54,9 @@ class TrajectoryStep:
 
 @dataclass(frozen=True)
 class SingleTurnTrajectory:
+    # [CLASS DOC]
+    # Immutable single-turn case: name, description, raw_prompt messages, the assistant response text,
+    # and the expected number of turns (default 2: prompt + response).
     """A single prompt/assistant-response trajectory for SingleTurnAgentLoop."""
 
     name: str
@@ -53,6 +68,9 @@ class SingleTurnTrajectory:
 
 @dataclass(frozen=True)
 class ToolAgentTrajectory:
+    # [CLASS DOC]
+    # Immutable multi-turn tool-agent case: name, description, raw_prompt, ordered steps, the
+    # FunctionTools available, and the maximum number of parallel tool calls (default 1).
     """A messages-level trajectory independent of any rollout server."""
 
     name: str
@@ -64,17 +82,26 @@ class ToolAgentTrajectory:
 
     @property
     def expected_generation_turns(self) -> int:
+        # [FUNCTION DOC]
+        # Number of assistant generations, i.e. the number of steps.
         return len(self.steps)
 
     @property
     def expected_num_turns(self) -> int:
+        # [FUNCTION DOC]
+        # 1 (prompt) + number of steps + number of steps that append environment messages.
         environment_turns = sum(1 for step in self.steps if step.appended_messages)
         return 1 + self.expected_generation_turns + environment_turns
 
     def tool_schemas(self) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Returns each tool's OpenAI schema dumped to a dict, omitting unset and None fields.
         return [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in self.tools]
 
     def full_messages(self) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Returns the whole conversation as a new list: shallow copies of the prompt messages, then for each
+        # step a deep (JSON) copy of the assistant message followed by copies of its appended messages.
         messages = [dict(message) for message in self.raw_prompt]
         for step in self.steps:
             messages.append(_clone_message(step.assistant))
@@ -86,6 +113,8 @@ MockTrajectory = SingleTurnTrajectory | ToolAgentTrajectory
 
 
 def _clone_message(message: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Deep-copies a JSON-compatible message via a JSON round trip.
     return json.loads(json.dumps(message, ensure_ascii=False))
 
 
@@ -95,6 +124,9 @@ def _schema(
     properties: dict[str, dict[str, Any]],
     required: list[str],
 ) -> OpenAIFunctionToolSchema:
+    # [FUNCTION DOC]
+    # HELPER: Builds and validates an OpenAIFunctionToolSchema of type function with the given name,
+    # description, object parameters with the given properties, and required list.
     return OpenAIFunctionToolSchema.model_validate(
         {
             "type": "function",
@@ -112,6 +144,8 @@ def _schema(
 
 
 def _assistant(content: str, tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds an assistant message with content, adding tool_calls only when a non-empty list is given.
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
         message["tool_calls"] = tool_calls
@@ -119,6 +153,9 @@ def _assistant(content: str, tool_calls: list[dict[str, Any]] | None = None) -> 
 
 
 def _tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds an OpenAI-style tool call dict with id, type "function", and function name plus
+    # arguments (kept as a dict, not a JSON string).
     return {
         "id": call_id,
         "type": "function",
@@ -130,6 +167,9 @@ def _tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, 
 
 
 def _tool_message(call_id: str, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a tool-role message with tool_call_id, name, and the payload serialized as compact
+    # JSON (no spaces, non-ASCII preserved) as content.
     return {
         "role": "tool",
         "tool_call_id": call_id,
@@ -139,6 +179,9 @@ def _tool_message(call_id: str, name: str, payload: dict[str, Any]) -> dict[str,
 
 
 def get_weather(city: str, day: str) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Deterministic mock tool: looks up a fixed table keyed by (city, day) and returns city and day merged
+    # with the entry, or condition "unknown" and high_c None when absent.
     """Return a deterministic weather snapshot for a city and day."""
     table = {
         ("Seattle", "today"): {"condition": "rain", "high_c": 12, "wind_kph": 22},
@@ -150,6 +193,9 @@ def get_weather(city: str, day: str) -> dict[str, Any]:
 
 
 def estimate_travel(origin: str, destination: str, depart_window: str) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Deterministic mock tool: returns route "origin->destination", depart_window, merged with the fixed
+    # table entry (minutes, risk) for the triple, or nothing extra when absent.
     """Estimate deterministic travel time for a simple route."""
     route = f"{origin}->{destination}"
     table = {
@@ -162,6 +208,9 @@ def estimate_travel(origin: str, destination: str, depart_window: str) -> dict[s
 
 
 def reserve_room(room: str, start_time: str, end_time: str | None = None) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Deterministic mock tool: returns a failure dict (ok false, error, room, start_time) if end_time is
+    # missing or empty; otherwise a success dict with the fixed confirmation "room-4821".
     """Reserve a room if the request has a complete time range."""
     if not end_time:
         return {"ok": False, "error": "end_time is required", "room": room, "start_time": start_time}
@@ -169,6 +218,9 @@ def reserve_room(room: str, start_time: str, end_time: str | None = None) -> dic
 
 
 def lookup_incident(incident_id: str) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Deterministic mock tool: only "INC-1042" succeeds (status mitigated, owner edge-oncall); any other id
+    # returns ok false with a format error and the received id.
     """Look up a deterministic support incident."""
     if incident_id != "INC-1042":
         return {"ok": False, "error": "incident_id must use the INC-#### format", "received": incident_id}
@@ -176,6 +228,9 @@ def lookup_incident(incident_id: str) -> dict[str, Any]:
 
 
 def build_common_tools() -> tuple[FunctionTool, ...]:
+    # [FUNCTION DOC]
+    # HELPER: Returns a tuple of the four FunctionTools wrapping the mock tool functions with their schemas
+    # (reserve_room's end_time allows string or null and is optional).
     return (
         FunctionTool(
             name="get_weather",
@@ -511,6 +566,8 @@ TOOL_AGENT_TRAJECTORY_BY_NAME = {trajectory.name: trajectory for trajectory in T
 
 
 def get_trajectory(name: str) -> MockTrajectory:
+    # [FUNCTION DOC]
+    # Looks up a text trajectory by name. Exceptions: ValueError listing valid names if unknown.
     try:
         return TRAJECTORY_BY_NAME[name]
     except KeyError as exc:
@@ -518,12 +575,17 @@ def get_trajectory(name: str) -> MockTrajectory:
 
 
 def select_trajectories(names: list[str] | None = None) -> list[MockTrajectory]:
+    # [FUNCTION DOC]
+    # Returns all text trajectories when names is empty/None, else those named (in the given order).
+    # Exceptions: ValueError for unknown names.
     if not names:
         return list(TRAJECTORIES)
     return [get_trajectory(name) for name in names]
 
 
 def get_tool_agent_trajectory(name: str) -> ToolAgentTrajectory:
+    # [FUNCTION DOC]
+    # Looks up a tool-agent trajectory by name. Exceptions: ValueError listing valid names if unknown.
     try:
         return TOOL_AGENT_TRAJECTORY_BY_NAME[name]
     except KeyError as exc:
@@ -533,6 +595,8 @@ def get_tool_agent_trajectory(name: str) -> ToolAgentTrajectory:
 
 
 def select_tool_agent_trajectories(names: list[str] | None = None) -> list[ToolAgentTrajectory]:
+    # [FUNCTION DOC]
+    # Returns all tool-agent trajectories when names is empty/None, else those named.
     if not names:
         return list(TOOL_AGENT_TRAJECTORIES)
     return [get_tool_agent_trajectory(name) for name in names]
@@ -557,6 +621,13 @@ def select_tool_agent_trajectories(names: list[str] | None = None) -> list[ToolA
 
 
 def _format_tool_call_text(tool_parser: str, name: str, arguments: dict[str, Any]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Renders one tool call as raw model-generated text for a parser format: hermes/qwen3_coder
+    # wrap a JSON object of name and arguments in <tool_call> tags on separate lines; glm uses
+    # <tool_call>name followed by <arg_key>/<arg_value> pairs (values stringified); kimi uses
+    # <|tool_call_begin|>name<|tool_call_argument_begin|>JSON<|tool_call_end|>; gemma4 uses
+    # <|tool_call>call:name{key:value,...}<tool_call|> with strings wrapped in <|"|>, booleans lowercase,
+    # None as null, others bare. Exceptions: ValueError for unsupported parsers.
     """Render a single tool call as the raw text the model would generate for
     the given tool-parser format."""
     args_json = json.dumps(arguments, ensure_ascii=False)
@@ -586,6 +657,10 @@ def _format_tool_call_text(tool_parser: str, name: str, arguments: dict[str, Any
 
 
 def _format_assistant_content(tool_parser: str, reasoning: str, calls: list[tuple[str, dict[str, Any]]]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns just the reasoning if there are no calls. Otherwise renders each call; for kimi
+    # concatenates them inside a tool_calls_section begin/end wrapper, for others joins them with
+    # newlines; prefixes reasoning plus a newline when reasoning is non-empty.
     """Build the assistant turn's content (reasoning + raw tool-call text)."""
     if not calls:
         return reasoning
@@ -603,6 +678,9 @@ def _format_assistant_content(tool_parser: str, reasoning: str, calls: list[tupl
 
 @dataclass
 class VLToolResponseSpec:
+    # [CLASS DOC]
+    # A canned tool response (tool name, text, optional PIL image) used both as the trajectory's tool
+    # message and as the runtime tool's return value. tool_name is informational only.
     """A single tool response used both to build the mock trajectory prefix and
     to drive the deterministic tool at runtime."""
 
@@ -611,6 +689,9 @@ class VLToolResponseSpec:
     image: PILImage | None = None
 
     def to_message(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Builds a tool-role message whose content is a list: an image block first if an image exists, then a
+        # text block. No tool_call_id or name is included.
         content: list[dict[str, Any]] = []
         if self.image is not None:
             content.append({"type": "image", "image": self.image})
@@ -618,6 +699,8 @@ class VLToolResponseSpec:
         return {"role": "tool", "content": content}
 
     def to_tool_response(self) -> ToolResponse:
+        # [FUNCTION DOC]
+        # Returns a ToolResponse with the text, plus a one-image list when an image exists.
         if self.image is not None:
             return ToolResponse(text=self.text, image=[self.image])
         return ToolResponse(text=self.text)
@@ -625,6 +708,9 @@ class VLToolResponseSpec:
 
 @dataclass
 class VLToolStep:
+    # [CLASS DOC]
+    # One VL assistant turn: reasoning text, list of (tool name, arguments) calls, and the responses
+    # appended afterwards (see docstring).
     """One assistant generation.
 
     ``calls`` is the list of ``(tool_name, arguments)`` the assistant emits this
@@ -644,16 +730,23 @@ class VLToolStep:
     responses: list[VLToolResponseSpec] = field(default_factory=list)
 
     def assistant_message(self, tool_parser: str) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns an assistant message whose content is the reasoning plus raw tool-call text for the parser.
         content = _format_assistant_content(tool_parser, self.reasoning, self.calls)
         return {"role": "assistant", "content": content}
 
     @property
     def appended_messages(self) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Property returning the tool messages built from each response, in order.
         return [response.to_message() for response in self.responses]
 
 
 @dataclass
 class VLToolTrajectory:
+    # [CLASS DOC]
+    # Mutable VL tool-agent case: name, description, raw_prompt (may contain images), steps, FunctionTools
+    # and max parallel calls (default 1).
     name: str
     description: str
     raw_prompt: list[dict[str, Any]]
@@ -663,20 +756,30 @@ class VLToolTrajectory:
 
     @property
     def tool_schemas(self) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Property returning each tool's schema dict (unset and None fields omitted). Note: a property here,
+        # unlike the method on ToolAgentTrajectory.
         return [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in self.tools]
 
     @property
     def expected_generation_turns(self) -> int:
+        # [FUNCTION DOC]
+        # Number of steps.
         return len(self.steps)
 
     @property
     def expected_num_turns(self) -> int:
+        # [FUNCTION DOC]
+        # Steps + steps with responses + 1 for the prompt.
         tool_rounds = sum(1 for step in self.steps if step.responses)
         return self.expected_generation_turns + tool_rounds + 1
 
 
 @dataclass
 class VLSingleTurnTrajectory:
+    # [CLASS DOC]
+    # VL single-turn case: name, description, raw_prompt with an image, assistant response text, and
+    # fixed expected turn counts (1 generation, 2 total).
     name: str
     description: str
     raw_prompt: list[dict[str, Any]]
@@ -686,6 +789,8 @@ class VLSingleTurnTrajectory:
     expected_num_turns: int = 2
 
     def assistant_message(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns the assistant message with the response text as content.
         return {"role": "assistant", "content": self.assistant_response}
 
 
@@ -693,12 +798,17 @@ VLMockTrajectory = VLSingleTurnTrajectory | VLToolTrajectory
 
 
 def _solid_image(size: tuple[int, int], color: str) -> PILImage:
+    # [FUNCTION DOC]
+    # HELPER: Imports Pillow lazily and returns a new RGB image of the given size filled with the color.
     from PIL import Image
 
     return Image.new("RGB", size, color=color)
 
 
 def _make_query_tool(name: str, description: str, response: VLToolResponseSpec) -> FunctionTool:
+    # [FUNCTION DOC]
+    # HELPER: Builds a FunctionTool named name whose schema has one required string argument "query" and
+    # whose function ignores the query and returns the given response's ToolResponse.
     """Build a deterministic function tool with a single ``query`` argument.
 
     The tool ignores the query and always returns ``response``; the query only
@@ -722,6 +832,8 @@ def _make_query_tool(name: str, description: str, response: VLToolResponseSpec) 
     )
 
     def _fn(query: str = "") -> ToolResponse:
+        # [FUNCTION DOC]
+        # HELPER: Tool body: discards the query and returns the canned ToolResponse.
         del query
         return response.to_tool_response()
 
@@ -729,6 +841,12 @@ def _make_query_tool(name: str, description: str, response: VLToolResponseSpec) 
 
 
 def build_vl_trajectories() -> dict[str, VLMockTrajectory]:
+    # [FUNCTION DOC]
+    # Creates fresh images (84x84 teal prompt image, 56x56 orange and purple tool images) and returns a
+    # mapping from name to the three VL trajectories: a single-turn description, a single zoom_tool call
+    # returning the orange image followed by an answer, and two parallel calls (left_tool, right_tool)
+    # returning the two images followed by a summary (max_parallel_calls 2).
+    # Exceptions: ImportError if Pillow is missing.
     """Construct the inline VL trajectories.
 
     Uses small solid-color images so token counts stay small and image
@@ -835,6 +953,8 @@ VL_TRAJECTORY_NAMES: tuple[str, ...] = VL_SINGLE_TURN_TRAJECTORY_NAMES + VL_TOOL
 
 
 def get_vl_trajectory(name: str) -> VLMockTrajectory:
+    # [FUNCTION DOC]
+    # Builds the VL trajectories and returns the named one. Exceptions: ValueError if unknown.
     trajectories = build_vl_trajectories()
     try:
         return trajectories[name]
@@ -843,6 +963,9 @@ def get_vl_trajectory(name: str) -> VLMockTrajectory:
 
 
 def select_vl_trajectories(names: list[str] | None = None) -> list[VLMockTrajectory]:
+    # [FUNCTION DOC]
+    # Builds the VL trajectories and returns all (when names empty/None) or the named ones in order.
+    # Exceptions: ValueError listing any unknown names.
     trajectories = build_vl_trajectories()
     if not names:
         return list(trajectories.values())

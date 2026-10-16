@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CPU tests for the supervised top-k distillation path in MegatronEngineWithLMHead._lm_head_logits_processor: outputs
+# of the distillation logits processor must be propagated, and log-prob computation skipped when distillation_only is
+# set. Sets KMP_DUPLICATE_LIB_OK=TRUE (if unset) at import.
+
 """Unit tests for Megatron supervised top-k distillation (distillation_only) path.
 
 ``MegatronEngineWithLMHead._lm_head_logits_processor`` must propagate distillation
@@ -40,6 +46,8 @@ _DISTILLATION_KEYS = ("distillation_losses", "student_mass", "teacher_mass")
 
 
 def _make_engine_stub():
+    # [FUNCTION DOC]
+    # HELPER: Creates a MegatronEngineWithLMHead without __init__ whose engine config disables chunked entropy (chunk 1024).
     eng = object.__new__(MegatronEngineWithLMHead)
     eng.engine_config = SimpleNamespace(
         entropy_from_logits_with_chunking=False,
@@ -49,7 +57,11 @@ def _make_engine_stub():
 
 
 def _make_logits_processor(keys):
+    # [FUNCTION DOC]
+    # HELPER: Returns a fake processor mapping each key i to a (1, n) tensor filled with i+1, n being the logits' dim 1.
     def _proc(student_logits, data, data_format):
+        # [FUNCTION DOC]
+        # HELPER: The fake processor; ignores data and data_format.
         n = student_logits.shape[1]
         return {k: torch.full((1, n), float(i + 1)) for i, k in enumerate(keys)}
 
@@ -57,6 +69,11 @@ def _make_logits_processor(keys):
 
 
 def _run_logits_processor(eng, *, distillation_use_topk, distillation_only):
+    # [FUNCTION DOC]
+    # HELPER: Builds random packed logits/labels with 5 tokens (top-k) or 4 tokens (no top-k), unit temperature and an empty
+    # batch, patches vocab_parallel_log_probs_from_logits to return zeros, and invokes _lm_head_logits_processor in thd
+    # format with entropy and sum-pi-squared disabled.
+    # Outputs: tuple (the log-prob mock, returned dict, token count).
     total_nnz = 5 if distillation_use_topk else 4
     logits = torch.randn(1, total_nnz, _VOCAB_SIZE)
     label = torch.randint(0, _VOCAB_SIZE, (1, total_nnz))
@@ -85,6 +102,9 @@ def _run_logits_processor(eng, *, distillation_use_topk, distillation_only):
 
 @pytest.mark.parametrize("distillation_only", [False, True])
 def test_megatron_logits_processor_distillation_only_skips_log_probs(distillation_only):
+    # [FUNCTION DOC]
+    # With top-k enabled: when distillation_only the log-prob function is never called and log_probs is absent; otherwise
+    # called once and present. All distillation keys are present with shape (1, tokens).
     eng = _make_engine_stub()
     mock_log_probs, ret, total_nnz = _run_logits_processor(
         eng, distillation_use_topk=True, distillation_only=distillation_only
@@ -103,6 +123,8 @@ def test_megatron_logits_processor_distillation_only_skips_log_probs(distillatio
 
 
 def test_megatron_logits_processor_without_topk_always_computes_log_probs():
+    # [FUNCTION DOC]
+    # Without top-k, log probs are computed once and no distillation keys appear.
     """When distillation_use_topk=False, log_probs are always computed.
 
     distillation_only is only set by the trainer when use_topk=True, so we do not

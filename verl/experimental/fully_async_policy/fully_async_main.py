@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Hydra entry point for fully-async PPO training. Builds a Ray task runner that creates the trainer, the
+# rollouter, and the message queue connecting them, then runs both fit loops concurrently.
+
 import asyncio
 import os
 import socket
@@ -34,21 +38,41 @@ from verl.utils.fs import copy_to_local
 
 @ray.remote(num_cpus=1)
 class FullyAsyncTaskRunner:
+    # [CLASS DOC]
+    # Ray actor (1 CPU) orchestrating component construction and the concurrent training loop. Keeps a mapping
+    # of named components (tokenizer, processor, config, worker mapping, trainer, rollouter, queue, queue client,
+    # optional hybrid worker group).
     """
     Ray remote class for executing distributed PPO training tasks.
     """
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Behavior: initializes running flag false, empty component mapping, and an unused threading shutdown event.
+        # Outputs: none.
         self.running = False
         self.components = {}
         self.shutdown_event = threading.Event()
 
     def run(self, config):
+        # [FUNCTION DOC]
+        # Behavior: logs, initializes all components, then runs the training loop (blocks until done).
+        # Inputs: config - resolved-able OmegaConf config. Outputs: none.
+        # Exceptions: propagates failures from initialization or either component.
         print("[ASYNC MAIN] Starting fully async PPO training...")
         self._initialize_components(config)
         self._run_training_loop()
 
     def _initialize_components(self, config) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Builds every component in order.
+        # Behavior: logs host/pid and the config, resolves config in place; copies model to local (optionally shm);
+        # builds tokenizer and processor (processor may be none); builds role-worker mapping; creates trainer first, then
+        # extracts hybrid worker group, then creates rollouter; gives trainer the rollouter handle; copies total train
+        # steps from rollouter to trainer; creates MessageQueue actor sized by the rollouter's max queue size and a
+        # client, gives the client to both; loads checkpoints (trainer then rollouter); performs initial weight sync via
+        # trainer; optionally runs validation before training (default true).
+        # Inputs: config. Outputs: none. Side effects: creates Ray actors, many blocking remote calls, prints.
         print(f"[ASYNC MAIN] TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
@@ -115,6 +139,10 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] All components initialized successfully")
 
     def _create_rollouter(self, config) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Creates the FullyAsyncRollouter actor with config, tokenizer, processor, device; if a hybrid worker
+        # group exists injects it before initializing workers; then inits workers and sets max required samples; stores
+        # the handle under "rollouter". Side effects: Ray actor creation, blocking remote calls.
         print("[ASYNC MAIN] Starting create rollouter...")
         rollouter = FullyAsyncRollouter.remote(
             config=config,
@@ -136,6 +164,9 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] Rollouter created and initialized successfully")
 
     def _create_trainer(self, config) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Creates the FullyAsyncTrainer actor using all roles except Rollout, a resource pool manager built for
+        # those roles, the worker group class and device; initializes its workers and stores it under "trainer".
         print("[ASYNC MAIN] Starting create trainer...")
         trainer_role_mapping = {
             role: worker_cls
@@ -157,6 +188,10 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
 
     def _setup_hybrid_worker_group(self, config) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If trainer-side validation or dynamic resource scheduling is enabled, fetches the trainer's actor worker
+        # group and stores it as "hybrid_worker_group"; otherwise logs and skips.
+        # Inputs: config. Outputs: none. Side effects: blocking remote call, mutates components.
         """Extract the trainer's actor_rollout_wg for hybrid rollout replicas.
 
         Hybrid replicas are needed when *either*:
@@ -184,6 +219,12 @@ class FullyAsyncTaskRunner:
             )
 
     def _run_training_loop(self):
+        # [FUNCTION DOC]
+        # HELPER: Starts fit on rollouter and trainer, then waits on futures one at a time. Each completed future is
+        # fetched; if it raised, remaining futures are cancelled and the error re-raised. Outer handler cancels all
+        # outstanding futures and re-raises. Finally always clears the message queue (running a fresh event loop) and logs.
+        # Outputs: none. Exceptions: re-raises component failures.
+        # Side effects: sets running true, cancels Ray tasks, clears queue.
         self.running = True
 
         print("[ASYNC MAIN] Starting Rollouter and Trainer...")
@@ -221,6 +262,11 @@ class FullyAsyncTaskRunner:
 
 @hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)
 def main(config):
+    # [FUNCTION DOC]
+    # Behavior: Hydra main. Requires an async_training section (raises RuntimeError otherwise); auto-sets device;
+    # copies rollout nnodes and gpus-per-node from the top-level rollout section into actor_rollout_ref.rollout;
+    # migrates legacy reward config; runs the generic PPO launcher with FullyAsyncTaskRunner; prints total time.
+    # Inputs: config - Hydra config. Outputs: none. Side effects: launches distributed training.
     from verl.trainer.main_ppo import run_ppo
 
     # Ensure async training config exists

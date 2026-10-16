@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# GPU Ray test that a Worker can hold another Worker instance in-process (nested worker) and that registered
+# ONE_TO_ALL methods work for both the plain and the nesting worker groups.
 
 import ray
 
@@ -23,26 +26,41 @@ from verl.utils.device import get_device_name
 
 class TestActor(Worker):
     # TODO: pass *args and **kwargs is bug prone and not very convincing
+    # [CLASS DOC]
+    # HELPER: Worker storing value x; get returns x + rank.
     def __init__(self, x) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls base Worker init and stores x as self.a.
         super().__init__()
         self.a = x
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get(self):
+        # [FUNCTION DOC]
+        # HELPER: ONE_TO_ALL; returns self.a + self.rank.
         return self.a + self.rank
 
 
 class TestHighLevelActor(Worker):
+    # [CLASS DOC]
+    # HELPER: Worker that constructs a local (non-remote) TestActor and delegates get to it.
     def __init__(self, x=None) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls base init and creates an inner TestActor with the same x (default None); the inner worker reads the same rank env.
         super().__init__()
         self.test_actor = TestActor(x=x)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get(self):
+        # [FUNCTION DOC]
+        # HELPER: ONE_TO_ALL; returns the inner actor's get(), i.e. x + rank.
         return self.test_actor.get()
 
 
 def test_nested_worker():
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, creates a 4-GPU pool, a group of TestActor(x=2) and asserts get returns [2,3,4,5]; then a group of
+    # TestHighLevelActor(x=2) on the same pool returns the same. Side effects: starts/stops Ray.
     ray.init(num_cpus=100)
 
     # create 4 workers, each hold a GPU

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Config helpers: converting OmegaConf configs to dataclasses (or Hydra-instantiated objects), copying config values
+# into dicts, and cross-field validation of the PPO trainer config. Exports omega_conf_to_dataclass and validate_config.
+
 from dataclasses import is_dataclass
 from typing import Any, Optional
 
@@ -21,6 +25,13 @@ __all__ = ["omega_conf_to_dataclass", "validate_config"]
 
 
 def omega_conf_to_dataclass(config: DictConfig | dict, dataclass_type: Optional[type[Any]] = None) -> Any:
+    # [FUNCTION DOC]
+    # Behavior: empty/falsy config returns None when no type is given, else a default-constructed dataclass_type. Non-config
+    # objects (not DictConfig/ListConfig/dict/list) are returned unchanged. Without dataclass_type, requires "_target_" and
+    # instantiates via Hydra with partial conversion. With a type: requires it to be a dataclass, merges the config over the
+    # structured schema of the dataclass (config values override defaults, type-checked by OmegaConf) and converts to an
+    # object. Inputs: config; dataclass_type - optional. Outputs: instance (or None / passthrough object).
+    # Exceptions: AssertionError without _target_; ValueError for non-dataclass type; OmegaConf validation errors.
     """
     Convert an OmegaConf DictConfig to a dataclass.
 
@@ -66,12 +77,18 @@ def omega_conf_to_dataclass(config: DictConfig | dict, dataclass_type: Optional[
 
 
 def update_dict_with_config(dictionary: dict, config: DictConfig):
+    # [FUNCTION DOC]
+    # Behavior: for each key in the dict, overwrites its value with the same-named attribute of config if present.
+    # Inputs: dictionary (mutated), config. Outputs: none.
     for key in dictionary:
         if hasattr(config, key):
             dictionary[key] = getattr(config, key)
 
 
 def _validate_router_replay_config(actor_config: Any, rollout_correction: Any) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Raises ValueError if actor engine router_replay.mode is "R2" while rollout_correction.bypass_mode is true
+    # (R2 needs the old-log-prob recompute forward). Inputs: actor_config, rollout_correction (mapping or None).
     engine_config = getattr(actor_config, "engine", None)
     router_replay = getattr(engine_config, "router_replay", None)
     if (
@@ -90,6 +107,17 @@ def validate_config(
     use_reference_policy: bool,
     use_critic: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: validates the PPO config. n_gpus = n_gpus_per_node * nnodes. Without dynamic bsz: for megatron, asserts
+    # n_gpus divisible by TP*PP*CP and minimal batch = DP size * ppo_micro_batch_size_per_gpu; else minimal batch = n_gpus;
+    # asserts train_batch_size * rollout.n divisible by the minimal batch. Converts and validates the actor config, checks
+    # router replay vs bypass mode. Without dynamic bsz, checks ref (if used) and rollout log-prob micro batch settings are
+    # mutually exclusive and at least one set. Prints notices for in-reward KL plus KL loss and deprecated val_batch_size.
+    # Validates critic config if used. If val do_sample, asserts rollout temperature > 0. Computes LoRA rank (lora.rank,
+    # else lora_rank; 0 if lora.merge) and for vLLM checks it against supported max LoRA ranks. Prints success.
+    # Inputs: config, use_reference_policy, use_critic. Outputs: none.
+    # Exceptions: AssertionError/ValueError on invalid config.
+    # KNOWN ISSUE: the do_sample check validates rollout.temperature rather than val_kwargs.temperature.
     """Validate an OmegaConf DictConfig.
 
     Args:
@@ -129,6 +157,9 @@ def validate_config(
     # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
     # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
     def check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
+        # [FUNCTION DOC]
+        # HELPER: For the ref and rollout sections (others ignored), raises ValueError if neither or both of the deprecated
+        # micro batch size and its per-GPU variant are set. Inputs: mbs, mbs_per_gpu, name - section path.
         """Validate mutually exclusive micro batch size configuration options.
 
         Ensures that users don't set both deprecated micro_batch_size and

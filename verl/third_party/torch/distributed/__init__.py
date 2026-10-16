@@ -85,3 +85,7 @@
 # CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
+
+# [PACKAGE DOC]
+# Vendored subset of torch.distributed (license header only). Contains no code; hosts the copied _state_dict_utils
+# module taken from torch 2.7 to avoid an OOM in the torch 2.6 set_model_state_dict path.

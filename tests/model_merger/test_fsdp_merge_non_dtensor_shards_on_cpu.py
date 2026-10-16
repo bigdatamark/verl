@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for merge_non_dtensor_shards, which combines per-rank copies of a non-DTensor (replicated) state
+# entry from FSDP checkpoints: identical copies collapse to one tensor, disagreement raises ValueError.
+
 import pytest
 import torch
 
@@ -19,6 +23,8 @@ from verl.model_merger.fsdp_model_merger import merge_non_dtensor_shards
 
 
 def test_replicated_scalar_buffer_is_kept_as_is():
+    # [FUNCTION DOC]
+    # Asserts 8 identical 0-d tensors merge to a 0-d tensor with the same value (no concatenation).
     # A 0-d buffer replicated by FSDP2: torch.cat would raise on it.
     shards = [torch.tensor(-6.375) for _ in range(8)]
     merged = merge_non_dtensor_shards("clamp_min", shards)
@@ -27,18 +33,25 @@ def test_replicated_scalar_buffer_is_kept_as_is():
 
 
 def test_replicated_1d_buffer_is_not_concatenated():
+    # [FUNCTION DOC]
+    # Asserts 8 identical shape-(1,) tensors merge to shape (1,), not (8,).
     # A (1,) buffer replicated by FSDP2: concatenating would silently give (8,).
     shards = [torch.tensor([0.061]) for _ in range(8)]
     assert merge_non_dtensor_shards("layer_scalar", shards).shape == (1,)
 
 
 def test_single_rank_checkpoint_returns_the_tensor():
+    # [FUNCTION DOC]
+    # Asserts a single-rank list returns a tensor equal to the input.
     # world_size == 1 (the case the old torch.cat fallback was added for): one plain copy.
     tensor = torch.arange(6.0).reshape(2, 3)
     assert torch.equal(merge_non_dtensor_shards("weight", [tensor]), tensor)
 
 
 def test_ranks_disagreeing_is_an_error_naming_the_key():
+    # [FUNCTION DOC]
+    # Asserts ValueError naming the key and "rank 1" when same-shape copies differ in value, and ValueError naming
+    # the key when copies differ in shape.
     same_shape = [torch.full((2, 3), float(rank)) for rank in range(4)]
     with pytest.raises(ValueError, match="'suspicious'.*rank 1"):
         merge_non_dtensor_shards("suspicious", same_shape)

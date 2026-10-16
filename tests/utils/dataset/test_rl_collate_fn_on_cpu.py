@@ -11,10 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU unit test for the RL dataset collate function (verl.utils.dataset.rl_dataset.collate_fn).
+# Verifies that tensor fields are stacked into a batch tensor and that every non-tensor field
+# (lists, strings, dicts, empty dicts) is collected into a 1-D object array of length batch_size.
 import torch
 
 
 def test_rl_collate_fn():
+    # [FUNCTION DOC]
+    # Behavior: builds two sample dicts each holding a random int tensor "input_ids" of length 5 plus
+    # non-tensor fields "messages" (fixed length list), "raw_prompt_ids" (variable length list), "ability" (str),
+    # "reward_model" (dict) and "tools_kwargs" (empty dict); collates them; asserts input_ids is a tensor of
+    # shape (2, 5) and each non-tensor key has shape (2,) with first element of the expected Python type.
+    # Inputs: none. Outputs: none (pytest test).
+    # Exceptions: AssertionError on mismatch. Side effects: none.
     from verl.utils.dataset.rl_dataset import collate_fn
 
     max_prompt_length = 5

@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# GPU-free tests for vLLM prefill/decode (PD) disaggregation: DisaggregationConfig validation, RolloutConfig coercion
+# and backend-name gating, replica class dispatch, vLLMPDReplica KV-transfer config construction and init validation,
+# and vLLMHttpServer decode-peer round-robin plus the two-leg _pd_dispatch flow (NIXL and Mooncake). Tests needing
+# vllm import it lazily and skip if unavailable.
+
 """GPU-free unit tests for vLLM PD disaggregation config + replica plumbing.
 
 Covers Phase 1 of the verl-vllm-pd-disagg series:
@@ -39,6 +46,8 @@ from verl.workers.config import DisaggregationConfig, RolloutConfig
 
 
 def test_disaggregation_defaults_disabled_and_valid():
+    # [FUNCTION DOC]
+    # Default DisaggregationConfig: disabled, 1 prefill and 1 decode replica, nixl backend, no bootstrap port, no IB device.
     cfg = DisaggregationConfig()
     assert cfg.enabled is False
     assert cfg.prefill_replicas == 1
@@ -49,6 +58,8 @@ def test_disaggregation_defaults_disabled_and_valid():
 
 
 def test_disaggregation_enabled_nixl_accepted():
+    # [FUNCTION DOC]
+    # Enabled config with nixl backend is accepted.
     cfg = DisaggregationConfig(enabled=True, transfer_backend="nixl")
     assert cfg.enabled is True
     assert cfg.transfer_backend == "nixl"
@@ -56,16 +67,22 @@ def test_disaggregation_enabled_nixl_accepted():
 
 @pytest.mark.parametrize("backend", ["nixl", "mooncake", "ascend", "mori", "fake"])
 def test_disaggregation_all_known_backends_pass_config_validation(backend):
+    # [FUNCTION DOC]
+    # Each known backend name (nixl, mooncake, ascend, mori, fake) passes config-level validation.
     cfg = DisaggregationConfig(enabled=True, transfer_backend=backend)
     assert cfg.transfer_backend == backend
 
 
 def test_disaggregation_unknown_backend_rejected():
+    # [FUNCTION DOC]
+    # Unknown backend raises ValueError mentioning transfer_backend.
     with pytest.raises(ValueError, match="transfer_backend"):
         DisaggregationConfig(enabled=True, transfer_backend="bogus")
 
 
 def test_disaggregation_zero_replicas_rejected():
+    # [FUNCTION DOC]
+    # Zero prefill or decode replicas raise ValueError naming the field.
     with pytest.raises(ValueError, match="prefill_replicas"):
         DisaggregationConfig(enabled=True, prefill_replicas=0)
     with pytest.raises(ValueError, match="decode_replicas"):
@@ -73,22 +90,30 @@ def test_disaggregation_zero_replicas_rejected():
 
 
 def test_disaggregation_bad_bootstrap_port_rejected():
+    # [FUNCTION DOC]
+    # A bootstrap port above 65535 raises ValueError.
     with pytest.raises(ValueError, match="bootstrap_port"):
         DisaggregationConfig(enabled=True, bootstrap_port=70000)
 
 
 def test_disaggregation_disabled_skips_validation():
+    # [FUNCTION DOC]
+    # With enabled=False invalid values are tolerated.
     """When enabled=False, even bad values are tolerated (matches YAML defaults)."""
     cfg = DisaggregationConfig(enabled=False, transfer_backend="bogus", bootstrap_port=70000)
     assert cfg.enabled is False
 
 
 def test_effective_decode_tp_defaults_to_prefill_tp():
+    # [FUNCTION DOC]
+    # Without an override, effective_decode_tp returns the prefill TP.
     cfg = DisaggregationConfig(enabled=True)
     assert cfg.effective_decode_tp(prefill_tp=4) == 4
 
 
 def test_effective_decode_tp_respects_override():
+    # [FUNCTION DOC]
+    # decode_tensor_model_parallel_size overrides the prefill TP.
     cfg = DisaggregationConfig(enabled=True, decode_tensor_model_parallel_size=2)
     assert cfg.effective_decode_tp(prefill_tp=4) == 2
 
@@ -99,6 +124,8 @@ def test_effective_decode_tp_respects_override():
 
 
 def test_rollout_config_vllm_pd_enabled_ok():
+    # [FUNCTION DOC]
+    # RolloutConfig(name="vllm") with enabled disaggregation is accepted and keeps the nixl default.
     cfg = RolloutConfig(
         name="vllm",
         disaggregation=DisaggregationConfig(enabled=True),
@@ -109,6 +136,8 @@ def test_rollout_config_vllm_pd_enabled_ok():
 
 @pytest.mark.parametrize("name", ["sglang", "vllm"])
 def test_rollout_config_pd_enabled_passes_name_gate(name):
+    # [FUNCTION DOC]
+    # Enabled disaggregation is accepted for sglang and vllm names.
     """RolloutConfig accepts ``sglang`` / ``vllm`` when
     ``disaggregation.enabled=True`` — the canonical post-#6117 pattern."""
     cfg = RolloutConfig(
@@ -120,6 +149,8 @@ def test_rollout_config_pd_enabled_passes_name_gate(name):
 
 @pytest.mark.parametrize("name", ["trtllm"])
 def test_rollout_config_non_pd_name_rejects_pd(name):
+    # [FUNCTION DOC]
+    # A backend without PD support (trtllm) with enabled disaggregation raises ValueError.
     with pytest.raises(ValueError, match="disaggregation.enabled=True"):
         RolloutConfig(
             name=name,
@@ -128,12 +159,16 @@ def test_rollout_config_non_pd_name_rejects_pd(name):
 
 
 def test_rollout_config_disabled_pd_works_on_any_backend():
+    # [FUNCTION DOC]
+    # Default (disabled) disaggregation is accepted for sglang, vllm and trtllm.
     for name in ("sglang", "vllm", "trtllm"):
         cfg = RolloutConfig(name=name)
         assert cfg.disaggregation.enabled is False
 
 
 def test_rollout_config_accepts_dict_disaggregation():
+    # [FUNCTION DOC]
+    # A plain dict disaggregation value is coerced to DisaggregationConfig.
     """Hydra/OmegaConf hands the field as a plain dict; post_init must coerce."""
     cfg = RolloutConfig(
         name="vllm",
@@ -144,6 +179,8 @@ def test_rollout_config_accepts_dict_disaggregation():
 
 
 def test_rollout_config_accepts_dictconfig_disaggregation():
+    # [FUNCTION DOC]
+    # An OmegaConf DictConfig disaggregation value is coerced to DisaggregationConfig.
     from omegaconf import OmegaConf
 
     dc = OmegaConf.create({"enabled": True, "transfer_backend": "nixl", "decode_replicas": 2})
@@ -158,6 +195,8 @@ def test_rollout_config_accepts_dictconfig_disaggregation():
 
 
 def test_dispatcher_vllm_with_flag_returns_pd_replica():
+    # [FUNCTION DOC]
+    # Replica dispatch: the flag selects vLLMPDReplica (subclass of vLLMReplica); without it vLLMReplica. Skips without vllm.
     """``get_rollout_replica_class('vllm', disaggregation_enabled=True)``
     resolves to ``vLLMPDReplica``; the same name without the flag resolves to
     the colocated ``vLLMReplica``. Mirrors the SGLang dispatch from PR #6117."""
@@ -186,6 +225,9 @@ def _build_kv_cfg(
     transfer_backend: str = "nixl",
     mooncake_protocol=None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Skips if vllm missing; calls the static vLLMPDReplica._build_kv_transfer_config with the given keyword
+    # arguments and returns the resulting dict.
     # Lazy import: only meaningful when vllm-rollout deps are importable.
     pytest.importorskip("vllm")
     from verl.workers.rollout.vllm_rollout.vllm_pd_replica import vLLMPDReplica
@@ -199,6 +241,8 @@ def _build_kv_cfg(
 
 
 def test_build_kv_transfer_config_prefill_role_maps_to_kv_producer():
+    # [FUNCTION DOC]
+    # Prefill role yields NixlConnector, kv_producer, given engine_id, cuda buffer device, and no extra config.
     cfg = _build_kv_cfg(role="prefill", engine_id="e0")
     assert cfg["kv_connector"] == "NixlConnector"
     assert cfg["kv_role"] == "kv_producer"
@@ -208,6 +252,8 @@ def test_build_kv_transfer_config_prefill_role_maps_to_kv_producer():
 
 
 def test_build_kv_transfer_config_decode_role_maps_to_kv_consumer():
+    # [FUNCTION DOC]
+    # Decode role yields kv_consumer with the given engine_id.
     cfg = _build_kv_cfg(role="decode", engine_id="e1")
     assert cfg["kv_role"] == "kv_consumer"
     assert cfg["engine_id"] == "e1"
@@ -215,6 +261,8 @@ def test_build_kv_transfer_config_decode_role_maps_to_kv_consumer():
 
 @pytest.mark.parametrize("role,expected_role", [("prefill", "kv_producer"), ("decode", "kv_consumer")])
 def test_build_kv_transfer_config_mooncake_backend(role, expected_role):
+    # [FUNCTION DOC]
+    # Mooncake backend yields MooncakeConnector for both roles with the right kv_role.
     """Under transfer_backend='mooncake' the connector name must be
     'MooncakeConnector' on both prefill and decode legs. Earlier rev had a
     bug where decode silently fell back to NixlConnector because the
@@ -225,6 +273,8 @@ def test_build_kv_transfer_config_mooncake_backend(role, expected_role):
 
 
 def test_build_kv_transfer_config_mooncake_protocol_pinned():
+    # [FUNCTION DOC]
+    # A Mooncake protocol is placed into kv_connector_extra_config.
     """``mooncake_protocol`` lands in ``kv_connector_extra_config`` so vLLM's
     MooncakeConnector pins the requested transport instead of taking the
     upstream default ``"rdma"`` (which silently falls back to TCP on hosts
@@ -234,6 +284,8 @@ def test_build_kv_transfer_config_mooncake_protocol_pinned():
 
 
 def test_build_kv_transfer_config_mooncake_protocol_omitted_when_none():
+    # [FUNCTION DOC]
+    # No protocol means no kv_connector_extra_config key.
     """When ``mooncake_protocol`` is not supplied, the field is absent so vLLM
     keeps its own default. Useful for the NIXL path where the field is moot."""
     cfg = _build_kv_cfg(role="prefill", transfer_backend="mooncake", mooncake_protocol=None)
@@ -241,6 +293,8 @@ def test_build_kv_transfer_config_mooncake_protocol_omitted_when_none():
 
 
 def test_build_kv_transfer_config_mooncake_protocol_ignored_for_nixl():
+    # [FUNCTION DOC]
+    # Protocol is ignored for the NIXL connector.
     """``mooncake_protocol`` is meaningful only for the Mooncake connector;
     the NIXL connector ignores it (UCX picks transport on its own)."""
     cfg = _build_kv_cfg(role="prefill", transfer_backend="nixl", mooncake_protocol="nvlink")
@@ -249,15 +303,21 @@ def test_build_kv_transfer_config_mooncake_protocol_ignored_for_nixl():
 
 @pytest.mark.parametrize("protocol", ["nvlink", "local", "rdma", "tcp"])
 def test_disagg_config_accepts_known_mooncake_protocols(protocol):
+    # [FUNCTION DOC]
+    # Each known Mooncake protocol (nvlink, local, rdma, tcp) is accepted without error.
     DisaggregationConfig(enabled=True, transfer_backend="mooncake", mooncake_protocol=protocol)
 
 
 def test_disagg_config_rejects_unknown_mooncake_protocol():
+    # [FUNCTION DOC]
+    # An unknown Mooncake protocol raises ValueError.
     with pytest.raises(ValueError, match="mooncake_protocol"):
         DisaggregationConfig(enabled=True, transfer_backend="mooncake", mooncake_protocol="bogus")
 
 
 def test_disagg_config_default_mooncake_protocol_is_nvlink():
+    # [FUNCTION DOC]
+    # Default Mooncake protocol is nvlink.
     """Default to ``nvlink`` so single-node PD on H100/H200 actually uses the
     NVLink fabric. vLLM's upstream Mooncake default is ``rdma``, which on a
     no-RDMA rack silently falls back to TCP loopback."""
@@ -274,6 +334,10 @@ def test_disagg_config_default_mooncake_protocol_is_nvlink():
 
 
 def _make_pd_config(**overrides) -> RolloutConfig:
+    # [FUNCTION DOC]
+    # HELPER: Builds a RolloutConfig(name="vllm") with a DisaggregationConfig from overrides (enabled default True,
+    # 1 prefill / 1 decode replica, nixl, no decode TP override, no IB device); pops tensor/data parallel sizes (default 1)
+    # and passes any remaining overrides to RolloutConfig. Mutates the overrides dict by popping keys.
     disagg = DisaggregationConfig(
         enabled=overrides.pop("enabled", True),
         prefill_replicas=overrides.pop("prefill_replicas", 1),
@@ -293,12 +357,17 @@ def _make_pd_config(**overrides) -> RolloutConfig:
 
 @pytest.fixture
 def patched_replica_cls():
+    # [FUNCTION DOC]
+    # HELPER: Fixture; skips without vllm, patches vLLMReplica.__init__ with a stub that sets only the state PD validation needs, and yields vLLMPDReplica. Patch is undone after the test.
     """Patch parent ``vLLMReplica.__init__`` so we can exercise the PD validation
     in isolation (no Ray, no vLLMHttpServer remote-class construction)."""
     pytest.importorskip("vllm")
     from verl.workers.rollout.vllm_rollout import vllm_pd_replica as mod
 
     def _stub_super_init(self, replica_rank, config, model_config, gpus_per_node, *_a, **_kw):
+        # [FUNCTION DOC]
+        # HELPER: Replacement parent __init__ setting the minimal replica state: rank, dataclass config, model config,
+        # gpus_per_node, world_size (tp x dp), per-node GPUs, node count, empty worker/server lists, null server class/address/handle.
         # Faithful subset of RolloutReplica + vLLMReplica state needed by
         # vLLMPDReplica.__init__ to run its validation block.
         from verl.utils.config import omega_conf_to_dataclass
@@ -322,6 +391,8 @@ def patched_replica_cls():
 
 
 def test_pd_replica_init_happy_path_1p1d(patched_replica_cls):
+    # [FUNCTION DOC]
+    # 1P:1D config yields one prefill and one decode engine, TP 1 each, world size 2, and empty server lists.
     cfg = _make_pd_config()
     replica = patched_replica_cls(
         replica_rank=0,
@@ -338,6 +409,8 @@ def test_pd_replica_init_happy_path_1p1d(patched_replica_cls):
 
 
 def test_pd_replica_init_happy_path_1p3d(patched_replica_cls):
+    # [FUNCTION DOC]
+    # 1P:3D config yields 3 decode engines and world size 4.
     cfg = _make_pd_config(decode_replicas=3)
     replica = patched_replica_cls(
         replica_rank=0,
@@ -350,6 +423,8 @@ def test_pd_replica_init_happy_path_1p3d(patched_replica_cls):
 
 
 def test_pd_replica_init_accepts_tp_gt_1(patched_replica_cls):
+    # [FUNCTION DOC]
+    # Prefill TP 2 plus 2 decode replicas of TP 2 gives world size 6.
     """TP>1 per PD engine works as long as the worker_group footprint adds
     up. Each worker independently computes its socket key as
     base + self.local_rank (see utils.py::_get_zmq_handle), so the single
@@ -368,6 +443,8 @@ def test_pd_replica_init_accepts_tp_gt_1(patched_replica_cls):
 
 
 def test_pd_replica_init_accepts_mooncake(patched_replica_cls):
+    # [FUNCTION DOC]
+    # Mooncake backend is accepted by replica init.
     """Mooncake is now an accepted transfer_backend (requires
     `mooncake-transfer-engine` pip pkg at runtime in the engine actor)."""
     cfg = _make_pd_config(transfer_backend="mooncake")
@@ -376,30 +453,40 @@ def test_pd_replica_init_accepts_mooncake(patched_replica_cls):
 
 
 def test_pd_replica_init_rejects_unsupported_backend(patched_replica_cls):
+    # [FUNCTION DOC]
+    # Backend "mori" raises NotImplementedError at replica init.
     cfg = _make_pd_config(transfer_backend="mori")
     with pytest.raises(NotImplementedError, match="transfer_backend in"):
         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
 
 
 def test_pd_replica_init_rejects_multi_prefill(patched_replica_cls):
+    # [FUNCTION DOC]
+    # More than one prefill replica raises NotImplementedError.
     cfg = _make_pd_config(prefill_replicas=2)
     with pytest.raises(NotImplementedError, match="prefill_replicas=1"):
         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
 
 
 def test_pd_replica_init_rejects_dp_gt_1(patched_replica_cls):
+    # [FUNCTION DOC]
+    # data_parallel_size above 1 raises NotImplementedError.
     cfg = _make_pd_config(data_parallel_size=2)
     with pytest.raises(NotImplementedError, match="data_parallel_size=1"):
         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
 
 
 def test_pd_replica_init_rejects_oversized_world(patched_replica_cls):
+    # [FUNCTION DOC]
+    # A world needing more GPUs than one node (1+8 > 8) raises NotImplementedError "single-node only".
     cfg = _make_pd_config(decode_replicas=8)  # 1 + 8 = 9 GPUs needed
     with pytest.raises(NotImplementedError, match="single-node only"):
         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
 
 
 def test_pd_replica_init_requires_disaggregation_enabled(patched_replica_cls):
+    # [FUNCTION DOC]
+    # Constructing vLLMPDReplica with disaggregation disabled raises AssertionError.
     cfg = _make_pd_config(enabled=False)
     # RolloutConfig validation lets `name='vllm'` + `enabled=False` through
     # (that's the colocated path). But constructing vLLMPDReplica directly
@@ -419,9 +506,15 @@ def test_pd_replica_init_requires_disaggregation_enabled(patched_replica_cls):
 
 
 class _DispatchStub:
+    # [CLASS DOC]
+    # HELPER: Fake server instance carrying the attributes read by vLLMHttpServer._select_decode_peer and _pd_dispatch:
+    # role, decode peer list, rotation index (starting at 0), kv-transfer config with the connector name, and prefill
+    # engine id / side-channel host and port.
     """Minimal vLLMHttpServer-like instance for unbound-method tests."""
 
     def __init__(self, decode_peers, role="prefill", connector="NixlConnector"):
+        # [FUNCTION DOC]
+        # HELPER: Stores the attributes described in the class doc. Inputs: decode_peers - iterable of peers; role; connector name.
         self._disaggregation_role = role
         self._pd_decode_peers = list(decode_peers)
         self._pd_peer_idx = 0
@@ -434,6 +527,8 @@ class _DispatchStub:
         self._pd_prefill_side_channel_port = 5559
 
     def _select_decode_peer(self):
+        # [FUNCTION DOC]
+        # HELPER: Delegates to the real vLLMHttpServer._select_decode_peer with this stub as self; returns the chosen peer.
         # Borrow the real implementation to keep the stub aligned with
         # production rotation semantics — _pd_dispatch's behavior must not
         # depend on the test's peer-selection policy.
@@ -443,6 +538,8 @@ class _DispatchStub:
 
 
 def _import_http_server():
+    # [FUNCTION DOC]
+    # HELPER: Skips if vllm is missing; returns the vLLMHttpServer class.
     pytest.importorskip("vllm")
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
@@ -450,6 +547,8 @@ def _import_http_server():
 
 
 def test_select_decode_peer_round_robin_cycles():
+    # [FUNCTION DOC]
+    # Seven picks over three peers cycle strictly in order and advance the index to 7.
     server_cls = _import_http_server()
     stub = _DispatchStub(decode_peers=["peer0", "peer1", "peer2"])
     picks = [server_cls._select_decode_peer(stub) for _ in range(7)]
@@ -459,12 +558,16 @@ def test_select_decode_peer_round_robin_cycles():
 
 
 def test_select_decode_peer_single_peer_returns_same():
+    # [FUNCTION DOC]
+    # A single peer is always returned.
     server_cls = _import_http_server()
     stub = _DispatchStub(decode_peers=["only_peer"])
     assert all(server_cls._select_decode_peer(stub) == "only_peer" for _ in range(5))
 
 
 def test_select_decode_peer_distribution_balanced_at_32_with_3_peers():
+    # [FUNCTION DOC]
+    # 32 picks over 3 peers split 10/11/11 (spread at most 1).
     """Lock in the empirical Phase-3a observation: 32 sequential dispatches
     across 3 decode peers land in an exact (floor, ceil) split of (10, 11),
     spread of 1. Catches accidental drift away from strict cycle (e.g., a
@@ -480,6 +583,8 @@ def test_select_decode_peer_distribution_balanced_at_32_with_3_peers():
 
 @pytest.mark.asyncio
 async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
+    # [FUNCTION DOC]
+    # NIXL flow: prefill leg called once with request id suffix _P, max_tokens 1, do_remote_decode True, do_remote_prefill False and a transfer_id; decode peer called once positionally with prompt ids, unclamped sampling params, id suffix _D, plus the prefill's kv_transfer_params and priority 0; result is the decode output.
     """End-to-end shape of ``_pd_dispatch``: prefill leg sets max_tokens=1 +
     do_remote_decode, decode leg gets the prefill's kv_transfer_params."""
     from unittest.mock import MagicMock
@@ -506,6 +611,9 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
     captured_prefill_calls = []
 
     async def fake_generate(prompt_ids, sampling_params, request_id, **kw):
+        # [FUNCTION DOC]
+        # HELPER: Fake local prefill generate; records sampling params, request id and kwargs, and returns a TokenOutput with
+        # one token and the predefined NIXL kv_transfer_params in extra_fields.
         captured_prefill_calls.append({"sampling_params": dict(sampling_params), "request_id": request_id, **kw})
         from verl.workers.rollout.replica import TokenOutput
 
@@ -551,6 +659,8 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
 
 @pytest.mark.asyncio
 async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
+    # [FUNCTION DOC]
+    # Mooncake flow: decode kv_transfer_params are built locally (do_remote_prefill True, do_remote_decode False, prefill engine id, http bootstrap addr from side-channel host/port) with the same transfer_id as the prefill leg.
     """Under Mooncake, prefill's request_finished returns (_, None) — no
     kv_transfer_params come back. _pd_dispatch must instead construct decode
     kv_transfer_params from the prefill state set by set_pd_peer (engine_id +
@@ -564,6 +674,8 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     captured_prefill = []
 
     async def fake_generate(prompt_ids, sampling_params, request_id, **kw):
+        # [FUNCTION DOC]
+        # HELPER: Fake prefill generate recording its kv_transfer_params kwarg and returning a TokenOutput with no extra fields.
         captured_prefill.append(kw["kv_transfer_params"])
         from verl.workers.rollout.replica import TokenOutput
 
@@ -598,12 +710,16 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
 
 @pytest.mark.asyncio
 async def test_pd_dispatch_raises_when_prefill_returns_no_kv_params():
+    # [FUNCTION DOC]
+    # NIXL prefill output lacking kv_transfer_params raises RuntimeError.
     """Sanity: if NixlConnector silently produced no kv_transfer_params, fail
     fast rather than handing an empty dict to the decode peer."""
     server_cls = _import_http_server()
     from verl.workers.rollout.replica import TokenOutput
 
     async def empty_prefill(prompt_ids, sampling_params, request_id, **kw):
+        # [FUNCTION DOC]
+        # HELPER: Fake prefill generate returning a TokenOutput with empty extra_fields.
         return TokenOutput(token_ids=[0], stop_reason="completed", extra_fields={})
 
     stub = _DispatchStub(decode_peers=["peer0"])
@@ -619,6 +735,9 @@ async def test_pd_dispatch_raises_when_prefill_returns_no_kv_params():
 
 
 def _make_awaitable_token_output(token_ids):
+    # [FUNCTION DOC]
+    # HELPER: Builds a TokenOutput with the given token ids and "completed" stop reason and returns an un-awaited coroutine
+    # that resolves to it (single-use).
     """Wrap a TokenOutput in an awaitable so the test can ``await`` the
     decode_peer.generate.remote(...) MagicMock return value."""
     from verl.workers.rollout.replica import TokenOutput
@@ -626,6 +745,8 @@ def _make_awaitable_token_output(token_ids):
     out = TokenOutput(token_ids=token_ids, stop_reason="completed")
 
     async def _coro():
+        # [FUNCTION DOC]
+        # HELPER: Coroutine returning the captured TokenOutput.
         return out
 
     return _coro()

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests MegatronEngine._resolve_override_ddp_config: grad_reduce_in_fp32 is derived from the optimizer's effective main
+# gradient dtype unless explicitly overridden, and nothing is injected when there is no optimizer.
+
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +24,11 @@ from verl.workers.engine.megatron.transformer_impl import MegatronEngine
 
 
 class _Config(SimpleNamespace):
+    # [CLASS DOC]
+    # HELPER: SimpleNamespace that also supports a dict-like get(key, default).
     def get(self, key, default=None):
+        # [FUNCTION DOC]
+        # HELPER: Returns the attribute named key, or default if absent.
         return getattr(self, key, default)
 
 
@@ -31,6 +39,10 @@ def _resolve_ddp_config(
     override_ddp_config=None,
     with_optimizer=True,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Builds a MegatronEngine without __init__ with an engine config holding override_ddp_config (default empty)
+    # and, if with_optimizer, an adam optimizer config with the given precision-aware flag and main grads dtype (else None);
+    # returns the engine's resolved DDP override dict.
     engine = object.__new__(MegatronEngine)
     engine.engine_config = _Config(override_ddp_config=override_ddp_config or {})
     engine.optimizer_config = (
@@ -55,6 +67,8 @@ def _resolve_ddp_config(
     ],
 )
 def test_ddp_grad_dtype_follows_effective_main_grad_dtype(use_precision_aware_optimizer, main_grads_dtype, expected):
+    # [FUNCTION DOC]
+    # grad_reduce_in_fp32 is True unless the precision-aware optimizer is used with bf16 main grads.
     resolved = _resolve_ddp_config(
         use_precision_aware_optimizer=use_precision_aware_optimizer,
         main_grads_dtype=main_grads_dtype,
@@ -65,6 +79,8 @@ def test_ddp_grad_dtype_follows_effective_main_grad_dtype(use_precision_aware_op
 
 @pytest.mark.parametrize("explicit_value", [False, True])
 def test_explicit_ddp_grad_dtype_override_wins(explicit_value):
+    # [FUNCTION DOC]
+    # An explicit grad_reduce_in_fp32 override is preserved regardless of the optimizer settings.
     resolved = _resolve_ddp_config(
         use_precision_aware_optimizer=True,
         main_grads_dtype="bf16",
@@ -75,4 +91,6 @@ def test_explicit_ddp_grad_dtype_override_wins(explicit_value):
 
 
 def test_optimizerless_engine_does_not_inject_grad_dtype():
+    # [FUNCTION DOC]
+    # Without an optimizer config the resolved overrides are empty.
     assert _resolve_ddp_config(with_optimizer=False) == {}

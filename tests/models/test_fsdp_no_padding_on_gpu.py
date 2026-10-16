@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Module is skipped entirely without CUDA. Engines are created via __new__ so only prepare_model_inputs /
+# prepare_model_outputs logic is exercised, without loading a model.
+
 """GPU regression coverage for issue #6278.
 
 These tests exercise the FSDP language-model engine path with
@@ -31,6 +35,8 @@ if not torch.cuda.is_available():
 
 
 def _nested(rows: list[list[int]], device: str) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Builds a jagged nested long tensor on device from a list of integer rows.
     return torch.nested.as_nested_tensor(
         [torch.tensor(row, device=device, dtype=torch.long) for row in rows],
         layout=torch.jagged,
@@ -38,6 +44,11 @@ def _nested(rows: list[list[int]], device: str) -> torch.Tensor:
 
 
 def _make_micro_batch(device: str):
+    # [FUNCTION DOC]
+    # HELPER: Builds a 2-sample no-padding TensorDict: sequences of length 5 and 3 (prompts 3 and 2, responses 2 and 1),
+    # per-sample position ids, response-only loss_mask (lengths 2 and 1), unit temperature; non-tensor metadata:
+    # remove padding off, fused kernels off, NO_PADDING mode, pad id 0, max response length 2 (both key spellings).
+    # Outputs: TensorDict with batch size 2.
     from tensordict import TensorDict
 
     from verl.utils import tensordict_utils as tu
@@ -82,6 +93,8 @@ def _make_micro_batch(device: str):
 
 
 def _fsdp_engine_with_lm_head_cls():
+    # [FUNCTION DOC]
+    # HELPER: Imports and returns FSDPEngineWithLMHead while suppressing the "NPU not support router replay" warning.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="NPU not support router replay for now.", category=UserWarning)
         from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
@@ -92,6 +105,9 @@ def _fsdp_engine_with_lm_head_cls():
 def _legacy_attention_mask_from_response_loss_mask(
     loss_mask: torch.Tensor, batch_size: int, max_seq_len: int
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Reproduces the buggy pre-fix mask: ones shaped like each loss_mask row, padded with zeros to
+    # (batch_size, max_seq_len), int32.
     """Mirror the pre-fix mask construction to make the regression explicit."""
     attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
     attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)
@@ -99,6 +115,10 @@ def _legacy_attention_mask_from_response_loss_mask(
 
 
 def test_prepare_model_inputs_uses_full_sequence_attention_mask_on_gpu():
+    # [FUNCTION DOC]
+    # Behavior: asserts the legacy mask covers only response lengths [2, 1] (and differs from correct), while the
+    # engine's prepared attention_mask covers full lengths [5, 3], is int32 on cuda; padded input_ids shape (2, 5);
+    # and the rolled flat ids have 8 elements.
     device = "cuda"
     FSDPEngineWithLMHead = _fsdp_engine_with_lm_head_cls()
     engine = FSDPEngineWithLMHead.__new__(FSDPEngineWithLMHead)
@@ -138,6 +158,9 @@ def test_prepare_model_inputs_uses_full_sequence_attention_mask_on_gpu():
 
 
 def test_prepare_model_inputs_passes_declared_packed_sequence_boundaries_on_gpu():
+    # [FUNCTION DOC]
+    # Behavior: with remove padding on, ulysses off and pass_packed_cu_seqlens set, asserts cu_seqlens [0, 5, 8] on
+    # both cuda and CPU copies, packed input_ids shape (1, 8), attention_mask None, and 8 rolled ids.
     from verl.utils import tensordict_utils as tu
     from verl.utils.dataset.dataset_utils import DatasetPadMode
 
@@ -168,6 +191,11 @@ def test_prepare_model_inputs_passes_declared_packed_sequence_boundaries_on_gpu(
 
 
 def test_prepare_model_outputs_can_be_sliced_back_to_response_shape_on_gpu():
+    # [FUNCTION DOC]
+    # Behavior: feeds seeded random padded logits (2 x 5 x 32) through prepare_model_outputs, re-pads the nested
+    # log_probs to response shape, and asserts they equal log-probs computed from the flattened valid logits against
+    # the rolled ids, sliced at response positions (flat positions 2-3 and 6, the latter right-padded with 0).
+    # Asserts the raw output is nested and padded shape is (2, 2).
     from verl.utils.torch_functional import logprobs_from_logits
     from verl.workers.utils.padding import no_padding_2_padding
 

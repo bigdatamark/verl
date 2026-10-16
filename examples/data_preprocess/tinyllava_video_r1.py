@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script converting the locally downloaded Zhang199/TinyLLaVA-Video-R1-training-data
+# (nextqa_0-30s.jsonl plus extracted NextQA videos) into verl video RL parquet.
+# The __main__ block requires --data_dir (exits with an error if the JSONL is missing), prints
+# a sanity sample, splits 90/10 with seed 42, maps with 4 processes using --video_fps (default 1)
+# and --video_max_frames (default 32), keeps only the standard columns, writes train/test parquet
+# into the expanded, created --local_save_dir, and optionally copies to --hdfs_dir.
 """
 Preprocess Zhang199/TinyLLaVA-Video-R1-training-data to verl parquet format.
 
@@ -57,6 +64,10 @@ INSTRUCTION = (
 
 
 def build_prompt_text(problem: str) -> str:
+    # [FUNCTION DOC]
+    # Returns the prompt "<video>", newline, the problem (which already contains inline options),
+    # a blank line, and the think/answer INSTRUCTION. Inputs: problem string. Outputs: string.
+    # KNOWN ISSUE: docstring says the prompt is "<video>{problem}" but the code adds newlines and the instruction.
     """Build prompt with video placeholder: "<video>{problem}".
 
     The JSONL problem field already contains inline options:
@@ -72,9 +83,20 @@ def make_map_fn(
     video_fps: Optional[float] = None,
     video_max_frames: Optional[int] = None,
 ):
+    # [FUNCTION DOC]
+    # Factory returning a per-row mapping closure. Inputs: data_source name; video_dir dataset root;
+    # split name; optional video_fps and video_max_frames to embed in each video entry.
+    # Outputs: process_fn.
     """Factory function following verl geo3k/openr1mm closure pattern."""
 
     def process_fn(example, idx):
+        # [FUNCTION DOC]
+        # Resolves the video path by stripping leading "." and "/" characters from video_filename and
+        # joining it to video_dir (printing a warning to stderr if missing), builds the prompt, builds a
+        # video entry dict with path and optional fps/max_frames, and returns the record: user prompt,
+        # videos list, ability "video_qa", rule reward with the "<answer>X</answer>" solution, and
+        # extra_info {split, index, question, answer, video_path}.
+        # KNOWN ISSUE: stripping is by character set, so a path like "../x" would also lose its "..".
         problem = example["problem"]
         solution = example["solution"]  # already "<answer>X</answer>"
 
@@ -113,6 +135,9 @@ def make_map_fn(
 
 
 def load_jsonl(path: str) -> list[dict]:
+    # [FUNCTION DOC]
+    # HELPER: Reads a UTF-8 JSONL file, parsing each non-blank line as JSON.
+    # Outputs: list of dicts. Exceptions: OSError / JSON decode errors propagate.
     data = []
     with open(path, encoding="utf-8") as f:
         for line in f:

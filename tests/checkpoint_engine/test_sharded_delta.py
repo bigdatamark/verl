@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CPU unit tests for process-local sharded-delta weight sync primitives:
+# shard_delta_indices (bytewise diff of a shard with global offsets), ShardSpec /
+# derive_dtensor_placement for unsharded params, dim-0 converter NaN sentinels,
+# gather_slot_entries_to_rank0 sub-rounding on a world-1 gloo group, and
+# prime_delta_snapshots + hf_delta_export (identity and veomni converters, block
+# placements, replica ranks, missing-seed failure).
+
 """CPU unit tests for the sharded-delta primitives.
 
 The full sharded path (DTensor shards + gather-v across ranks vs the full-gather diff) is
@@ -29,6 +38,10 @@ from verl.checkpoint_engine.delta_sync.sparse_gather import shard_delta_indices
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_shard_delta_indices_matches_bytewise_diff(dtype):
+    # [FUNCTION DOC]
+    # Behavior: perturbs 4 positions of a 1000-element shard at flat offset 4096 and
+    # asserts returned global indices equal changed+offset and values match
+    # bit-for-bit (compared as int16 for bf16, int32 for fp32).
     torch.manual_seed(0)
     # A "shard" of some parameter, whose flat start in the full param is `offset`.
     shard = torch.randn(1000, dtype=dtype)
@@ -50,6 +63,8 @@ def test_shard_delta_indices_matches_bytewise_diff(dtype):
 
 
 def test_shard_delta_indices_no_change_is_empty():
+    # [FUNCTION DOC]
+    # Behavior: identical shard and snapshot produce empty index and value tensors.
     shard = torch.randn(256, dtype=torch.bfloat16)
     gidx, gval = shard_delta_indices(shard.clone(), shard, offset=0)
     assert gidx.numel() == 0
@@ -57,6 +72,9 @@ def test_shard_delta_indices_no_change_is_empty():
 
 
 def test_derive_dtensor_placement_unsharded():
+    # [FUNCTION DOC]
+    # Behavior: a plain tensor yields a ShardSpec with no mesh and its full shape;
+    # derive_dtensor_placement returns offset 0, contributes True, no group.
     # A non-DTensor (replicated / unsharded) param: offset 0, no gather group,
     # and outside a process group rank 0 is assumed -> contributes.
     from verl.workers.engine.spec import ShardSpec, derive_dtensor_placement
@@ -69,11 +87,18 @@ def test_derive_dtensor_placement_unsharded():
 
 
 def test_spec_to_hf_chunk_preserves_nan_sentinels():
+    # [FUNCTION DOC]
+    # Behavior: a ShardSpec with an identity dim-0 converter maps a NaN row with one
+    # real value at column 3, starting at row 2, to a single output "w.2" whose only
+    # non-NaN position is 3 holding 42.0.
     """A dim-0-separable converter must preserve NaN sentinel positions -- the
     property the engine's sender-side non-NaN extraction relies on."""
     from verl.workers.engine.spec import ShardSpec
 
     def to_hf_chunk(dim0_start, segment):
+        # [FUNCTION DOC]
+        # HELPER: identity-permutation dim-0 converter; maps each row i of segment to
+        # HF name "w.<dim0_start + i>". Outputs: list of (name, row tensor).
         # pure slice + rename, one output per dim-0 row (identity permutation)
         return [(f"w.{dim0_start + i}", segment[i]) for i in range(segment.shape[0])]
 
@@ -91,6 +116,12 @@ def test_spec_to_hf_chunk_preserves_nan_sentinels():
 
 
 def test_gather_slot_entries_sub_rounds_world1():
+    # [FUNCTION DOC]
+    # Behavior: initializes a single-rank gloo process group if none exists (default
+    # MASTER_ADDR/PORT 127.0.0.1:29512), gathers random idx/val split into 9 slots
+    # by counts once without and then with max_round_bytes budgets of 1, 4 and 8
+    # elements, and asserts all results equal per slot. Destroys the group if it created it.
+    # Side effects: sets env defaults, creates/destroys a process group.
     """max_round_bytes splits the slot list into deterministic sub-rounds; the
     reassembled output must equal the single-round result (world=1 mechanics)."""
     import os
@@ -128,6 +159,11 @@ def test_gather_slot_entries_sub_rounds_world1():
 
 
 def test_prime_then_hf_delta_export_roundtrip():
+    # [FUNCTION DOC]
+    # Behavior: primes a 12-element snapshot, changes positions 3 and 7, and asserts
+    # one exported entry with slot ("w",(12,)), dtype "float32", no group, count 2,
+    # int32 indices [3,7] and the new values; a second identical pass yields count 0
+    # (snapshot refreshed).
     """The backend-side default delta strategy: prime_delta_snapshots pins the
     shards; a later pass through hf_delta_export yields a final-HF-coordinate
     entry with exactly the changed elements and refreshes the snapshot (a
@@ -161,6 +197,11 @@ def test_prime_then_hf_delta_export_roundtrip():
 
 
 def test_hf_delta_export_converter_param():
+    # [FUNCTION DOC]
+    # Behavior: loads veomni utils by file path (avoiding heavy package init), builds
+    # a (3,4) spec covering the full block with a row converter and 3 HF slots,
+    # changes flat positions 5 and 11, and asserts per-slot counts [0,1,1] with
+    # within-slot indices [1,3] and the new values.
     """A converter param's delta entry carries hf_slots-keyed final coordinates:
     the NaN probe maps each touched element through to_hf_chunk (the converter
     machinery is veomni's own -- see verl.workers.engine.veomni.utils)."""
@@ -181,6 +222,9 @@ def test_hf_delta_export_converter_param():
     hf_entry_converter = _m.hf_entry_converter
 
     def to_hf_chunk(dim0_start, segment):
+        # [FUNCTION DOC]
+        # HELPER: identity-permutation dim-0 converter; maps each row i of segment to
+        # HF name "w.<dim0_start + i>". Outputs: list of (name, row tensor).
         return [(f"w.{dim0_start + i}", segment[i]) for i in range(segment.shape[0])]
 
     spec = ShardSpec(
@@ -205,6 +249,9 @@ def test_hf_delta_export_converter_param():
 
 
 def _load_veomni_delta_utils():
+    # [FUNCTION DOC]
+    # HELPER: loads verl/workers/engine/veomni/utils.py as a standalone module by
+    # file path and returns it. Side effects: executes that module.
     # veomni/utils.py is torch-only, but the veomni package __init__ pulls in the
     # full engine (heavy deps); load the module by file path to keep this a CPU
     # unit test.
@@ -221,6 +268,10 @@ def _load_veomni_delta_utils():
 
 
 def test_hf_delta_export_converter_nontrivial_block():
+    # [FUNCTION DOC]
+    # Behavior: rank holds sub-block (2,3,4) at offset (2,3,0) of full (8,6,4);
+    # changes local flat 5 and 23 and asserts they map to slots w.2 and w.3 at
+    # row-flat positions 17 and 23 with counts only in those slots.
     """The ep x fsdp double cut (veomni's real expert layout): this rank holds a
     strict sub-block -- experts 2:4, dim-1 window 3:6 of full (8, 6, 4) -- so
     the entry must translate through both the dim-0 (manual ep) and dim-1
@@ -231,6 +282,9 @@ def test_hf_delta_export_converter_nontrivial_block():
     hf_entry_converter = _load_veomni_delta_utils().hf_entry_converter
 
     def to_hf_chunk(dim0_start, segment):
+        # [FUNCTION DOC]
+        # HELPER: identity-permutation dim-0 converter; maps each row i of segment to
+        # HF name "w.<dim0_start + i>". Outputs: list of (name, row tensor).
         return [(f"w.{dim0_start + i}", segment[i]) for i in range(segment.shape[0])]
 
     full_shape = (8, 6, 4)
@@ -256,6 +310,9 @@ def test_hf_delta_export_converter_nontrivial_block():
 
 
 def test_hf_delta_export_replica_rank_stays_lockstep():
+    # [FUNCTION DOC]
+    # Behavior: with contributes False, export still lists all slots but with zero
+    # counts and empty indices/values, while the snapshot is updated to the new tensor.
     """A rank whose block is an HSDP replica (``spec.contributes=False``) must
     emit the full slot enumeration with zero counts -- lockstep intact, nothing
     on the wire -- and still refresh its snapshot."""
@@ -265,6 +322,9 @@ def test_hf_delta_export_replica_rank_stays_lockstep():
     hf_entry_converter = _load_veomni_delta_utils().hf_entry_converter
 
     def to_hf_chunk(dim0_start, segment):
+        # [FUNCTION DOC]
+        # HELPER: identity-permutation dim-0 converter; maps each row i of segment to
+        # HF name "w.<dim0_start + i>". Outputs: list of (name, row tensor).
         return [(f"w.{dim0_start + i}", segment[i]) for i in range(segment.shape[0])]
 
     spec = ShardSpec(
@@ -289,6 +349,8 @@ def test_hf_delta_export_replica_rank_stays_lockstep():
 
 
 def test_hf_delta_export_requires_seed():
+    # [FUNCTION DOC]
+    # Behavior: exporting without a primed snapshot raises AssertionError mentioning "seed snapshot".
     """A delta export without a prior prime must fail loud, not diff against
     garbage."""
     import pytest
@@ -297,6 +359,8 @@ def test_hf_delta_export_requires_seed():
     from verl.workers.engine.utils import _hf_entry_identity, hf_delta_export
 
     def raw():
+        # [FUNCTION DOC]
+        # HELPER: generator yielding one ("w", zeros(4), spec) triple.
         yield "w", torch.zeros(4), ShardSpec(full_shape=(4,))
 
     with pytest.raises(AssertionError, match="seed snapshot"):

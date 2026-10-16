@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Decorator-based registration of plain Python functions as agent tools.
+# Globals: FUNCTION_TOOL_REGISTRY maps tool name to FunctionTool; _LOADED_FUNCTION_TOOL_PATHS caches, per absolute
+# file path, the tools that loading that file registered (so a file is executed only once).
+# Side effects: module logger level from VERL_LOGGING_LEVEL (default WARN).
+
 """
 Lightweight function-based tool registration.
 """
@@ -43,6 +50,8 @@ _LOADED_FUNCTION_TOOL_PATHS: dict[str, list[FunctionTool]] = {}
 
 @dataclass
 class FunctionTool:
+    # [CLASS DOC]
+    # Dataclass record for a registered function tool: name, fn (callable), tool_schema, is_async (true when fn is a coroutine function).
     """Carrier object stored in :data:`FUNCTION_TOOL_REGISTRY`.
 
     Exposes the minimal interface that the agent loop relies on:
@@ -58,6 +67,10 @@ class FunctionTool:
     is_async: bool = False
 
     async def call(self, parameters: dict[str, Any]) -> Any:
+        # [FUNCTION DOC]
+        # Behavior: calls fn with parameters as keyword arguments; awaits directly if async, otherwise runs it in a worker
+        # thread via asyncio.to_thread. Inputs: parameters - mapping of arg name to value. Outputs: fn's raw return value.
+        # Exceptions: propagates anything fn raises (including TypeError for bad arguments).
         """Invoke the underlying function with the LLM-supplied parameters."""
         if self.is_async:
             return await self.fn(**parameters)
@@ -69,6 +82,14 @@ def function_tool(
     *,
     schema: Optional[OpenAIFunctionToolSchema | dict] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: decorator factory usable bare or called. If name is callable and no schema is given, treats it as the
+    # function and registers immediately; otherwise returns a decorator using name as override.
+    # Inputs: name - tool name, or the function itself (bare form); schema - optional prebuilt schema or dict.
+    # Outputs: the original function (bare) or a decorator returning the original function.
+    # Exceptions: see inner decorator. Side effects: mutates FUNCTION_TOOL_REGISTRY.
+    # Note: bare usage combined with schema is impossible since schema is keyword-only; calling with a callable name AND
+    # a schema would treat the callable as a name override (likely a misuse).
     """Register a Python function as a verl tool.
 
     The OpenAI tool schema is inferred from the function via
@@ -101,7 +122,16 @@ def function_tool(
     """
 
     def _make_decorator(tool_name_override: Optional[str]):
+        # [FUNCTION DOC]
+        # HELPER: builds the actual decorator closed over a name override. Inputs: tool_name_override - name or None.
+        # Outputs: decorator function.
         def decorator(fn: Callable):
+            # [FUNCTION DOC]
+            # HELPER: Behavior: resolves the tool name (override or fn's name); builds schema from: a given schema object as-is,
+            # a dict validated into OpenAIFunctionToolSchema, or inferred from fn. Creates a FunctionTool entry. If a different
+            # function is already registered under that name raises ValueError; re-registering the same function is allowed
+            # (overwrites entry). Stores entry in the registry, logs at info, returns fn unchanged.
+            # Exceptions: ValueError on name conflict; pydantic validation errors; schema inference errors.
             tool_name = tool_name_override or fn.__name__
 
             if isinstance(schema, OpenAIFunctionToolSchema):
@@ -139,6 +169,8 @@ def function_tool(
 
 
 def get_function_tool(name: str) -> FunctionTool:
+    # [FUNCTION DOC]
+    # Behavior: returns the registry entry for name. Exceptions: KeyError with guidance message if not registered.
     """Look up a registered function tool by name. Raises ``KeyError`` if absent."""
     if name not in FUNCTION_TOOL_REGISTRY:
         raise KeyError(
@@ -149,6 +181,14 @@ def get_function_tool(name: str) -> FunctionTool:
 
 
 def load_function_tools_from_path(path: str) -> list[FunctionTool]:
+    # [FUNCTION DOC]
+    # Behavior: resolves path to absolute; raises FileNotFoundError if not a file; returns the cached tool list if
+    # already loaded. Otherwise snapshots registry keys, executes the file as a synthetic module (name derived from the
+    # path with separators and dots replaced by underscores) registered in sys.modules, then collects newly-added
+    # registry names (sorted). Warns if none were added, else logs info. Caches and returns the list of new FunctionTools.
+    # Exceptions: FileNotFoundError; ImportError if no import spec can be created; anything raised by the executed file.
+    # Side effects: executes arbitrary code, mutates sys.modules, the registry and the path cache.
+    # Note: tools in the file whose names were already registered before loading are not included in the result.
     """Execute a Python file at ``path`` and return its registered function tools."""
     abs_path = os.path.abspath(path)
     if not os.path.isfile(abs_path):
@@ -185,6 +225,11 @@ def load_function_tools_from_path(path: str) -> list[FunctionTool]:
 
 
 def _build_schema_from_fn(fn: Callable, tool_name: str) -> OpenAIFunctionToolSchema:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: rejects functions with *args/**kwargs-style parameters, then uses transformers get_json_schema
+    # to build the schema from the docstring and type hints, overrides the function name with tool_name, validates
+    # into OpenAIFunctionToolSchema. Exceptions: ValueError for variadic params; transformers docstring/type-hint
+    # parsing exceptions; pydantic validation errors.
     """Infer the OpenAI tool schema for ``fn`` via transformers.
 
     The heavy lifting (signature inspection + Google-style docstring parsing
@@ -211,6 +256,12 @@ def _build_schema_from_fn(fn: Callable, tool_name: str) -> OpenAIFunctionToolSch
 
 
 def normalize_function_tool_return(ret: Any) -> tuple[ToolResponse, float, dict]:
+    # [FUNCTION DOC]
+    # Behavior: normalizes a tool function's return value to (ToolResponse, reward float, metrics dict):
+    # ToolResponse as-is; str as text; dict as JSON text (non-ASCII kept); tuple of length 1-3 where element 0 is coerced
+    # to a response, element 1 (None means 0.0) is cast to float, element 2 (None means empty) is cast to dict;
+    # anything else becomes its string form. Missing reward/metrics default to 0.0 / empty.
+    # Exceptions: TypeError for tuples of length 0 or more than 3; ValueError/TypeError from float/dict casts.
     """Coerce a function's return value into the ``(ToolResponse, reward, metrics)`` triple.
 
     Accepted shapes:
@@ -249,6 +300,8 @@ def normalize_function_tool_return(ret: Any) -> tuple[ToolResponse, float, dict]
 
 
 def _coerce_response(value: Any) -> ToolResponse:
+    # [FUNCTION DOC]
+    # HELPER: Converts a single value to ToolResponse: ToolResponse unchanged, str as text, dict as JSON text, else string form.
     if isinstance(value, ToolResponse):
         return value
     if isinstance(value, str):

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Registers the "naive" reward manager: rule-based or custom score of the last sequence, with tool fields, turn count
+# and rollout-time reward scores passed through extra_info.
+
 import inspect
 
 from verl import DataProto
@@ -22,9 +26,14 @@ from verl.utils.reward_score import default_compute_score
 
 @register("naive")
 class NaiveRewardManager(RewardManagerBase):
+    # [CLASS DOC]
+    # Default reward manager scoring a single sample in-process (async score functions awaited, sync ones run in an
+    # executor thread).
     """The reward manager."""
 
     def __init__(self, config, tokenizer, compute_score, reward_router_address=None, reward_model_tokenizer=None):
+        # [FUNCTION DOC]
+        # Behavior: base init; uses compute_score or the default; detects async; stores router address and RM tokenizer.
         super().__init__(config, tokenizer, compute_score)
         self.compute_score = compute_score or default_compute_score
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
@@ -32,6 +41,14 @@ class NaiveRewardManager(RewardManagerBase):
         self.reward_model_tokenizer = reward_model_tokenizer
 
     async def run_single(self, data: DataProto) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: takes the last item; computes valid response tokens; reads data_source, ground truth and extra_info; merges
+        # tool_extra_fields into extra_info if present; sets extra_info num_turns (from "__num_turns__", may be none) and
+        # rollout_reward_scores (from "reward_scores", default empty); decodes the response in an executor; calls the score
+        # function (with router kwargs when a router exists); a mapping result gives "score" plus all entries as extra info,
+        # a scalar gives score and "acc".
+        # Outputs: mapping with reward_score and reward_extra_info.
+        # KNOWN ISSUE: extra_info stored on the sample is mutated in place.
         data = data[-1:]  # for multi-sequence outputs, we only compute reward based on the last sequence
         data_item = data[0]
         response_ids = data_item.batch["responses"]

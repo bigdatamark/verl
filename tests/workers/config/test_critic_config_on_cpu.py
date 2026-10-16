@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for critic configuration dataclasses (CriticConfig, FSDPCriticConfig, McoreCriticConfig):
+# instantiation from Hydra YAML, inheritance, dict-like access, frozen vs mutable fields, profiler config
+# and __post_init__ validation rules. The whole test class is currently skipped as flaky.
+# Side effects: Hydra global initialization when composing YAML configs.
+
 import os
 from pathlib import Path
 
@@ -32,14 +38,24 @@ from verl.workers.config import (
 
 @pytest.mark.skip(reason="This test is flaky when we actively load model config")
 class TestCriticConfig:
+    # [CLASS DOC]
+    # Test suite grouping all critic config tests; marked skip at class level (flaky when model config is loaded).
     """Test suite for critic configuration dataclasses."""
 
     @pytest.fixture
     def config_dir(self):
+        # [FUNCTION DOC]
+        # HELPER: pytest fixture returning the path of the repo's verl/trainer/config/critic directory, computed
+        # by walking four parents up from this test file. Inputs: none. Outputs: a Path. Side effects: none.
         """Get the path to the config directory."""
         return Path(__file__).parent.parent.parent.parent / "verl" / "trainer" / "config" / "critic"
 
     def test_megatron_critic_config_instantiation_from_yaml(self, config_dir):
+        # [FUNCTION DOC]
+        # Checks megatron_critic.yaml exists, composes it via Hydra (config dir resolved relative to the CWD,
+        # overriding ppo_micro_batch_size_per_gpu=1), converts to a dataclass, and asserts it is a McoreCriticConfig
+        # and CriticConfig exposing the expected attributes, with callable get and strategy "megatron".
+        # Inputs: config_dir fixture. Exceptions: AssertionError; Hydra errors if CWD is not the repo root.
         """Test that McoreCriticConfig can be instantiated from megatron_critic.yaml."""
         yaml_path = config_dir / "megatron_critic.yaml"
         assert yaml_path.exists(), f"Config file not found: {yaml_path}"
@@ -71,6 +87,10 @@ class TestCriticConfig:
         assert megatron_config_obj.strategy == "megatron"
 
     def test_fsdp_critic_config_instantiation_from_yaml(self, config_dir):
+        # [FUNCTION DOC]
+        # Same as the megatron YAML test but for dp_critic.yaml, expecting FSDPCriticConfig with FSDP-specific
+        # attributes (forward micro batch sizes, ulysses SP size, grad_clip) and strategy "fsdp".
+        # Inputs: config_dir fixture. Exceptions: AssertionError.
         """Test that FSDPCriticConfig can be instantiated from dp_critic.yaml."""
         yaml_path = config_dir / "dp_critic.yaml"
         assert yaml_path.exists(), f"Config file not found: {yaml_path}"
@@ -104,6 +124,9 @@ class TestCriticConfig:
         assert fsdp_config_obj.strategy == "fsdp"
 
     def test_config_inheritance_hierarchy(self):
+        # [FUNCTION DOC]
+        # Constructs Mcore, FSDP and base critic configs and asserts isinstance relationships: subclasses are
+        # CriticConfig, and a plain CriticConfig is neither subclass. Exceptions: AssertionError.
         """Test that the inheritance hierarchy is correct."""
         megatron_config = McoreCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=McoreOptimizerConfig(lr=0.1))
         assert isinstance(megatron_config, CriticConfig)
@@ -119,6 +142,9 @@ class TestCriticConfig:
         assert not isinstance(critic_config, FSDPCriticConfig)
 
     def test_config_dict_interface(self):
+        # [FUNCTION DOC]
+        # Verifies BaseConfig dict-like behavior: membership test, item access, get with default, iteration over
+        # keys (containing strategy and rollout_n) and positive length. Exceptions: AssertionError.
         """Test that configs provide dict-like interface from BaseConfig."""
         optim = OptimizerConfig(lr=0.1)
         config = CriticConfig(ppo_micro_batch_size_per_gpu=1, strategy="fsdp2", optim=optim)
@@ -136,6 +162,9 @@ class TestCriticConfig:
         assert len(config) > 0
 
     def test_frozen_fields_immutability(self):
+        # [FUNCTION DOC]
+        # Asserts that assigning to frozen fields (base: rollout_n, strategy, cliprange_value; Mcore: nccl_timeout,
+        # data_loader_seed; FSDP: ulysses_sequence_parallel_size, grad_clip) raises AttributeError/TypeError/ValueError.
         """Test that frozen fields raise exceptions when modified after creation."""
         critic_config = CriticConfig(ppo_micro_batch_size_per_gpu=1, strategy="fsdp2", optim=OptimizerConfig(lr=0.1))
         frozen_fields = ["rollout_n", "strategy", "cliprange_value"]
@@ -159,6 +188,9 @@ class TestCriticConfig:
                 setattr(fsdp_config, field_name, "modified_value")
 
     def test_batch_size_fields_modifiable(self):
+        # [FUNCTION DOC]
+        # Asserts that batch-size fields (ppo mini/micro sizes on the base config, forward micro sizes on FSDP)
+        # can be reassigned after construction and retain the new values.
         """Test that batch size fields can be modified after creation."""
         optim = OptimizerConfig(lr=0.1)
         critic_config = CriticConfig(ppo_micro_batch_size_per_gpu=1, strategy="fsdp2", optim=optim)
@@ -180,6 +212,10 @@ class TestCriticConfig:
         assert fsdp_config.forward_micro_batch_size_per_gpu == 8
 
     def test_profiler_config_type_validation(self):
+        # [FUNCTION DOC]
+        # Checks the default profiler is a ProfilerConfig with all_ranks False and empty ranks, that a custom
+        # profiler is preserved, and that ProfilerConfig.union ORs enable/all_ranks and unions ranks while
+        # intersect ANDs all_ranks and intersects ranks.
         """Test that profiler field has correct type and validation."""
         optim = OptimizerConfig(lr=0.1)
         critic_config = CriticConfig(ppo_micro_batch_size_per_gpu=1, strategy="fsdp2", optim=optim)
@@ -208,6 +244,10 @@ class TestCriticConfig:
         assert intersect_result.ranks == [1]
 
     def test_critic_config_validation_logic(self):
+        # [FUNCTION DOC]
+        # Exercises CriticConfig __post_init__: valid with only per-GPU micro batch, valid with only global micro
+        # batch, valid with dynamic bsz; raises ValueError when both micro batch sizes are set, and when neither is
+        # set (with dynamic bsz disabled). Exceptions: AssertionError / pytest failures.
         """Test the __post_init__ validation logic for CriticConfig."""
         optim = OptimizerConfig(lr=0.1)
         valid_config = CriticConfig(
@@ -251,6 +291,9 @@ class TestCriticConfig:
             )
 
     def test_micro_batch_size_divisibility_validation(self):
+        # [FUNCTION DOC]
+        # Checks that mini batch size must be divisible by global micro batch size (7 vs 4 raises ValueError)
+        # unless dynamic bsz is enabled, and that valid divisible combinations construct fine.
         """Test micro batch size divisibility validation in __post_init__."""
         optim = OptimizerConfig(lr=0.1)
         valid_config = CriticConfig(
@@ -276,6 +319,9 @@ class TestCriticConfig:
         assert dynamic_config.use_dynamic_bsz is True
 
     def test_fsdp_sequence_parallelism_validation(self):
+        # [FUNCTION DOC]
+        # Checks FSDPCriticConfig requires model.use_remove_padding when ulysses_sequence_parallel_size > 1
+        # (raises ValueError otherwise), and accepts use_remove_padding False when SP size is 1.
         """Test FSDP sequence parallelism validation in FSDPCriticConfig.__post_init__."""
         valid_config = FSDPCriticConfig(
             ppo_micro_batch_size_per_gpu=2,

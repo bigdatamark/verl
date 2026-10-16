@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for initialize_turn_separator (derives the token ids a chat template
+# places between a turn's end-of-turn token and the next turn, by probing user
+# turns) and initialize_system_prompt, using self-contained jinja ChatML-style
+# tokenizers. Verifies the separator for plain, separator-less, thinking-scaffold,
+# default-system-prompt, list-valued-eos and multimodal (list content) templates,
+# and that adding the separator makes incremental agent-loop tokenization equal to
+# rendering the full conversation. Module constants define ChatML template
+# variants and a special-token map (im_start 1, im_end 2, newline 3).
 """CPU tests for ``initialize_turn_separator`` and the multi-turn agent-loop token boundary.
 
 These exercise the chat-template utility directly with a self-contained ChatML tokenizer, so no
@@ -51,15 +60,27 @@ _SPECIALS = {"<|im_start|>": _IM_START, "<|im_end|>": _IM_END, "\n": _NL}
 
 
 class ChatMLTokenizer:
+    # [CLASS DOC]
+    # HELPER: Offline deterministic tokenizer rendering a jinja chat template and
+    # encoding specials to fixed ids and other space-separated words to ids assigned
+    # from 100 upward on first sight. eos_token_id is the im_end id.
     """Deterministic, offline tokenizer mimicking a ChatML ``apply_chat_template``."""
 
     eos_token_id = _IM_END
 
     def __init__(self, template: str = _CHATML):
+        # [FUNCTION DOC]
+        # HELPER: Compiles the template (default ChatML) and starts an empty word vocab.
         self._template = Template(template)
         self._vocab: dict[str, int] = {}
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Splits text on the special tokens (kept as separate pieces), maps
+        # specials to their ids, and maps each non-empty space-separated word to a stable
+        # id, growing the vocab as needed.
+        # Inputs: text; add_special_tokens - ignored. Outputs: list of ints.
+        # Side effects: extends the vocab.
         ids: list[int] = []
         for piece in re.split(r"(<\|im_start\|>|<\|im_end\|>|\n)", text):
             if piece == "":
@@ -73,11 +94,22 @@ class ChatMLTokenizer:
         return ids
 
     def apply_chat_template(self, messages, add_generation_prompt=False, tokenize=True, tools=None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Renders the template with the messages and generation flag; returns ids
+        # when tokenize is True, else the rendered string. tools and kwargs are ignored.
         text = self._template.render(messages=messages, add_generation_prompt=add_generation_prompt)
         return self.encode(text) if tokenize else text
 
 
 def _rollout_ids(tokenizer, system_prompt, turn_separator, turns):
+    # [FUNCTION DOC]
+    # HELPER: Builds rollout ids the way the tool agent loop does: encode the user
+    # prompt with generation prompt, then per turn append the encoded assistant text
+    # plus an explicit im_end, then the separator followed by the tool message
+    # rendered alone with generation prompt and with the system-prompt prefix
+    # (length of system_prompt) removed.
+    # Inputs: tokenizer; system_prompt - ids to strip; turn_separator - ids;
+    # turns - list of (assistant_text, tool_content). Outputs: list of ids.
     """Reproduce ToolAgentLoop's incremental token construction.
 
     ``turns`` is a list of ``(assistant_text, tool_content)`` pairs. Each assistant turn is the
@@ -96,6 +128,9 @@ def _rollout_ids(tokenizer, system_prompt, turn_separator, turns):
 
 
 def _reference_ids(tokenizer, turns):
+    # [FUNCTION DOC]
+    # HELPER: Renders the whole conversation (user, then alternating assistant and
+    # tool messages) with generation prompt as the reference ids.
     user = {"role": "user", "content": "what is the weather in Paris?"}
     messages = [user]
     for assistant_text, tool_content in turns:
@@ -105,16 +140,23 @@ def _reference_ids(tokenizer, turns):
 
 
 def test_turn_separator_is_the_newline_token():
+    # [FUNCTION DOC]
+    # Behavior: plain ChatML yields separator [newline].
     tok = ChatMLTokenizer()
     assert initialize_turn_separator(tok) == [_NL]
 
 
 def test_no_separator_template_returns_empty():
+    # [FUNCTION DOC]
+    # Behavior: a template with nothing after im_end yields an empty separator.
     tok = ChatMLTokenizer(_CHATML_NO_SEP)
     assert initialize_turn_separator(tok) == []
 
 
 def test_separator_with_list_valued_eos_and_multi_token_close():
+    # [FUNCTION DOC]
+    # Behavior: with a list-valued eos_token_id and turns closing with two special
+    # tokens before the newline, the separator is just [newline].
     """Guard for list-valued ``eos_token_id`` (e.g. Llama 3) with a multi-token turn close.
 
     Each turn closes with two special tokens before the ``\\n`` separator, so the naive
@@ -130,12 +172,19 @@ def test_separator_with_list_valued_eos_and_multi_token_close():
     )
 
     class MultiCloseTokenizer:
+        # [CLASS DOC]
+        # HELPER: Tokenizer for a template whose turns close with <|end|><|im_end|> and
+        # whose eos_token_id is the list of both ids.
         eos_token_id = [end, im_end]  # list rather than a single int
 
         def __init__(self):
+            # [FUNCTION DOC]
+            # HELPER: Starts an empty word vocab.
             self._vocab: dict[str, int] = {}
 
         def encode(self, text, add_special_tokens=False):
+            # [FUNCTION DOC]
+            # HELPER: Same splitting/encoding as ChatMLTokenizer.encode with this template's specials.
             ids = []
             for piece in re.split(r"(<\|s\|>|<\|end\|>|<\|im_end\|>|\n)", text):
                 if piece == "":
@@ -149,6 +198,8 @@ def test_separator_with_list_valued_eos_and_multi_token_close():
             return ids
 
         def apply_chat_template(self, messages, add_generation_prompt=False, tokenize=True, tools=None, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Renders the closure template; ids or text depending on tokenize.
             text = template.render(messages=messages, add_generation_prompt=add_generation_prompt)
             return self.encode(text) if tokenize else text
 
@@ -156,6 +207,9 @@ def test_separator_with_list_valued_eos_and_multi_token_close():
 
 
 class MultimodalChatMLProcessor(ChatMLTokenizer):
+    # [CLASS DOC]
+    # HELPER: ChatML tokenizer that, like a multimodal processor, requires message
+    # content to be a list of text parts and raises TypeError on string content.
     """ChatML tokenizer that rejects bare-string ``content``, like a multimodal processor.
 
     Multimodal processors iterate ``content`` expecting a list of typed parts (``{"type": "text",
@@ -164,6 +218,9 @@ class MultimodalChatMLProcessor(ChatMLTokenizer):
     """
 
     def apply_chat_template(self, messages, add_generation_prompt=False, tokenize=True, tools=None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Raises TypeError if any message content is a string; otherwise
+        # concatenates the parts' text and delegates to the parent renderer.
         flattened = []
         for m in messages:
             content = m["content"]
@@ -175,6 +232,9 @@ class MultimodalChatMLProcessor(ChatMLTokenizer):
 
 
 def test_separator_derived_when_processor_requires_list_content():
+    # [FUNCTION DOC]
+    # Behavior: confirms the processor rejects string content, and that the helper
+    # still derives [newline] by falling back to list-of-parts content.
     """Guard the multimodal path: string-content probe crashes, list-of-parts probe recovers it."""
     proc = MultimodalChatMLProcessor()
     # The string-content form the plain path uses really does raise on this processor.
@@ -189,6 +249,10 @@ def test_separator_derived_when_processor_requires_list_content():
 
 
 def test_separator_ignores_assistant_reasoning_scaffold():
+    # [FUNCTION DOC]
+    # Behavior: with a thinking template, the naive assistant-turn probe (the suffix
+    # after the generation prompt minus the first token) is not [newline], while the
+    # helper still returns [newline].
     """Regression guard for the Qwen3 ``<think>`` gotcha.
 
     A thinking template injects ``<think></think>`` scaffolding into assistant turns. Deriving the
@@ -211,6 +275,9 @@ def test_separator_ignores_assistant_reasoning_scaffold():
 
 
 def test_incremental_encoding_matches_full_render_single_turn():
+    # [FUNCTION DOC]
+    # Behavior: for one tool turn, omitting the separator yields ids exactly one token
+    # shorter than the reference; with the separator the ids match the reference.
     tok = ChatMLTokenizer()
     system_prompt = initialize_system_prompt(tok)
     separator = initialize_turn_separator(tok)
@@ -228,6 +295,9 @@ def test_incremental_encoding_matches_full_render_single_turn():
 
 
 def test_incremental_encoding_matches_full_render_multi_turn():
+    # [FUNCTION DOC]
+    # Behavior: for three tool turns the separator-based ids match the reference and
+    # the separator-less path is shorter by exactly the number of turns.
     tok = ChatMLTokenizer()
     system_prompt = initialize_system_prompt(tok)
     separator = initialize_turn_separator(tok)
@@ -245,6 +315,10 @@ def test_incremental_encoding_matches_full_render_multi_turn():
 
 
 def test_separator_with_default_system_prompt_template():
+    # [FUNCTION DOC]
+    # Behavior: with a template that always prepends a fixed system message, the
+    # separator is [newline] and incremental ids (system prefix stripped from tool
+    # renders) match the full render.
     template = (
         "<|im_start|>system\nYou are helpful<|im_end|>\n"
         "{% for m in messages %}<|im_start|>{{m['role']}}\n{{m['content']}}<|im_end|>\n{% endfor %}"

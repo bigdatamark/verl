@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Local-only test of GptOssToolParser: parses a GPT-OSS harmony-format response
+# (commentary channel addressed to functions.<name>) into function calls.
+# Requires downloading the openai/gpt-oss-20b tokenizer, hence skipped by default.
+
 import pytest
 from transformers import AutoTokenizer
 
@@ -20,6 +26,14 @@ from verl.experimental.agent_loop.tool_parser import GptOssToolParser
 @pytest.mark.asyncio
 @pytest.mark.skip(reason="local test only")
 async def test_gpt_oss_tool_parser():
+    # [FUNCTION DOC]
+    # Behavior: encodes a sample harmony transcript containing one tool call plus a
+    # tool response, runs the parser's async extract_tool_calls on the token ids,
+    # and asserts exactly one call named get_current_weather with JSON arguments
+    # {"location": "Tokyo"} (the tool-response message must not be counted).
+    # Inputs: none. Outputs: none (assertions).
+    # Exceptions: AssertionError on mismatch; network/HF errors loading tokenizer.
+    # Side effects: downloads tokenizer from the HF hub. Marked skip.
     example_text = """
 <|start|>assistant<|channel|>commentary to=functions.get_current_weather \
 <|constrain|>json<|message|>{"location": "Tokyo"}<|call|>

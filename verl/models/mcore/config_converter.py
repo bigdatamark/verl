@@ -16,6 +16,12 @@
 
 # convert huggingface config to mcore transformer config
 
+# [MODULE DOC]
+# Converters from HuggingFace PretrainedConfig to Megatron-Core TransformerConfig / MLATransformerConfig for supported
+# architectures (dense Llama/Qwen2/Qwen3, Qwen2-MoE, Mixtral, Qwen3-MoE, DeepseekV3, Qwen2.5-VL). Every converter
+# takes the HF config, a dtype, and keyword overrides that are applied last. Parallel sizes are read from the current
+# Megatron parallel state, so model parallel must be initialized first.
+
 
 import warnings
 from typing import TypeVar
@@ -34,6 +40,15 @@ T = TypeVar("T", bound=TransformerConfig)
 def _get_base_transformer_config(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Builds the common keyword dict for a TransformerConfig.
+    # Behavior: copies architecture sizes (layers, hidden, heads, query groups = kv heads, ffn size, dropouts, head_dim as
+    # kv_channels, rms eps), sets SiLU gated MLP with RMSNorm and bias-enabled linears, dtype fields (bf16 flag when dtype
+    # is bfloat16), parallel sizes (TP, PP, EP, expert-TP, VPP, CP) from parallel state, sequence parallel when TP>1,
+    # overlapped p2p comm when VPP>1, no batched p2p, variable sequence lengths, masked softmax fusion and alltoall MoE
+    # dispatcher; then applies overrides.
+    # Outputs: dict of config kwargs.
+    # KNOWN ISSUE: docstring says it returns a TransformerConfig, but it returns a plain dict.
     """
     Create a base TransformerConfig with common parameters across different model architectures.
     TODO: (ycl) use dataclass or converter config?
@@ -101,6 +116,14 @@ def _get_base_transformer_config(
 def _get_mla_transformer_config(
     hf_config: PretrainedConfig, mla_rope_config: dict, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Base kwargs plus MLA fields: q/kv LoRA ranks, qk head dims (nope and rope), v head dim, rotary base from
+    # the HF rope theta, and rope scaling fields (factor, type, original max positions, beta fast/slow, mscale,
+    # mscale_all_dim) taken from mla_rope_config.
+    # Inputs: mla_rope_config - dict holding those rope keys.
+    # Outputs: dict of kwargs.
+    # Exceptions: KeyError if mla_rope_config misses a required key.
+    # KNOWN ISSUE: docstring says it returns an MLATransformerConfig, but it returns a dict.
     """
     Create a MLATransformerConfig with common parameters across different model architectures.
     This is specifically for MLA models like DeepseekV3.
@@ -137,6 +160,14 @@ def _get_mla_transformer_config(
 
 
 def check_and_construct_configs(original_config: dict, cls: type[T]) -> T:
+    # [FUNCTION DOC]
+    # Behavior: removes (with a warning) any keys that are not attributes of cls (for older Megatron versions), converts a
+    # string attention_backend to the AttnBackend enum, prints the final config on rank 0 (or when not distributed), and
+    # instantiates cls.
+    # Inputs: original_config - kwargs dict (mutated); cls - TransformerConfig subclass.
+    # Outputs: an instance of cls.
+    # KNOWN ISSUE: docstring says it returns a dict; it returns the constructed config object.
+    # Side effects: mutates the input dict; warns; prints.
     """
     Check and disable incompatible configurations for older Megatron version.
 
@@ -167,6 +198,10 @@ def check_and_construct_configs(original_config: dict, cls: type[T]) -> T:
 def hf_to_mcore_config_dense(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> TransformerConfig:
+    # [FUNCTION DOC]
+    # Behavior: dense models: no linear biases; QKV bias always on for Qwen2 architectures, else hf attention_bias; QK
+    # layernorm on for Qwen3 architectures; CPU init off; overrides applied; constructs TransformerConfig.
+    # Outputs: TransformerConfig.
     # for LlamaForCausalLM or Qwen2ForCausalLM
     qkv_bias = True if "Qwen2" in hf_config.architectures[0] else getattr(hf_config, "attention_bias", False)
     qk_layernorm = True if "Qwen3" in hf_config.architectures[0] else False
@@ -187,6 +222,11 @@ def hf_to_mcore_config_dense(
 def hf_to_mcore_config_qwen2moe(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> TransformerConfig:
+    # [FUNCTION DOC]
+    # Behavior: Qwen2-MoE: base config with MoE fields from HF (moe ffn size, topk, num experts, shared expert size,
+    # aux loss coeff) plus fixed choices: no load balancing, router bias update rate 0.001, shared expert overlap, grouped
+    # GEMM, softmax scoring with pre-softmax, fused layernorm/bias ops, QKV bias on. Applies overrides and constructs.
+    # Outputs: TransformerConfig.
     args: dict = _get_base_transformer_config(
         hf_config=hf_config,
         dtype=dtype,
@@ -221,6 +261,11 @@ def hf_to_mcore_config_qwen2moe(
 def hf_to_mcore_config_mixtral(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> TransformerConfig:
+    # [FUNCTION DOC]
+    # Behavior: Mixtral: MoE config with num_local_experts, topk, aux coeff, intermediate_size as expert ffn size, no shared
+    # experts, no load balancing, softmax pre-softmax routing, grouped GEMM, rope fusion and fused bias ops. Applies
+    # overrides and constructs.
+    # Outputs: TransformerConfig.
     args: dict = _get_base_transformer_config(
         hf_config=hf_config,
         dtype=dtype,
@@ -254,6 +299,12 @@ def hf_to_mcore_config_mixtral(
 def hf_to_mcore_config_qwen3moe(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> TransformerConfig:
+    # [FUNCTION DOC]
+    # Behavior: Qwen3-MoE (and Qwen3.5 MoE): MoE fields from HF, no load balancing, grouped GEMM, softmax routing without
+    # pre-softmax, QK layernorm, fused ops; constructs the config, then if mtp_num_hidden_layers (top-level or in
+    # text_config) is positive sets mtp_num_layers and mtp_loss_scaling_factor (HF value or 0.1).
+    # Outputs: TransformerConfig.
+    # KNOWN ISSUE: the docstring describes it as extending hf_to_mcore_config_qwen3moe, i.e. itself.
     """Config converter for Qwen3.5 MoE models (e.g. Qwen3.5-35B-A3B, Qwen3.5-397B-A17B).
 
     Extends ``hf_to_mcore_config_qwen3moe`` with MTP (Multi-Token Prediction) support:
@@ -307,6 +358,17 @@ def hf_to_mcore_config_qwen3moe(
 def hf_to_mcore_config_dpskv3(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> MLATransformerConfig:
+    # [FUNCTION DOC]
+    # Behavior: DeepseekV3: enables Megatron experimental features and applies verl's MLA patches; builds a rope config
+    # from defaults updated by hf rope_scaling; marks the first first_k_dense_replace layers as dense in moe_layer_freq;
+    # requires num_nextn_predict_layers to be 0 (if present) and no quantization_config; builds MLA kwargs with fused
+    # attention backend, QK layernorm, expert-bias sigmoid routing with seq aux loss, shared experts sized
+    # moe_intermediate_size * n_shared_experts, routed scaling factor, fp64 router dtype, and fused ops; applies overrides,
+    # constructs MLATransformerConfig, then sets mtp_num_layers from num_nextn_predict_layers (scaling factor 0.1) if
+    # present.
+    # Outputs: MLATransformerConfig.
+    # Exceptions: AssertionError for MTP or quantized checkpoints.
+    # Side effects: global Megatron experimental flag and monkey patches.
     # DeepseekV3ForCausalLM
     from megatron.core.config import set_experimental_flag
     from megatron.core.transformer.enums import AttnBackend
@@ -391,6 +453,10 @@ def hf_to_mcore_config_dpskv3(
 def hf_to_mcore_config_qwen2_5_vl(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> TransformerConfig:
+    # [FUNCTION DOC]
+    # Behavior: Qwen2.5-VL: base config without linear bias, with QKV bias and the mrope_section from rope_scaling; applies
+    # overrides, maps attention backend strings and constructs TransformerConfig directly (no unsupported-key filtering).
+    # Outputs: TransformerConfig.
     # Qwen2_5_VLForConditionalGeneration
 
     args = _get_base_transformer_config(
@@ -410,11 +476,16 @@ def hf_to_mcore_config_qwen2_5_vl(
 def hf_to_mcore_config_llama4(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> TransformerConfig:
+    # [FUNCTION DOC]
+    # Placeholder for Llama4. Exceptions: always raises NotImplementedError.
     # Llama4ForConditionalGeneration
     raise NotImplementedError("Llama4ForConditionalGeneration is not supported yet")
 
 
 def mapping_string_to_attn_backend(args: dict) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: If args holds attention_backend as a string, replaces it with the matching AttnBackend enum member.
+    # Outputs: the same (mutated) dict. Exceptions: KeyError for unknown backend names.
     if "attention_backend" in args and isinstance(args["attention_backend"], str):
         from megatron.core.transformer.enums import AttnBackend
 

@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Notation used below: log_ratio = training log-prob minus rollout log-prob per token;
+# token divergences k1 = -log_ratio, k2 = half of log_ratio squared, k3 = exp(log_ratio) - 1 -
+# log_ratio, all computed on log_ratio clamped to +/- SAFETY_BOUND (20). Metric keys produced
+# by the inner functions are unprefixed; the unified entry points add "rollout_corr/".
 """
 Rollout Correction Helper Module
 
@@ -91,6 +97,11 @@ TOKEN_LEVEL_ROLLOUT_RS_OPTIONS: set[str] = {"token_k1", "token_k2", "token_k3"}
 
 
 def _parse_rollout_is_threshold(threshold_spec: str | float) -> tuple[float, Optional[float]]:
+    # [FUNCTION DOC]
+    # HELPER: Parses an IS threshold spec into (upper, lower). A number gives (value, None); a
+    # string "x" gives (x, None); "lower_upper" gives both. Validates positivity and lower <= upper.
+    # Exceptions: TypeError for booleans or unsupported types; ValueError for empty/unparseable
+    # strings or invalid bounds. Outputs: (upper float, lower float or None).
     if isinstance(threshold_spec, bool):
         raise TypeError(
             "rollout_is_threshold must be specified as a float or a string threshold specification, not a boolean."
@@ -132,6 +143,14 @@ def _parse_rollout_is_threshold(threshold_spec: str | float) -> tuple[float, Opt
 def _parse_rollout_rs_thresholds(
     options: list[str], threshold_spec: Optional[str | float]
 ) -> dict[str, dict[str, Optional[float]]]:
+    # [FUNCTION DOC]
+    # HELPER: Parses RS thresholds per option. Accepts a number or comma-separated string; must
+    # supply either 1 value (broadcast to all options) or exactly one per option. For *k1
+    # options: "lower_upper" or a single upper with lower defaulting to 1/upper; both must be
+    # positive with lower <= upper. Other options: a single positive upper bound ("_" rejected).
+    # Inputs: options - deduplicated option names; threshold_spec.
+    # Outputs: mapping option -> {lower: float or None, upper: float}.
+    # Exceptions: ValueError for missing/invalid/mismatched specs; TypeError for wrong types.
     if threshold_spec is None:
         raise ValueError("rollout_rs_threshold must be provided for rejection sampling.")
 
@@ -200,6 +219,19 @@ def compute_rollout_rejection_mask(
     rollout_rs: str = "token_k1",
     rollout_rs_threshold: Optional[str | float] = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    # [FUNCTION DOC]
+    # Behavior: validates rollout_rs and threshold; returns the mask unchanged with no metrics for
+    # an empty batch. Splits/deduplicates options (each must be supported), parses thresholds,
+    # computes token k1/k2/k3. For each option computes a keep decision: token_k1 keeps tokens with
+    # k1 in [log lower, log upper]; token_k2/k3 keep tokens <= upper; seq_sum_*/seq_mean_* use the
+    # masked per-sequence sum/mean of the token divergence (k1 with log bounds, k2/k3 with upper);
+    # seq_max_k2/k3 use the masked per-sequence max (0 for empty rows). Sequence decisions are
+    # broadcast to all tokens. Keep masks are multiplied together (logical AND). Per option, adds
+    # compute_rs_metrics output plus token and sequence masked fractions; overall adds
+    # rollout_rs_masked_fraction (token-level) and rollout_rs_seq_masked_fraction (fraction of
+    # sequences with any rejected valid token).
+    # Inputs/Outputs: see docstring; returned mask has the input mask's dtype.
+    # Exceptions: ValueError for invalid options or thresholds.
     """Compute hard trust region mask using divergence estimators.
 
     This function enforces a hard trust region constraint by masking tokens/sequences
@@ -271,12 +303,18 @@ def compute_rollout_rejection_mask(
     metrics: dict[str, float] = {}
 
     def _sequence_sum(values: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Masked per-sequence sum over the last axis using the enclosing response_mask.
         return verl_F.masked_sum(values, response_mask, axis=-1)
 
     def _sequence_mean(values: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Masked per-sequence mean over the last axis using the enclosing response_mask.
         return verl_F.masked_mean(values, response_mask, axis=-1)
 
     def _sequence_max(values: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Masked per-sequence max (padding filled with -inf); rows with no valid tokens give 0.
         mask_bool = response_mask.bool()
         neg_inf = torch.tensor(float("-inf"), device=values.device, dtype=values.dtype)
         masked_values = values.masked_fill(~mask_bool, neg_inf)
@@ -425,6 +463,16 @@ def compute_rs_metrics(
     rollout_rs_threshold_lower: float,
     apply_lower_threshold: bool,
 ) -> dict[str, float]:
+    # [FUNCTION DOC]
+    # Behavior: requires at least one valid token. Uses per-sequence values (or masked
+    # per-sequence mean of the statistic), restricted to valid sequences. Reports <prefix>_mean
+    # (masked token mean), _max/_min (over sequences for sequence level, else over valid tokens),
+    # _fraction_high/_fraction_low (fraction above upper / below lower, lower only if enabled),
+    # _std (masked std of the statistic clamped to [lower or 0, upper]; 0 if <= 1 token), and
+    # sequence summaries _seq_mean/_seq_std/_seq_max/_seq_min/_seq_max_deviation (abs from 0)/
+    # _seq_fraction_high and, when lower applies, _seq_fraction_low (always emitted as 0 when no
+    # valid sequences). prefix = "rollout_rs_<option>".
+    # Outputs: dict of floats. Exceptions: ValueError on an all-zero mask.
     """Compute metrics for hard trust region enforcement (per-option).
 
     Args:
@@ -526,6 +574,18 @@ def compute_rollout_correction_weights(
     rollout_is_threshold: str | float = 2.0,
     rollout_is_batch_normalize: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    # [FUNCTION DOC]
+    # Behavior: validates level ("token" or "sequence") and parses the threshold. Token level:
+    # raw weight = exp(clamped log_ratio). Sequence level: raw weight = exp(clamped masked sum of
+    # log_ratio) broadcast across tokens. Raw weights are multiplied by the mask. Single upper
+    # bound -> TIS (clamp at upper); lower_upper -> IcePop (zero weights outside [lower, upper]).
+    # Computes IS metrics (plus rollout_is_oob_ratio for IcePop), detaches the weights, and if
+    # batch normalization is requested divides by the (distributed when torch.distributed is
+    # initialized) masked mean of token weights or of per-sequence weights; records
+    # rollout_is_batch_norm_factor (1.0 when the mean is <= 1e-8 and no normalization happens).
+    # Inputs/Outputs: see docstring.
+    # Exceptions: ValueError for invalid level / thresholds.
+    # Side effects: may perform distributed all-reduce.
     """Compute importance sampling weights to correct for off-policy distribution shifts.
 
     This function calculates IS weights (π_train / π_rollout) using log ratios for numerical stability.
@@ -666,6 +726,17 @@ def compute_is_metrics(
     rollout_is_threshold: float,
     rollout_is_threshold_lower: Optional[float] = None,
 ) -> dict[str, float]:
+    # [FUNCTION DOC]
+    # Behavior: requires a valid token; lower threshold defaults to 1/upper. Sequence level:
+    # max/min from exp of the max/min unclamped log ratio (max clamped to SAFETY_BOUND), mean of
+    # applied weights, fractions of sequences whose log ratio exceeds log upper / falls below log
+    # lower. Token level: masked mean of applied weights, fractions of raw weights above upper /
+    # below lower, max/min of applied weights over valid tokens. Then rollout_is_std (masked std of
+    # weights clamped to [0, upper]), rollout_is_eff_sample_size (1 / masked mean of squared
+    # weights normalized by their mean), and for 2-D weights per-sequence mean weight stats
+    # (rollout_is_seq_mean/std/max/min/max_deviation from 1.0) plus sequence high/low fractions
+    # measured on raw per-sequence mean weights.
+    # Outputs: dict of floats. Exceptions: ValueError on an all-zero mask.
     """Compute comprehensive metrics for truncated importance sampling weights.
 
     This function calculates statistics for the applied IS weights while using the
@@ -793,6 +864,14 @@ def compute_rollout_correction_and_rejection_mask(
     rollout_rs: Optional[str] = None,
     rollout_rs_threshold: Optional[str | float] = None,
 ) -> tuple[Optional[DataProto], torch.Tensor, dict[str, float]]:
+    # [FUNCTION DOC]
+    # Behavior: validates mask non-empty and shapes equal; computes log_ratio; computes IS
+    # weights only when rollout_is and its threshold are set; computes the rejection mask only when
+    # rollout_rs is set (threshold then required) - otherwise the mask is a clone of the input;
+    # always adds off-policy metrics; prefixes all metric keys with "rollout_corr/" (tensor values
+    # converted to Python scalars); wraps weights in a DataProto under "rollout_is_weights".
+    # Inputs/Outputs: see docstring.
+    # Exceptions: ValueError for empty mask, shape mismatch, or missing RS threshold.
     """Unified interface for computing IS weights and rejection masks.
 
     This function combines IS weight calculation (truncated) and rejection sampling (masked)
@@ -906,6 +985,15 @@ def compute_offpolicy_metrics(
     rollout_log_prob: Optional[torch.Tensor],
     response_mask: torch.Tensor,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Behavior: requires a valid token (assertion). Always reports training_ppl (batch mean of
+    # exp of negative per-sequence mean log prob) and training_log_ppl. When rollout log probs are
+    # given also reports: kl (masked mean of rollout minus training log prob), k3_kl, rollout_ppl,
+    # rollout_log_ppl, log_ppl_diff mean/abs mean/max/min (rollout minus training per-sequence
+    # mean log prob), ppl_ratio (mean of exp of that diff), chi2_token (masked mean of squared
+    # clamped token ratio minus 1) and chi2_seq (mean of exp of twice the clamped per-sequence sum
+    # of log ratios, minus 1).
+    # Outputs: dict of floats (unprefixed). Exceptions: AssertionError on all-zero mask.
     """Compute off-policy diagnostic metrics (helper function).
 
     This helper function operates on raw tensors and is used internally by:
@@ -1013,6 +1101,14 @@ def compute_offpolicy_metrics(
 def compute_rollout_correction_and_add_to_batch(
     batch: DataProto, rollout_corr_config: RolloutCorrectionConfig
 ) -> tuple[DataProto, dict]:
+    # [FUNCTION DOC]
+    # Behavior: reads rollout_is (default None), rollout_is_threshold (2.0),
+    # rollout_is_batch_normalize (False), rollout_rs (None), rollout_rs_threshold (None) from the
+    # config, runs the unified computation on old_log_probs / rollout_log_probs / response_mask,
+    # overwrites response_mask with the (possibly) rejected mask, and unions the IS weights into
+    # the batch when computed.
+    # Inputs: batch; rollout_corr_config - mapping-like config with get.
+    # Outputs: (batch, prefixed metrics). Side effects: mutates batch.batch["response_mask"].
     """Compute rollout correction weights and apply rejection sampling.
 
     Computes importance sampling weights to correct for off-policy issues between
@@ -1072,6 +1168,9 @@ def compute_rollout_corr_metrics_from_logprobs(
     rollout_log_prob: torch.Tensor,
     response_mask: torch.Tensor,
 ) -> dict[str, float]:
+    # [FUNCTION DOC]
+    # Behavior: computes off-policy metrics with the current-policy log probs in the training role
+    # and prefixes keys with "rollout_corr/". Outputs: dict of floats.
     """Compute rollout correction metrics from log probabilities during training.
 
     This function is used in the actor to compute metrics using the CURRENT policy
@@ -1111,6 +1210,15 @@ def apply_bypass_mode(
     rollout_corr_config: Optional[RolloutCorrectionConfig] = None,
     policy_loss_config: PolicyLossConfig = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: requires rollout_log_probs in the batch; sets old_log_probs to the rollout log
+    # probs (same tensor), then in the policy loss config (opened for new keys) stores the
+    # rollout correction config under rollout_correction and sets loss_mode to "bypass_mode".
+    # Inputs: batch; rollout_corr_config; policy_loss_config - OmegaConf config to mutate.
+    # Outputs: none. Exceptions: ValueError when rollout_log_probs is missing.
+    # Side effects: mutates batch and policy_loss_config.
+    # KNOWN ISSUE: policy_loss_config defaults to None, but open_dict / item assignment on None
+    # would fail, so the argument is effectively required.
     """
     Setup bypass mode: Use rollout_log_probs as old_log_probs.
 

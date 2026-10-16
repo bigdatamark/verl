@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Unit and cross-process tests for the POSIX shared-memory helpers used by the
+# vLLM bucketed weight transfer: create_shared_memory (create a named segment, or
+# attach to an existing one on name collision) and rebuild_shared_memory (view a
+# named segment as a 1-D tensor of a given dtype, returning the tensor and handle).
+# Run directly via unittest when executed as a script.
 
 import multiprocessing
 import unittest
@@ -22,9 +28,18 @@ from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import create_sh
 
 
 class TestSharedMemory(unittest.TestCase):
+    # [CLASS DOC]
+    # Unit tests for create/rebuild of shared memory within a single process. Each test
+    # gets a fresh short random segment name in setUp.
+    # KNOWN ISSUE: segments are never closed/unlinked (tearDown is a no-op and only
+    # Python references are deleted), so each test leaks a named segment in /dev/shm.
     """Test cases for shared memory utility functions."""
 
     def setUp(self):
+        # [FUNCTION DOC]
+        # HELPER: Generates a unique segment name "shm_" plus 8 hex chars from a UUID4,
+        # kept short to stay within POSIX name length limits.
+        # Side effects: sets self.test_name.
         """Set up test fixtures before each test method."""
         # Use short unique names to avoid POSIX shared memory name length limits
         import uuid
@@ -33,12 +48,17 @@ class TestSharedMemory(unittest.TestCase):
         self.test_name = f"shm_{short_id}"
 
     def tearDown(self):
+        # [FUNCTION DOC]
+        # HELPER: No-op cleanup; relies on the OS and reference deletion inside tests.
         """Clean up shared memory after each test method."""
         # Note: We're relying on the OS to clean up shared memory
         # as we properly delete all references in the tests
         pass
 
     def test_create_shared_memory_new(self):
+        # [FUNCTION DOC]
+        # Behavior: creates a 1024-byte segment and asserts it exists, has size at least
+        # the request (OS may round up) and carries the requested name.
         """Test creating new shared memory with unique name."""
         size = 1024
 
@@ -54,6 +74,10 @@ class TestSharedMemory(unittest.TestCase):
         del shm
 
     def test_create_shared_memory_attach_existing(self):
+        # [FUNCTION DOC]
+        # Behavior: creating twice with the same name must not raise; the second call
+        # attaches to the existing segment, and both handles report the same name and
+        # size at least the request.
         """Test that create_shared_memory attaches to existing shared memory when FileExistsError occurs."""
         size = 2048
 
@@ -76,6 +100,10 @@ class TestSharedMemory(unittest.TestCase):
         del shm1, shm2
 
     def test_rebuild_shared_memory_default_dtype(self):
+        # [FUNCTION DOC]
+        # Behavior: writes bytes 0..1023 (uint8) into a fresh segment, rebuilds with the
+        # default dtype, and asserts dtype uint8, length equal to size, and contents equal
+        # to a direct uint8 view of the segment buffer.
         """Test rebuilding tensor from shared memory with default dtype (uint8)."""
         size = 1024
 
@@ -99,6 +127,9 @@ class TestSharedMemory(unittest.TestCase):
         del tensor, reconstructed
 
     def test_rebuild_shared_memory_custom_dtype(self):
+        # [FUNCTION DOC]
+        # Behavior: writes 64 float32 values (256 bytes), rebuilds with dtype float32,
+        # asserts dtype, length 64, and equality with a float32 view of the buffer.
         """Test rebuilding tensor from shared memory with custom dtype."""
         size = 256  # 256 bytes = 64 float32 values
 
@@ -122,6 +153,11 @@ class TestSharedMemory(unittest.TestCase):
         del tensor, reconstructed
 
     def test_shared_memory_data_integrity(self):
+        # [FUNCTION DOC]
+        # Behavior: writes random uint8 data, rebuilds, and asserts the raw buffer view
+        # equals the original data.
+        # KNOWN ISSUE: the rebuilt tensor itself is never compared; only the raw buffer
+        # view is checked, so rebuild_shared_memory's output is not actually verified.
         """Test that data remains intact between create and rebuild operations."""
         size = 512
 
@@ -143,6 +179,11 @@ class TestSharedMemory(unittest.TestCase):
         del tensor, reconstructed
 
     def test_shared_memory_different_dtypes(self):
+        # [FUNCTION DOC]
+        # Behavior: for each of float32, float64, int32, int64, uint8 over a 256-byte
+        # segment, writes an arange of the matching element count, rebuilds with that
+        # dtype, and asserts dtype, element count, and buffer contents. The same segment
+        # name is reused (attached) on every iteration.
         """Test shared memory operations with different tensor dtypes."""
         test_cases = [
             (torch.float32, 256, 64),  # 256 bytes / 4 bytes = 64 values
@@ -174,6 +215,10 @@ class TestSharedMemory(unittest.TestCase):
             del tensor, reconstructed
 
     def test_shared_memory_multiple_operations(self):
+        # [FUNCTION DOC]
+        # Behavior: two sequential create/write/rebuild rounds with the same name and
+        # different data (arange, then arange doubled), each asserting the buffer view
+        # matches the data written in that round.
         """Test multiple create/rebuild operations with the same name."""
         size = 512
 
@@ -198,6 +243,18 @@ class TestSharedMemory(unittest.TestCase):
 
 # Module-level function for cross-process testing
 def child_process_function(name, size, test_data_bytes):
+    # [FUNCTION DOC]
+    # HELPER: Child-process target for the cross-process test. Reconstructs expected
+    # uint8 data from bytes, attaches to the named segment, views the first size bytes
+    # as uint8, and compares.
+    # Inputs: name - segment name; size - byte count; test_data_bytes - expected bytes.
+    # Outputs: True on match, False if any exception (including the mismatch assert)
+    # occurs, after printing the error.
+    # Side effects: attaches to and closes (does not unlink) the segment.
+    # KNOWN ISSUE: as a multiprocessing target the return value is discarded, so a
+    # data mismatch still yields exit code 0 and the parent test cannot detect it.
+    # Also closing the segment while the tensor view may still hold an exported buffer
+    # could raise BufferError in some cases.
     """Child process function to rebuild and verify tensor."""
     shm = None
     tensor = None
@@ -228,9 +285,18 @@ def child_process_function(name, size, test_data_bytes):
 
 
 class TestSharedMemoryIntegration(unittest.TestCase):
+    # [CLASS DOC]
+    # Integration test sharing a segment between a parent and a child process.
     """Integration tests for shared memory operations across process boundaries."""
 
     def test_cross_process_shared_memory(self):
+        # [FUNCTION DOC]
+        # Behavior: parent creates segment "test_cross_proc" with bytes 0..1023, spawns a
+        # child running child_process_function with the expected bytes, waits up to 5s,
+        # and asserts the child exit code is 0.
+        # Side effects: spawns a process; never unlinks the named segment (leak).
+        # KNOWN ISSUE: fixed segment name can collide across concurrent runs, and the exit
+        # code check cannot catch data mismatches (see child_process_function).
         """Test shared memory can be created in one process and accessed in another."""
         size = 1024
         test_data = torch.arange(size, dtype=torch.uint8)

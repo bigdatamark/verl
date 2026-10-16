@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Utilities for the v1 PPO trainers: a metrics aggregator that reduces per-iteration metrics across a
+# parameter_sync_step cycle, and a GRPO advantage computation for multi-trajectory (multi-session) agent loops.
+
 from collections import Counter, defaultdict
 from typing import Any
 
@@ -24,12 +28,19 @@ from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
 
 
 class MetricsAggregator:
+    # [CLASS DOC]
+    # Accumulates scalar metrics (with per-entry sample weights) and counter-style dict metrics over several iterations,
+    # then reduces each metric by a rule chosen from its name (explicit lists, then keyword heuristics).
+    # State: metric_values and metric_weights (name to list), dict_metrics (name to Counter), step_count, aggregation_rules.
     """
     Combine per-iteration training metrics collected within a single ``parameter_sync_step`` cycle.
     Adapted from ``verl.experimental.fully_async_policy.detach_utils.MetricsAggregator`.
     """
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Behavior: initializes empty default-dict containers, step_count 0, and the explicit aggregation rules.
+        # Inputs/Outputs: none.
         self.metric_values: dict[str, list[float]] = defaultdict(list)
         self.metric_weights: dict[str, list[int]] = defaultdict(list)
         self.dict_metrics: dict[str, Counter] = defaultdict(Counter)
@@ -37,6 +48,10 @@ class MetricsAggregator:
         self.aggregation_rules = self._init_aggregation_rules()
 
     def _init_aggregation_rules(self) -> dict[str, list[str]]:
+        # [FUNCTION DOC]
+        # HELPER: Returns the explicit rule table: "sum" for train/validation evicted and discarded sample counts across
+        # off_policy, filter_groups and rollout_failure; "last" for training/global_step and training/rollout_probs_diff_valid.
+        # Inputs: none. Outputs: mapping from aggregation type to list of metric names.
         return {
             "sum": [
                 "training/off_policy/evicted_samples",
@@ -55,6 +70,11 @@ class MetricsAggregator:
         }
 
     def add_step_metrics(self, metrics: dict[str, Any], sample_count: int = 0):
+        # [FUNCTION DOC]
+        # Behavior: increments step_count and records each metric: booleans skipped; the DAPO filtered-reward-counts key with a
+        # dict value is merged into its Counter; int/float/numpy numbers and single-element tensors are stored as float with a
+        # weight from _get_metric_weight; other types ignored.
+        # Inputs: metrics - name to value mapping; sample_count - default weight. Outputs: none. Side effects: mutates state.
         """Record one iteration's metrics."""
         self.step_count += 1
         for key, value in metrics.items():
@@ -71,6 +91,11 @@ class MetricsAggregator:
                 self.metric_weights[key].append(self._get_metric_weight(key, metrics, sample_count))
 
     def _get_metric_weight(self, metric_name: str, metrics: dict[str, Any], sample_count: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: For names ending in "/off_policy/evicted_samples_staleness/mean", weight is the value of the matching
+        # ".../evicted_samples" metric in the same dict (tensor item if single element, else sample_count; numeric cast to int);
+        # all other metrics (and missing/non-numeric counts) use sample_count.
+        # Inputs: metric_name, metrics dict, sample_count. Outputs: int weight.
         """Return the sample weight used when reducing per-iteration average metrics."""
         if metric_name.endswith("/off_policy/evicted_samples_staleness/mean"):
             prefix = metric_name.rsplit("_staleness/mean", 1)[0]
@@ -82,6 +107,11 @@ class MetricsAggregator:
         return sample_count
 
     def _get_aggregation_type(self, metric_name: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Determines aggregation type: explicit rule lists first; then lowercase name heuristics in order: lr names
+        # ("/lr", "_lr", "lr") -> "last"; contains "timing_s/" or "timing_per_token_ms/" -> "time_sum"; contains "max" ->
+        # "max"; contains "min" -> "min"; contains "sum"/"total" -> "sum"; otherwise "weighted_avg".
+        # Inputs: metric_name. Outputs: aggregation type string.
         for agg_type, metric_list in self.aggregation_rules.items():
             if metric_name in metric_list:
                 return agg_type
@@ -102,6 +132,10 @@ class MetricsAggregator:
         return "weighted_avg"
 
     def _aggregate_single_metric(self, metric_name: str, values: list[float]) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Reduces values by aggregation type: empty -> 0.0; last -> final value; weighted_avg -> weight-weighted mean,
+        # falling back to plain mean if weight count mismatches or weights sum to 0; sum/time_sum -> sum; max/min; else mean.
+        # Inputs: metric_name, values. Outputs: float.
         if not values:
             return 0.0
 
@@ -123,6 +157,9 @@ class MetricsAggregator:
         return sum(values) / len(values)
 
     def get_aggregated_metrics(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: returns empty dict if no steps recorded; otherwise aggregates every scalar metric, adds non-empty dict
+        # metrics as plain dicts, and applies special derived-metric recomputation. Inputs: none. Outputs: name to value dict.
         if self.step_count == 0:
             return {}
         aggregated = {name: self._aggregate_single_metric(name, values) for name, values in self.metric_values.items()}
@@ -132,6 +169,9 @@ class MetricsAggregator:
         return self._special_metrics_aggregate(aggregated)
 
     def _special_metrics_aggregate(self, aggregated: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: If global_seqlen max, min and minmax_diff are all present, recomputes minmax_diff as aggregated max minus
+        # aggregated min. Inputs: aggregated dict (mutated in place). Outputs: the same dict.
         """Recompute derived metrics that cannot be reduced from their per-iteration values."""
         if {"global_seqlen/minmax_diff", "global_seqlen/max", "global_seqlen/min"}.issubset(aggregated):
             aggregated["global_seqlen/minmax_diff"] = aggregated["global_seqlen/max"] - aggregated["global_seqlen/min"]
@@ -139,6 +179,8 @@ class MetricsAggregator:
         return aggregated
 
     def reset(self):
+        # [FUNCTION DOC]
+        # Behavior: clears all accumulated values, weights and dict metrics and resets step_count to 0. Inputs/Outputs: none.
         self.metric_values.clear()
         self.metric_weights.clear()
         self.dict_metrics.clear()
@@ -155,6 +197,17 @@ def compute_advantage_for_multi_trajectories(
     norm_adv_by_std_in_grpo: bool = True,
     config: Any = None,
 ) -> DataProto:
+    # [FUNCTION DOC]
+    # Behavior: non-GRPO estimators delegate directly to compute_advantage with all arguments. For GRPO: parses each
+    # batch key as "{uid}_{session_id}_{index}" (splitting from the right, so uid may contain underscores), picks the row
+    # with the highest index per uid_session as the session's final output, runs compute_advantage on only those rows,
+    # takes each final row's advantage at its first response-mask position as the session score, then broadcasts each
+    # session's score to every row of that session multiplied by its response mask, writing it to both "advantages" and
+    # "returns" in the original data.
+    # Inputs: data - DataProto with response_mask; batch_keys - one key per row in row order; adv_estimator; gamma; lam;
+    # num_repeat; norm_adv_by_std_in_grpo; config - passed through.
+    # Outputs: DataProto (the input data mutated in place for GRPO; the compute_advantage result otherwise).
+    # Exceptions: AssertionError on malformed keys; ValueError if the index part is not an integer.
     """Compute GRPO advantages from each session's final output. For non-GRPO
     estimators, such as GAE, are delegated to the original compute_advantage() unchanged.
 

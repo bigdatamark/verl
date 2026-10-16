@@ -14,6 +14,9 @@
 # limitations under the License.
 
 # -*- coding: utf-8 -*-
+# [MODULE DOC]
+# Filesystem-agnostic IO helpers: re-exports copy/exists/makedirs from hdfs_io, detects HDFS paths, copies remote checkpoints/models to a local cache (with file locking and directory-structure verification), optionally to /dev/shm, and creates directories safely across processes.
+
 """File-system agnostic IO APIs"""
 
 import hashlib
@@ -32,6 +35,8 @@ _HDFS_PREFIX = "hdfs://"
 
 
 def is_non_local(path):
+    # [FUNCTION DOC]
+    # Returns True if path starts with "hdfs://".
     """Check if a path is a non-local (HDFS) path.
 
     Args:
@@ -44,6 +49,8 @@ def is_non_local(path):
 
 
 def md5_encode(path: str) -> str:
+    # [FUNCTION DOC]
+    # Returns the hex MD5 digest of the path string.
     """Generate an MD5 hash of a path string.
 
     This function is used to create unique identifiers for paths, typically
@@ -59,6 +66,10 @@ def md5_encode(path: str) -> str:
 
 
 def get_local_temp_path(hdfs_path: str, cache_dir: str) -> str:
+    # [FUNCTION DOC]
+    # Behavior: creates cache_dir/<md5(hdfs_path)> and returns that directory joined with basename(hdfs_path).
+    # Outputs: local destination path (not created itself).
+    # Side effects: creates a directory.
     """Generate a unique local cache path for an HDFS resource.
     Creates a MD5-hashed subdirectory in cache_dir to avoid name conflicts,
     then returns path combining this subdirectory with the HDFS basename.
@@ -80,6 +91,9 @@ def get_local_temp_path(hdfs_path: str, cache_dir: str) -> str:
 
 
 def verify_copy(src: str, dest: str) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: returns False if either path is missing or one is a file and the other is not. For files compares sizes. For directories walks src, requires each corresponding dest directory to exist, collects relative entry names on both sides (only for directories visited in src) and requires equal sets, then checks entry kinds match and file sizes are equal.
+    # Outputs: bool.
     """
     verify the copy of src to dest by comparing their sizes and file structures.
 
@@ -139,6 +153,11 @@ def verify_copy(src: str, dest: str) -> bool:
 
 
 def copy_to_shm(src: str):
+    # [FUNCTION DOC]
+    # Behavior: destination is /dev/shm/verl-cache/<md5(absolute src)>/<basename>. If it exists and verify_copy passes, prints a warning and reuses it; otherwise copies the directory tree (merging into existing) or the file with metadata.
+    # Inputs: src - local path.
+    # Outputs: destination path.
+    # Side effects: creates directories and copies data to shared memory.
     """
     Load the model into   /dev/shm   to make the process of loading the model multiple times more efficient.
     """
@@ -162,6 +181,9 @@ def copy_to_shm(src: str):
 
 
 def _record_directory_structure(folder_path):
+    # [FUNCTION DOC]
+    # HELPER: Writes .directory_record.txt in folder_path listing every subdirectory ("dir:<rel>") and file ("file:<rel>", excluding the record itself) found by walking it.
+    # Outputs: record file path.
     record_file = os.path.join(folder_path, ".directory_record.txt")
     with open(record_file, "w") as f:
         for root, dirs, files in os.walk(folder_path):
@@ -176,6 +198,8 @@ def _record_directory_structure(folder_path):
 
 
 def _check_directory_structure(folder_path, record_file):
+    # [FUNCTION DOC]
+    # HELPER: Returns True iff the record file exists and the set of current dir/file entries (same format, excluding the record file) equals the recorded set.
     if not os.path.exists(record_file):
         return False
     existing_entries = set()
@@ -195,6 +219,10 @@ def _check_directory_structure(folder_path, record_file):
 def copy_to_local(
     src: str, cache_dir=None, filelock=".file.lock", verbose=False, always_recopy=False, use_shm: bool = False
 ) -> str:
+    # [FUNCTION DOC]
+    # Behavior: resolves src to a local path via copy_local_path_from_hdfs. When use_shm and the result is not an existing path (e.g. a Hugging Face model id), tries huggingface_hub snapshot_download and uses the resolved directory if it exists (ImportError ignored, other errors printed). If use_shm, copies the result to /dev/shm and returns that path; otherwise returns the local path.
+    # Inputs: src; cache_dir; filelock; verbose; always_recopy; use_shm.
+    # Outputs: local path string.
     """Copy files/directories from HDFS to local cache with validation.
 
     Args:
@@ -232,6 +260,12 @@ def copy_to_local(
 def copy_local_path_from_hdfs(
     src: str, cache_dir=None, filelock=".file.lock", verbose=False, always_recopy=False
 ) -> str:
+    # [FUNCTION DOC]
+    # Behavior: for HDFS paths, under a file lock named md5(src).lock in cache_dir (default system temp dir): optionally deletes an existing copy when always_recopy; copies if missing and records directory structure for directories; if an existing directory fails the structure check, deletes and recopies it. Returns the local path. Non-HDFS src is returned unchanged.
+    # Inputs: src - must not end with "/"; cache_dir; filelock (ignored, overwritten by the md5 name); verbose; always_recopy.
+    # Outputs: local path.
+    # Exceptions: AssertionError for trailing slash; copy errors propagate.
+    # Side effects: filesystem writes/deletes, locking, printing.
     """Deprecated. Please use copy_to_local instead."""
     from filelock import FileLock
 
@@ -275,6 +309,10 @@ def copy_local_path_from_hdfs(
 
 
 def local_mkdir_safe(path):
+    # [FUNCTION DOC]
+    # Behavior: makes path absolute relative to cwd, then creates it (exist_ok) while holding a FileLock in the system temp dir named from a 32-bit hash of the path (60 s timeout); on any lock failure prints a warning and creates the directory without the lock.
+    # Outputs: the absolute path.
+    # KNOWN ISSUE: Python's string hash is randomized per process, so different processes compute different lock file names and the lock does not actually serialize across processes (makedirs with exist_ok is safe regardless).
     """_summary_
     Thread-safe directory creation function that ensures the directory is created
     even if multiple processes attempt to create it simultaneously.

@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests for rollout-server profiling support in verl.utils.profiler: building vLLM and SGLang profiler arguments
+# (trace directory, captured contents, token-window to delay/num-iterations), relocating rollout engine traces into
+# save_path with replica / global-GPU-rank naming and optional filtering to requested global ranks, parsing a GPU's
+# local rank from engine trace file names, deriving the global-rank keep set, the DistProfiler finish hook, mapping
+# global ranks to rollout replicas in build_rollout_dist_profiler, and the vLLM / SGLang HTTP servers' start/stop
+# profile methods (called unbound on mocks; skipped when the engine package is unavailable).
+
 import json
 import os
 import tempfile
@@ -34,7 +42,13 @@ from verl.utils.profiler.profile import DistProfiler, build_rollout_dist_profile
 
 
 class TestServerProfilerArgs(unittest.TestCase):
+    # [CLASS DOC]
+    # unittest TestCase for build_vllm_profiler_args / build_sglang_profiler_args and rollout_trace_dir.
     def test_build_vllm_profiler_args(self):
+        # [FUNCTION DOC]
+        # With stack, shapes and memory enabled and a clean environment, asserts the legacy VLLM_TORCH_PROFILER_* env vars are
+        # set (dir is save_path/agent_loop_rollout_replica_<rank>) and the JSON "profiler_config" argument mirrors them with
+        # zero delay/max iterations. Side effects: env vars are set within a patched environment only.
         # Case 1: All features enabled
         tool_config = TorchProfilerToolConfig(contents=["stack", "shapes", "memory"])
         config = ProfilerConfig(save_path="/tmp/test", tool_config=tool_config)
@@ -60,6 +74,8 @@ class TestServerProfilerArgs(unittest.TestCase):
             self.assertEqual(profiler_config_dict["max_iterations"], 0)
 
     def test_build_vllm_profiler_args_skips_legacy_env(self):
+        # [FUNCTION DOC]
+        # With legacy_env False, asserts no legacy env vars are set while the JSON profiler_config still carries the trace dir.
         """vLLM >= 0.13.0 rejects the VLLM_TORCH_PROFILER_* names, so they must stay unset."""
         tool_config = TorchProfilerToolConfig(contents=["stack"])
         config = ProfilerConfig(save_path="/tmp/test", tool_config=tool_config)
@@ -80,6 +96,8 @@ class TestServerProfilerArgs(unittest.TestCase):
             self.assertEqual(profiler_config_dict["torch_profiler_dir"], "/tmp/test/agent_loop_rollout_replica_0")
 
     def test_build_vllm_profiler_args_with_profile_window(self):
+        # [FUNCTION DOC]
+        # Token window 12..46 maps to delay_iterations 12 and max_iterations 34 (end minus start).
         tool_config = TorchProfilerToolConfig(contents=["stack"], profile_token_start=12, profile_token_end=46)
         config = ProfilerConfig(save_path="/tmp/test", tool_config=tool_config)
 
@@ -89,6 +107,8 @@ class TestServerProfilerArgs(unittest.TestCase):
         self.assertEqual(profiler_config_dict["max_iterations"], 34)
 
     def test_build_vllm_profiler_args_with_npu_profile_window(self):
+        # [FUNCTION DOC]
+        # Same window mapping for an NPU tool config (5..13 gives 5 and 8).
         tool_config = NPUToolConfig(contents=["npu"], profile_token_start=5, profile_token_end=13)
         config = ProfilerConfig(save_path="/tmp/test", tool_config=tool_config)
         args = build_vllm_profiler_args(config, tool_config, rank=0)
@@ -97,6 +117,8 @@ class TestServerProfilerArgs(unittest.TestCase):
         self.assertEqual(profiler_config_dict["max_iterations"], 8)
 
     def test_rollout_trace_dir_matches_what_the_engines_write_to(self):
+        # [FUNCTION DOC]
+        # Asserts rollout_trace_dir for rank 2 equals both the SGLang output_dir and the vLLM torch_profiler_dir.
         """The finish hook derives its directory from this helper, so it must not drift."""
         tool_config = TorchProfilerToolConfig(contents=["cpu"])
         config = ProfilerConfig(save_path="/tmp/test", tool_config=tool_config)
@@ -108,6 +130,9 @@ class TestServerProfilerArgs(unittest.TestCase):
         self.assertEqual(json.loads(args["profiler_config"])["torch_profiler_dir"], expected)
 
     def test_build_sglang_profiler_args(self):
+        # [FUNCTION DOC]
+        # With stack/shapes/memory contents, asserts building SGLang args emits a UserWarning (memory unsupported), sets
+        # output_dir, with_stack and record_shapes, and leaves start_step/num_steps None.
         # Case 1: Basic features
         tool_config = TorchProfilerToolConfig(contents=["stack", "shapes", "memory"])
         config = ProfilerConfig(save_path="/tmp/test", tool_config=tool_config)
@@ -120,6 +145,8 @@ class TestServerProfilerArgs(unittest.TestCase):
         self.assertIsNone(args["num_steps"])
 
     def test_build_sglang_profiler_args_with_profile_window(self):
+        # [FUNCTION DOC]
+        # Token window 7..16 maps to SGLang start_step 7 and num_steps 9.
         tool_config = TorchProfilerToolConfig(contents=["stack"], profile_token_start=7, profile_token_end=16)
         config = ProfilerConfig(save_path="/tmp/test", tool_config=tool_config)
         args = build_sglang_profiler_args(config, tool_config, rank=0)
@@ -128,9 +155,14 @@ class TestServerProfilerArgs(unittest.TestCase):
 
 
 class TestRolloutTraceRelocation(unittest.TestCase):
+    # [CLASS DOC]
+    # unittest TestCase for relocate_rollout_traces.
     """Engines write into a sub-directory; relocation brings the traces to the configured path."""
 
     def _config(self, save_path: str, **kwargs) -> ProfilerConfig:
+        # [FUNCTION DOC]
+        # HELPER: Builds an enabled torch ProfilerConfig (ranks [0], discrete CPU tool config) with the given save_path and
+        # extra fields.
         return ProfilerConfig(
             tool="torch",
             enable=True,
@@ -141,6 +173,9 @@ class TestRolloutTraceRelocation(unittest.TestCase):
         )
 
     def _write_engine_traces(self, config: ProfilerConfig, rank: int, *names: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Creates rollout_trace_dir(config, rank) and writes each named file (content = its name) into it.
+        # Outputs: the source directory path. Side effects: creates directories/files.
         src_dir = rollout_trace_dir(config, rank)
         os.makedirs(src_dir, exist_ok=True)
         for name in names:
@@ -149,6 +184,9 @@ class TestRolloutTraceRelocation(unittest.TestCase):
         return src_dir
 
     def test_traces_end_up_next_to_the_training_ones(self):
+        # [FUNCTION DOC]
+        # With relocate_results, a trace for replica 2 is moved to save_path as "rollout-replica2_<name>", the returned list
+        # contains that path, and the source dir becomes empty.
         with tempfile.TemporaryDirectory() as save_path:
             config = self._config(save_path, relocate_results=True)
             src_dir = self._write_engine_traces(config, 2, "host_123.pt.trace.json.gz")
@@ -162,6 +200,8 @@ class TestRolloutTraceRelocation(unittest.TestCase):
             self.assertEqual(os.listdir(src_dir), [])
 
     def test_traces_stay_where_the_engine_wrote_them_by_default(self):
+        # [FUNCTION DOC]
+        # Without relocate_results, relocation returns [] and the source file stays in place.
         with tempfile.TemporaryDirectory() as save_path:
             config = self._config(save_path)
             src_dir = self._write_engine_traces(config, 0, "host_123.pt.trace.json.gz")
@@ -171,12 +211,17 @@ class TestRolloutTraceRelocation(unittest.TestCase):
             self.assertEqual(os.listdir(src_dir), ["host_123.pt.trace.json.gz"])
 
     def test_an_engine_that_wrote_nothing_is_not_an_error(self):
+        # [FUNCTION DOC]
+        # Relocation with no trace directory present returns [] without raising.
         with tempfile.TemporaryDirectory() as save_path:
             config = self._config(save_path, relocate_results=True)
 
             self.assertEqual(relocate_rollout_traces(config, rank=1), [])
 
     def test_global_gpu_rank_is_added_when_the_engine_encodes_the_tp_rank(self):
+        # [FUNCTION DOC]
+        # With world_size 2 for replica 4, files named rank0/rank1 are renamed with "-globalrank8" / "-globalrank9"
+        # (replica * world_size + local rank).
         # The name should line up with the global `ranks` the user configured: with tp=2, replica 4
         # drives the engine spanning global GPUs 8 and 9, and the engine names its per-GPU traces by
         # tensor-parallel rank, so rank0 -> global 8 and rank1 -> global 9.
@@ -195,6 +240,8 @@ class TestRolloutTraceRelocation(unittest.TestCase):
             )
 
     def test_replica_index_is_used_when_the_tp_rank_is_not_in_the_name(self):
+        # [FUNCTION DOC]
+        # A host/pid-named trace (no local rank) keeps the replica-only name.
         # Engines that name traces by host/pid instead of tp rank cannot be mapped to a single GPU,
         # so the whole (tp-sharded) engine keeps the replica-only name.
         with tempfile.TemporaryDirectory() as save_path:
@@ -209,6 +256,8 @@ class TestRolloutTraceRelocation(unittest.TestCase):
             )
 
     def test_world_size_one_keeps_the_replica_index_which_already_is_the_global_rank(self):
+        # [FUNCTION DOC]
+        # With world_size 1, no global-rank suffix is added even for rank-named files.
         # tp=dp=pp=1: the replica index equals the global GPU rank, so no extra suffix is needed.
         with tempfile.TemporaryDirectory() as save_path:
             config = self._config(save_path, relocate_results=True)
@@ -222,6 +271,9 @@ class TestRolloutTraceRelocation(unittest.TestCase):
             )
 
     def test_ranks_0_and_8_yield_exactly_gpu_0_and_8_not_their_tp_mates(self):
+        # [FUNCTION DOC]
+        # With keep_global_ranks {0, 8} and world_size 2, replicas 0 and 4 relocate only their local-rank-0 files (global 0 and 8);
+        # the save_path top level holds exactly those two files and the tp-rank-1 files remain in their source dirs.
         # The whole point: tp=2 forces the engine to trace its whole replica, but ranks=[0, 8] must
         # surface exactly global GPUs 0 and 8. Replica 0 owns GPUs 0-1 and replica 4 owns GPUs 8-9,
         # so tp rank 1 (GPUs 1 and 9) is dropped, not relocated into save_path.
@@ -258,6 +310,8 @@ class TestRolloutTraceRelocation(unittest.TestCase):
             self.assertEqual(os.listdir(rollout_trace_dir(config, 4)), ["rank1.pt.trace.json.gz"])
 
     def test_filtering_never_drops_a_file_whose_global_rank_is_unknown(self):
+        # [FUNCTION DOC]
+        # A file whose local rank cannot be parsed is relocated even when filtering by keep_global_ranks.
         # If the tp rank cannot be read from the engine's name we cannot prove the file is unwanted,
         # so it is kept rather than risk dropping a rank the user asked for.
         with tempfile.TemporaryDirectory() as save_path:
@@ -272,6 +326,8 @@ class TestRolloutTraceRelocation(unittest.TestCase):
             )
 
     def test_sglang_tp_named_traces_are_filtered_to_the_requested_ranks(self):
+        # [FUNCTION DOC]
+        # SGLang "-TP-<n>" names are filtered the same way: only TP-0 of replicas 0 and 4 is kept.
         # SGLang names per-GPU traces "{profile_id}-TP-{tp}.trace.json.gz". ranks=[0, 8] with tp=2
         # must keep only TP-0 of replica 0 (global 0) and TP-0 of replica 4 (global 8).
         with tempfile.TemporaryDirectory() as save_path:
@@ -292,6 +348,8 @@ class TestRolloutTraceRelocation(unittest.TestCase):
             )
 
     def test_vllm_instance_rank_named_traces_are_filtered_to_the_requested_ranks(self):
+        # [FUNCTION DOC]
+        # vLLM "-rank-<n>." names are filtered: only rank-0 of replica 4 (global 8) is kept.
         # vLLM names per-GPU traces "{instance_id}-rank-{tp}.{ts}.pt.trace.json.gz".
         with tempfile.TemporaryDirectory() as save_path:
             config = self._config(save_path, relocate_results=True)
@@ -307,6 +365,8 @@ class TestRolloutTraceRelocation(unittest.TestCase):
             )
 
     def test_multi_dim_parallel_names_are_kept_rather_than_mismapped(self):
+        # [FUNCTION DOC]
+        # Names encoding multiple parallel dims (TP and DP) are ambiguous, so all are kept with replica-only names.
         # With DP/PP/EP in the name the GPU's linear offset is layout-dependent; do not guess, keep all.
         with tempfile.TemporaryDirectory() as save_path:
             config = self._config(save_path, relocate_results=True)
@@ -321,56 +381,88 @@ class TestRolloutTraceRelocation(unittest.TestCase):
 
 
 class TestRolloutTraceLocalRank(unittest.TestCase):
+    # [CLASS DOC]
+    # unittest TestCase for rollout_trace_local_rank.
     """`rollout_trace_local_rank` reads a GPU's offset within its replica from the engine file name."""
 
     def test_reads_sglang_tp_rank(self):
+        # [FUNCTION DOC]
+        # Parses SGLang "-TP-0"/"-TP-1" names to 0 and 1.
         self.assertEqual(rollout_trace_local_rank("42-TP-0.trace.json.gz", world_size=2), 0)
         self.assertEqual(rollout_trace_local_rank("42-TP-1.trace.json.gz", world_size=2), 1)
 
     def test_reads_vllm_instance_rank(self):
+        # [FUNCTION DOC]
+        # Parses vLLM "-rank-<n>." names to the rank.
         self.assertEqual(rollout_trace_local_rank("inst-rank-0.99.pt.trace.json.gz", world_size=4), 0)
         self.assertEqual(rollout_trace_local_rank("inst-rank-3.99.pt.trace.json.gz", world_size=4), 3)
 
     def test_reads_bare_rank_prefix(self):
+        # [FUNCTION DOC]
+        # Parses a bare "rank0" prefix to 0.
         self.assertEqual(rollout_trace_local_rank("rank0.pt.trace.json.gz", world_size=2), 0)
 
     def test_multi_dim_layout_is_ambiguous(self):
+        # [FUNCTION DOC]
+        # A name with both TP and DP is ambiguous and returns None.
         self.assertIsNone(rollout_trace_local_rank("42-TP-0-DP-1.trace.json.gz", world_size=4))
 
     def test_rank_out_of_range_is_rejected(self):
+        # [FUNCTION DOC]
+        # A parsed rank not less than world_size returns None.
         # A parsed value that cannot be a valid offset in this replica is not trusted.
         self.assertIsNone(rollout_trace_local_rank("42-TP-9.trace.json.gz", world_size=2))
 
     def test_host_pid_names_are_unknown(self):
+        # [FUNCTION DOC]
+        # Host/pid names return None.
         self.assertIsNone(rollout_trace_local_rank("host_12345.170.pt.trace.json.gz", world_size=2))
 
     def test_world_size_one_needs_no_offset(self):
+        # [FUNCTION DOC]
+        # With world_size 1 the offset is unnecessary and None is returned.
         self.assertIsNone(rollout_trace_local_rank("42-TP-0.trace.json.gz", world_size=1))
 
 
 class TestRolloutProfilerGlobalRanks(unittest.TestCase):
+    # [CLASS DOC]
+    # unittest TestCase for rollout_profiler_global_ranks.
     """`rollout_profiler_global_ranks` derives the "keep" set relocation uses from the config."""
 
     def _config(self, **kwargs) -> ProfilerConfig:
+        # [FUNCTION DOC]
+        # HELPER: Builds an enabled torch ProfilerConfig with save_path /tmp/test, no tool config and extra fields.
         return ProfilerConfig(tool="torch", enable=True, save_path="/tmp/test", tool_config=None, **kwargs)
 
     def test_explicit_ranks_become_the_keep_set(self):
+        # [FUNCTION DOC]
+        # Explicit ranks [0, 8] produce the keep set {0, 8}.
         self.assertEqual(rollout_profiler_global_ranks(self._config(ranks=[0, 8])), {0, 8})
 
     def test_all_ranks_keeps_everything(self):
+        # [FUNCTION DOC]
+        # all_ranks True produces None (keep everything) regardless of ranks.
         self.assertIsNone(rollout_profiler_global_ranks(self._config(all_ranks=True, ranks=[0, 8])))
 
     def test_empty_ranks_keeps_everything(self):
+        # [FUNCTION DOC]
+        # Empty ranks produce None.
         self.assertIsNone(rollout_profiler_global_ranks(self._config(ranks=[])))
 
     def test_missing_profiler_config_keeps_everything(self):
+        # [FUNCTION DOC]
+        # A None profiler config produces None.
         self.assertIsNone(rollout_profiler_global_ranks(None))
 
 
 class TestRolloutFinishHook(unittest.TestCase):
+    # [CLASS DOC]
+    # unittest TestCase for DistProfiler.run_finish_hook (real shell commands).
     """The finish hook runs the user's command once, on the last profiled step (run_command=True)."""
 
     def _config(self, save_path: str, cmd: str, **kwargs) -> ProfilerConfig:
+        # [FUNCTION DOC]
+        # HELPER: Builds an enabled torch ProfilerConfig for rank 0 with the given save_path and finish_hook_cmd plus extras.
         return ProfilerConfig(
             tool="torch",
             enable=True,
@@ -382,6 +474,8 @@ class TestRolloutFinishHook(unittest.TestCase):
         )
 
     def test_run_finish_hook_runs_command_without_going_through_stop(self):
+        # [FUNCTION DOC]
+        # run_finish_hook (without stop) runs the command, which touches a marker file.
         with tempfile.TemporaryDirectory() as save_path:
             marker = os.path.join(save_path, "hook_ran")
             profiler = DistProfiler(rank=0, config=self._config(save_path, f"touch {marker}"))
@@ -391,6 +485,8 @@ class TestRolloutFinishHook(unittest.TestCase):
             self.assertTrue(os.path.exists(marker))
 
     def test_run_finish_hook_exports_save_path_to_the_command(self):
+        # [FUNCTION DOC]
+        # The command sees VERL_PROFILE_SAVE_PATH equal to save_path (written to a file and read back).
         with tempfile.TemporaryDirectory() as save_path:
             out = os.path.join(save_path, "env")
             profiler = DistProfiler(rank=0, config=self._config(save_path, f'echo "$VERL_PROFILE_SAVE_PATH" > {out}'))
@@ -401,6 +497,8 @@ class TestRolloutFinishHook(unittest.TestCase):
                 self.assertEqual(f.read().strip(), save_path)
 
     def test_run_finish_hook_skips_unselected_ranks(self):
+        # [FUNCTION DOC]
+        # With finish_hook_ranks [3] at rank 0, the command does not run.
         with tempfile.TemporaryDirectory() as save_path:
             marker = os.path.join(save_path, "hook_ran")
             config = self._config(save_path, f"touch {marker}", finish_hook_ranks=[3])
@@ -411,6 +509,8 @@ class TestRolloutFinishHook(unittest.TestCase):
             self.assertFalse(os.path.exists(marker))
 
     def test_run_finish_hook_defers_the_command_until_the_final_step(self):
+        # [FUNCTION DOC]
+        # run_command False does not run the command; run_command True then runs it.
         # The command runs once, on the last profiled step: earlier steps pass run_command=False, so
         # nothing is uploaded yet (backend stop + relocation still happen elsewhere every step), and
         # the last step passes run_command=True to fire the single upload of the whole save_path.
@@ -425,6 +525,8 @@ class TestRolloutFinishHook(unittest.TestCase):
             self.assertTrue(os.path.exists(marker))  # last step: command runs exactly once
 
     def test_run_finish_hook_uploads_the_whole_save_path_once(self):
+        # [FUNCTION DOC]
+        # With two trace files in save_path, a command that logs each matching basename runs once and lists each file exactly once.
         # A single end-of-run upload of the directory sends each accumulated trace exactly once --
         # this is what replaces the per-step upload (which re-sent earlier steps every step).
         with tempfile.TemporaryDirectory() as save_path:
@@ -444,16 +546,25 @@ class TestRolloutFinishHook(unittest.TestCase):
 
 
 class TestBuildRolloutDistProfiler(unittest.TestCase):
+    # [CLASS DOC]
+    # unittest TestCase for build_rollout_dist_profiler's mapping of global GPU ranks to replicas.
     """Rollout `ranks` are global GPU ranks; the helper maps each to the replica that owns it."""
 
     def _config(self, **kwargs) -> ProfilerConfig:
+        # [FUNCTION DOC]
+        # HELPER: Builds an enabled ProfilerConfig with no tool, save_path /tmp/test and extra fields.
         return ProfilerConfig(tool=None, enable=True, save_path="/tmp/test", tool_config=None, **kwargs)
 
     def _selected(self, replica_rank: int, world_size: int, **cfg) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Builds a rollout DistProfiler for the replica and world size and returns whether it is enabled and selects
+        # this rank.
         profiler = build_rollout_dist_profiler(replica_rank, world_size, config=self._config(**cfg))
         return profiler.check_enable() and profiler.check_this_rank()
 
     def test_global_ranks_map_to_the_owning_replica(self):
+        # [FUNCTION DOC]
+        # With world_size 8, ranks [0, 8] select replicas 0 and 1 only (not replicas 8 or 2).
         # world_size 8 (e.g. tp=8): global rank 0 lives on replica 0, global rank 8 lives on replica 1.
         self.assertTrue(self._selected(0, 8, ranks=[0, 8]))
         self.assertTrue(self._selected(1, 8, ranks=[0, 8]))
@@ -462,26 +573,36 @@ class TestBuildRolloutDistProfiler(unittest.TestCase):
         self.assertFalse(self._selected(2, 8, ranks=[0, 8]))
 
     def test_a_rank_inside_a_replica_selects_that_whole_replica(self):
+        # [FUNCTION DOC]
+        # Any global rank inside a replica's span (3 for replica 0, 9 for replica 1) selects that replica.
         # Any global rank owned by a replica selects it, not just the replica's base rank.
         self.assertTrue(self._selected(0, 8, ranks=[3]))  # rank 3 is on replica 0
         self.assertTrue(self._selected(1, 8, ranks=[9]))  # rank 9 is on replica 1
         self.assertFalse(self._selected(0, 8, ranks=[9]))
 
     def test_all_ranks_profiles_every_replica(self):
+        # [FUNCTION DOC]
+        # all_ranks selects every replica.
         for replica_rank in range(4):
             self.assertTrue(self._selected(replica_rank, 8, all_ranks=True, ranks=[0]))
 
     def test_empty_ranks_defaults_to_the_replica_owning_global_rank_0(self):
+        # [FUNCTION DOC]
+        # Empty ranks select only the replica owning global rank 0.
         self.assertTrue(self._selected(0, 8, ranks=[]))
         self.assertFalse(self._selected(1, 8, ranks=[]))
 
     def test_world_size_one_keeps_global_ranks_equal_to_replica_ranks(self):
+        # [FUNCTION DOC]
+        # With world_size 1, replica indices equal global ranks.
         # tp=dp=pp=1: the replica index equals the global rank, so [0, 8] selects replicas 0 and 8.
         self.assertTrue(self._selected(0, 1, ranks=[0, 8]))
         self.assertTrue(self._selected(8, 1, ranks=[0, 8]))
         self.assertFalse(self._selected(1, 1, ranks=[0, 8]))
 
     def test_source_config_is_not_mutated(self):
+        # [FUNCTION DOC]
+        # Building the profiler does not mutate the caller's config ranks.
         config = self._config(ranks=[0, 8])
         build_rollout_dist_profiler(1, 8, config=config)
         # The caller's (frozen) config still holds the original global ranks.
@@ -489,7 +610,14 @@ class TestBuildRolloutDistProfiler(unittest.TestCase):
 
 
 class TestServerProfilerFunctionality(unittest.IsolatedAsyncioTestCase):
+    # [CLASS DOC]
+    # Async unittest TestCase for the vLLM and SGLang HTTP servers' profiling hooks, called as unbound methods on mocks.
     async def test_vllm_start_stop_profile(self):
+        # [FUNCTION DOC]
+        # Skips if the vLLM server cannot be imported. With a profiler mock enabled, selected and discrete, and an AsyncMock
+        # engine on node rank 0: start_profile calls engine.start_profile once; stop_profile calls engine.stop_profile once,
+        # calls relocate_rollout_traces with the config, replica rank, replica world size and keep set, and does not run the
+        # finish hook.
         try:
             # Import strictly inside test to avoid import errors if dependencies missing
             from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
@@ -535,6 +663,8 @@ class TestServerProfilerFunctionality(unittest.IsolatedAsyncioTestCase):
         mock_profiler.run_finish_hook.assert_not_called()
 
     async def test_vllm_stop_profile_skips_relocation_when_not_profiled(self):
+        # [FUNCTION DOC]
+        # Skips without vLLM. When this rank is not selected, stop_profile neither stops the engine nor relocates traces.
         try:
             from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
         except ImportError:
@@ -560,6 +690,8 @@ class TestServerProfilerFunctionality(unittest.IsolatedAsyncioTestCase):
         mock_relocate.assert_not_called()
 
     async def test_vllm_start_stop_profile_non_master_node(self):
+        # [FUNCTION DOC]
+        # Skips without vLLM. On a non-master node (node_rank 1), start/stop_profile do not touch the engine.
         try:
             from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
         except ImportError:
@@ -586,6 +718,11 @@ class TestServerProfilerFunctionality(unittest.IsolatedAsyncioTestCase):
         mock_engine.stop_profile.assert_not_called()
 
     async def test_sglang_start_stop_profile(self):
+        # [FUNCTION DOC]
+        # Skips without SGLang. With build_sglang_profiler_args patched to return a known dict, start_profile builds args from
+        # the profiler config, tool config and replica rank and passes them to tokenizer_manager.start_profile; stop_profile
+        # calls tokenizer_manager.stop_profile once, relocates traces with the expected arguments, and does not run the
+        # finish hook.
         try:
             # Import strictly inside test to avoid import errors if dependencies missing
             from verl.workers.rollout.sglang_rollout.async_sglang_server import SGLangHttpServer

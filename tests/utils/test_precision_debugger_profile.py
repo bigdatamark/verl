@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU test for PrecisionDebuggerProfiler._resolve_model with Megatron-style engines whose module is a list of
+# pipeline model chunks.
+
 import logging
 import types
 
@@ -20,11 +24,18 @@ from verl.utils.profiler.precision_debugger_profile import PrecisionDebuggerProf
 
 
 class _FakeModel:
+    # [CLASS DOC]
+    # HELPER: Minimal model type with a forward method (the property used to recognize a valid chunk).
     def forward(self):
+        # [FUNCTION DOC]
+        # HELPER: No-op forward.
         pass
 
 
 def test_resolve_megatron_model_chunks_uses_first_valid_chunk(caplog):
+    # [FUNCTION DOC]
+    # A worker whose actor engine module list is [plain object, model A, model B]: asserts _resolve_model returns model A
+    # (first chunk with forward) and logs a warning that only the first of 2 model chunks is bound.
     """Megatron's engine module may contain pipeline model chunks."""
     first_model = _FakeModel()
     second_model = _FakeModel()

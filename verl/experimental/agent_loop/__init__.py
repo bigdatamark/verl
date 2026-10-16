@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Package agent_loop: asynchronous multi-turn rollout framework. Re-exports AgentLoopBase, AgentLoopManager,
+# AgentLoopWorker, AgentLoopOutput and get_trajectory_info from agent_loop, and imports SingleTurnAgentLoop and
+# ToolAgentLoop solely so their register decorators add them to the agent loop registry
+# ("single_turn_agent", "tool_agent").
+# Side effects: populates the agent loop registry on import.
+
 from .agent_loop import (
     AgentLoopBase,
     AgentLoopManager,

@@ -12,6 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI that checks whether a model's chat template (optionally overridden by a .jinja file) is
+# compatible with verl's Continuous Token (CT) incremental tokenization, using the mock
+# trajectories in scripts.chat_template_mock_trajectories (text ones always, vision-language ones
+# when a processor is loaded). See the module docstring for the two check layers: raw-template
+# prefix diagnostics (warnings only) and CT builder merge-boundary checks (verdict-determining).
+# At import it adds the repo root to sys.path so the sibling module and verl import from source.
+# Results are CheckResult records; the process exit code is 0 (pass, possibly with warnings),
+# 1 (CT failures) or 2 (setup failure).
 """Check chat-template append-only.
 
 The checker runs the mock trajectories in
@@ -97,6 +106,10 @@ CheckLayer = Literal["raw-template", "continuous-token"]
 
 @dataclass(frozen=True)
 class CheckResult:
+    # [CLASS DOC]
+    # Immutable record of one check case. Fields: layer ("raw-template" or "continuous-token"),
+    # case_name (dotted trajectory/turn label), passed flag, and an optional error message (may be
+    # multi-line, first line a summary, following lines decoded diff context).
     layer: CheckLayer
     case_name: str
     passed: bool
@@ -104,10 +117,16 @@ class CheckResult:
 
 
 def _clone(value: Any) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Deep-copies JSON-compatible data by serializing to JSON and back (non-ASCII preserved).
+    # None passes through as None. Raises TypeError for non-serializable values such as images.
     return json.loads(json.dumps(value, ensure_ascii=False))
 
 
 def _set_pad_token(tokenizer) -> None:
+    # [FUNCTION DOC]
+    # HELPER: If the tokenizer lacks a pad token id / pad token but has an EOS id / token, copies the
+    # EOS value into the pad slot. Side effects: mutates the tokenizer.
     if getattr(tokenizer, "pad_token_id", None) is None and getattr(tokenizer, "eos_token_id", None) is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
@@ -115,6 +134,10 @@ def _set_pad_token(tokenizer) -> None:
 
 
 def _load_tokenizer(model: str, *, local_files_only: bool, template_path: str | None):
+    # [FUNCTION DOC]
+    # HELPER: Loads a fast AutoTokenizer with remote code trusted and the given local-only flag, sets
+    # the pad token, optionally replaces chat_template with the contents of the template file, and
+    # returns it. Exceptions: ValueError if the tokenizer ends up without a chat template; loader errors.
     tokenizer = AutoTokenizer.from_pretrained(
         model,
         trust_remote_code=True,
@@ -130,16 +153,22 @@ def _load_tokenizer(model: str, *, local_files_only: bool, template_path: str | 
 
 
 def _tools_for(trajectory: MockTrajectory) -> list[dict[str, Any]] | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns the tool schemas for tool-agent text trajectories, else None.
     if isinstance(trajectory, ToolAgentTrajectory):
         return trajectory.tool_schemas()
     return None
 
 
 def _initial_messages(trajectory: MockTrajectory) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # HELPER: Returns cloned copies of the trajectory's raw_prompt messages.
     return [_clone(message) for message in trajectory.raw_prompt]
 
 
 def _assistant_message_for_single_turn(trajectory: SingleTurnTrajectory) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds an assistant message whose content is the single-turn trajectory's assistant_response.
     return {"role": "assistant", "content": trajectory.assistant_response}
 
 
@@ -151,6 +180,10 @@ def _render_tokens(
     add_generation_prompt: bool,
     chat_template_kwargs: dict[str, Any],
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Renders messages (and tools) through the tokenizer chat template with tokenization on,
+    # using cloned inputs and forwarding the generation-prompt flag and extra template kwargs, then
+    # normalizes the result to a flat list of ints.
     tokenized = apply_chat_template(
         tokenizer,
         _clone(messages),
@@ -171,6 +204,9 @@ def _render_ids(
     add_generation_prompt: bool,
     chat_template_kwargs: dict[str, Any],
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Dispatches ground-truth rendering: through the processor (with image expansion) when a
+    # processor is given, otherwise through the tokenizer. Same keyword inputs; returns token ids.
     """Render ground-truth token IDs using the renderer the *model* uses.
 
     Whether rendering goes through the processor or the bare tokenizer is a
@@ -198,6 +234,9 @@ def _render_ids(
 
 
 def _token_repr(tokenizer, token_id: int | None) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the repr of the decoded text of one token id, or "?" if the tokenizer or id is
+    # missing or decoding fails.
     if tokenizer is None or token_id is None:
         return "?"
     try:
@@ -216,6 +255,10 @@ def _diff_context(
     right_label: str,
     radius: int = 16,
 ) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Builds a two-line string showing decoded text of both id sequences in the window from
+    # radius tokens before the mismatch index to radius tokens after it, labeled and aligned. Returns
+    # an empty string if there is no tokenizer or decoding fails.
     """Render a decoded window around the first diverging token, so a failure
     shows human-readable text (e.g. ``<think>`` vs ``<tool_call>``) rather than
     bare token IDs. Returns an empty string when no decoder is available."""
@@ -236,6 +279,10 @@ def _diff_context(
 
 
 def _token_prefix_error(prefix_ids: list[int], full_ids: list[int], *, tokenizer=None) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns None if prefix_ids is an exact prefix of full_ids; otherwise returns a message
+    # naming the first differing index (or the shorter length if one runs out), both lengths, both token
+    # values with decoded reprs (None when out of range), followed by the decoded diff context.
     if full_ids[: len(prefix_ids)] == prefix_ids:
         return None
     limit = min(len(prefix_ids), len(full_ids))
@@ -252,6 +299,9 @@ def _token_prefix_error(prefix_ids: list[int], full_ids: list[int], *, tokenizer
 
 
 def _token_mismatch_error(expected: list[int], actual: list[int], *, tokenizer=None) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Like _token_prefix_error but requires full equality of expected and actual id lists;
+    # returns None when equal, else a "Token mismatch" message with lengths, values and diff context.
     if actual == expected:
         return None
     limit = min(len(expected), len(actual))
@@ -268,6 +318,8 @@ def _token_mismatch_error(expected: list[int], actual: list[int], *, tokenizer=N
 
 
 def _tokenizer_name(tokenizer) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the tokenizer's name_or_path, falling back to init_kwargs' name_or_path, else "".
     name = getattr(tokenizer, "name_or_path", None)
     if name:
         return str(name)
@@ -278,6 +330,10 @@ def _tokenizer_name(tokenizer) -> str:
 
 
 def _is_glm_tokenizer(tokenizer) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns true if the lowercased tokenizer name contains any known GLM-4.7/GLM-5/GLM-4V
+    # family marker (dash/underscore spellings), or its alphanumeric-only form contains a compact
+    # marker (glm47, glm5, glm4v, glm41v, glm45v, glm46v). These families share the no-trailing-EOS stop shape.
     tokenizer_name = _tokenizer_name(tokenizer).lower()
     compact_name = "".join(char for char in tokenizer_name if char.isalnum())
     # GLM text families (GLM-4.7 / GLM-5) and the GLM-4V vision families
@@ -304,6 +360,9 @@ def _is_glm_tokenizer(tokenizer) -> bool:
 
 
 def _warn_glm_tool_template_limitations(model_name: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Based on markers in the model name, prints a warning for GLM-4V/4.1V (no tool role in the
+    # template) or, otherwise, GLM-4.5V (tool-response images stringified). Prints nothing for other models.
     """Warn about GLM vision templates that cannot faithfully render tool turns.
 
     - GLM-4V / GLM-4.1V templates have no ``tool`` role branch at all, so any
@@ -337,6 +396,9 @@ def _warn_glm_tool_template_limitations(model_name: str) -> None:
 
 
 def _tokenizer_eos_token_ids(tokenizer) -> set[int]:
+    # [FUNCTION DOC]
+    # HELPER: Normalizes the tokenizer's eos_token_id into a set of ints (empty if None; drops None
+    # entries of a list/tuple/set). Exceptions: TypeError for any other type.
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     if eos_token_id is None:
         return set()
@@ -348,6 +410,9 @@ def _tokenizer_eos_token_ids(tokenizer) -> set[int]:
 
 
 def _require_single_token_id(tokenizer, token: str) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Converts a token string to exactly one non-negative int id, unwrapping a one-element
+    # list. Exceptions: ValueError if undefined, multi-id, or invalid.
     token_id = tokenizer.convert_tokens_to_ids(token)
     if token_id is None:
         raise ValueError(f"Tokenizer does not define required token {token!r}")
@@ -366,6 +431,13 @@ def _truncate_after_final_eos(
     *,
     has_tool_calls: bool,
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Trims a rendered prefix to the shape a rollout server returns when generation stops.
+    # Behavior: collect EOS ids plus the Kimi im_end id when applicable; raise ValueError if the
+    # token list is empty. For GLM tokenizers, append the <|observation|> id when the turn had tool
+    # calls, otherwise return unchanged. Else, if an EOS id is found, return the list up to and
+    # including the last EOS occurrence. Exceptions: ValueError if no EOS id is present (message
+    # includes the last 16 ids) or required GLM token is missing.
     """Approximate the runtime token stream returned by generation.
 
     Full chat-template renders can include template whitespace after the model's
@@ -418,6 +490,10 @@ def _record_raw_prefix_check(
     tools: list[dict[str, Any]] | None,
     chat_template_kwargs: dict[str, Any],
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Renders the prefix messages and the full messages (each with its own generation-prompt
+    # flag), checks the prefix property, and appends a raw-template CheckResult under case_name. Any
+    # exception is captured as a failed result with "ExceptionType: message". Side effects: appends to results.
     try:
         prefix_ids = _render_ids(
             tokenizer,
@@ -448,6 +524,13 @@ def run_raw_template_checks(
     processor: Any | None = None,
     chat_template_kwargs: dict[str, Any],
 ) -> list[CheckResult]:
+    # [FUNCTION DOC]
+    # Produces raw-template diagnostics for one text trajectory. For a single-turn trajectory: one case
+    # "<name>.assistant_turn1" comparing prompt-with-generation-prompt against prompt+assistant. For
+    # tool-agent trajectories, iterates steps (1-based): an "assistant_turnN" case (history with
+    # generation prompt vs history+assistant), and, if the step appends messages, an
+    # "append_turnN.<roles>" case (history+assistant vs that plus appended messages with generation
+    # prompt); then extends the history. Outputs: list of CheckResult.
     """Run direct chat-template prefix diagnostics without Continuous Token logic.
 
     Each case renders the trajectory boundary twice with ``tokenize=True``:
@@ -521,6 +604,8 @@ def _append_ct_result(
     actual_ids: list[int],
     tokenizer=None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Compares expected vs actual ids and appends a continuous-token CheckResult.
     error = _token_mismatch_error(expected_ids, actual_ids, tokenizer=tokenizer)
     results.append(CheckResult("continuous-token", case_name, error is None, error))
 
@@ -535,6 +620,10 @@ def _create_builder_or_error(
     chat_template_kwargs: dict[str, Any],
     processor: Any | None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Optionally imports a custom module (to register a custom builder), then creates the CT
+    # builder for the given family/model type/kwargs/processor. Returns (builder, None) on success or
+    # (None, failed CheckResult named "<trajectory>.builder") on any exception.
     """Instantiate the CT builder, returning ``(builder, None)`` or ``(None, error)``."""
     try:
         if custom_builder_module:
@@ -554,6 +643,10 @@ def _create_builder_or_error(
 
 
 def _ct_merge_boundaries(messages: list[dict[str, Any]]) -> list[tuple[int, int]]:
+    # [FUNCTION DOC]
+    # HELPER: Scans messages for each position i where message i-1 is assistant and message i is not,
+    # extends m over the maximal run of non-assistant messages, records (i, m) and resumes at m.
+    # Outputs: list of (n, m) index pairs.
     """Enumerate merge boundaries as ``(n, m)`` spans.
 
     A boundary exists wherever a non-assistant run follows an assistant turn:
@@ -588,6 +681,14 @@ def _run_ct_merge_checks(
     chat_template_kwargs: dict[str, Any],
     clone,
 ) -> list[CheckResult]:
+    # [FUNCTION DOC]
+    # HELPER: For each boundary (n, m): case name "<traj>.merge_at<n>.<roles of run>"; clones the prefix
+    # (up to n) and full (up to m) message lists; renders the prefix without generation prompt and trims
+    # it via _truncate_after_final_eos using the tool-call flag of the assistant at n-1; calls the
+    # builder's merge_context_tokens with prefix messages, full messages, prefix ids and tools; renders
+    # the full list with a generation prompt as expected ids. Exceptions in any step become a failed
+    # result; otherwise the merged token_ids are compared to expected. Inputs include a clone function
+    # (JSON clone for text, deepcopy for VL). Outputs: list of CheckResult.
     """Per-boundary Continuous Token merge check (production-shaped, no diff extraction).
 
     For each ``(n, m)`` boundary the prefix ``messages[:n]`` (which ends at an
@@ -642,6 +743,9 @@ def _run_ct_merge_checks(
 
 
 def _assemble_text_messages(trajectory: MockTrajectory) -> tuple[list[dict[str, Any]], dict[int, bool]]:
+    # [FUNCTION DOC]
+    # HELPER: Flattens a text trajectory into one message list (prompt, then each assistant message and
+    # its appended messages) and a mapping from each assistant message index to whether it has tool_calls.
     """Flatten a text trajectory to a message list + per-assistant tool-call map."""
     messages = _initial_messages(trajectory)
     tool_calls: dict[int, bool] = {}
@@ -668,6 +772,10 @@ def run_continuous_token_checks(
     chat_template_kwargs: dict[str, Any],
     processor: Any | None = None,
 ) -> list[CheckResult]:
+    # [FUNCTION DOC]
+    # Builds the CT builder (returning a single failure result if that fails), flattens the trajectory,
+    # and runs the per-boundary merge checks with the JSON clone. Outputs: list of CheckResult (empty for
+    # single-turn trajectories, which have no boundary).
     """Run per-boundary Continuous Token merge checks for a text trajectory.
 
     Mirrors production's incremental path: a pretokenized prefix (up to and
@@ -720,10 +828,15 @@ def run_continuous_token_checks(
 def _clone_mm(value: Any) -> Any:
     # VL messages embed PIL images, which are not JSON-serializable, so the
     # text-path json clone cannot be reused here.
+    # [FUNCTION DOC]
+    # HELPER: Deep copy suitable for messages containing PIL images.
     return copy.deepcopy(value)
 
 
 def _extract_images(messages: list[dict[str, Any]]) -> list[Any]:
+    # [FUNCTION DOC]
+    # HELPER: Collects, in order, every non-None "image" value from content blocks of type "image" in
+    # messages whose content is a list.
     images: list[Any] = []
     for message in messages:
         content = message.get("content")
@@ -744,6 +857,10 @@ def _render_processor_ids(
     add_generation_prompt: bool,
     chat_template_kwargs: dict[str, Any],
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Deep-copies messages, renders them to text via the processor chat template (tokenization
+    # off, tools JSON-cloned), extracts images, runs the multimodal processor on the text with those
+    # images (or none), and returns the normalized input_ids.
     """Render messages to token IDs through the multimodal processor.
 
     Mirrors ``VLContinuousTokenMixin.render_tokens_with_mm``: render text via the
@@ -770,6 +887,9 @@ def _render_processor_ids(
 
 
 def _kimi_assistant_end_token_ids(tokenizer) -> set[int]:
+    # [FUNCTION DOC]
+    # HELPER: For Kimi tokenizers (name contains "kimi"), returns a set with the <|im_end|> id if valid;
+    # otherwise an empty set.
     if "kimi" not in _tokenizer_name(tokenizer).lower():
         return set()
     token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -779,6 +899,9 @@ def _kimi_assistant_end_token_ids(tokenizer) -> set[int]:
 
 
 def _infer_tool_parser(model: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Picks the tool-call text format for VL assistant messages from the model name: "kimi" if
+    # the name contains kimi, "glm" if its alphanumeric form contains glm, else "hermes".
     normalized = model.lower()
     compact = "".join(char for char in normalized if char.isalnum())
     if "kimi" in normalized:
@@ -790,6 +913,8 @@ def _infer_tool_parser(model: str) -> str:
 
 
 def _vl_tools_for(trajectory: VLMockTrajectory) -> list[dict[str, Any]] | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns tool schemas for VL tool trajectories, else None.
     if isinstance(trajectory, VLToolTrajectory):
         return trajectory.tool_schemas
     return None
@@ -800,6 +925,11 @@ def _vl_assistant_steps(
     *,
     tool_parser: str,
 ) -> list[tuple[dict[str, Any], list[dict[str, Any]], bool]]:
+    # [FUNCTION DOC]
+    # HELPER: Returns per-turn tuples (assistant message, appended messages, has_tool_calls). A VL
+    # single-turn trajectory yields one tuple with no appended messages and no tool calls; a VL tool
+    # trajectory yields each step's assistant message rendered for the tool parser, deep-copied
+    # appended messages, and whether the step has calls.
     """Return ``(assistant_message, appended_messages, has_tool_calls)`` per turn."""
     if isinstance(trajectory, VLSingleTurnTrajectory):
         return [(trajectory.assistant_message(), [], False)]
@@ -818,6 +948,10 @@ def run_raw_template_checks_vl(
     tool_parser: str,
     chat_template_kwargs: dict[str, Any],
 ) -> list[CheckResult]:
+    # [FUNCTION DOC]
+    # Raw-template diagnostics for a VL trajectory, mirroring run_raw_template_checks (assistant_turnN
+    # and append_turnN cases) but rendering through the processor and using processor.tokenizer for
+    # decoding. Outputs: list of CheckResult.
     """Processor-based raw append-only diagnostics for a VL trajectory."""
     results: list[CheckResult] = []
     tokenizer = processor.tokenizer
@@ -859,6 +993,9 @@ def run_raw_template_checks_vl(
 def _assemble_vl_messages(
     trajectory: VLMockTrajectory, *, tool_parser: str
 ) -> tuple[list[dict[str, Any]], dict[int, bool]]:
+    # [FUNCTION DOC]
+    # HELPER: Flattens a VL trajectory into a message list and an assistant-index to has-tool-calls
+    # mapping, taking the flag from the step rather than the message.
     """Flatten a VL trajectory to a message list + per-assistant tool-call map.
 
     VL assistant turns embed tool calls as raw text (no structured ``tool_calls``
@@ -885,6 +1022,10 @@ def run_continuous_token_checks_vl(
     tool_parser: str,
     chat_template_kwargs: dict[str, Any],
 ) -> list[CheckResult]:
+    # [FUNCTION DOC]
+    # Per-boundary CT merge checks for a VL trajectory: creates the builder (with the processor), flattens
+    # messages, and runs the merge checks with processor rendering and deepcopy cloning.
+    # Outputs: list of CheckResult.
     """Per-boundary VL Continuous Token merge check.
 
     Same per-boundary contract as :func:`run_continuous_token_checks`, but every
@@ -920,6 +1061,10 @@ def run_continuous_token_checks_vl(
 
 
 def _print_results(title: str, results: list[CheckResult], *, failed_status: str = "FAIL") -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints the title, then one line per result "[PASS|<failed_status>] <padded name>" plus the
+    # first error line truncated to 120 chars; for failures with multi-line errors also prints the
+    # remaining lines indented; ends with a blank line.
     print(title)
     max_name_len = max((len(result.case_name) for result in results), default=0)
     for result in results:
@@ -942,6 +1087,10 @@ def _print_results(title: str, results: list[CheckResult], *, failed_status: str
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Parses CLI options: --model (required), --template, --model-family (default auto),
+    # --custom-builder-module, --chat-template-kwargs (parsed as JSON), --allow-download,
+    # --enable-multimodal, --skip-vl, --show-traceback. The module docstring is the help epilog.
     parser = argparse.ArgumentParser(
         description="Check a model chat template against verl mock trajectories and Continuous Token.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -993,6 +1142,22 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    # [FUNCTION DOC]
+    # Entry point. Defaults TOKENIZERS_PARALLELISM to false; loads the tokenizer (local-only unless
+    # --allow-download) and the HF config dict to get model_type; resolves the CT family; if
+    # --enable-multimodal is set or the family's builder supports multimodal, loads an AutoProcessor
+    # and re-resolves the family based on whether it has an image processor. Any setup error prints a
+    # message (and traceback if requested) and returns 2. Prints a header (template source, model,
+    # family, kwargs, trajectory count) and GLM warnings. Runs raw and CT checks for every text
+    # trajectory and prints both tables (raw failures shown as WARN). If a processor exists and VL is
+    # not skipped, builds VL trajectories (warning and skipping on failure), infers the tool parser, runs
+    # VL raw and CT checks appending to the same lists, and prints tables filtered to case names
+    # starting with "vl_". Prints totals and a verdict: returns 1 if any CT check failed, else 0
+    # (noting raw-prefix warnings if any).
+    # KNOWN ISSUE: the "elif needs_processor and not enable_multimodal" warning branch is unreachable,
+    # since needs_processor already triggers processor loading in the preceding branch.
+    # KNOWN ISSUE: the requested model_family (possibly "auto"), not the resolved family, is passed to
+    # the builder checks, so the printed family may differ from what the builder resolves.
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     args = parse_args()
     chat_template_kwargs = dict(args.chat_template_kwargs or {})

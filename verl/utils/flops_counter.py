@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Model FLOPs Utilization (MFU) estimation. Holds a table (_DEVICE_FLOPS) of peak dense BF16 throughput per accelerator name substring, per-architecture analytic estimators of training (forward+backward) FLOPs, and a dispatch table ESTIMATE_FUNC from HF config model_type to estimator. Common convention used by the estimators: dense FLOPs = 6 * (active non-attention parameter count) * total tokens, where parameter count covers MLP/MoE, attention projections and embedding + LM head (counted twice: vocab*hidden*2); attention-score FLOPs = 6 * sum over sequences of seqlen^2 * head_dim * num_heads * layers; result is returned in TFLOPs per second (total / delta_time / 1e12).
+
 import inspect
 
 import torch
@@ -45,6 +48,11 @@ _DEVICE_FLOPS = {
 
 
 def get_device_flops(unit="T", device_name=None):
+    # [FUNCTION DOC]
+    # Behavior: determines device name (or uses the provided one, intended for tests): "CPU" if the torch device module is torch.cpu, else the device module's get_device_name(). Iterates table keys in reverse lexicographic order and takes the first key that is a substring of the name (so longer names like "H200" and "L40S" win over "H20"/"L40"); unknown devices give infinity. Converts to the requested unit.
+    # Inputs: unit - one of B, K, M, G, T, P; device_name - optional override.
+    # Outputs: float peak FLOPs in the requested unit (inf for unknown devices).
+    # KNOWN ISSUE: the docstring says "B" means billion, but the conversion treats "B" as the base unit (no scaling); an unknown unit string divides by 1000 six times.
     """Get the theoretical FLOPS (Floating Point Operations Per Second) capacity of the current device.
 
     Args:
@@ -62,6 +70,8 @@ def get_device_flops(unit="T", device_name=None):
     """
 
     def unit_convert(number, level):
+        # [FUNCTION DOC]
+        # HELPER: Divides number by 1000 once per position of level in the list [B, K, M, G, T, P]; non-positive numbers are returned unchanged.
         units = ["B", "K", "M", "G", "T", "P"]
         if number <= 0:
             return number
@@ -90,6 +100,10 @@ def get_device_flops(unit="T", device_name=None):
 
 
 def _estimate_qwen2_flops(config, tokens_sum, batch_seqlens, delta_time):
+    # [FUNCTION DOC]
+    # HELPER: Estimator for dense GQA decoders with SwiGLU MLP (Qwen2/3, Llama, Mistral, etc.). MLP params = 3*hidden*intermediate; attention projection params = hidden*(q+k+v+o sizes) with head_dim from config or hidden/heads.
+    # Inputs: config, tokens_sum, batch_seqlens, delta_time.
+    # Outputs: achieved TFLOPs/s.
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
     num_hidden_layers = config.num_hidden_layers
@@ -126,6 +140,9 @@ def _estimate_qwen2_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 def _estimate_qwen3_vl_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
     # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
+    # [FUNCTION DOC]
+    # HELPER: Estimator for Qwen-VL dense models, reading LLM dims from config.text_config (head_dim computed as hidden/heads) and adding vision encoder FLOPs from _estimate_qwen3_vit_flop when kwargs contain images_seqlens.
+    # KNOWN ISSUE: ignores an explicit text_config.head_dim (unlike the MoE variant); also reused for qwen2_vl/qwen2_5_vl whose configs may lack text_config or the Qwen3 vision fields.
     hidden_size = config.text_config.hidden_size
     vocab_size = config.text_config.vocab_size
     num_hidden_layers = config.text_config.num_hidden_layers
@@ -170,6 +187,8 @@ def _estimate_qwen3_vl_flops(config, tokens_sum, batch_seqlens, delta_time, **ka
 
 def _estimate_qwen3_vl_moe_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
     # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
+    # [FUNCTION DOC]
+    # HELPER: Estimator for Qwen3-VL MoE: per-layer router gate (hidden*num_experts) + top-k routed expert SwiGLU params + attention projections, plus optional vision FLOPs from images_seqlens.
     hidden_size = config.text_config.hidden_size
     vocab_size = config.text_config.vocab_size
     num_hidden_layers = config.text_config.num_hidden_layers
@@ -217,6 +236,10 @@ def _estimate_qwen3_vl_moe_flops(config, tokens_sum, batch_seqlens, delta_time, 
 
 
 def _estimate_qwen3_vit_flop(images_seqlens, config):
+    # [FUNCTION DOC]
+    # HELPER: Estimates training FLOPs (not divided by time) of the Qwen3-VL vision tower. Returns 0 if config is None. Params: patch-embed conv, per-layer 2-matrix MLP and 4*dim^2 attention, a patch merger ((out_hidden + dim*m^2)*(dim*m^2) with merge size m) plus one extra merger per deepstack layer. Attention FLOPs use factor 12 * sum seqlen^2 * head_dim * heads * depth (full non-causal attention).
+    # Inputs: images_seqlens - per-image token counts; config - vision config.
+    # Outputs: total FLOPs.
     """
     Estimate the FLOPS of the vision encoder for Qwen3-VL
     """
@@ -269,6 +292,8 @@ def _estimate_qwen3_vit_flop(images_seqlens, config):
 
 
 def _count_qwen3_5_layer_types(config):
+    # [FUNCTION DOC]
+    # HELPER: Returns (num_full_attention_layers, num_linear_attention_layers) from config.layer_types if present, else assuming every full_attention_interval-th layer (default 4) is full attention.
     layer_types = getattr(config, "layer_types", None)
     if layer_types:
         num_full_attn_layers = sum(layer_type == "full_attention" for layer_type in layer_types)
@@ -283,6 +308,9 @@ def _count_qwen3_5_layer_types(config):
 
 
 def _compute_qwen3_5_hybrid_attn_params(config):
+    # [FUNCTION DOC]
+    # HELPER: Computes total attention-related parameter count for Qwen3.5 hybrid models: full-attention layers (q_proj doubled for the sigmoid gate, plus k, v, o) and Gated DeltaNet linear-attention layers (projections hidden*(2k + 3v + 2*num_value_heads) plus a depthwise conv of kernel*(2k+v)).
+    # Outputs: (attn_linear_N summed over layers, num_full_attn_layers, num_linear_attn_layers, head_dim, num_attention_heads).
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
     num_key_value_heads = config.num_key_value_heads
@@ -309,6 +337,8 @@ def _compute_qwen3_5_hybrid_attn_params(config):
 
 
 def _compute_qwen3_5_gdn_recurrence_flops(config, tokens_sum, num_linear_attn_layers):
+    # [FUNCTION DOC]
+    # HELPER: Approximates GDN recurrence FLOPs as 15 * key_head_dim * value_head_dim * num_value_heads * tokens * linear layers.
     return (
         15
         * config.linear_key_head_dim
@@ -321,6 +351,8 @@ def _compute_qwen3_5_gdn_recurrence_flops(config, tokens_sum, num_linear_attn_la
 
 def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
     # qwen3_5 and qwen3_5_moe use text_config and vision_config for the LLM and ViT parts.
+    # [FUNCTION DOC]
+    # HELPER: Estimator for Qwen3.5 (dense and MoE, text-only or VL). Uses text_config when present. MLP params are either dense SwiGLU or MoE (router gate + top-k experts + shared expert + shared-expert gate) times layers; attention params from the hybrid helper; attention-score FLOPs only for full-attention layers; adds GDN recurrence FLOPs and optional vision FLOPs.
     text_config = config.text_config if hasattr(config, "text_config") else config
     hidden_size = text_config.hidden_size
     vocab_size = text_config.vocab_size
@@ -361,6 +393,8 @@ def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kar
 
 
 def _estimate_deepseek_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
+    # [FUNCTION DOC]
+    # HELPER: Estimator for DeepSeek-V3 MLA + MoE. Attention params: q projection (direct, or LoRA down/up when q_lora_rank set), KV down-projection to kv_lora_rank+rope dim, KV up-projection, and output projection. MoE layers count router + (topk + shared) experts; the first first_k_dense_replace layers use a dense SwiGLU MLP. Attention-score FLOPs = 3 * sum(seqlen^2 * layers) * (q_head_dim + v_head_dim) * heads (causal halving).
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
     moe_intermediate_size = config.moe_intermediate_size
@@ -415,6 +449,8 @@ def _estimate_deepseek_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 
 def _estimate_qwen2_moe_flops(config, tokens_sum, batch_seqlens, delta_time):
+    # [FUNCTION DOC]
+    # HELPER: Estimator for Qwen2/3 MoE: per-layer top-k expert SwiGLU params + router gate + GQA attention projections. Shared experts are not counted.
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
     num_hidden_layers = config.num_hidden_layers
@@ -452,6 +488,8 @@ def _estimate_qwen2_moe_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 
 def _estimate_gemma3_flops(config, tokens_sum, batch_seqlens, delta_time):
+    # [FUNCTION DOC]
+    # HELPER: Estimator for Gemma3 text: dense 3-matrix GeGLU MLP and GQA attention. Attention-score term accounts for sliding-window layers: if layer_types is absent, synthesizes it with every sliding_window_pattern-th layer (default 6) full; sliding layers use seqlen*min(seqlen, sliding_window) instead of seqlen^2; with no layer types, all layers are full.
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
     num_hidden_layers = config.num_hidden_layers
@@ -520,6 +558,8 @@ def _estimate_gemma3_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 
 def _estimate_apertus_flops(config, tokens_sum, batch_seqlens, delta_time):
+    # [FUNCTION DOC]
+    # HELPER: Estimator for Apertus: 2-matrix XIELU MLP, GQA attention, plus q/k norm params per layer.
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
     num_hidden_layers = config.num_hidden_layers
@@ -560,6 +600,8 @@ def _estimate_apertus_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 
 def _estimate_gpt_oss_flops(config, tokens_sum, batch_seqlens, delta_time):
+    # [FUNCTION DOC]
+    # HELPER: Estimator for GPT-OSS MoE: router + top-k experts (3 matrices, intermediate_size per expert) and GQA attention; sliding-window layers (from layer_types, window default 128) use seqlen*min(seqlen, window).
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
     num_hidden_layers = config.num_hidden_layers
@@ -631,10 +673,14 @@ def _estimate_gpt_oss_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 
 def _estimate_unknown_flops(config, tokens_sum, batch_seqlens, delta_time):
+    # [FUNCTION DOC]
+    # HELPER: Fallback estimator for unsupported model types; always returns 0.
     return 0
 
 
 def _estimate_hy_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
+    # [FUNCTION DOC]
+    # HELPER: Estimator for Hy V3 MoE: router + (top-k + shared) SwiGLU experts (moe_intermediate_size, falling back to expert_hidden_dim) and GQA attention with explicit head_dim.
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
     # Hy V3 uses expert_hidden_dim as the legacy alias for moe_intermediate_size.
@@ -702,6 +748,8 @@ ESTIMATE_FUNC = {
 
 
 class FlopsCounter:
+    # [CLASS DOC]
+    # Computes achieved vs. peak FLOPs for MFU logging for a given HF model config.
     """
     Used to count mfu during training loop
 
@@ -712,6 +760,8 @@ class FlopsCounter:
     """
 
     def __init__(self, config: PretrainedConfig):
+        # [FUNCTION DOC]
+        # Stores config; prints a warning if config.model_type is not supported (MFU will be zero).
         VALID_CONFIG_TYPE = ESTIMATE_FUNC.keys()
         if config.model_type not in VALID_CONFIG_TYPE:
             print(
@@ -723,6 +773,10 @@ class FlopsCounter:
 
     # TODO: actually we can make this a static method
     def estimate_flops(self, batch_seqlens, delta_time, **kargs):
+        # [FUNCTION DOC]
+        # Behavior: sums sequence lengths, picks the estimator by model_type (fallback returns 0), forwards extra kwargs (e.g. images_seqlens) only if the estimator accepts variable keyword arguments, and queries the device's peak TFLOPs.
+        # Inputs: batch_seqlens - list of valid token counts per sequence; delta_time - seconds; kargs - extra estimator inputs.
+        # Outputs: tuple (achieved TFLOPs/s, peak TFLOPs).
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
 

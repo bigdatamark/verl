@@ -11,3 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# HTTP routers that load-balance reward model requests across reward model servers: a built-in FastAPI router
+# (naive_router) and a wrapper launching the sglang router (inner_sglang_router). No code here.

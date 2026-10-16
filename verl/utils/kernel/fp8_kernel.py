@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Blockwise FP8 (float8_e4m3fn) weight quantization with a Triton kernel and a PyTorch fallback. Each (BLOCK_M x BLOCK_N) tile gets one float32 descale factor (absmax / FP8_MAX) such that original ~= fp8 value * descale. Triton use is detected at import (_TRITON_AVAILABLE) and can be disabled with VERL_DISABLE_TRITON_FP8 in {1,true,yes}. Exposes FP8_DTYPE, FP8_MAX, FP8_MIN constants.
+
 import logging
 import os
 
@@ -39,11 +42,15 @@ FP8_MIN = -FP8_MAX
 
 
 def ceil_div(x: int, y: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Integer ceiling division.
     """Perform ceiling division of two integers."""
     return (x + y - 1) // y
 
 
 def is_triton_available() -> bool:
+    # [FUNCTION DOC]
+    # Returns whether Triton imported successfully.
     """Check if Triton is available for FP8 kernels."""
     return _TRITON_AVAILABLE
 
@@ -69,6 +76,9 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr = 128,
         BLOCK_N: tl.constexpr = 128,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Triton kernel (defined only when Triton is available). Program (pid_m, pid_n) loads its tile with masked out-of-range elements as 0, computes absmax floored at eps, descale = absmax / fp8_max, writes clamp(x / descale) cast to the output FP8 dtype, and stores descale at S[pid_m, pid_n].
+        # Inputs: pointers X, Y, S with their strides, M, N, eps, fp8 range, constexpr block sizes.
         """Triton kernel for blockwise FP8 quantization.
 
         Each program instance handles one block of size (BLOCK_M, BLOCK_N).
@@ -111,6 +121,11 @@ if _TRITON_AVAILABLE:
         x: torch.Tensor,
         weight_block_size: list[int] | tuple[int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Allocates the FP8 output (M, N) and float32 scale (ceil(M/BM), ceil(N/BN)) and launches the kernel over a 2-D grid; block sizes default to 128x128; uses 8 warps / 2 stages for contiguous input, else 1 warp / 4 stages.
+        # Inputs: x - 2-D tensor; weight_block_size - optional [BM, BN].
+        # Outputs: (fp8 tensor, descale tensor).
+        # Exceptions: AssertionError if x is not 2-D.
         """Quantize a 2D tensor to FP8 using blockwise quantization with Triton.
 
         This function provides high-performance FP8 quantization with minimal memory overhead.
@@ -143,6 +158,8 @@ if _TRITON_AVAILABLE:
 
         # Grid: one program per block
         def grid(meta):
+            # [FUNCTION DOC]
+            # HELPER: Grid function returning the number of tiles along each dimension for given meta block sizes.
             return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
 
         # Tune kernel parameters based on memory layout
@@ -174,6 +191,11 @@ def scaled_fp8_blockwise_triton(
     data_hp: torch.Tensor,
     weight_block_size: list[int] | tuple[int, int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: zero-pads the input up to multiples of the block sizes, runs the Triton cast, crops the FP8 output back to the original shape (contiguous) and returns the per-block descale of the padded shape.
+    # Inputs: data_hp (M, N); weight_block_size [BM, BN].
+    # Outputs: (fp8 data, descale of shape (ceil(M/BM), ceil(N/BN))).
+    # Exceptions: RuntimeError if Triton is unavailable.
     """High-performance FP8 blockwise quantization using Triton kernel.
 
     This is the recommended function to use for FP8 quantization when Triton is available.
@@ -228,6 +250,11 @@ def _scaled_fp8_blockwise_pytorch(
     data_hp: torch.Tensor,
     weight_block_size: list[int] | tuple[int, int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: PyTorch fallback. Requires square blocks; zero-pads to block multiples, reshapes into (blocks_m, blocks_n, block*block) float32, computes per-block absmax, scale = FP8_MAX / absmax (set to 1 when absmax is 0 or inf), descale = 1/scale, scales and clamps in place, casts to FP8, restores layout and crops padding.
+    # Outputs: (fp8 data (M, N), descale of shape (blocks_m, blocks_n, 1)).
+    # Exceptions: AssertionError if block sizes differ.
+    # Note: descale has an extra trailing singleton dim compared with the Triton path; callers squeeze it.
     """PyTorch implementation of blockwise FP8 quantization.
 
     Memory-optimized implementation that:
@@ -313,6 +340,10 @@ def scaled_fp8_blockwise(
     data_hp: torch.Tensor,
     weight_block_size: list[int] | tuple[int, int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: asserts 2-D input and dispatches to the Triton implementation when available and not disabled, otherwise to the PyTorch fallback.
+    # Outputs: (fp8 data, descale).
+    # Exceptions: AssertionError for non-2-D input.
     """Cast tensor from high precision to FP8 with blockwise quantization.
 
     This function automatically selects the best available implementation:

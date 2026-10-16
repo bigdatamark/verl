@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# HuggingFace transformers model patches used by verl: re-exports apply_monkey_patch (Ulysses
+# sequence parallel / fused kernel / remove-padding patches for supported HF models) and
+# apply_tiled_mlp_monkey_patch (memory-saving tiled MLP).
+
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.models.transformers.tiled_mlp import apply_tiled_mlp_monkey_patch
 

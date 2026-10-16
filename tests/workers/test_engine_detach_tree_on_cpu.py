@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Regression tests (verl#6698) that per-micro-batch model outputs are detached from the autograd graph via the shared
+# detach_tree helper, plus a static source check that every engine backend publishes "model_output" through
+# detach_tree. ENGINE_DIR is the installed verl/workers/engine directory; MODEL_OUTPUT_CALL_SITES lists the backend
+# transformer_impl files inspected.
+
 """Regression guard for verl#6698 on the non-FSDP engines.
 
 verl#6699 fixed ``FSDPEngineWithLMHead.forward_step`` (see
@@ -48,10 +55,15 @@ MODEL_OUTPUT_CALL_SITES = [
 
 
 class _TinyCheckpointedLM(torch.nn.Module):
+    # [CLASS DOC]
+    # HELPER: Tiny model with a frozen 16x8 embedding whose output is forced to require grad, followed by a
+    # gradient-checkpointed bias-free 8x8 linear block; keeps a weak reference to the checkpoint-saved block input.
     """Frozen embedding + checkpointed trainable block, mimicking a PEFT/LoRA
     base model with gradient checkpointing and enable_input_require_grads."""
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates the frozen embedding, trainable projection, and an empty weakref slot.
         super().__init__()
         self.embed = torch.nn.Embedding(16, 8)
         self.embed.weight.requires_grad_(False)  # frozen base
@@ -59,6 +71,10 @@ class _TinyCheckpointedLM(torch.nn.Module):
         self.saved_block_input = None  # weakref to the checkpoint-saved input
 
     def forward(self, input_ids):
+        # [FUNCTION DOC]
+        # HELPER: Embeds input_ids, marks the embedding output as requiring grad, runs the projection under non-reentrant
+        # checkpointing, stores a weakref to the embedding output, and returns the hidden tensor.
+        # Side effects: overwrites saved_block_input.
         x = self.embed(input_ids)
         # PEFT enable_input_require_grads: embedding output requires grad so
         # gradients can flow into trainable params under checkpointing.
@@ -69,6 +85,9 @@ class _TinyCheckpointedLM(torch.nn.Module):
 
 
 def test_detach_tree_releases_the_checkpoint_saved_activation():
+    # [FUNCTION DOC]
+    # Detached outputs have no grad_fn; backward through the live graph still reaches the projection; after deleting
+    # the loss and hidden tensor and collecting garbage, the saved block input is freed although the detached outputs are held.
     module = _TinyCheckpointedLM()
     hidden = module(torch.randint(0, 16, (1, 6)))
 
@@ -92,6 +111,9 @@ def test_detach_tree_releases_the_checkpoint_saved_activation():
 
 
 def test_detach_tree_preserves_values_and_untouched_objects():
+    # [FUNCTION DOC]
+    # detach_tree recurses through dicts, lists and tuples preserving container types: grad-tracking tensors are detached
+    # with equal values, no-grad tensors and non-tensor objects are returned as the same objects, scalars unchanged.
     attached = torch.ones(4, requires_grad=True) * 2
     plain = torch.ones(4)
     metric = object()
@@ -107,6 +129,8 @@ def test_detach_tree_preserves_values_and_untouched_objects():
 
 
 def test_detach_tree_keeps_nested_tensors_intact():
+    # [FUNCTION DOC]
+    # A jagged nested tensor with grad is detached and keeps its values.
     """Backends publish per-token outputs as jagged nested tensors."""
     values = torch.arange(6, dtype=torch.float32, requires_grad=True) * 1.0
     nested = torch.nested.nested_tensor_from_jagged(values, torch.tensor([0, 2, 6]))
@@ -119,6 +143,11 @@ def test_detach_tree_keeps_nested_tensors_intact():
 
 @pytest.mark.parametrize("relpath", MODEL_OUTPUT_CALL_SITES)
 def test_backend_publishes_model_output_through_detach_tree(relpath):
+    # [FUNCTION DOC]
+    # For each backend file: parses the source into a syntax tree, collects every value assigned to a subscript keyed
+    # "model_output" or placed under a "model_output" dict key, and asserts at least one exists and each is a direct
+    # call to a function named detach_tree.
+    # Side effects: reads source files from disk.
     tree = ast.parse((ENGINE_DIR / relpath).read_text())
 
     published = []

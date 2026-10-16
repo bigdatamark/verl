@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# 4-rank CUDA pytest (run under torchrun) exercising router-replay pipeline-parallel collectives with PP=4, including
+# stages that own no MoE layers, uneven MoE distribution, virtual pipeline stages and nested (jagged) route tensors.
+
 """Run with torchrun --nproc-per-node=4 -m pytest to exercise real PP collectives."""
 
 import pytest
@@ -37,6 +42,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires 
 
 @pytest.fixture(scope="module", autouse=True)
 def _parallel_groups():
+    # [FUNCTION DOC]
+    # HELPER: Module-scoped autouse fixture: initializes distributed (asserting world size 4) and Megatron PP=4; on teardown
+    # barriers, destroys model parallel and the process group.
     _, _, world_size = initialize_global_process_group()
     assert world_size == 4
     mpu.initialize_model_parallel(pipeline_model_parallel_size=4)
@@ -50,6 +58,13 @@ def _parallel_groups():
 @pytest.mark.parametrize("vpp_size", [None, 2])
 @pytest.mark.parametrize("all_dense", [False, True])
 def test_empty_and_uneven_pp_collectives(monkeypatch, nested, vpp_size, all_dense):
+    # [FUNCTION DOC]
+    # Behavior: parametrized over nested routes, VPP size (None or 2) and all-dense layers. Builds an 8-layer config with
+    # MoE layers at 3, 7, 8 (1-based) or none. For each local virtual stage collects the 1-based MoE layer numbers in its
+    # range and builds synthetic int16 routes (value layer*100 + sample*10 + token index; sample lengths 3,5 if nested
+    # else 5,5); merges VPP chunks when VPP is used, gathers across PP and asserts the result is int16 on CPU and equals
+    # the routes built for all MoE layers. Then, for registries of local-only and global MoE layer numbers patched into
+    # RouterReplay.router_instances, asserts the helper's per-stage micro-batch router list equals that stage's layers.
     frequency = [0] * 8 if all_dense else [0, 0, 1, 0, 0, 0, 1, 1]
     config = TransformerConfig(
         num_layers=8,
@@ -64,6 +79,9 @@ def test_empty_and_uneven_pp_collectives(monkeypatch, nested, vpp_size, all_dens
     )
 
     def make_routes(layer_numbers):
+        # [FUNCTION DOC]
+        # HELPER: Builds per-sample route tensors of shape (length, number of layers, 2) filled with layer*100 + sample_id*10 +
+        # token index; returns a jagged nested tensor if nested else a stacked dense tensor.
         lengths = [3, 5] if nested else [5, 5]
         samples = []
         for sample_id, length in enumerate(lengths):

@@ -29,3 +29,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+# [PACKAGE DOC]
+# Kernel package for custom GPU kernels (e.g. fused linear cross-entropy / log-prob and FP8 quantization kernels). Contains no code itself.

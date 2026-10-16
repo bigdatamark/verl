@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# torchrun script (NCCL, typically 8 GPUs) validating sharded sparse delta extraction and rank-0 gathering against a
+# full-gather diff baseline for DTensors under many mesh/placement layouts (1-D FSDP, FSDP x SP replicate, FSDP x TP
+# with strided and row shards, EFSDP x EP, and 3-D HSDP variants). Prints per-case and overall PASS/FAIL; does not exit non-zero.
+# KNOWN ISSUE: failures are only printed; the script always exits successfully, so CI cannot detect a FAIL from the exit code.
+
 """Validate verl.checkpoint_engine.delta_sync.sparse_gather against the full-gather diff.
 
 torchrun --nproc_per_node=8 tests/special_distributed/test_sharded_delta_gather.py
@@ -30,6 +37,17 @@ from verl.workers.engine.spec import ShardSpec, derive_dtensor_placement, transl
 
 
 def _run_case(shape, placements, mesh, dev, rank, si):
+    # [FUNCTION DOC]
+    # HELPER: Runs one case.
+    # Behavior: seeds with si, creates a random bf16 tensor of the shape and a copy with ~1% of random positions perturbed
+    # (generator seeded 100 + si), distributes both with the placements. Derives the placement, contribution flag and
+    # gather process group from the new DTensor's shard spec (asserting it equals the old one's) and asserts the group size
+    # equals the product of mesh sizes over shard / strided-shard dims. Contributing ranks diff local shards and translate
+    # indices to global flat indices; others send empty entries; entries are gathered to the group's rank 0. Baseline:
+    # full-tensor diff on bit patterns. Non-zero global ranks return True; rank 0 compares sorted indices and bitwise
+    # values and count, prints a tagged result line and returns the boolean.
+    # Inputs: shape, placements list, mesh, dev, rank (global), si (seed index). Outputs: bool.
+    # Exceptions: AssertionError on placement mismatch or wrong group size.
     """Diff a distributed param via the real sharded module vs a full-gather baseline."""
     torch.manual_seed(si)
     full_old = torch.randn(*shape, dtype=torch.bfloat16, device=dev)
@@ -91,6 +109,12 @@ def _run_case(shape, placements, mesh, dev, rank, si):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: inits NCCL, sets device to the global rank, then runs case batches: 1-D Shard(0) for several uneven shapes;
+    # if world is even, (fsdp, sp) with Shard(0)+Replicate; if divisible by 4, (fsdp, tp) with strided+shard and
+    # Shard(0)+Shard(1), and (efsdp, ep) with strided split 4 on 3-D expert shapes; if divisible by 8, 3-D replicate x
+    # fsdp/efsdp x tp/ep meshes including a replicate degree of 4. Rank 0 prints the overall result; barrier and destroy.
+    # KNOWN ISSUE: device is set from the global rank, which breaks multi-node runs.
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.cuda.set_device(rank)

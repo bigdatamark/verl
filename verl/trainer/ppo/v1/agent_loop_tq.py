@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# TransferQueue (TQ) variants of the agent loop worker and manager for the v1 trainer.
+# Generation is fire-and-forget: each prompt uid gets a TQ tag with status running ->
+# finished/failure, and every finished trajectory is written to TQ under key
+# "<uid>_<session_id>_<output_index>" in partition "train" or "val" with length and
+# staleness (global step) tags, instead of being returned to the caller.
+
 # TODO: move this file to verl.experimental.agent_loop after V1 is stable
 """TransferQueue adapter for AgentLoopManager and AgentLoopWorker"""
 
@@ -39,24 +46,45 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Mutates a sampling params mapping for greedy decoding: top_p 1.0, top_k -1,
+    # temperature 0. Outputs: none.
     params["top_p"] = 1.0
     params["top_k"] = -1
     params["temperature"] = 0
 
 
 async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseException]:
+    # [FUNCTION DOC]
+    # HELPER: Awaits all tasks with exceptions captured and returns only the exceptions raised
+    # (empty list when all succeed). Never raises from task failures.
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return [result for result in results if isinstance(result, BaseException)]
 
 
 @ray.remote
 class AgentLoopWorkerTQ(AgentLoopWorker):
+    # [CLASS DOC]
+    # Ray actor extending AgentLoopWorker: initializes the TQ client and keeps strong references
+    # to background prompt tasks so they are not garbage-collected.
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: delegates to the base worker init, calls tq.init(), creates an empty
+        # background task set. Side effects: TQ client initialization.
         super().__init__(*args, **kwargs)
         tq.init()
         self.background_tasks = set()
 
     async def generate_sequences(self, batch: TensorDict) -> None:
+        # [FUNCTION DOC]
+        # Behavior: reads and removes the optional "validate" flag; builds sampling params from the
+        # rollout config (temperature, top_p, top_k, repetition_penalty 1.0, logprobs flag), using
+        # val_kwargs top_p/top_k/temperature for validation; sets agent_name to the default agent
+        # loop when absent; fetches per-sample trajectory info; for each row builds a per-sample
+        # prompt mapping (tensor rows, NonTensorStack items, NonTensorData broadcast values; other
+        # types are logged as errors and skipped) and schedules _run_prompt as a background task.
+        # Inputs: batch - TensorDict with global_steps, index, uid, etc. Outputs: none (returns
+        # before generation finishes). Side effects: mutates batch, creates asyncio tasks.
         """Spawn agent loop for each sample in the batch without waiting for the results."""
         validate = batch["validate"] if "validate" in batch else False
         batch.pop("validate", None)
@@ -105,6 +133,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             task.add_done_callback(self.background_tasks.discard)
 
     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Behavior: tags the uid as running in TQ partition train/val. Chooses n from an optional
+        # per-sample "__rollout_n__" (default rollout.n or val_kwargs.n) and "__do_sample__" (default
+        # true; for training, false switches to greedy params). Launches n agent loops concurrently
+        # with session_id 0..n-1, waits for all to settle, logs errors, then tags the uid finished or
+        # failure. On an unexpected exception it logs, settles any started tasks, and tags failure.
+        # Inputs: prompt - per-sample mapping (mutated by popping control keys); sampling_params;
+        # trajectory - info including validate; trace. Outputs: none.
+        # Side effects: TQ tag writes; error logging. Never raises.
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
@@ -150,6 +187,18 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: normalizes output to a list (warns and returns when empty), computes reward scores,
+        # computes teacher logprobs for the final output, and propagates the final reward score and
+        # reward_extra_info to earlier outputs. For each output builds int64 prompts/responses tensors,
+        # input_ids, all-ones attention mask, multimodal inputs and position ids; the stored field
+        # mapping is the output's dict plus all sample kwargs, with multi_modal_data dropped,
+        # loss_mask = response_mask, and input_ids/position_ids/multi_modal_inputs set. Tags record
+        # status success, prompt/response/seq lengths, global_steps and min/max_global_steps from
+        # extra_fields. Writes all outputs to TQ in one batch put.
+        # Inputs: output - one or more agent loop outputs; validate - partition selector; kwargs -
+        # sample fields including uid, session_id, global_steps. Outputs: none.
+        # Side effects: TQ writes; mutates outputs.
         """Put agent loop outputs into TransferQueue."""
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
@@ -228,19 +277,32 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
 
 class AgentLoopManagerTQ(AgentLoopManager):
+    # [CLASS DOC]
+    # Agent loop manager that spawns AgentLoopWorkerTQ workers and dispatches batches without
+    # collecting outputs (results flow through TQ).
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: sets the worker class to AgentLoopWorkerTQ before base init.
         self.agent_loop_workers_class = AgentLoopWorkerTQ
         super().__init__(*args, **kwargs)
 
     @classmethod
     @auto_await
     async def create(cls, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: async factory (sync-callable via auto_await): constructs the manager and
+        # initializes its workers. Outputs: the manager instance.
         """Create agent loop manager."""
         instance = cls(*args, **kwargs)
         await instance._init_agent_loop_workers()
         return instance
 
     def generate_sequences(self, prompts: TensorDict) -> None:
+        # [FUNCTION DOC]
+        # Behavior: splits the batch into one chunk per worker and waits (ray.get) for each worker's
+        # generate_sequences call, which only schedules generation and returns quickly.
+        # Inputs: prompts - TensorDict batch. Outputs: none.
+        # Exceptions: propagates Ray remote errors.
         """
         Dispatch input batch to agent loop workers without blocking. Workers should put agent loop outputs
         into TransferQueue once an agent loop finished.

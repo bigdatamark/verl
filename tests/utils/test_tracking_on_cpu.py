@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for verl.utils.tracking: Tracking.finish idempotency for wandb and
+# mlflow backends, the DAPO filtered-reward-count wandb table logger (incremental
+# table mode on new wandb, full-history rebuild on older wandb), and validation
+# generation logging to trackio as chat traces. External tracker modules are
+# replaced by mocks injected into the module table.
 
 import sys
 import types
@@ -20,6 +26,10 @@ from verl.utils.tracking import DapoFilteredRewardTableLogger, Tracking, Validat
 
 
 def test_tracking_finish_finalizes_wandb_once():
+    # [FUNCTION DOC]
+    # Behavior: a Tracking built without its constructor, holding a mocked wandb
+    # logger, calls wandb finish exactly once (with the first call's exit_code 1)
+    # across two finish calls.
     tracking = Tracking.__new__(Tracking)
     tracking.logger = {"wandb": MagicMock()}
     tracking._finished = False
@@ -31,6 +41,8 @@ def test_tracking_finish_finalizes_wandb_once():
 
 
 def test_tracking_finish_finalizes_mlflow_once():
+    # [FUNCTION DOC]
+    # Behavior: same idempotency for an mlflow logger: finish delegated only once.
     tracking = Tracking.__new__(Tracking)
     tracking.logger = {"mlflow": MagicMock()}
     tracking._finished = False
@@ -42,6 +54,12 @@ def test_tracking_finish_finalizes_mlflow_once():
 
 
 def test_dapo_filtered_reward_table_logs_incremental_rows():
+    # [FUNCTION DOC]
+    # Behavior: with wandb version 0.20.0 and an active run, the logger creates one
+    # incremental-mode table with columns step and reward_counts, adds one row per
+    # call with the reward counts formatted as "reward:count" pairs sorted by reward
+    # and joined by ", " (e.g. "0:3, 1:2"), and logs the same table object under
+    # training/filter_groups/filtered_reward_counts at each step.
     mock_wandb = MagicMock()
     mock_wandb.run = object()
     mock_wandb.__version__ = "0.20.0"
@@ -61,6 +79,9 @@ def test_dapo_filtered_reward_table_logs_incremental_rows():
 
 
 def test_dapo_filtered_reward_table_falls_back_to_full_history():
+    # [FUNCTION DOC]
+    # Behavior: with wandb 0.19.11 (no incremental mode) each call builds a new table
+    # containing the full row history so far and logs that new table at the step.
     mock_wandb = MagicMock()
     mock_wandb.run = object()
     mock_wandb.__version__ = "0.19.11"
@@ -83,6 +104,10 @@ def test_dapo_filtered_reward_table_falls_back_to_full_history():
 
 
 def test_validation_generations_logger_logs_trackio_traces():
+    # [FUNCTION DOC]
+    # Behavior: with trackio mocked (no current run), logging one validation sample
+    # (input, output, score) creates one Trace with user/assistant messages, metadata
+    # source "validation_generations" and score 0.5, and logs once at step 7.
     mock_trackio = MagicMock()
     mock_trackio.context_vars = types.SimpleNamespace(current_run=MagicMock())
     mock_trackio.context_vars.current_run.get.return_value = None

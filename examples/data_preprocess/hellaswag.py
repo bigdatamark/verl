@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script converting Rowan/hellaswag (train/validation/test) to verl parquet for
+# log-likelihood multiple-choice evaluation. Rows without a label are filtered out.
+# Each record: user prompt = cleaned "activity_label: ctx_a Ctx_b", ability "nlp",
+# reward_model {style "model", eval "multiple_choice", ground_truth int label, choices cleaned endings}.
+# Args: --local_dataset_path, --local_save_dir (default ~/data/hellaswag), deprecated --local_dir, --hdfs_dir.
+# KNOWN ISSUE: the `instruction` string is defined but never used.
+# KNOWN ISSUE: the save dir is not tilde-expanded or created before writing.
 """
 Preprocess Hellaswag dataset.
 
@@ -26,6 +34,10 @@ from verl.utils.hdfs_io import copy, makedirs
 
 
 def preprocess(text):
+    # [FUNCTION DOC]
+    # HELPER: Cleans HellaSwag text: strips whitespace, replaces " [title]" with ". ", removes
+    # any bracketed segments (non-greedy), then collapses double spaces into one (single pass,
+    # so runs of 3+ spaces may remain). Inputs: text. Outputs: cleaned string.
     text = text.strip()
     # NOTE: Brackets are artifacts of the WikiHow dataset portion of HellaSwag.
     text = text.replace(" [title]", ". ")
@@ -60,7 +72,12 @@ if __name__ == "__main__":
     instruction = "Please complete the following sentence.\n"
 
     def make_map_fn(split):
+        # [FUNCTION DOC]
+        # Returns a process_fn closure bound to the split name.
         def process_fn(doc, idx):
+            # [FUNCTION DOC]
+            # Builds the query from activity_label and contexts (ctx_b capitalized), cleans each ending,
+            # converts the label to int, and returns the record. Exceptions: ValueError if label is not numeric.
             ctx = doc["ctx_a"] + " " + doc["ctx_b"].capitalize()
             query = preprocess(doc["activity_label"] + ": " + ctx)
             choices = [preprocess(ending) for ending in doc["endings"]]

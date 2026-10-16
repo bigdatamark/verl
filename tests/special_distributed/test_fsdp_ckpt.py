@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Distributed (torchrun, >= 2 GPUs) test that FSDPCheckpointManager save/load restores model, optimizer and LR
+# scheduler exactly, for FSDP1 or FSDP2 (selected by STRATEGY env var when run as main, which also sets
+# FLASH_ATTENTION_DETERMINISTIC=1). Requires a local Qwen2.5-0.5B-Instruct tokenizer under ~/models.
+
 import os
 import shutil
 import tempfile
@@ -29,6 +35,12 @@ from verl.utils.fsdp_utils import MixedPrecisionPolicy, apply_fsdp2
 
 
 def create_random_input_ids(batch_size, seq_len, vocab_size):
+    # [FUNCTION DOC]
+    # HELPER: Creates random token ids of shape (batch_size, seq_len), a random left-padded attention mask (<=10% left pad,
+    # 50-70% valid), derives position ids, and removes padding with the device-appropriate unpad_input (flash_attn on CUDA,
+    # verl's on NPU).
+    # Outputs: (input_ids, position_ids), each of shape (1, total_valid_tokens).
+    # KNOWN ISSUE: on devices other than cuda/npu unpad_input is never imported, causing a NameError.
     if get_device_name() == "cuda":
         from flash_attn.bert_padding import unpad_input
     elif get_device_name() == "npu":
@@ -48,6 +60,15 @@ def create_random_input_ids(batch_size, seq_len, vocab_size):
 
 
 def test_fsdp_ckpt(strategy="fsdp"):
+    # [FUNCTION DOC]
+    # Behavior: inits distributed and a "dp" mesh; builds a 1-layer default Qwen2 model in bf16 with flash attention;
+    # wraps it with FSDP1 FULL_SHARD (bf16 params, fp32 reduce/buffers) when strategy is "fsdp", else FSDP2; creates
+    # AdamW(lr 1e-4) and StepLR(gamma 0.9) and a checkpoint manager. Does one update on input 1, saves a checkpoint to a
+    # temp dir and snapshots the state dict; does a second update on input 2 and records logits on input 2; loads the
+    # checkpoint, asserts the state dict exactly matches the snapshot, repeats the second update and asserts logits match
+    # the earlier logits exactly. Cleans up the temp dir and destroys the process group.
+    # Inputs: strategy - "fsdp" or anything else for FSDP2.
+    # Side effects: writes/deletes a temp checkpoint dir, prints.
     assert get_torch_device().device_count() >= 2, "need at least 2 gpus for test"
     local_rank, rank, world_size = initialize_global_process_group()
     device_mesh = init_device_mesh(get_device_name(), mesh_shape=(world_size,), mesh_dim_names=("dp",))

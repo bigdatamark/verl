@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script converting hiyouga/geometry3k (train/test) into verl multimodal RL parquet format.
+# Each row: data_source, a single user prompt = problem + think/boxed instruction, the images
+# list passed through, ability "math", rule-style reward with the answer as ground truth, and
+# extra_info {split, index, answer, question}. Mapping uses 8 processes.
+# Args: --local_dataset_path, --local_save_dir (default ~/data/geo3k), deprecated --local_dir, --hdfs_dir.
+# Outputs: train.parquet and test.parquet in the save dir; optional HDFS copy.
+# KNOWN ISSUE: the save dir is not tilde-expanded or created before writing.
 """
 Preprocess the Geometry3k dataset to parquet format
 """
@@ -56,7 +64,12 @@ if __name__ == "__main__":
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
+        # [FUNCTION DOC]
+        # Returns a process_fn closure bound to the split name.
         def process_fn(example, idx):
+            # [FUNCTION DOC]
+            # Pops problem, answer and images from the example and returns the RL record described in
+            # the module doc. Inputs: example row; idx row index. Exceptions: KeyError if fields missing.
             problem = example.pop("problem")
             prompt = problem + " " + instruction_following
             answer = example.pop("answer")

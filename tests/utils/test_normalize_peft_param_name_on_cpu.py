@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for verl.utils.fsdp_utils.normalize_peft_param_name on unwrapped models: normalized peft state dict
+# keys must equal base model keys (base_model prefix and .base_layer infixes stripped, LoRA/adapter keys dropped),
+# shapes must match, and empty input is handled.
+
 import pytest
 import torch
 from peft import LoraConfig, get_peft_model
@@ -21,6 +26,8 @@ from verl.utils.fsdp_utils import normalize_peft_param_name
 
 
 def create_base_model():
+    # [FUNCTION DOC]
+    # HELPER: Builds a small randomly initialized Qwen3 causal LM (2 layers, hidden 128, intermediate 256).
     """Create a simple base model for testing."""
     config = Qwen3Config(
         num_hidden_layers=2,
@@ -34,6 +41,8 @@ def create_base_model():
 
 
 def create_peft_model():
+    # [FUNCTION DOC]
+    # HELPER: Builds a base model via create_base_model and wraps it with peft LoRA (r 8, alpha 16) on all linear modules.
     lora_config = LoraConfig(
         r=8, lora_alpha=16, target_modules="all-linear", lora_dropout=0.0, bias="none", task_type="CAUSAL_LM"
     )
@@ -44,17 +53,23 @@ def create_peft_model():
 
 @pytest.fixture
 def base_model():
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture returning a fresh base model.
     """Create a simple base model for testing."""
     return create_base_model()
 
 
 @pytest.fixture
 def peft_model():
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture returning a fresh LoRA peft model.
     """Create a PEFT model with LoRA adapters."""
     return create_peft_model()
 
 
 def test_normalize_peft_param_name_keys_match_base_model():
+    # [FUNCTION DOC]
+    # Normalizes a peft model's state dict and asserts its key set exactly equals the base model's (prints both).
     """Test that normalized PEFT model keys match base model keys."""
     # Get state dicts
     base_model = create_base_model()
@@ -84,6 +99,8 @@ def test_normalize_peft_param_name_keys_match_base_model():
 
 
 def test_normalize_peft_param_name_removes_lora_keys(peft_model):
+    # [FUNCTION DOC]
+    # Asserts the raw peft state dict has "lora_" keys and the normalized one has none.
     """Test that LoRA-specific parameters are removed after normalization."""
     peft_state_dict = peft_model.state_dict()
 
@@ -100,6 +117,8 @@ def test_normalize_peft_param_name_removes_lora_keys(peft_model):
 
 
 def test_normalize_peft_param_name_removes_base_model_prefix(peft_model):
+    # [FUNCTION DOC]
+    # Asserts the raw peft state dict has keys containing "base_model" and the normalized one has none.
     """Test that base_model prefix is removed from parameter names."""
     peft_state_dict = peft_model.state_dict()
 
@@ -116,6 +135,8 @@ def test_normalize_peft_param_name_removes_base_model_prefix(peft_model):
 
 
 def test_normalize_peft_param_name_removes_base_layer_suffix(peft_model):
+    # [FUNCTION DOC]
+    # Asserts the raw peft state dict has ".base_layer" keys and the normalized one has none.
     """Test that .base_layer suffix is removed from parameter names."""
     peft_state_dict = peft_model.state_dict()
 
@@ -132,6 +153,8 @@ def test_normalize_peft_param_name_removes_base_layer_suffix(peft_model):
 
 
 def test_normalize_peft_param_name_tensor_shapes_match(base_model, peft_model):
+    # [FUNCTION DOC]
+    # For every base key, asserts it exists in the normalized peft state dict with the same shape.
     """Test that tensor shapes match between base model and normalized PEFT model."""
     base_state_dict = base_model.state_dict()
     peft_state_dict = peft_model.state_dict()
@@ -148,6 +171,8 @@ def test_normalize_peft_param_name_tensor_shapes_match(base_model, peft_model):
 
 
 def test_normalize_peft_param_name_empty_dict():
+    # [FUNCTION DOC]
+    # Normalizing an empty dict returns an empty dict.
     """Test that normalize_peft_param_name handles empty dict."""
     result = normalize_peft_param_name({})
     assert result == {}, "Empty dict should return empty dict"
@@ -163,6 +188,9 @@ def test_normalize_peft_param_name_empty_dict():
     ],
 )
 def test_normalize_peft_param_name_filters_lora_patterns(lora_key_pattern):
+    # [FUNCTION DOC]
+    # Parametrized over LoRA-like key patterns (lora_A/lora_B, adapter_, lora_embedding_A): a dict containing the
+    # pattern plus one regular weight normalizes to only the regular weight.
     """Test that various LoRA key patterns are filtered out."""
     test_dict = {
         lora_key_pattern: torch.randn(10, 10),

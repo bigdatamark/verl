@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Distributed test (TP=2, PP=2, CP=2, so 8 ranks) that hf_to_mcore_config produces Megatron TransformerConfig fields
+# consistent with several HF configs read from ~/models/configs/<name>/config.json.
+
 import os
 
 import megatron.core.parallel_state as mpu
@@ -34,6 +38,10 @@ TEST_MODELS = [
 
 
 def check_config_converter_results(tf_config: TransformerConfig | MLATransformerConfig, hf_config: PretrainedConfig):
+    # [FUNCTION DOC]
+    # HELPER: Asserts layer count, hidden size, attention heads, query groups (= kv heads), FFN size, attention dropout,
+    # hidden dropout (HF default 0.0), kv_channels (= head_dim when the HF config defines one) and layernorm epsilon
+    # (= rms_norm_eps) match. Exceptions: AssertionError with a descriptive message.
     assert tf_config.num_layers == hf_config.num_hidden_layers, (
         f"Number of layers mismatch: {tf_config.num_layers} != {hf_config.num_hidden_layers}"
     )
@@ -65,6 +73,8 @@ def check_config_converter_results(tf_config: TransformerConfig | MLATransformer
 
 
 def modify_hf_config(name: str, hf_config: PretrainedConfig):
+    # [FUNCTION DOC]
+    # HELPER: For DeepSeek-V3-Base disables MTP layers and clears quantization_config (mutating the config); returns the config.
     if name == "deepseek-ai/DeepSeek-V3-Base":
         hf_config.num_nextn_predict_layers = 0
         hf_config.quantization_config = None
@@ -72,6 +82,10 @@ def modify_hf_config(name: str, hf_config: PretrainedConfig):
 
 
 def test_mcore_config_converter():
+    # [FUNCTION DOC]
+    # Behavior: inits distributed and Megatron model parallel, then for each model in TEST_MODELS loads, adjusts, converts
+    # in bf16 and checks the config; finally destroys the process group.
+    # Side effects: global distributed state, prints model names.
     """
     Test the conversion of Hugging Face model configurations to MCore configurations.
     """

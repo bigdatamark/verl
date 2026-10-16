@@ -8,6 +8,9 @@
 #
 # This source code is licensed under the BSD-style license in https://github.com/pytorch/torchtune/blob/main/LICENSE
 
+# [MODULE DOC]
+# Backward-compatible device helper facade. Almost every function is a thin delegate to the active platform object from verl.plugin.platform get_platform(). Also exposes module-level flags is_cuda_available and is_npu_available computed at import time, and Ascend NPU version detection / IPC-support checks implemented locally.
+
 """Backward-compatible device utilities.
 
 All public names in this module are preserved for existing callers (80+ import
@@ -35,6 +38,10 @@ logger = logging.getLogger(__name__)
 
 
 def is_torch_npu_available(check_device=True) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: returns False if torch has no npu attribute; otherwise, when check_device is true returns torch.npu.is_available(), else True. ImportError yields False.
+    # Inputs: check_device - whether to require an actual device rather than only the torch_npu extension.
+    # Outputs: bool.
     """Check if Ascend NPU is available for PyTorch operations.
 
     Attempts to detect NPU availability by checking for the torch.npu module
@@ -63,6 +70,8 @@ is_npu_available = is_torch_npu_available()
 
 
 def get_resource_name() -> str:
+    # [FUNCTION DOC]
+    # Returns the platform's Ray resource name (e.g. "GPU", "NPU").
     """Function that return ray resource name based on the device type.
     Returns:
         ray resource name string, e.g. "GPU", "NPU".
@@ -71,6 +80,8 @@ def get_resource_name() -> str:
 
 
 def get_vendor() -> str:
+    # [FUNCTION DOC]
+    # Returns the platform vendor name string.
     """Return the hardware vendor name for the current platform.
 
     Returns:
@@ -85,6 +96,8 @@ def get_vendor() -> str:
 
 
 def get_visible_devices_keyword() -> str:
+    # [FUNCTION DOC]
+    # Returns the platform's visible-devices environment variable name.
     """Get the environment variable name for visible device selection.
 
     Returns:
@@ -94,6 +107,8 @@ def get_visible_devices_keyword() -> str:
 
 
 def get_device_name() -> str:
+    # [FUNCTION DOC]
+    # Returns the platform device type string (e.g. "cuda", "npu", "cpu").
     """Get the device type string based on available accelerators.
 
     Returns:
@@ -103,6 +118,8 @@ def get_device_name() -> str:
 
 
 def get_torch_device():
+    # [FUNCTION DOC]
+    # Returns the torch device module for the platform (e.g. torch.cuda).
     """Get the PyTorch device module for the current accelerator.
 
     Returns:
@@ -112,6 +129,8 @@ def get_torch_device():
 
 
 def get_device_id() -> int:
+    # [FUNCTION DOC]
+    # Returns the current device index from the platform.
     """Get the index of the current accelerator device.
 
     Returns:
@@ -121,6 +140,8 @@ def get_device_id() -> int:
 
 
 def get_nccl_backend() -> str:
+    # [FUNCTION DOC]
+    # Returns the platform's collective communication backend name.
     """Get the distributed communication backend based on device type.
 
     Returns:
@@ -135,6 +156,9 @@ def get_nccl_backend() -> str:
 
 
 def set_expandable_segments(enable: bool) -> None:
+    # [FUNCTION DOC]
+    # Sets the allocator setting "expandable_segments:<True|False>" through the platform.
+    # Side effects: changes allocator configuration.
     """Configure memory allocator expandable segments setting.
 
     Args:
@@ -149,6 +173,10 @@ def set_expandable_segments(enable: bool) -> None:
 
 
 def auto_set_device(config) -> None:
+    # [FUNCTION DOC]
+    # Behavior: if config has trainer.device and the detected platform device is not "cpu" and differs from the configured value, overwrites config.trainer.device with the detected device (warning unless the configured value was "cpu").
+    # Inputs: config - config object (may be None).
+    # Side effects: mutates config, logs warning.
     """Automatically configure device name for different accelerators.
 
     Args:
@@ -172,6 +200,8 @@ def auto_set_device(config) -> None:
 
 
 def get_device_capability(device_id: int = 0) -> tuple[int | None, int | None]:
+    # [FUNCTION DOC]
+    # Returns (major, minor) compute capability for device_id from the platform, or (None, None) where not applicable.
     """Get the compute capability of the current accelerator device.
 
     Args:
@@ -185,6 +215,8 @@ def get_device_capability(device_id: int = 0) -> tuple[int | None, int | None]:
 
 @unique
 class AscendHardwareVersion(IntEnum):
+    # [CLASS DOC]
+    # Unique integer enum of Ascend NPU generations: NONE (no/unknown device access), A2, A3, A5, and MAX_VERSION for unrecognized newer chip names.
     NONE = 0
     A2 = 2
     A3 = 3
@@ -193,6 +225,11 @@ class AscendHardwareVersion(IntEnum):
 
 
 def get_npu_versions() -> tuple[AscendHardwareVersion, str, str]:
+    # [FUNCTION DOC]
+    # Behavior: (1) Determines hardware generation from torch_npu device name substrings (Ascend910_95/Ascend950 -> A5, Ascend910_93 -> A3, Ascend910B/A2G -> A2, other -> MAX_VERSION; any failure -> NONE). (2) Runs "npu-smi info -t board -i 1"; if it fails, retries with the first id in ASCEND_VISIBLE_DEVICES, then with that id integer-divided by 2 (one-card-two-die A3). Parses the first "Software Version" line, value after the colon, lowercased. (3) Validates architecture is arm64/aarch64/x86_64, locates <ASCEND_HOME_PATH or default toolkit path>/<arch>-linux/ascend_toolkit_install.info and parses the first "version=" line lowercased.
+    # Outputs: (hardware_version, software_version, cann_version).
+    # Exceptions: CalledProcessError re-raised if npu-smi fails and env var missing/invalid or the final retry fails; ValueError/IndexError path re-raises the original error; RuntimeError when the software version, architecture, toolkit path, info file or CANN version cannot be found.
+    # Side effects: spawns subprocesses, reads files.
     """Get the NPU chip generation, software version and CANN toolkit version.
 
     Returns:
@@ -294,6 +331,11 @@ def get_npu_versions() -> tuple[AscendHardwareVersion, str, str]:
 
 
 def check_ipc_version_support(software_version: str, cann_version: str) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: extracts a base version from each string with a regex: if the third component starts with "t", take only major.minor; otherwise major.minor plus optional third part that is a number or "rcN". Returns True iff software base >= 25.3.rc1 and CANN base >= 8.3.rc1 (packaging version comparison); logs the failing condition otherwise.
+    # Inputs: software_version, cann_version - version strings.
+    # Outputs: bool.
+    # Exceptions: RuntimeError if either string does not match the pattern.
     """Check if the given software and CANN versions support IPC.
 
     Compares the software version and CANN toolkit version against minimum
@@ -351,6 +393,8 @@ def check_ipc_version_support(software_version: str, cann_version: str) -> bool:
 
 
 def is_support_ipc() -> bool:
+    # [FUNCTION DOC]
+    # Returns whether the platform supports device IPC.
     """Check if the device supports IPC (Inter-Process Communication).
 
     Delegates to the platform abstraction layer.
@@ -362,6 +406,8 @@ def is_support_ipc() -> bool:
 
 
 def is_device_available() -> bool:
+    # [FUNCTION DOC]
+    # Returns whether any accelerator is available on the platform.
     """Check if any accelerator device is available.
 
     Returns:
@@ -376,6 +422,8 @@ def is_device_available() -> bool:
 
 
 def manual_seed(seed: int) -> None:
+    # [FUNCTION DOC]
+    # Seeds the current accelerator RNG via the platform.
     """Set the seed for the current accelerator device.
 
     Args:
@@ -385,6 +433,8 @@ def manual_seed(seed: int) -> None:
 
 
 def manual_seed_all(seed: int) -> None:
+    # [FUNCTION DOC]
+    # Seeds all accelerator RNGs via the platform.
     """Set the seed for all accelerator devices.
 
     Args:

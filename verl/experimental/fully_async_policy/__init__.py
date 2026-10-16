@@ -11,3 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Package fully_async_policy: experimental fully asynchronous RL training (rollout and training decoupled, with
+# staleness-bounded sample queues and dynamic scheduling of hybrid rollout resources). This __init__ contains no
+# code; importing it has no side effects.

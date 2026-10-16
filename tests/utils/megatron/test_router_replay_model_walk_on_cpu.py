@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# At import time, inserts MagicMock modules (only if absent) for the megatron.core surfaces and
+# verl.models.mcore.util needed by router_replay_utils, then imports the real router replay helpers.
+# Tests that replay targets and actions are applied to routers found by walking the given model, not to the
+# process-global RouterReplay.router_instances list (which may contain orphan routers), and that MTP routers
+# are skipped.
 
 """Router replay addressed through the forwarded model rather than the global router list.
 
@@ -63,25 +69,38 @@ TOPK = 2
 
 
 class FakeTopKRouter(torch.nn.Module):
+    # [CLASS DOC]
+    # HELPER: Fake MoE router module holding a 1-based layer_number and a newly constructed RouterReplay
+    # (which registers itself in the global instance list).
     """Stands in for Megatron's ``TopKRouter``: owns a ``router_replay`` and the 1-based
     ``layer_number`` its transformer layer assigns it."""
 
     def __init__(self, layer_number):
+        # [FUNCTION DOC]
+        # HELPER: Stores layer_number and creates the router_replay. Inputs: layer_number - int.
         super().__init__()
         self.layer_number = layer_number
         self.router_replay = RouterReplay()
 
 
 def _build_model():
+    # [FUNCTION DOC]
+    # HELPER: Returns a module list of NUM_LAYERS FakeTopKRouter with layer numbers 1..NUM_LAYERS.
     return torch.nn.ModuleList([FakeTopKRouter(layer_number) for layer_number in range(1, NUM_LAYERS + 1)])
 
 
 def _routers(model):
+    # [FUNCTION DOC]
+    # HELPER: Returns the list of router_replay objects of each module in model, in order.
     return [module.router_replay for module in model]
 
 
 @pytest.fixture
 def orphans_then_model(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture; patches router_replay_utils.TopKRouter to FakeTopKRouter, clears the global router list,
+    # creates NUM_LAYERS orphan RouterReplay objects first, then builds the model, and yields (orphans, model).
+    # Clears the global router list again on teardown. Side effects: mutates RouterReplay.router_instances.
     """Register routers that never make it into the model, then build the model — the registration
     order an mbridge prebuild produces."""
     monkeypatch.setattr(router_replay_utils, "TopKRouter", FakeTopKRouter)
@@ -94,6 +113,10 @@ def orphans_then_model(monkeypatch):
 
 @pytest.fixture
 def tf_config(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture; patches router_replay_utils device_name to "cpu", preprocess_packed_seqs to return its
+    # input unchanged with None metadata, and the sequence-parallel scatter to identity. Returns a namespace config
+    # with fp8 None, num_layers NUM_LAYERS and moe_layer_freq 1.
     monkeypatch.setattr(router_replay_utils, "device_name", "cpu")
     monkeypatch.setattr(router_replay_utils, "preprocess_packed_seqs", lambda x, mask, **kwargs: (x, None))
     monkeypatch.setattr(router_replay_utils, "scatter_to_sequence_parallel_region", lambda x: x)
@@ -101,6 +124,11 @@ def tf_config(monkeypatch):
 
 
 def test_targets_are_written_to_the_forwarded_models_own_routers(orphans_then_model, tf_config):
+    # [FUNCTION DOC]
+    # Behavior: builds a top-k index tensor of shape (1, NUM_TOKENS, NUM_LAYERS, TOPK) where layer i is filled with i,
+    # an all-true mask, and calls set_router_replay_data with the model; asserts each model router's target_topk_idx
+    # equals a (NUM_TOKENS, TOPK) tensor filled with its layer index, and every orphan's target stays None.
+    # Inputs: orphans_then_model, tf_config fixtures. Outputs: none.
     orphans, model = orphans_then_model
 
     # [1, tokens, layers, topk], with every row of layer i filled with i.
@@ -117,6 +145,9 @@ def test_targets_are_written_to_the_forwarded_models_own_routers(orphans_then_mo
 
 
 def test_action_is_toggled_on_the_forwarded_models_own_routers(orphans_then_model):
+    # [FUNCTION DOC]
+    # Behavior: sets action REPLAY_BACKWARD on the model and asserts all model routers have it and orphans remain None.
+    # Inputs: orphans_then_model. Outputs: none.
     orphans, model = orphans_then_model
 
     router_replay_utils.set_model_router_replay_action(model, RouterReplayAction.REPLAY_BACKWARD)
@@ -126,6 +157,10 @@ def test_action_is_toggled_on_the_forwarded_models_own_routers(orphans_then_mode
 
 
 def test_mtp_routers_are_not_addressed(orphans_then_model):
+    # [FUNCTION DOC]
+    # Behavior: builds a container module with the decoder routers under "decoder" and one extra router (layer 1)
+    # under "mtp"; sets REPLAY_BACKWARD and asserts iter_model_routers yields layer numbers 1..NUM_LAYERS only and the
+    # MTP router's action stays None. Inputs: orphans_then_model. Outputs: none.
     """MTP layers restart layer numbering at 1, so they would alias decoder layer 1."""
     _, decoder = orphans_then_model
     model = torch.nn.Module()

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Ulysses sequence-parallel flash-attention forward for the DeepSeek-V3-style MLA (multi-head latent
+# attention) text attention used by Kimi-VL, plus local rotary/repeat helpers.
+
 from typing import Optional
 
 import torch
@@ -33,6 +37,9 @@ from verl.utils.ulysses import (
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
 def rotate_half(x):
+    # [FUNCTION DOC]
+    # HELPER: Splits the last dimension in half and returns the concatenation of the negated second half
+    # and the first half. Inputs: x tensor. Outputs: same-shape tensor. Side effects: none.
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -41,6 +48,15 @@ def rotate_half(x):
 
 # Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    # [FUNCTION DOC]
+    # HELPER: DeepSeek-style rotary application: gathers cos/sin at position_ids and unsqueezes at
+    # unsqueeze_dim, permutes q and k from interleaved pairs to half-split layout (view last dim as pairs
+    # and transpose), then applies x*cos + rotate_half(x)*sin.
+    # Inputs: q, k [b, h, s, d]; cos, sin [max_len, d]; position_ids [b, s]; unsqueeze_dim.
+    # Outputs: (rotated q, rotated k).
+    # Side effects: none.
+    # KNOWN ISSUE: comment says copied from Llama, but the interleave-to-half permutation of q/k differs
+    # from Llama's implementation.
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
@@ -77,6 +93,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Repeats KV heads n_rep times along the head dimension (equivalent to repeat_interleave on
+    # dim 1). Inputs: hidden_states [b, kvh, s, d]; n_rep. Outputs: [b, kvh*n_rep, s, d] (input returned
+    # as-is when n_rep is 1). Side effects: none.
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
@@ -98,6 +118,23 @@ def _ulysses_flash_attn_forward(
     use_cache: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    # [FUNCTION DOC]
+    # HELPER: Replacement MLA attention forward with Ulysses SP. Computes q (direct projection or LoRA-style
+    # q_a -> layernorm -> q_b), compressed KV and rope key part from kv_a_proj_with_mqa, expands KV via
+    # kv_b_proj into nope keys and values. Under SP > 1: validates heads, repeats the single rope-key head
+    # sp_size times (so one head per rank after all-to-all), repeats nope keys and values by the KV group
+    # count, and all-to-alls q, k_pe, k_nope, values (gather sequence, scatter heads). Splits q into nope
+    # and rope parts, computes rotary cos/sin for the full length, applies rotary, assembles query and key
+    # states of q_head_dim, pads values to q_head_dim if needed, transposes to [b, s, h, d] and calls HF
+    # _flash_attention_forward (dropout only in training, causal, softmax_scale, position ids for varlen).
+    # Then all-to-alls back, trims value padding, reshapes and applies o_proj.
+    # Inputs: self - MLA attention module; hidden_states [b, s_local, hidden]; attention_mask;
+    # position_ids (full-length positions expected under SP); past_key_value, output_attentions,
+    # use_cache and kwargs ignored.
+    # Outputs: (attn_output, None) for transformers >= 4.53, else (attn_output, None, None).
+    # Exceptions: Ulysses validation errors.
+    # Side effects: SP collectives.
+    # KNOWN ISSUE: past_key_value / use_cache are ignored, so KV caching is not supported.
     bsz, q_len, _ = hidden_states.size()
 
     if self.q_lora_rank is None:

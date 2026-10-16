@@ -85,3 +85,8 @@
 # CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
+
+# [PACKAGE DOC]
+# Package marker for verl's vendored copy of torch.distributed.checkpoint utilities.
+# Contains only the upstream PyTorch license header; no code or exports. The real content lives in
+# the state_dict submodule.

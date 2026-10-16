@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# GPU/Ray integration test of RewardLoopManager with a standalone generative reward model (Qwen2.5-1.5B-Instruct
+# judge via reward_fn.compute_score_gsm8k) on an 8-GPU pool, TP=2. Prints judge responses; no assertions.
+
 import os
 
 import ray
@@ -26,6 +30,18 @@ from verl.utils.tokenizer import normalize_token_ids
 
 
 def create_data_samples(tokenizer) -> DataProto:
+    # [FUNCTION DOC]
+    # HELPER: Builds a 4-sample batch from fixed conversations (two answers to a sigmoid-range question, one right
+    # and one wrong, and two answers about the capital of Australia, one right and one wrong). For each conversation
+    # tokenizes the user turn with the chat template as the prompt and takes the tokens of the full conversation
+    # beyond the prompt length as the response; left-pads prompts to 1024 and right-pads responses to 4096 with the
+    # pad token, builds the matching attention mask, concatenated input_ids, and position ids from the mask.
+    # Non-tensor fields: data_source "gsm8k", reward_model ground_truth "Not Used", raw_prompt (user turn only),
+    # extra_info question (user text).
+    # Inputs: tokenizer - HF tokenizer of the rollout model with a chat template and pad token.
+    # Outputs: tuple (DataProto, list of the raw conversations).
+    # Exceptions: tensor stacking fails if any prompt/response exceeds the fixed lengths.
+    # KNOWN ISSUE: return annotation says DataProto but the function returns a (DataProto, convs) tuple.
     convs = [
         [
             {
@@ -106,6 +122,12 @@ def create_data_samples(tokenizer) -> DataProto:
 
 
 def test_reward_model_manager():
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, composes ppo_trainer config, sets the rollout model (Qwen2.5-0.5B) path, the gsm8k GenRM
+    # custom reward function, one reward worker, dapo manager and standalone GenRM rollout settings; creates
+    # RewardLoopManager, builds samples, computes RM scores and prints each problem, answer and the genrm_response
+    # non-tensor field.
+    # Side effects: Ray lifecycle, GPU servers, prints.
     ray.init(
         runtime_env={
             "env_vars": {

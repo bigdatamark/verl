@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Training side of fully-async PPO. FullyAsyncTrainer is a Ray actor that pulls serialized rollout samples from the
+# message queue, assembles batches of required_samples, runs the PPO pipeline (reward, log-probs, advantages,
+# critic/actor updates), and every trigger_parameter_sync_step local steps synchronizes weights to rollout
+# replicas, optionally switching hybrid replicas on/off via dynamic resource scheduling.
+# Side effects on import: creates a module logger.
+
 import asyncio
 import logging
 import os
@@ -45,6 +52,9 @@ logger = logging.getLogger(__name__)
 
 
 class TrainingStopException(Exception):
+    # [CLASS DOC]
+    # Exception used as a control-flow signal that the message queue delivered the termination marker and training
+    # should stop. No extra state.
     """Exception raised to signal training should stop"""
 
     pass
@@ -52,6 +62,11 @@ class TrainingStopException(Exception):
 
 @ray.remote(num_cpus=10)
 class FullyAsyncTrainer(SeparateRayPPOTrainer):
+    # [CLASS DOC]
+    # Ray actor (10 CPUs). Key state: current_param_version (logical global step used for logging/checkpoints),
+    # local_trigger_step (1..trigger_parameter_sync_step within a sync cycle), required_samples, worker groups,
+    # checkpoint managers for standalone and hybrid replicas, dynamic resource controller and its context, a metrics
+    # aggregator over micro-steps in a sync cycle, and per-step wait time statistics.
     """
     A fully asynchronous PPO trainer that obtains samples from a MessageQueue for training.
     Based on an improved implementation of OneStepOffRayTrainer
@@ -66,6 +81,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
         device_name=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores tokenizer, config, role mapping, pool manager and worker group class; asserts no hybrid engine;
+        # determines reference policy, reward model, critic use and distillation config; sets ref_in_actor when a LoRA rank
+        # (nested or legacy key) is positive or a LoRA adapter path is set; builds KL controller when KL-in-reward is on;
+        # initializes step/profile/metric bookkeeping and a Tracking logger with the resolved config; initializes async
+        # fields; chooses train role ActorRollout when trainer-side validation or dynamic scheduling is enabled, else Actor;
+        # computes required_samples; builds the MetricsAggregator from trainer (hybrid) and rollout (standalone) GPU counts;
+        # reads dynamic scheduling options (policy name default "default", deactivate ratio default 0.3, rebalance default
+        # true, staleness threshold default 1); sets only_hybrid when dynamic scheduling is on and rollout.nnodes is 0; builds
+        # the DynamicScheduleContext.
+        # Inputs: config; tokenizer; role_worker_mapping; resource_pool_manager; ray_worker_group_cls; optional device_name.
+        # Exceptions: AssertionError if hybrid engine is enabled.
+        # Side effects: initializes tracking backends.
+        # KNOWN ISSUE: kl_ctrl_in_reward is only assigned when use_kl_in_reward is true; the inline comment claims rebalance
+        # defaults to False but the code default is True.
         # ==================== RayPPOTrainer config ====================
 
         # Store the tokenizer for text processing
@@ -215,6 +245,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
     async def _setup_checkpoint_manager(self):
+        # [FUNCTION DOC]
+        # HELPER: Fetches active replicas from the rollouter and builds a CheckpointEngineManager for them from the
+        # rollout checkpoint engine config and the actor worker group.
         """Setup checkpoint manager after rollouter is initialized"""
         replicas = await self.rollouter.get_replicas.remote()
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
@@ -224,6 +257,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print(f"[FullyAsyncTrainer] Checkpoint manager initialized (backend={checkpoint_engine_config.backend})")
 
     async def _setup_hybrid_checkpoint_manager(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns immediately unless trainer-side validation or dynamic scheduling is enabled. Otherwise builds a
+        # second CheckpointEngineManager with the backend temporarily forced to "naive" (restored afterwards) and an empty
+        # replica list; fetches all hybrid replicas from the rollouter (blocking); if none, returns; else appends each to the
+        # manager's replicas and awaits sleep on them so the trainer owns the GPU memory.
+        # Side effects: config mutation (temporary), remote calls, GPU memory release, prints.
         """Setup hybrid checkpoint manager and perform initial sleep of hybrid replicas.
 
         When use_trainer_do_validate is enabled:
@@ -296,10 +335,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print("[FullyAsyncTrainer] Initial sleep complete, GPU memory now owned by training engine")
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
+        # [FUNCTION DOC]
+        # Behavior: stores the message queue client.
         """Set message queue client"""
         self.message_queue_client = message_queue_client
 
     async def _setup_dynamic_resource_controller(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Counts standalone and hybrid replicas from the rollouter (blocking gets), sets only_hybrid when standalone
+        # count is 0, builds the configured policy via the registry with the initial deactivate ratio and only_hybrid, and
+        # constructs the DynamicResourceController. Exceptions: propagates unknown-policy errors from the registry.
         """Initialise :class:`DynamicResourceController` with the configured policy.
 
         The policy is selected by ``async_training.dynamic_schedule_policy`` (a
@@ -344,6 +389,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
     async def set_rollouter(self, rollouter):
+        # [FUNCTION DOC]
+        # Behavior: stores the rollouter handle, sets up the standalone and hybrid checkpoint managers, and if dynamic
+        # scheduling is enabled sets up the dynamic resource controller.
         """Set rollouter reference and initialize all checkpoint managers."""
         self.rollouter = rollouter
         # Setup checkpoint manager after rollouter is set
@@ -354,6 +402,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await self._setup_dynamic_resource_controller()
 
     def set_total_train_steps(self, total_training_steps):
+        # [FUNCTION DOC]
+        # Behavior: stores total train steps, then (inside a catch-all) enables struct mode and writes total_training_steps
+        # into actor and critic optimizer configs when present; warns on failure. Creates a tqdm progress bar.
+        # Inputs: total_training_steps - int. Side effects: mutates config; creates progress bar.
         self.total_train_steps = total_training_steps
 
         try:
@@ -369,10 +421,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.progress_bar = tqdm(total=self.total_train_steps, initial=0, desc="Training Progress")
 
     def get_actor_wg(self):
+        # [FUNCTION DOC]
+        # Behavior: returns the actor worker group.
         """Get actor worker group"""
         return self.actor_wg
 
     async def _get_samples_from_queue(self) -> tuple[None, None] | tuple[int, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Collects required_samples samples from the message queue one at a time. When dynamic scheduling is
+        # enabled, first records queue size and computes how many samples must actually be waited for (required minus
+        # backlog, at least 0). Stops early on a none termination marker. If fewer than required were collected, returns
+        # (none, none). Otherwise deserializes with cloudpickle, assembles a batch (with batch balancing if configured),
+        # stores total wait time in batch meta_info, appends wait time and pending-wait sample count to step lists, and
+        # returns (0, batch).
+        # Outputs: tuple of (epoch placeholder 0, DataProto) or (none, none). Side effects: queue consumption, prints.
+        # KNOWN ISSUE: docstring promises a three-element tuple, but a two-element tuple is returned.
         """
         Get samples from message queue and compose gen_batch_output
         Uses a loop to continuously collect samples until enough are gathered
@@ -452,6 +515,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         return 0, batch
 
     def _create_actor_rollout_classes(self):
+        # [FUNCTION DOC]
+        # HELPER: Registers only the train role's worker class (with actor_rollout_ref config, distillation config and
+        # role name) in its resource pool's class mapping.
         # create actor — the role is Role.ActorRollout when use_trainer_do_validate or
         # use_dynamic_resource_scheduling is enabled (so the trainer worker also hosts a
         # local rollout engine for naive weight sync via hybrid_checkpoint_manager).
@@ -468,10 +534,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.resource_pool_to_cls[resource_pool][str(role)] = role_cls
 
     def _create_reward_model_class(self):
+        # [FUNCTION DOC]
+        # HELPER: No-op; reward models are managed by the reward loop on the rollout side.
         # In fully async mode, RM is managed by RewardLoopManager (standalone). Skip worker group creation for RM.
         pass
 
     def _init_models(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes critic and (if separate) reference policy worker groups; initializes the train-role worker group
+        # and aliases it as both actor_wg and actor_rollout_wg.
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
             self.critic_wg.init_model()
@@ -485,6 +556,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
 
     async def init_workers(self):
+        # [FUNCTION DOC]
+        # Behavior: creates resource pools, worker classes, worker groups, then initializes models.
         """Initialize distributed training workers using Ray backend.
         Creates:
         1. Ray resource pools from configuration
@@ -496,6 +569,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._init_models()
 
     async def fit(self):
+        # [FUNCTION DOC]
+        # Behavior: requires message queue client and rollouter (ValueError otherwise); resets max step duration,
+        # increments global_steps, clears profile flags; repeatedly runs fit_step until TrainingStopException. Then closes
+        # the progress bar; if the last sync cycle was not already validated (param version not a multiple of test_freq,
+        # or local step mid-cycle) forces a weight update, logs aggregated metrics if any, and validates. Finally forces a
+        # checkpoint save.
+        # Exceptions: ValueError on missing dependencies; propagates other training errors.
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC
@@ -534,6 +614,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_save_checkpoint(force=True)
 
     async def fit_step(self, batch_dict: dict = None):
+        # [FUNCTION DOC]
+        # Behavior: one training micro-step. Resets per-step metrics/timing/reward fields; starts profiling if the next
+        # param version is in the profiler steps. Inside the "step" timer: if dynamic scheduling wants to deactivate
+        # hybrid replicas, waits (blocking) until the queue holds the policy's threshold sample count, deactivates them and
+        # accumulates the deactivation duration in the context; otherwise records a zero wait metric when scheduling is on.
+        # Then fetches a batch, computes reward, old log-prob, ref log-prob, critic values, advantages, updates critic and
+        # actor, advances the local step, possibly syncs weights, dumps data, and records train resource utilization.
+        # Afterwards validates, saves checkpoint, stops profiling, collects metrics, logs aggregated cycle metrics if a sync
+        # happened, and post-processes the step.
+        # Inputs: batch_dict - unused. Outputs: none.
+        # Exceptions: TrainingStopException when the queue is exhausted.
         """
         Single-step training template method. Handles all logic for one training step.
 
@@ -619,6 +710,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     )
 
     def _record_train_resource_utilization(self, allocated_time: float) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sums the timing entries named in the train-compute key list (missing keys count 0) and stores it and the
+        # given allocated time as raw seconds in metrics. Inputs: allocated_time - seconds.
         """Record raw (unratioed) numerator/denominator seconds for train-resource utilization.
 
         Numerator: time spent on actual training-GPU compute, i.e. the sum of
@@ -641,6 +735,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.metrics["dynamic_resource/train_allocated_time_s"] = allocated_time
 
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
+        # [FUNCTION DOC]
+        # HELPER: Inside the "gen" timer fetches a batch from the queue, raising TrainingStopException if none, and collects
+        # sample metrics; sets the rollout temperature in meta_info. Inputs: batch - ignored. Outputs: DataProto.
         metrics = self.metrics
         timing_raw = self.timing_raw
         with marked_timer("gen", timing_raw, color="red"):
@@ -652,6 +749,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         return batch
 
     def _compute_old_log_prob(self, batch: DataProto):
+        # [FUNCTION DOC]
+        # HELPER: Overrides old log-prob computation so all micro-steps in a sync cycle use the version-1 parameters. At
+        # local step 1 saves model params to CPU slot 1 and computes. Otherwise saves the current params into a slot named
+        # by the local step, restores slot 1, computes, restores the current params and clears that slot.
+        # Outputs: (old log-prob, MFU) from the parent. Side effects: CPU parameter copies on workers.
         """
         If algorithm.rollout_correction.bypass_mode is False,
         use model engine and first version model params to re-calculate old_log_prob.
@@ -674,6 +776,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         return old_log_prob, old_log_prob_mfu
 
     def _fit_update_local_step(self):
+        # [FUNCTION DOC]
+        # HELPER: Logs step info; increments local_trigger_step if below trigger_parameter_sync_step, else increments
+        # current_param_version and resets local step to 1.
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(
             f"[FullyAsyncTrainer] global_steps: {self.global_steps} "
@@ -688,6 +793,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.local_trigger_step = 1
 
     async def _fit_update_weights(self) -> dict | None:
+        # [FUNCTION DOC]
+        # Behavior: no-op returning none unless local_trigger_step is 1 (i.e. a cycle just finished). Stops rollout profiling
+        # if the current version is a profiler step. Fetches total produced samples and completed steps from the rollouter
+        # (blocking); expected samples = step_required_samples times completed steps; buffer = step_required_samples times
+        # staleness threshold. With dynamic scheduling, updates the context (including copies of step wait lists) and asks
+        # the policy whether to activate. Under the param_sync timer: unless only_hybrid, broadcasts weights to standalone
+        # replicas; if activating, syncs hybrid weights, activates hybrid replicas, optionally requests a rebalance, and
+        # accumulates the activation duration. Then resets rollouter staleness (receiving its timing mapping), starts
+        # profiling for the next step if configured, lets the policy update after the step and zeroes the switch durations,
+        # clears step wait lists, and logs the rollouter timing.
+        # Outputs: rollouter timing mapping, or none when no sync was done.
+        # Side effects: weight transfer, replica state changes, logging.
         """Sync updated weights to rollout replicas.
 
         Returns:
@@ -788,6 +905,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         return timing_raw
 
     def _fit_log_aggregated_training_metrics(self, rollout_reset_timing_raw: dict):
+        # [FUNCTION DOC]
+        # HELPER: Gets aggregated metrics for the cycle from the aggregator (passing rollout resource utilization), logs them
+        # if non-empty at the current param version, and resets the aggregator.
         """Log aggregated training metrics for the sync cycle just finished.
 
         Args:
@@ -810,6 +930,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.metrics_aggregator.reset()
 
     async def _fit_validate(self, val_before_train=False):
+        # [FUNCTION DOC]
+        # HELPER: Only at local step 1. Validates if test_freq is positive, the version is a positive multiple of it, or when
+        # val_before_train is set. Uses trainer-side validation if configured, else asks the rollouter to validate and logs
+        # the metrics. Inputs: val_before_train - bool.
         if self.local_trigger_step != 1:
             return
 
@@ -830,6 +954,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.logger.log(data=val_metrics, step=self.current_param_version)
 
     async def _trainer_side_validate(self):
+        # [FUNCTION DOC]
+        # HELPER: Phase 1: pushes weights to hybrid replicas, aborts all requests on standalone and hybrid replicas, adds
+        # hybrid replicas to the load balancer, resumes generation on both. Phase 2: runs validation on the rollouter and
+        # logs metrics. Phase 3: aborts both again, removes hybrid replicas from the load balancer, sleeps hybrid replicas,
+        # and resumes both. Logs durations. Side effects: replica state changes and GPU memory movement.
+        # KNOWN ISSUE: resume_generation_replicas is called on hybrid replicas right after they were put to sleep.
         """Run trainer-side validation using hybrid rollout replicas."""
         print("[FullyAsyncTrainer] _trainer_side_validate === START ===")
         validate_start = time.time()
@@ -871,6 +1001,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print(f"[FullyAsyncTrainer] _trainer_side_validate === END === (total: {total_time:.2f}s)")
 
     def _fit_save_checkpoint(self, force=False):
+        # [FUNCTION DOC]
+        # HELPER: Returns if this version was already checkpointed. Otherwise checks ESI expiration; saves when save_freq is
+        # positive and (force, version is a multiple of save_freq, or ESI expiring), recording last_ckpt_version.
+        # Inputs: force - bool.
         if self.current_param_version == self.last_ckpt_version:
             return
 
@@ -898,6 +1032,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 self.last_ckpt_version = self.current_param_version
 
     def _fit_postprocess_step(self):
+        # [FUNCTION DOC]
+        # HELPER: Increments global_steps, records the current message queue size (synchronous call) in metrics, adds the
+        # step's metrics to the aggregator with required_samples as sample count, and advances the progress bar at local
+        # step 1.
         self.global_steps += 1
 
         # Snapshot of samples left in the message queue for subsequent steps, taken right
@@ -915,6 +1053,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.progress_bar.update(1)
 
     def _save_checkpoint(self):
+        # [FUNCTION DOC]
+        # HELPER: Saves actor (and critic if used) checkpoints under default_local_dir/global_step_<param version>/ with
+        # optional HDFS mirrors and keep-count limits (forced to 1 when the deprecated remove-previous option is set), asks
+        # the rollouter to save its dataloader state into the same folder (blocking), and writes the version into
+        # latest_checkpointed_iteration.txt. Side effects: filesystem writes.
         # Warning: Currently, to align the training process and metrics of colocate,
         # we use current_param_version instead of global step.
         # This can be logically aligned with the original self.global_steps of colocate
@@ -978,6 +1121,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f.write(str(self.current_param_version))
 
     async def load_checkpoint(self):
+        # [FUNCTION DOC]
+        # Behavior: returns 0 if resume is disabled; raises NotImplementedError for HDFS. Finds the latest checkpoint in
+        # default_local_dir (made absolute). In "auto" mode returns 0 when none; in "resume_path" mode asserts and uses the
+        # given path. Sets current_param_version from the folder name, global_steps to version times trigger step plus 1,
+        # and last_ckpt_version; loads actor and (if used) critic checkpoints.
+        # Outputs: loaded param version or 0.
+        # KNOWN ISSUE: unknown resume modes are not rejected and fall through using the latest found folder, which may be none
+        # and then fail.
         if self.config.trainer.resume_mode == "disable":
             return 0
 
@@ -1031,6 +1182,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         return self.current_param_version
 
     def _collect_metrics_from_samples(self, batch, metrics):
+        # [FUNCTION DOC]
+        # HELPER: If the batch has meta_info, counts trajectories whose param version is at least one behind the current
+        # version, accumulates the stale counter, records it and the current version, and copies all meta_info entries whose
+        # key starts with "fully_async" or "timing_s" into metrics. Side effects: mutates metrics and the counter.
         """
         Collect metrics from samples
         """

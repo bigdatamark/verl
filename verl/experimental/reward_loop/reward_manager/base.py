@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Abstract base for reward-loop reward managers, which score a single sample asynchronously.
+# Defines the raw reward function type alias (any callable or none).
+# Side effects on import: module logger with level from VERL_LOGGING_LEVEL (default WARN).
+
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -32,9 +37,15 @@ RawRewardFn = Callable[..., Any] | None
 
 
 class RewardManagerBase(ABC):
+    # [CLASS DOC]
+    # Abstract base holding config, tokenizer, the raw compute_score callable and an event loop; has a per-class
+    # one-time initialization hook and a default way of placing per-sample scores into an rm_scores tensor.
     _class_initialized = False
 
     def __init__(self, config: DictConfig, tokenizer: AutoTokenizer, compute_score: RawRewardFn):
+        # [FUNCTION DOC]
+        # Behavior: stores config, tokenizer and compute_score, obtains an event loop, and runs the class-level init hook.
+        # Inputs: config; tokenizer; compute_score - callable or none.
         """Initialize reward manager.
 
         Args:
@@ -49,6 +60,9 @@ class RewardManagerBase(ABC):
 
     @classmethod
     def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer):
+        # [FUNCTION DOC]
+        # Behavior: sets the class's initialized flag on first call; later calls do nothing. Subclasses override to set up
+        # shared state (e.g. rate limiters). Inputs: config, tokenizer (unused here).
         """Initialize class state shared across all instances."""
         if cls._class_initialized:
             return
@@ -56,10 +70,17 @@ class RewardManagerBase(ABC):
 
     @abstractmethod
     async def run_single(self, data: DataProto):
+        # [FUNCTION DOC]
+        # Behavior: abstract; subclasses compute and return a result mapping (reward_score, reward_extra_info) for one
+        # sample. Exceptions: NotImplementedError if called on the base.
         raise NotImplementedError
 
     @classmethod
     def assemble_rm_scores(cls, data: DataProto, scores: list[float]) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: creates a float32 zero tensor shaped like responses and writes each sample's score at the index of its
+        # last valid response token (response attention-mask sum minus one).
+        # Inputs: data with prompts, responses, attention_mask; scores - one float per sample. Outputs: rm_scores tensor.
         """Assemble per-sample reward scores into the ``rm_scores`` tensor for a batch.
 
         Args:

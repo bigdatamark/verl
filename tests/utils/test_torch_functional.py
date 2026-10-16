@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for tensor helpers in verl.utils.torch_functional: masked_mean (incl. NaN
+# handling), the distributed statistics helpers distributed_mean_max_min_std and
+# distributed_masked_mean (multi-process, require 2 and 4 accelerator devices with
+# an NCCL-like backend and file rendezvous), calculate_sum_pi_squared_from_logits
+# (sum of squared softmax probabilities via a stable identity), and
+# expand_as_nested (broadcast one value per row onto a jagged nested tensor).
 
 import os
 
@@ -30,6 +37,14 @@ from verl.utils.torch_functional import (
 
 
 def _worker_mean(rank: int, world_size: int, rendezvous_file: str):
+    # [FUNCTION DOC]
+    # HELPER: Spawned worker: binds device rank, joins the group via the rendezvous
+    # file, contributes the scalar rank+1, calls distributed_mean_max_min_std with
+    # max, min and std all requested, and asserts every rank sees mean, max, min and
+    # unbiased (N-1) std of 1..world_size.
+    # Inputs: rank; world_size; rendezvous_file - path for file:// init.
+    # Side effects: initializes and destroys a process group. Exceptions:
+    # AssertionError tagged with the stat name and rank.
     # 1) set GPU and init NCCL
     get_torch_device().set_device(rank)
     dist.init_process_group(
@@ -67,6 +82,11 @@ def _worker_mean(rank: int, world_size: int, rendezvous_file: str):
     ],
 )
 def test_masked_mean(value, mask, gt):
+    # [FUNCTION DOC]
+    # Behavior: masked_mean of the value list under the mask equals gt; NaNs at
+    # masked-out positions are ignored (result 2.5), while a NaN under the mask
+    # yields NaN (both NaN counts as equal).
+    # Inputs: value, mask, gt - parametrized lists/scalar.
     res = masked_mean(torch.tensor(value), torch.tensor(mask))
     gt = torch.tensor(gt)
     assert torch.allclose(res, gt) or (torch.isnan(res) and torch.isnan(gt))
@@ -74,6 +94,10 @@ def test_masked_mean(value, mask, gt):
 
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_distributed_mean_max_min_std(world_size, tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: spawns world_size workers running the mean/max/min/std check, joined;
+    # any worker failure fails the test.
+    # Inputs: world_size - 2 or 4; tmp_path - pytest temp dir for the rendezvous file.
     rendezvous_file = str(tmp_path / "rdzv_mean")
     os.makedirs(os.path.dirname(rendezvous_file), exist_ok=True)
 
@@ -86,6 +110,11 @@ def test_distributed_mean_max_min_std(world_size, tmp_path):
 
 
 def _worker_mask(rank: int, world_size: int, rendezvous_file: str):
+    # [FUNCTION DOC]
+    # HELPER: Spawned worker: each rank holds [2r+1, 2r+2]; rank 0 masks in only its
+    # first element, others only their second; asserts distributed_masked_mean equals
+    # the mean of the selected values (1 and 2r+2 for r >= 1) across all ranks.
+    # Inputs/Side effects: as in the mean worker.
     get_torch_device().set_device(rank)
     dist.init_process_group(
         backend=get_nccl_backend(),
@@ -112,6 +141,9 @@ def _worker_mask(rank: int, world_size: int, rendezvous_file: str):
 
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_distributed_masked_mean(world_size, tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: spawns world_size workers for the masked-mean check.
+    # Inputs: world_size - 2 or 4; tmp_path.
     rendezvous_file = str(tmp_path / "rdzv_mask")
     os.makedirs(os.path.dirname(rendezvous_file), exist_ok=True)
 
@@ -126,6 +158,11 @@ def test_distributed_masked_mean(world_size, tmp_path):
 @pytest.mark.parametrize("shape", [(8, 17), (3, 5, 32), (1, 1024)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_calculate_sum_pi_squared_from_logits(shape, dtype):
+    # [FUNCTION DOC]
+    # Behavior: for several shapes and float32/float64, random logits scaled by 5
+    # (seed 0) must give the same per-row result and shape as softmax squared summed
+    # over the last dim (tolerance 1e-5), with values in (0, 1].
+    # Inputs: shape; dtype.
     """Σπ² computed from the logsumexp identity must match the naive softmax-then-square."""
     torch.manual_seed(0)
     logits = torch.randn(*shape, dtype=dtype) * 5.0  # broaden range to expose numerical issues
@@ -141,6 +178,9 @@ def test_calculate_sum_pi_squared_from_logits(shape, dtype):
 
 
 def test_calculate_sum_pi_squared_from_logits_extreme_values():
+    # [FUNCTION DOC]
+    # Behavior: float64 logits near +/-1000 produce finite results matching the naive
+    # softmax computation to 1e-10.
     """Stable under large-magnitude logits where naive exp would overflow."""
     # fp64 so the comparison isn't dominated by fp32 precision near |z|=1000
     logits = torch.tensor([[1000.0, 1001.0, 999.0], [-1000.0, -999.0, -998.0]], dtype=torch.float64)
@@ -151,6 +191,12 @@ def test_calculate_sum_pi_squared_from_logits_extreme_values():
 
 
 def test_expand_as_nested():
+    # [FUNCTION DOC]
+    # Behavior: expanding [1, 2, 3] onto a jagged nested tensor with rows of length
+    # 2, 3, 4 yields values repeating each scalar by its row length and the same
+    # offsets. Asserts AssertionError when the second argument is not nested, when the
+    # number of values differs from the number of rows, when the first argument is not
+    # 1-D, and when the nested tensor has an extra trailing dim.
     a = torch.randn(2)
     b = torch.randn(3)
     c = torch.randn(4)

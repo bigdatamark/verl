@@ -12,6 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Converts a HuggingFace checkpoint into a Megatron-Core distributed checkpoint (dist_checkpointing
+# format) for use by verl's Megatron backend. Supports single-process conversion for dense GPT-like
+# models (via verl's generic loader), Qwen2-MoE, Qwen3-MoE, Qwen2.5-VL and DeepSeek-V3, and
+# multi-process (torchrun) pipeline/expert-parallel conversion for DeepSeek-V3 and Qwen2/3-MoE.
+# Optionally applies the MindSpeed NPU patch when available, and can verify the saved checkpoint
+# by reloading it and comparing tensors. The __main__ block parses CLI args and calls convert_hf_to_mcore.
 
 import argparse
 import os
@@ -49,6 +56,9 @@ from verl.utils.megatron_utils import get_model
 
 
 def _init_args():
+    # [FUNCTION DOC]
+    # HELPER: Parses --hf_model_path and --output_path (required), --pp_size and --ep_size (default 1),
+    # and flags --use_cpu_initialization, --test, --trust_remote_code. Outputs: namespace.
     """
     Examples:
 
@@ -73,6 +83,14 @@ def _init_args():
 def test_conversion(megatron_model_provider, tfconfig, output_path, model):
     ########### test ###########
     # load model
+    # [FUNCTION DOC]
+    # Verification step: builds a fresh DDP-wrapped Megatron model from the same provider and config,
+    # loads the saved dist checkpoint into its sharded state dict (unexpected keys tolerated), then
+    # compares in both directions against the converted model's state dict: for keys present in both,
+    # asserts equal shape and exact equality (sharded tensors viewed at their local shape), printing
+    # "<name> is equal"; prints warnings for None entries or keys missing on one side.
+    # Inputs: model provider function, transformer config, checkpoint path, converted model list.
+    # Exceptions: AssertionError on any mismatch. Side effects: GPU allocation, checkpoint read, prints.
     model_test = get_model(
         model_provider_func=megatron_model_provider,
         model_type=ModelType.encoder_or_decoder,
@@ -122,6 +140,25 @@ def test_conversion(megatron_model_provider, tfconfig, output_path, model):
 def convert_checkpoint_from_transformers_to_megatron(
     hf_model, model, hf_config, layer_start_end: Optional[tuple[int, int]] = None
 ):
+    # [FUNCTION DOC]
+    # Copies weights of a Qwen2/Qwen3-MoE style HF model into one pipeline stage of a Megatron GPT model.
+    # Behavior: layer range defaults to all local decoder layers; reads PP/EP rank and size. On the first
+    # PP rank copies token embeddings. Asserts the local layer count matches the range. For each local
+    # layer (paired with HF layers in the range): input layernorm into the fused QKV layernorm weight;
+    # Q/K/V weights reshaped per KV group (Q group size = head_dim * heads / kv_heads) and concatenated
+    # along the group dimension into the fused QKV weight; same for biases when qkv_bias or
+    # attention_bias is set; q_norm/k_norm if present; output projection; post-attention layernorm into
+    # the pre-MLP layernorm; router weight from mlp.gate. Experts are sliced to this EP rank's contiguous
+    # block: with the transformers 5.x fused 3D layout, gate_up rows split into gate and up halves and
+    # concatenated as fc1, down_proj as fc2; with a module list, gate/up concatenated as fc1 and down_proj
+    # as fc2; written into grouped-GEMM parameters "weight<local idx>". Shared experts (when
+    # shared_expert_intermediate_size is set) copy gate weight, fused gate/up fc1 and down fc2. Prints a
+    # per-layer element count. On the last PP rank copies final norm and lm_head.
+    # Inputs: hf_model, model (unwrapped Megatron module), hf_config, optional (start, end) layer range.
+    # Outputs: number of elements copied on this rank. Exceptions: AssertionError/ValueError from shape or
+    # dtype mismatch, TypeError for unsupported expert containers. Runs under inference mode.
+    # KNOWN ISSUE: assumes every layer is MoE (mlp.gate / experts); dense layers are not handled.
+    # KNOWN ISSUE: lm_head is copied unconditionally, which would fail or be redundant for tied embeddings.
     if layer_start_end is None:
         layer_start_end = (0, len(model.decoder.layers))
     layer_start, layer_end = layer_start_end
@@ -239,6 +276,10 @@ def safe_copy(
     dst_tensor: torch.Tensor,
     skip_dtype_assert: bool = False,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Copies src data into dst in place after checking dtype equality (unless skipped) and shape
+    # equality. Outputs: number of elements in src. Exceptions: ValueError on dtype mismatch,
+    # AssertionError on shape mismatch. Side effects: mutates dst.
     if not skip_dtype_assert:
         if src_tensor.dtype != dst_tensor.dtype:
             raise ValueError(f"Get source dtype {src_tensor.dtype}, but target dtype {dst_tensor.dtype}")
@@ -249,6 +290,18 @@ def safe_copy(
 
 @torch.inference_mode()
 def convert_checkpoint_from_transformers_to_megatron_qwen2_5_vl(hfmodel, mgmodel, hf_config):
+    # [FUNCTION DOC]
+    # Copies a Qwen2.5-VL HF model into a Megatron VL model (single process, no PP/EP), casting both
+    # models to bfloat16. Vision tower (location depends on transformers version, before/after 4.52):
+    # rotary inv_freq (not counted), patch embedding, and per block: norm1 into QKV layernorm, norm2 into
+    # fc1 layernorm, fused QKV weight and bias reordered from (3, groups, ...) to (groups, 3, ...) layout,
+    # attention proj weight/bias, gate+up concatenated into fc1 weight/bias, down into fc2. Projector:
+    # ln_q into the vision final layernorm, merger MLP layers 0 and 2 into the projection fc1/fc2. Asserts
+    # copied elements equal the HF vision state-dict size. Language model: embeddings, and per layer
+    # input layernorm, Q/K/V weights grouped per KV group and concatenated into fused QKV (and biases),
+    # output proj, gate+up fc1, down fc2, post-attention layernorm into fc1 layernorm; final norm; lm_head
+    # when embeddings are untied (not counted). Asserts the count equals the HF language model state-dict size.
+    # Outputs: None. Exceptions: AssertionError/ValueError on mismatches. Side effects: casts both models in place.
     mgmodel = mgmodel.bfloat16()
     hfmodel = hfmodel.bfloat16()
     num_attention_heads = hf_config.num_attention_heads
@@ -362,6 +415,20 @@ def convert_checkpoint_from_transformers_to_megatron_dpskv3(
     tfconfig,
     layer_start_end: Optional[tuple[int, int]] = None,
 ):
+    # [FUNCTION DOC]
+    # Copies a DeepSeek-V3 HF model (MLA attention, MoE) into one PP stage of a Megatron model; warns that
+    # MTP layers are unsupported. Embeddings on the first PP rank. Per local layer: input layernorm; Q
+    # projection (direct if q_lora_rank is None, else down/up projections plus q_a layernorm); KV down
+    # (with MQA), KV up and kv_a layernorm; output proj. Dense layers (no router): post-attention
+    # layernorm into fc1 layernorm, gate+up fc1, down fc2. MoE layers: router weight and the
+    # e_score_correction_bias into expert_bias (dtype check skipped); experts either as grouped-GEMM
+    # parameters for this EP rank's contiguous slice, or as local_experts modules; pre-MLP layernorm;
+    # shared experts fc1/fc2. After each layer prints counts and asserts the copied count equals the HF
+    # layer's size minus the experts owned by other EP ranks (3 matrices per expert of the fc2 size).
+    # Last PP rank: final norm and, if untied, lm_head. Outputs: elements copied on this rank.
+    # KNOWN ISSUE: numel_w2 is only set in the grouped-GEMM path, so the per-layer assertion for MoE layers
+    # raises NameError (or uses a stale value) when moe_grouped_gemm is off.
+    # KNOWN ISSUE: the non-grouped-GEMM path indexes local_experts by global expert index, ignoring EP sharding.
     warnings.warn("MTP model is not supported yet", stacklevel=2)
     if layer_start_end is None:
         layer_start_end = (0, len(model.decoder.layers))
@@ -460,10 +527,15 @@ def convert_checkpoint_from_transformers_to_megatron_dpskv3(
 
 @contextmanager
 def noop_context() -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Context manager that does nothing (used instead of init_empty_weights).
     yield
 
 
 def support_distributed_convert(hf_config: AutoConfig) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns true if the HF config's architectures include DeepseekV3ForCausalLM,
+    # Qwen3MoeForCausalLM or Qwen2MoeForCausalLM.
     for arch in ["DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM", "Qwen2MoeForCausalLM"]:
         if arch in hf_config.architectures:
             return True
@@ -473,6 +545,26 @@ def support_distributed_convert(hf_config: AutoConfig) -> bool:
 def convert_hf_to_mcore(
     hf_model_path, output_path, pp_size=1, ep_size=1, use_cpu_initialization=False, test=False, trust_remote_code=False
 ):
+    # [FUNCTION DOC]
+    # Main conversion driver. Creates the output dir and returns early (with a message) if it is non-empty
+    # and not in test mode. Sets single-process torch.distributed env defaults when WORLD_SIZE is absent,
+    # initializes an NCCL process group, selects the local device; if ep_size * pp_size differs from the
+    # world size, forces pp_size to the world size. Initializes Megatron model parallel state (TP=1, CP=1)
+    # and seeds. Loads the HF config, applies the MindSpeed MLA repatch for DeepSeek-V3 when available,
+    # and rejects multi-process runs for unsupported architectures. Computes per-stage layer counts and
+    # builds the Megatron transformer config (bf16, first/last stage layer counts when applicable), then
+    # builds the Megatron model (optionally on the meta device and materialized empty on CPU). Loads the
+    # HF model in bf16 (image-text class for Qwen2.5-VL). In distributed mode converts this stage's layer
+    # range for DeepSeek-V3 or Qwen MoE, all-reduces the copied count and warns if it differs from the HF
+    # parameter count. Otherwise dispatches to the architecture-specific converter, or for other models
+    # uses verl's generic GPT loader (asserting CPU initialization is off). Saves the sharded state dict
+    # with dist_checkpointing if the output dir is still empty, then optionally runs test_conversion.
+    # Inputs: paths, pp/ep sizes, CPU-init flag, test flag, trust_remote_code. Outputs: None.
+    # Exceptions: NotImplementedError for unsupported distributed architectures; converter errors.
+    # Side effects: env vars, process group, GPU memory, checkpoint files.
+    # KNOWN ISSUE: the warnings.catch_warnings block is empty, so it suppresses nothing.
+    # KNOWN ISSUE: when ep_size * pp_size != world_size, pp_size is reset to the world size while ep_size
+    # is kept, which can still be inconsistent.
     os.makedirs(output_path, exist_ok=True)
     if len(os.listdir(output_path)) > 0 and not test:
         print(f"Output path {output_path} is not empty, skipping conversion")
@@ -529,6 +621,10 @@ def convert_hf_to_mcore(
 
     # init megatron model
     def megatron_model_provider(pre_process, post_process):
+        # [FUNCTION DOC]
+        # HELPER: Model provider for get_model: builds a verl mcore model for the given pre/post-process flags
+        # using the enclosing transformer and HF configs, sharing embeddings with output weights when tied,
+        # as a policy (non-value) model.
         from verl.models.mcore import init_mcore_model
 
         parallel_model = init_mcore_model(

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE]
+# Checkpoint utilities package. Exposes CheckpointHandler and OrchestrationMode from checkpoint_handler; the
+# FSDP/Megatron checkpoint managers live in submodules and are imported directly.
+
 from .checkpoint_handler import CheckpointHandler, OrchestrationMode
 
 __all__ = ["CheckpointHandler", "OrchestrationMode"]

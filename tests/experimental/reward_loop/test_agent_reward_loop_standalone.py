@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# GPU/Ray integration test of the reward loop with a standalone GenRM: the reward model gets its own resource
+# pool and the rollout server loads weights from disk with no trainer; the agent loop calls reward workers
+# directly so rm_scores come back with generations. Requires 8 GPUs (4 rollout + 4 RM), local models and GSM8K data.
+
 import os
 
 import ray
@@ -27,6 +32,13 @@ from verl.workers.rollout.llm_server import LLMServerManager
 
 
 def test_agent_reward_loop_standalone():
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, composes ppo_trainer config, configures async rollout (TP=2, 1 node of 4 GPUs,
+    # load_format auto) and a standalone GenRM (enable_resource_pool True, 4 GPUs, TP=2, dapo manager, gsm8k custom
+    # scorer). Creates RewardLoopManager, an LLMServerManager with no worker group, and an AgentLoopManager wired to
+    # the reward loop worker handles. Loads one 64-sample GSM8K batch, generates sequences, sums rm_scores per sample
+    # and prints them.
+    # Side effects: Ray cluster lifecycle, GPU usage, prints.
     ray.init(
         runtime_env={
             "env_vars": {

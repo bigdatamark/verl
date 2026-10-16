@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for audio support in multimodal input handling: audio placeholder expansion in RLHFDataset message
+# building, audio kwargs in build_multimodal_processor_inputs, and padding-merge of variable-length audio features
+# in extract_multi_modal_inputs.
 
 import types
 
@@ -22,6 +26,10 @@ from verl.utils.tokenizer import build_multimodal_processor_inputs
 
 
 def test_build_messages_replaces_audio_placeholder() -> None:
+    # [FUNCTION DOC]
+    # Behavior: skips if the datasets package is missing; builds an RLHFDataset without its constructor, setting
+    # prompt/image/video/audio keys and a placeholder processor, and asserts a prompt "Listen to this: <audio> and
+    # answer." with one audio path becomes text, audio (path) and text parts in order. Inputs: none. Outputs: none.
     pytest.importorskip("datasets")
     from verl.utils.dataset.rl_dataset import RLHFDataset
 
@@ -49,13 +57,24 @@ def test_build_messages_replaces_audio_placeholder() -> None:
 
 
 def test_build_multimodal_processor_inputs_includes_audio_sampling_rate() -> None:
+    # [FUNCTION DOC]
+    # Behavior: uses a fake processor exposing feature_extractor.sampling_rate 16000 that records call kwargs and
+    # returns fixed input_ids; asserts build_multimodal_processor_inputs returns the processor output and passes
+    # audio, sampling_rate 16000 (from the feature extractor) and the extra mm kwarg use_audio_in_video True.
+    # Inputs: none. Outputs: none.
     captured = {}
 
     class AudioProcessor:
+        # [CLASS DOC]
+        # HELPER: Fake audio-capable processor.
         def __init__(self):
+            # [FUNCTION DOC]
+            # HELPER: Sets feature_extractor to a namespace with sampling_rate 16000.
             self.feature_extractor = types.SimpleNamespace(sampling_rate=16000)
 
         def __call__(self, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records kwargs into captured and returns input_ids tensor [[1, 2, 3]].
             captured.update(kwargs)
             return {"input_ids": torch.tensor([[1, 2, 3]])}
 
@@ -76,10 +95,17 @@ def test_build_multimodal_processor_inputs_includes_audio_sampling_rate() -> Non
 
 
 def test_build_multimodal_processor_inputs_skips_video_kwargs_when_no_videos() -> None:
+    # [FUNCTION DOC]
+    # Behavior: with a text-only fake processor and no media, asserts no video-specific kwargs (do_sample_frames,
+    # video_metadata) are passed. Inputs: none. Outputs: none.
     captured = {}
 
     class TextOnlyProcessor:
+        # [CLASS DOC]
+        # HELPER: Fake processor with no feature extractor.
         def __call__(self, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records kwargs into captured and returns input_ids [[1, 2, 3]].
             captured.update(kwargs)
             return {"input_ids": torch.tensor([[1, 2, 3]])}
 
@@ -95,6 +121,10 @@ def test_build_multimodal_processor_inputs_skips_video_kwargs_when_no_videos() -
 
 
 def test_extract_multi_modal_inputs_merges_variable_audio_fields() -> None:
+    # [FUNCTION DOC]
+    # Behavior: merges two samples whose input_features have last dims 3 and 5 and attention masks of length 3 and 5;
+    # asserts features are right-padded with zeros to (2, 2, 5) and concatenated, masks are zero-padded to length 5
+    # and stacked, and the 1-D video_second_per_grid values are concatenated. Inputs: none. Outputs: none.
     first_features = torch.arange(6, dtype=torch.float32).view(1, 2, 3)
     second_features = torch.arange(10, dtype=torch.float32).view(1, 2, 5)
 
@@ -122,6 +152,9 @@ def test_extract_multi_modal_inputs_merges_variable_audio_fields() -> None:
 
 
 def test_extract_multi_modal_inputs_rejects_unknown_ragged_fields() -> None:
+    # [FUNCTION DOC]
+    # Behavior: asserts merging two samples with an unrecognized field of mismatched shapes raises RuntimeError
+    # mentioning the field name. Inputs: none. Outputs: none.
     with pytest.raises(RuntimeError, match="extra_audio_field"):
         extract_multi_modal_inputs(
             [

@@ -13,6 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests that AsyncRolloutRequest incrementally ("delta") tokenizes multimodal tool responses correctly: after a
+# multi-turn conversation where each tool response adds an image, the request's accumulated input_ids and
+# multi_modal_inputs must equal a full re-tokenization of the whole conversation via the chat template.
+# Requires a local Qwen2.5-VL-3B-Instruct processor under ~/models (tests skip otherwise) and network access to
+# fetch the sample images.
+
 
 import os
 
@@ -29,6 +36,18 @@ from verl.workers.rollout.schemas import (
 
 
 def _test_add_tool_response_messages_image_delta(processor, image_list, description_list, resize_image=False):
+    # [FUNCTION DOC]
+    # HELPER: Shared test body. Loads every image, optionally resizes all to the smallest width/height, builds an
+    # AsyncRolloutRequest (system prompt + user message with the first image, STRICT sanity checking, large length limits),
+    # then for each subsequent image: computes the generation prompt, adds the previous description as an assistant
+    # message, adds a tool response containing the image, and asserts the request's multi_modal_data images equal the
+    # images seen so far. When resize_image is true, every tool-response token delta must equal the first one.
+    # Finally adds the last description, re-applies the chat template to the full message list, and asserts input_ids and
+    # each multimodal input tensor (excluding input_ids/attention_mask) match the request's incremental state.
+    # Inputs: processor - HF multimodal processor; image_list - list of image spec dicts; description_list - same length
+    # list of strings; resize_image - bool.
+    # Outputs: none. Exceptions: AssertionError on mismatch (including unequal list lengths).
+    # Side effects: downloads images via process_image.
     assert len(image_list) == len(description_list)
     # Get the smallest dimensions across all images
     processed_images = []
@@ -154,6 +173,8 @@ def _test_add_tool_response_messages_image_delta(processor, image_list, descript
     reason="Processor not available for Qwen/Qwen2.5-VL-B-Instruct",
 )
 def test_add_tool_response_messages_image_delta():
+    # [FUNCTION DOC]
+    # Runs the shared delta check with three images of differing sizes (no resizing).
     processor = hf_processor(os.path.expanduser("~/models/Qwen/Qwen2.5-VL-3B-Instruct"))
 
     # From Qwen2.5-VL-3B-Instruct HF example
@@ -176,6 +197,8 @@ def test_add_tool_response_messages_image_delta():
     reason="Processor not available for Qwen/Qwen2.5-VL-B-Instruct",
 )
 def test_add_tool_response_messages_image_delta_resize_image():
+    # [FUNCTION DOC]
+    # Runs the shared delta check with images resized to a common size, also asserting constant per-turn token deltas.
     processor = hf_processor(os.path.expanduser("~/models/Qwen/Qwen2.5-VL-3B-Instruct"))
 
     # From Qwen2.5-VL-3B-Instruct HF example

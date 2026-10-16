@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Registers the "fixed_ratio" dynamic scheduling policy, whose deactivate ratio never adapts.
+
 """Built-in "fixed_ratio" dynamic scheduling policy (no adaptive ratio update)."""
 
 import ray
@@ -21,6 +24,10 @@ from .base import DynamicScheduleContext, DynamicSchedulePolicyBase, register_po
 
 @register_policy("fixed_ratio")
 class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
+    # [CLASS DOC]
+    # Policy with a constant deactivate_ratio. Always deactivates when hybrid is active; waits for
+    # ratio times step_required_samples before deactivating; activates when the generated-sample surplus is below
+    # that threshold; can ask the rollouter to rebalance requests.
     """Fixed-ratio policy: same as default but deactivate_ratio is never updated.
 
     Identical to :class:`DefaultDynamicSchedulePolicy` except that
@@ -36,6 +43,9 @@ class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
     """
 
     def __init__(self, deactivate_ratio: float = 0.3, only_hybrid: bool = False):
+        # [FUNCTION DOC]
+        # Behavior: stores ratio and only_hybrid flag; when only_hybrid, forces ratio to 1.0 and logs.
+        # Inputs: deactivate_ratio - float in (0,1]; only_hybrid - bool. Outputs: none. Side effects: print.
         self.deactivate_ratio = deactivate_ratio
         self.only_hybrid = only_hybrid
         if only_hybrid:
@@ -43,12 +53,19 @@ class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             self.deactivate_ratio = 1.0
 
     def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: returns is_hybrid_active unchanged (deactivate whenever active). Inputs: step, active flag, ctx (unused).
+        # Outputs: bool.
         return is_hybrid_active
 
     def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns the integer floor of ctx.step_required_samples times deactivate_ratio. Outputs: int.
         return int(ctx.step_required_samples * self.deactivate_ratio)
 
     def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
+        # [FUNCTION DOC]
+        # Behavior: no state change; just logs the ratio and context statistics. Outputs: none. Side effects: print.
         """No-op: deactivate_ratio is fixed and never updated."""
         print(
             f"[FixedRatioDynamicSchedulePolicy] step={global_steps} "
@@ -60,6 +77,10 @@ class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
     def should_activate_after_step(
         self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext
     ) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: returns True in only-hybrid mode. Otherwise logs context and returns whether
+        # (total_generated_samples minus expected_samples) is less than deactivate_ratio times step_required_samples.
+        # Inputs: global_steps and is_hybrid_active (unused), ctx. Outputs: bool. Side effects: prints.
         if self.only_hybrid:
             return True
 
@@ -73,6 +94,11 @@ class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         return ctx.total_generated_samples - ctx.expected_samples < self.deactivate_ratio * ctx.step_required_samples
 
     def request_rebalance(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
+        # [FUNCTION DOC]
+        # Behavior: if no rollouter reference was injected, logs and returns. Otherwise blocking-calls the rollouter's
+        # rebalance_requests and logs the number of cleared sticky entries and server loads from the result mapping.
+        # Inputs: global_steps (logging), ctx (unused). Outputs: none.
+        # Exceptions: any exception from the remote call is caught and logged.
         """Redistribute requests across all active replicas after activation."""
         if not hasattr(self, "_rollouter") or self._rollouter is None:
             print("[FixedRatioDynamicSchedulePolicy] request_rebalance skipped: no rollouter reference available")

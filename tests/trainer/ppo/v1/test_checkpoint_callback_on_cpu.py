@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests for PPOTrainer._save_checkpoint's interaction with the CheckpointCallback hook: on_save must fire
+# only after the worker group save succeeds, receive the async_save flag, not fire on worker failure, and
+# callback exceptions must propagate. Uses a trainer created without __init__ and mocked workers.
+
 import os
 from unittest.mock import MagicMock
 
@@ -23,23 +28,41 @@ from verl.trainer.ppo.v1.trainer_base import PPOTrainer
 
 
 class _StubTrainer(PPOTrainer):
+    # [CLASS DOC]
+    # HELPER: concrete PPOTrainer subclass implementing the abstract on_step_end/on_sample_end hooks as no-ops.
     def on_step_end(self):
+        # [FUNCTION DOC]
+        # HELPER: no-op.
         pass
 
     def on_sample_end(self):
+        # [FUNCTION DOC]
+        # HELPER: no-op.
         pass
 
 
 class _RecordingCallback(CheckpointCallback):
+    # [CLASS DOC]
+    # HELPER: CheckpointCallback that records on_save invocations into a shared events list.
     def __init__(self, config=None, events=None):
+        # [FUNCTION DOC]
+        # HELPER: calls the parent constructor with config and stores events (new empty list if None).
         super().__init__(config=config)
         self.events = events if events is not None else []
 
     def on_save(self, trainer, global_step, checkpoint_dir, async_save=False, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: appends a tuple ("on_save", global_step, checkpoint_dir, async_save) to events; extra kwargs ignored.
         self.events.append(("on_save", global_step, checkpoint_dir, async_save))
 
 
 def _make_trainer(tmp_path, events, async_save=False):
+    # [FUNCTION DOC]
+    # HELPER: builds a _StubTrainer via __new__ (no init) in sync mode at global step 3 without critic; config
+    # points default_local_dir at tmp_path, resume "auto", no hdfs, no custom callback class, and actor
+    # checkpoint async_save as given. Attaches a _RecordingCallback, a mocked actor_rollout_wg whose
+    # save_checkpoint appends ("wg_save",) to events, and a mocked dataloader with an empty state_dict.
+    # Inputs: tmp_path, events list, async_save bool. Outputs: the trainer.
     trainer = _StubTrainer.__new__(_StubTrainer)
     trainer.trainer_mode = "sync"
     trainer.global_steps = 3
@@ -67,6 +90,9 @@ def _make_trainer(tmp_path, events, async_save=False):
 
 
 def test_save_fires_on_save_after_worker_save(tmp_path):
+    # [FUNCTION DOC]
+    # Asserts event order is worker save then on_save(3, <tmp>/global_step_3, False), and that the tracker file
+    # latest_checkpointed_iteration.txt contains "3". Side effects: writes files under tmp_path.
     events = []
     trainer = _make_trainer(tmp_path, events)
 
@@ -83,6 +109,8 @@ def test_save_fires_on_save_after_worker_save(tmp_path):
 
 
 def test_async_save_fires_on_save_with_flag(tmp_path):
+    # [FUNCTION DOC]
+    # With async_save, asserts the last event is on_save with flag True and that the tracker file is NOT written.
     events = []
     trainer = _make_trainer(tmp_path, events, async_save=True)
 
@@ -94,6 +122,8 @@ def test_async_save_fires_on_save_with_flag(tmp_path):
 
 
 def test_on_save_not_fired_on_worker_failure(tmp_path):
+    # [FUNCTION DOC]
+    # Worker save raises RuntimeError; asserts it propagates and no events were recorded.
     events = []
     trainer = _make_trainer(tmp_path, events)
     trainer.actor_rollout_wg.save_checkpoint.side_effect = RuntimeError("save failed")
@@ -105,6 +135,8 @@ def test_on_save_not_fired_on_worker_failure(tmp_path):
 
 
 def test_callback_exception_propagates(tmp_path):
+    # [FUNCTION DOC]
+    # Replaces on_save with a mock raising RuntimeError; asserts the error propagates out of _save_checkpoint.
     events = []
     trainer = _make_trainer(tmp_path, events)
     trainer.checkpoint_callback.on_save = MagicMock(side_effect=RuntimeError("callback failed"))

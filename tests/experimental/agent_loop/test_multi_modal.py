@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# GPU integration tests of the agent loop with multimodal inputs on Qwen3.5-2B:
+# a tool agent whose tool returns generated images, and a single-turn agent over
+# text, image and (unless ROLLOUT_NAME is sglang) video prompts. Requires env
+# ROLLOUT_NAME, local model and test video under ~/models.
+
 import json
 import os
 from typing import Any
@@ -36,6 +43,9 @@ ROLLOUT_SUPPORTS_VIDEO = os.getenv("ROLLOUT_NAME", "vllm") != "sglang"
 
 
 def parse_multi_modal_type(messages: list[dict]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: classifies a conversation by its last message: "text" if content is a
+    # string, otherwise the type of the first image/video content part, else "text".
     message = messages[-1]
     if isinstance(message["content"], str):
         return "text"
@@ -51,6 +61,12 @@ def parse_multi_modal_type(messages: list[dict]) -> str:
 
 @pytest.fixture
 def init_config() -> DictConfig:
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture composing Hydra ppo_trainer (cwd-relative config dir)
+    # with dynamic batch size and FSDP param/optimizer offload, then setting model
+    # path, rollout name from ROLLOUT_NAME, async mode, eager, prompt/response length
+    # 10240/4096, n=4, seed 0, 2 agent workers and skip_tokenizer_init.
+    # Exceptions: KeyError if ROLLOUT_NAME unset.
     from hydra import compose, initialize_config_dir
 
     with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
@@ -80,7 +96,15 @@ def init_config() -> DictConfig:
 
 
 class ImageGeneratorTool(BaseTool):
+    # [CLASS DOC]
+    # HELPER: test tool producing a synthetic PIL image; its OpenAI schema is derived
+    # from generate_image's signature and docstring.
     def generate_image(self, description: str, size: str = "256x256"):
+        # [FUNCTION DOC]
+        # HELPER: parses size "WxH", picks red/blue/green by keyword in the description
+        # (else gray), fills an RGB image and paints 20x20 white squares on a 50-pixel
+        # grid. Returns the image. Exceptions: ValueError on malformed size.
+        # Side effects: prints a debug line.
         """Generate a simple image based on description.
 
         Args:
@@ -118,10 +142,16 @@ class ImageGeneratorTool(BaseTool):
         return image
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
+        # [FUNCTION DOC]
+        # HELPER: builds the OpenAI function schema from generate_image via transformers get_json_schema.
         schema = get_json_schema(self.generate_image)
         return OpenAIFunctionToolSchema(**schema)
 
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
+        # [FUNCTION DOC]
+        # HELPER: async; calls generate_image with the parameters and returns
+        # (ToolResponse with the image list, reward 0, empty metrics); on any exception
+        # returns a ToolResponse with the error text instead.
         try:
             image = self.generate_image(**parameters)
             # Return the PIL Image directly - the framework should handle the conversion
@@ -131,6 +161,17 @@ class ImageGeneratorTool(BaseTool):
 
 
 def test_multimodal_tool_agent(init_config):
+    # [FUNCTION DOC]
+    # Behavior: restarts Ray, sets a custom tool-calling chat template read from
+    # qwen_vl_tool_chat_template.jinja2 next to this file, writes a tool config with
+    # ImageGeneratorTool to /tmp/multimodal_tool_config.json, sets n=2, one parallel
+    # call and one user turn, prompt_length 65536, builds the agent loop manager and
+    # generates for 4 (or 5 with video) prompts repeated n times via the tool agent.
+    # Asserts: output count; video samples have video inputs and 2 or 4 turns; the
+    # plain chat prompt has 2 turns; tool prompts have 4 turns and image inputs;
+    # response_mask excludes tool_response tags. Prints responses.
+    # Side effects: Ray lifecycle, writes /tmp file, GPU use.
+    # KNOWN ISSUE: the final image_found_count >= 0 assertion is always true, so image presence is never actually checked.
     """Test agent loop with multimodal tool that returns images using Qwen VL model."""
     ray.shutdown()
     ray.init(
@@ -310,6 +351,14 @@ def test_multimodal_tool_agent(init_config):
 
 
 def test_multimodal_single_turn_agent(init_config):
+    # [FUNCTION DOC]
+    # Behavior: restarts Ray, sets n=2, prompt_length 65536, builds the manager and
+    # runs the single-turn agent on text, image, system+image and optional video
+    # prompts. Asserts output count, every sample has 2 turns, response and mask
+    # shapes match, position_ids are (batch, 4, seq_len) (mrope), and multimodal
+    # inputs match each prompt's type (none for text, pixel_values/image_grid_thw for
+    # images, video keys for video). Prints prompts and responses.
+    # KNOWN ISSUE: image_pad_count is never incremented and has_image_pad is never asserted, so the image-pad check is only printed.
     """Test single turn agent loop with multimodal inputs using Qwen VL model."""
     ray.shutdown()
     ray.init(

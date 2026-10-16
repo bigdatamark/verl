@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# End-to-end NPU (Ascend) correctness tests for checkpoint engines: sync weights
+# from FSDP trainer workers to mock rollout workers via a backend and verify the
+# received weights equal the HF checkpoint. Requires 8 NPUs and a local Qwen3-8B.
+# Running as a script invokes the HCCL test with a model under HDFS_ROOT.
+
 import os
 
 import pytest
@@ -44,6 +51,19 @@ async def test_hccl_checkpoint_engine(
     check_allclose=True,
     model_path="~/models/Qwen/Qwen3-8B-Base",
 ):
+    # [FUNCTION DOC]
+    # Behavior: tests the collective backend on NPU (HCCL env vars) with 2 trainer
+    # / 6 rollout ranks and bucket sizes 3072MB and 128MB (128MB forces chunked
+    # transfer of weights larger than a bucket); passes rebuild_group to the engine.
+    # Flow: ray.init with backend-specific env vars; build CheckpointEngineConfig,
+    # HFModelConfig (remove padding) and a vllm RolloutConfig; make a resource pool of
+    # num_gpus_per_node x num_nodes (max colocate 3), split it into trainer and
+    # rollout pools; create trainer and rollout worker groups (see test_utils);
+    # create a CheckpointEngineManager and 3 times: update_weights then
+    # check_weights on the rollout group (compares against the HF model). ray.shutdown at end.
+    # Outputs: none. Exceptions: AssertionError on weight mismatch; Ray/backend errors.
+    # Side effects: starts/stops Ray, allocates devices, loads model from model_path (~ expanded).
+    # KNOWN ISSUE: named "hccl" but configures backend "nccl" (presumably mapped to HCCL on NPU by the engine).
     model_path = os.path.expanduser(model_path)
     ray.init(
         runtime_env={
@@ -96,6 +116,16 @@ async def test_kimi_checkpoint_engine(
     check_allclose=True,
     model_path="~/models/Qwen/Qwen3-8B-Base",
 ):
+    # [FUNCTION DOC]
+    # Behavior: same flow for backend "kimi_ckpt_engine" (default bucket size). Skipped in CI.
+    # Flow: ray.init with backend-specific env vars; build CheckpointEngineConfig,
+    # HFModelConfig (remove padding) and a vllm RolloutConfig; make a resource pool of
+    # num_gpus_per_node x num_nodes (max colocate 3), split it into trainer and
+    # rollout pools; create trainer and rollout worker groups (see test_utils);
+    # create a CheckpointEngineManager and 3 times: update_weights then
+    # check_weights on the rollout group (compares against the HF model). ray.shutdown at end.
+    # Outputs: none. Exceptions: AssertionError on weight mismatch; Ray/backend errors.
+    # Side effects: starts/stops Ray, allocates devices, loads model from model_path (~ expanded).
     model_path = os.path.expanduser(model_path)
     ray.init(
         runtime_env={
@@ -146,6 +176,17 @@ async def test_mooncake_checkpoint_engine(
     check_allclose=True,
     model_path="~/models/Qwen/Qwen3-8B-Base",
 ):
+    # [FUNCTION DOC]
+    # Behavior: same flow for backend "mooncake" with engine kwarg device="npu" and
+    # ASCEND_USE_SHORT_CONNECTION env. Skipped in CI.
+    # Flow: ray.init with backend-specific env vars; build CheckpointEngineConfig,
+    # HFModelConfig (remove padding) and a vllm RolloutConfig; make a resource pool of
+    # num_gpus_per_node x num_nodes (max colocate 3), split it into trainer and
+    # rollout pools; create trainer and rollout worker groups (see test_utils);
+    # create a CheckpointEngineManager and 3 times: update_weights then
+    # check_weights on the rollout group (compares against the HF model). ray.shutdown at end.
+    # Outputs: none. Exceptions: AssertionError on weight mismatch; Ray/backend errors.
+    # Side effects: starts/stops Ray, allocates devices, loads model from model_path (~ expanded).
     model_path = os.path.expanduser(model_path)
     ray.init(
         runtime_env={

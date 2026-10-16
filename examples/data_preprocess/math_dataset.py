@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script converting DigitalLearningGmbH/MATH-lighteval (mirror of lighteval/MATH) into
+# verl RL parquet. Prompt = problem + "\boxed{}" instruction; ground truth is the content of
+# the last \boxed{} in the reference solution. Writes train/test parquet plus one JSON example
+# per split (train_example.json, test_example.json) to the tilde-expanded save dir
+# (default ~/data/math), optionally copying to HDFS.
+# KNOWN ISSUE: the save dir is not created before writing.
 """
 Preprocess the MATH-lighteval dataset to parquet format
 """
@@ -26,6 +33,9 @@ from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_b
 
 
 def extract_solution(solution_str):
+    # [FUNCTION DOC]
+    # HELPER: Returns the inner text of the last \boxed{...} expression in a solution string, using
+    # verl's math_reward helpers. May raise if no boxed answer is present (remove_boxed receives None).
     return remove_boxed(last_boxed_only_string(solution_str))
 
 
@@ -61,7 +71,12 @@ if __name__ == "__main__":
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
+        # [FUNCTION DOC]
+        # Returns a process_fn closure bound to the split name.
         def process_fn(example, idx):
+            # [FUNCTION DOC]
+            # Pops problem and solution, builds the prompt, extracts the boxed answer, and returns the
+            # record with ability "math", rule reward, and extra_info {split, index}.
             question = example.pop("problem")
 
             question = question + " " + instruction_following

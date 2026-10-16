@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Detached-worker demo client script (not a pytest test). Connects to an already running Ray cluster
+# (namespace "verl"), reattaches to the detached Trainer workers started by server.py by their actor names,
+# builds a random CUDA batch and calls the remote train_model, printing the result.
+# Side effects (when run as main): ray.init to an existing cluster, allocates CUDA tensors, triggers remote training.
+
 """
 In client, we can get the server handler and send RPC request
 """
@@ -25,6 +32,12 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 
 
 def compute_position_id_with_mask(mask):
+    # [FUNCTION DOC]
+    # HELPER: Derives position ids from an attention mask.
+    # Behavior: cumulative sum of the mask along the last dimension minus one, clipped to a minimum of 0.
+    # Inputs: mask - integer/bool tensor of shape (..., seq_len) with 1 for valid tokens.
+    # Outputs: tensor of same shape with positions (0 for left padding positions and the first valid token).
+    # Exceptions/side effects: none.
     return torch.clip(torch.cumsum(mask, dim=-1) - 1, min=0, max=None)
 
 

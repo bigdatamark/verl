@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Registers the "dapo" reward manager: rule-based score with optional DAPO overlong-response penalty.
+
 import inspect
 
 from verl import DataProto
@@ -22,9 +25,16 @@ from verl.utils.reward_score import default_compute_score
 
 @register("dapo")
 class DAPORewardManager(RewardManagerBase):
+    # [CLASS DOC]
+    # Reward manager that scores the last sequence of a sample and optionally adds a linear overlong penalty.
     """DAPO Reward Manager."""
 
     def __init__(self, config, tokenizer, compute_score, reward_router_address=None, reward_model_tokenizer=None):
+        # [FUNCTION DOC]
+        # Behavior: calls base init; uses the given compute_score or the default one; records whether it is a coroutine;
+        # reads overlong_buffer_cfg and max_resp_len from reward.reward_kwargs; stores router address and RM tokenizer. When
+        # the overlong buffer is enabled asserts max_resp_len is set, at least the buffer length, and the buffer length is
+        # positive. Exceptions: AssertionError on invalid overlong config.
         super().__init__(config, tokenizer, compute_score)
         self.compute_score = compute_score or default_compute_score
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
@@ -50,6 +60,15 @@ class DAPORewardManager(RewardManagerBase):
             )
 
     async def run_single(self, data: DataProto) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: takes the last item; decodes valid response tokens (in an executor, skipping special tokens); gathers
+        # data_source, ground truth and extra_info; passes router address and RM tokenizer only if a router exists; awaits
+        # the score function (directly if async, else in an executor). A mapping result supplies "score" and all its entries
+        # become extra info; a scalar becomes both score and "acc". If overlong penalty is enabled, adds
+        # min(-(valid length - (max_resp_len - buffer len)) / buffer len * penalty factor, 0), logging overlong_reward and an
+        # overlong flag when configured.
+        # Inputs: DataProto with responses, attention_mask, data_source, reward_model.ground_truth. Outputs: mapping with
+        # reward_score and reward_extra_info.
         data = data[-1:]  # for multi-sequence outputs, we only compute reward based on the last sequence
         data_item = data[0]
         response_ids = data_item.batch["responses"]

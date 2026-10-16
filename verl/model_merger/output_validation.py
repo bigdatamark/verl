@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Validation of a model merger output directory: checks that it holds a valid config.json and a complete set of
+# HuggingFace weights (single-file or sharded with an index).
+
 import json
 from pathlib import Path, PurePosixPath
 
@@ -21,10 +25,16 @@ _WEIGHT_INDEX_NAMES = ("model.safetensors.index.json", "pytorch_model.bin.index.
 
 
 def _is_nonempty_file(path: Path) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns true if path is an existing regular file with size greater than zero.
     return path.is_file() and path.stat().st_size > 0
 
 
 def _safe_shard_path(target_dir: Path, shard_name: str) -> Path | None:
+    # [FUNCTION DOC]
+    # HELPER: Resolves a shard filename from an index's weight_map under target_dir safely.
+    # Behavior: treats the name as a POSIX path; rejects absolute paths, empty paths, or any containing "..".
+    # Outputs: the joined path under target_dir, or None if unsafe.
     shard_path = PurePosixPath(shard_name)
     if shard_path.is_absolute() or not shard_path.parts or ".." in shard_path.parts:
         return None
@@ -32,6 +42,16 @@ def _safe_shard_path(target_dir: Path, shard_name: str) -> Path | None:
 
 
 def validate_hf_model_output(target_dir: str | Path) -> None:
+    # [FUNCTION DOC]
+    # Behavior: collects errors: config.json must exist, be non-empty, and parse as a JSON object. Weights are complete
+    # if model.safetensors or pytorch_model.bin is a non-empty file, or if any existing index file
+    # (safetensors/bin index json) parses, has a non-empty dict weight_map whose values are non-empty strings, all
+    # shard paths are safe, and every referenced shard is a non-empty file. Index problems are only reported when no
+    # complete weights were found, followed by a summary "no complete model weights" message.
+    # Inputs: target_dir - path (string or Path) of the merged model.
+    # Outputs: none.
+    # Exceptions: RuntimeError listing all collected errors joined by "; " if any.
+    # Side effects: reads files from disk.
     """Raise when a model merger output is not a complete Hugging Face model."""
     target_dir = Path(target_dir)
     errors = []

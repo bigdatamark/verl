@@ -12,3 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Package for agent-loop tools: base tool class, OpenAI-style schemas, decorator-based function tools,
+# and a registry that loads tools from yaml config / python files. No code in this file.

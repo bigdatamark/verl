@@ -1,4 +1,8 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
+# [MODULE DOC]
+# AMD ROCm/HIP implementation registered under the name amd; subclasses the CUDA platform because ROCm PyTorch exposes the
+# device as cuda.
+
 """AMD ROCm/HIP platform implementation.
 
 ROCm is largely CUDA-compatible: PyTorch on ROCm reuses the ``torch.cuda.*``
@@ -19,15 +23,27 @@ from .platform_manager import PlatformRegistry
 
 @PlatformRegistry.register(platform="amd")
 class PlatformROCm(PlatformCUDA):
+    # [CLASS DOC]
+    # ROCm platform. Inherits everything from the CUDA platform (device_name stays cuda, CUDA_VISIBLE_DEVICES, nccl backend,
+    # GPU Ray resource) and overrides vendor name, detection, rollout env vars and Ray no-set env vars.
     """Platform backend for AMD ROCm/HIP GPUs (reuses PlatformCUDA where compatible)."""
 
     @property
     def vendor_name(self) -> str:
+        # [FUNCTION DOC]
+        # Outputs: amd.
         # NOTE: device_name stays 'cuda' on purpose — PyTorch ROCm exposes the
         # device type string as "cuda" (torch.device("cuda") works via hipify).
         return "amd"
 
     def is_platform_available(self, use_smi_check=False) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: False if torch has no cuda attribute or is not a HIP build. With use_smi_check, locate rocm-smi on PATH or
+        # /usr/bin, /usr/local/bin, /opt/rocm/bin; return False if absent, True if it runs successfully; else fall back to
+        # torch.cuda.is_available().
+        # Outputs: bool. Side effects: may spawn rocm-smi.
+        # KNOWN ISSUE: same as the CUDA variant, the comment says a built torch.cuda is sufficient when the SMI tool is missing,
+        # but the code returns False in that case.
         if not hasattr(torch, "cuda"):
             return False
         # Only ROCm (HIP) torch builds qualify as the AMD platform.
@@ -58,6 +74,8 @@ class PlatformROCm(PlatformCUDA):
         return torch.cuda.is_available()
 
     def rollout_env_vars(self) -> dict[str, str]:
+        # [FUNCTION DOC]
+        # Outputs: the CUDA rollout env vars plus SGLANG_USE_AITER (current env value, default 1) to route SGLang kernels via AITER.
         # Extend CUDA's rollout env vars with ROCm-specific ones. SGLANG_USE_AITER
         # routes SGLang's non-attention kernels (RMSNorm/RoPE/MoE/quant) through AITER.
         # Default to "1" but honor an explicit user override (e.g. SGLANG_USE_AITER=0
@@ -68,6 +86,8 @@ class PlatformROCm(PlatformCUDA):
         }
 
     def ray_noset_envvars(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Outputs: CUDA no-set var list plus the HIP_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES no-set variables.
         # On ROCm, HIP_VISIBLE_DEVICES takes precedence over CUDA_VISIBLE_DEVICES,
         # and ROCR_VISIBLE_DEVICES is also relevant, so tell Ray not to manage them.
         return super().ray_noset_envvars() + [

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Helpers for the "separation" experimental trainer that decouples training (actor/critic/ref) from rollout.
+# Builds the Ray resource-pool manager and the role -> worker-class mapping used by the separated trainer.
+
 
 import ray
 
@@ -20,6 +24,15 @@ from verl.trainer.ppo.utils import Role, need_reference_policy
 
 
 def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
+    # [FUNCTION DOC]
+    # Behavior: builds a resource pool spec for training roles only. If any of Actor, ActorRollout, Critic or RefPolicy
+    # is in roles, validates trainer GPU/node counts and creates a single "trainer_pool" (n_gpus_per_node repeated nnodes
+    # times), mapping every present training role to it. For Rollout and RewardModel it only validates their gpu/node
+    # counts (> 0); no pools are created for them here (they are managed elsewhere).
+    # Inputs: config - full trainer config (trainer.*, rollout.*, reward.reward_model.*); roles - list of Role values.
+    # Outputs: a ResourcePoolManager built from the spec and role->pool mapping.
+    # Exceptions: AssertionError when a required n_gpus_per_node / nnodes is not positive.
+    # Side effects: none.
     """
     Create resource pool manager
 
@@ -60,6 +73,15 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
 
 
 def create_role_worker_mapping(config):
+    # [FUNCTION DOC]
+    # Behavior: lazily imports worker classes and returns the role->Ray-remote-class mapping. The training role is
+    # Role.Actor by default, or Role.ActorRollout when async_training.use_trainer_do_validate or
+    # async_training.use_dynamic_resource_scheduling is enabled; it maps to DetachActorWorker. Critic maps to
+    # TrainingWorker. RefPolicy (DetachActorWorker) is added only when need_reference_policy(config) is true.
+    # Inputs: config - trainer config (optional async_training section).
+    # Outputs: tuple (mapping from Role to ray.remote-wrapped class, RayWorkerGroup class).
+    # KNOWN ISSUE: docstring says it returns a dict, but it actually returns a (dict, worker-group class) tuple.
+    # Side effects: none.
     """
     Create mapping from roles to worker classes
 

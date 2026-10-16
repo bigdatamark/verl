@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# GPU Ray benchmark-style test of large DataProto transfer to a data-parallel worker group using one worker per
+# visible GPU: measures pickling, parallel ray.put, launch and get times, and checks each worker incremented data.
+
 """
 In this test, we instantiate a data parallel worker with N GPUs (auto-detected).
 """
@@ -32,12 +37,21 @@ from verl.utils.ray_utils import parallel_put
 
 @ray.remote
 class DummyWorker(Worker):
+    # [CLASS DOC]
+    # HELPER: Ray worker that initializes torch.distributed and echoes data incremented by 1.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Calls base Worker init then initializes the default process group from env.
+        # Side effects: global distributed init.
         super().__init__()
         dist.init_process_group()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def do_nothing(self, data):
+        # [FUNCTION DOC]
+        # HELPER: DP_COMPUTE, non-blocking. Adds 1 in place to every tensor in data.batch; with tensordict >= 0.5.0
+        # consolidates the batch into contiguous storage before returning.
+        # Inputs: data - DataProto shard (here the pre-chunked object ref). Outputs: the mutated DataProto.
         for key in data.batch.keys():
             data.batch[key] += 1
         if version.parse(tensordict.__version__) >= version.parse("0.5.0"):
@@ -46,6 +60,11 @@ class DummyWorker(Worker):
 
 
 def test_data_transfer():
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, creates a group over all GPUs, builds 2 random int tensors of 4096 x 32768, chunks the
+    # DataProto per worker (consolidating batches for new tensordict), times cloudpickle and pickle dumps,
+    # parallel_put of chunks, the non-blocking call and ray.get, then asserts every output equals input + 1 per key.
+    # Exceptions: AssertionError on mismatch. Side effects: heavy memory use, timing prints, starts/stops Ray.
     ray.init()
     # construct resource pool
     ngpus = torch.cuda.device_count()

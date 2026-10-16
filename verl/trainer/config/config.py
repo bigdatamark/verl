@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Shared dataclass configs used across trainer and workers: checkpoint, profiling, hybrid rollout GPU-switch, base model, and external module configs. __all__ omits ModuleConfig although it is public.
+
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -22,6 +25,8 @@ __all__ = ["CheckpointConfig", "ProfileConfig", "HybridRolloutSwitchConfig", "Ba
 
 @dataclass
 class CheckpointConfig(BaseConfig):
+    # [CLASS DOC]
+    # Backend-agnostic checkpoint settings: contents to save and to load (both default model, optimizer, extra), async save flag, strict export validation flag, LoRA-only save flag. Plain fields.
     """Configuration for model checkpointing.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -53,6 +58,8 @@ class CheckpointConfig(BaseConfig):
 
 @dataclass
 class ProfileConfig(BaseConfig):
+    # [CLASS DOC]
+    # Profiler settings: ranks to profile (None means all), start/end step (-1 default), output path. Plain fields.
     """Configuration for profiling.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -72,6 +79,8 @@ class ProfileConfig(BaseConfig):
 
 @dataclass
 class HybridRolloutSwitchConfig(BaseConfig):
+    # [CLASS DOC]
+    # Settings for lending idle trainer GPUs to rollout: enable flag, switch threshold ratio, adaptive-threshold flag with step up/down amounts, release steps, and switch cost averaging window size. Validated in post-init.
     """Configuration for lending idle trainer GPUs to rollout between training steps."""
 
     enable_switch: bool = False
@@ -83,6 +92,8 @@ class HybridRolloutSwitchConfig(BaseConfig):
     switch_cost_window_size: int = 3
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: validates fields after dataclass init. Exceptions: ValueError if switch_threshold_ratio is not in the half-open interval (0, 1], or switch_cost_window_size is not positive. Side effects: none.
         if not 0.0 < self.switch_threshold_ratio <= 1.0:
             raise ValueError(f"switch_threshold_ratio must be in (0, 1], got {self.switch_threshold_ratio}")
         if self.switch_cost_window_size <= 0:
@@ -91,6 +102,8 @@ class HybridRolloutSwitchConfig(BaseConfig):
 
 @dataclass
 class BaseModelConfig(BaseConfig):
+    # [CLASS DOC]
+    # Base pretrained model settings: weights path, optional tokenizer path, HF config overrides, optional external model lib, trust_remote_code flag, LoRA settings dict. Plain fields.
     """Base configuration for a model.
     Contains core settings for loading and initializing a pretrained model checkpoint.
 
@@ -113,6 +126,8 @@ class BaseModelConfig(BaseConfig):
 
 @dataclass
 class ModuleConfig(BaseConfig):
+    # [CLASS DOC]
+    # Points to an external Python module file (path) and optional importable module name; when name is None the module is loaded under a hashed name and not registered in sys.modules. Plain fields.
     """Configuration for external Python module, which can be loaded, executed (and optionally, ``import``ed).
 
     Args:

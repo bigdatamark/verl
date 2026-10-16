@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CLI checker used by e2e scripts: scans a training log for lines starting with "step", extracts the critic/rewards/mean
+# metric from each, and asserts the best value exceeds --target (default 0.2). Prints the best reward and "Check passes".
+# Exceptions: AssertionError (exit non-zero) when the target is not exceeded.
+
 import argparse
 
 import numpy as np
@@ -19,6 +24,10 @@ import numpy as np
 
 def extract_reward_from_line(line):
     # TODO: this function needs error handling
+    # [FUNCTION DOC]
+    # HELPER: Parses a metrics line formatted as "key:value" pairs separated by " - ".
+    # Outputs: the float value of key "critic/rewards/mean", or negative infinity if absent or if any parsing error occurs
+    # (e.g. a pair without exactly one colon, which aborts the whole line). Exceptions: none (all swallowed).
     try:
         key_vals = line.split(" - ")
         for key_val in key_vals:

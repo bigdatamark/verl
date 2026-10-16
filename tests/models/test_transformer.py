@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# GPU/NPU tests checking that remove-padding (varlen flash attention on packed sequences) forwards of randomly
+# initialized 1-layer HF models (Llama, Mistral, Gemma, Qwen2, Apertus in test_configs) match padded forwards, plus
+# attn_implementation override config checks. Padding utilities come from flash_attn on CUDA or verl's own on NPU.
+
 import torch
 from transformers import (
     ApertusConfig,
@@ -45,6 +50,11 @@ test_configs = [
 
 
 def test_hf_casual_models():
+    # [FUNCTION DOC]
+    # Behavior: for each config builds a bf16 flash-attention causal LM on the device, makes random ids (4 x 128) with a
+    # random left-padded mask and position ids, unpads ids and positions, runs a packed forward and a padded forward
+    # (then unpads its logits), computes per-token response log-probs (response length 127) from both, and asserts their
+    # masked means agree (atol 1e-2). Prints "Check pass".
     batch_size = 4
     seqlen = 128
     response_length = 127
@@ -115,6 +125,10 @@ def test_hf_casual_models():
 
 
 def test_hf_value_models():
+    # [FUNCTION DOC]
+    # Behavior: same comparison for single-label token-classification (value) models with dropout disabled: packed
+    # logits are re-padded and the masked mean of values must match the padded forward (atol 1e-2).
+    # Side effects: mutates the shared module-level configs (num_labels, dropout fields).
     batch_size = 4
     seqlen = 128
 
@@ -170,6 +184,10 @@ def test_hf_value_models():
 
 
 def test_attn_implementation_override():
+    # [FUNCTION DOC]
+    # Behavior: asserts that looking up "attn_implementation" in override dicts with default "flash_attention_2" returns
+    # the expected value for several cases, and that LlamaConfig stores a provided _attn_implementation.
+    # KNOWN ISSUE: only re-implements the dictionary lookup locally; it does not exercise any verl worker code.
     """Test that attn_implementation override config is properly respected."""
     # Test case 1: Test the actual extraction logic (no network required)
     test_cases = [
@@ -205,6 +223,10 @@ def test_attn_implementation_override():
 
 
 def test_fsdp_worker_attn_implementation_integration():
+    # [FUNCTION DOC]
+    # Behavior: re-checks the same override lookup for "eager" and empty configs and loops over a locally constructed
+    # expected-calls list asserting it carries "eager".
+    # KNOWN ISSUE: tautological; no FSDP worker code is invoked despite the name.
     """Test integration of attn_implementation with FSDP worker logic."""
 
     # Mock the FSDP worker configuration scenario

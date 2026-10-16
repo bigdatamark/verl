@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Module base: the DynamicSchedulePolicyBase interface, the DynamicScheduleContext dataclass passed to every policy
+# call, and a module-level registry mapping policy names to classes.
+
 """Policy base class and registry.
 
 Custom policy example::
@@ -37,9 +41,14 @@ _policy_registry: dict[str, type["DynamicSchedulePolicyBase"]] = {}
 
 
 def register_policy(name: str):
+    # [FUNCTION DOC]
+    # Behavior: returns a class decorator that registers the class under name (overwriting duplicates) and returns it.
+    # Side effects: mutates the registry.
     """Decorator: register a DynamicSchedulePolicyBase subclass under *name*."""
 
     def decorator(cls: type["DynamicSchedulePolicyBase"]) -> type["DynamicSchedulePolicyBase"]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: stores cls in the registry and returns it.
         _policy_registry[name] = cls
         return cls
 
@@ -47,6 +56,9 @@ def register_policy(name: str):
 
 
 def build_policy(name: str, **kwargs) -> "DynamicSchedulePolicyBase":
+    # [FUNCTION DOC]
+    # Behavior: instantiates the policy registered under name with the given keyword arguments.
+    # Outputs: policy instance. Exceptions: KeyError listing registered names when unknown.
     """Instantiate a registered policy by name, forwarding **kwargs to its __init__."""
     if name not in _policy_registry:
         raise KeyError(f"Unknown dynamic scheduling policy '{name}'. Registered: {list(_policy_registry.keys())}")
@@ -55,6 +67,10 @@ def build_policy(name: str, **kwargs) -> "DynamicSchedulePolicyBase":
 
 @dataclass
 class DynamicScheduleContext:
+    # [CLASS DOC]
+    # Dataclass of scheduling inputs: static run config (required_samples, trigger_parameter_sync_step), per-step state
+    # (cumulative generated, expected and buffer sample counts, per-collection wait times and waited sample counts,
+    # only_hybrid flag), last activate/deactivate durations, and derived step_required_samples.
     """Unified context for all dynamic scheduling policy decisions and state updates.
 
     Combines static training-run configuration (constant across a run) with
@@ -103,10 +119,14 @@ class DynamicScheduleContext:
     step_required_samples: int = field(init=False)
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: computes step_required_samples as required_samples times trigger_parameter_sync_step. Side effects: sets the field.
         self.step_required_samples = self.required_samples * self.trigger_parameter_sync_step
 
 
 class DynamicSchedulePolicyBase(ABC):
+    # [CLASS DOC]
+    # Abstract scheduling policy; see docstring for per-step call order. Stateless by default; subclasses may keep state.
     """Abstract base class for dynamic resource scheduling policies.
 
     Subclasses must implement :meth:`should_deactivate` and
@@ -123,6 +143,8 @@ class DynamicSchedulePolicyBase(ABC):
 
     @abstractmethod
     def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: abstract; decide whether to deactivate hybrid replicas before training. Outputs: bool.
         """Return True to trigger deactivation this step, False to keep hybrid active.
 
         Args:
@@ -133,6 +155,8 @@ class DynamicSchedulePolicyBase(ABC):
 
     @abstractmethod
     def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
+        # [FUNCTION DOC]
+        # Behavior: abstract; minimum buffered sample count to wait for before deactivation. Outputs: int.
         """Return the minimum buffered-sample count before deactivation proceeds.
 
         Args:
@@ -140,6 +164,8 @@ class DynamicSchedulePolicyBase(ABC):
         """
 
     def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:  # noqa: B027
+        # [FUNCTION DOC]
+        # Behavior: optional hook after weight sync; default does nothing.
         """Update policy state after weight sync. Override to adapt parameters.
 
         Args:
@@ -151,6 +177,8 @@ class DynamicSchedulePolicyBase(ABC):
     def should_activate_after_step(
         self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext
     ) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: abstract; decide whether to (re)activate hybrid replicas after weight sync. Outputs: bool.
         """Return True to trigger activation after this step, False to keep hybrid deactivated.
 
         Args:
@@ -160,6 +188,8 @@ class DynamicSchedulePolicyBase(ABC):
         """
 
     def request_rebalance(self, global_steps: int, ctx: DynamicScheduleContext) -> None:  # noqa: B027
+        # [FUNCTION DOC]
+        # Behavior: optional hook after activation to redistribute requests; default does nothing.
         """Redistribute requests across inference replicas after activation.
 
         Called immediately after hybrid replicas are activated and registered

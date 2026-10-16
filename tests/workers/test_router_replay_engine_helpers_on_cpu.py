@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for the VeOmni engine's router-replay glue: _prepare_router_replay_inputs (arming the VeOmniRouterReplay
+# controller and building per-layer replay targets from routed_experts, padded by pad_size) and prepare_model_outputs
+# (unpadding recorded expert indices and re-wrapping them per sample as int16 nested tensors). veomni modules are
+# stubbed with MagicMock in sys.modules (only if absent) before importing the engines. Constants: 3 layers, top-k 2.
+
 """Engine-driver glue tests for VeOmni router replay.
 
 Complements ``tests/utils/veomni/test_router_replay_on_cpu.py`` (which
@@ -84,6 +90,8 @@ _L, _TOPK = 3, 2
 
 
 def _make_jagged_input_ids(seq_lens: list[int]) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Builds a jagged nested tensor of random int64 token ids (0..99) with one component per given sequence length.
     """Build a jagged NestedTensor mimicking what ``left_right_2_no_padding``
     produces for ``input_ids``."""
     pieces = [torch.randint(0, 100, (s,), dtype=torch.int64) for s in seq_lens]
@@ -91,6 +99,8 @@ def _make_jagged_input_ids(seq_lens: list[int]) -> torch.Tensor:
 
 
 def _make_jagged_routed_experts(seq_lens: list[int], L: int = _L, topk: int = _TOPK) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Builds a jagged nested tensor of random expert ids (0..7) with components of shape [seq_len, L, topk].
     """Build a jagged NestedTensor mimicking the trainer-side
     ``routed_experts`` shape: ``[bs, jagged_seq, L, topk]``."""
     pieces = [torch.randint(0, 8, (s, L, topk), dtype=torch.int64) for s in seq_lens]
@@ -98,6 +108,9 @@ def _make_jagged_routed_experts(seq_lens: list[int], L: int = _L, topk: int = _T
 
 
 def _make_engine(controller: VeOmniRouterReplay | None, mode: str = "R2") -> VeOmniEngineWithLMHead:
+    # [FUNCTION DOC]
+    # HELPER: Creates a VeOmniEngineWithLMHead without __init__ with the given controller (or None), replay mode string
+    # (default "R2") and Ulysses SP disabled.
     """Build a bare ``VeOmniEngineWithLMHead`` instance without invoking
     its ``__init__`` (which requires a torch.distributed process group,
     parallel_state init, etc.). Only the attributes the two helpers read
@@ -111,6 +124,8 @@ def _make_engine(controller: VeOmniRouterReplay | None, mode: str = "R2") -> VeO
 
 @pytest.fixture
 def controller():
+    # [FUNCTION DOC]
+    # HELPER: Fixture returning a fresh VeOmniRouterReplay controller.
     return VeOmniRouterReplay()
 
 
@@ -120,7 +135,11 @@ def controller():
 
 
 class TestPrepareRouterReplayInputs:
+    # [CLASS DOC]
+    # Tests for _prepare_router_replay_inputs in record, replay and disabled states.
     def test_record_only_arms_the_controller(self, controller):
+        # [FUNCTION DOC]
+        # In record mode, stale recorded buffers are cleared, routed_experts is ignored, and no targets are set.
         """RECORD doesn't read ``routed_experts`` (it's the *output*, not an
         input). Even when the micro_batch carries one, it must be ignored —
         and the previous micro-batch's buffer must be dropped."""
@@ -142,6 +161,8 @@ class TestPrepareRouterReplayInputs:
         assert controller._targets == []
 
     def test_replay_missing_routed_experts_raises(self, controller):
+        # [FUNCTION DOC]
+        # Replay without routed_experts raises RuntimeError "missing 'routed_experts'".
         """Strict mode: REPLAY without routed_experts is a plumbing bug
         (compute_log_prob → update_actor lost the field), not a soft
         fallback."""
@@ -152,6 +173,8 @@ class TestPrepareRouterReplayInputs:
             engine._prepare_router_replay_inputs(td, {"pad_size": 0})
 
     def test_replay_unbinds_targets_per_layer(self, controller):
+        # [FUNCTION DOC]
+        # Without padding, replay targets are one [total_tokens, topk] tensor per layer equal to the flattened routed_experts slice.
         """``routed_experts`` covers prompt + response for every token, so with
         no padding the targets go through verbatim: one ``[total_nnz, topk]``
         tensor per layer."""
@@ -176,6 +199,8 @@ class TestPrepareRouterReplayInputs:
             assert torch.equal(t, flat[:, pos, :])
 
     def test_replay_pad_extends_targets_with_zero_rows(self, controller):
+        # [FUNCTION DOC]
+        # With pad_size 5, each target grows by 5 zero rows after the real tokens.
         """With ``pad_to_length`` (or the Ulysses alignment) the packed sequence
         the routers see is longer than the recorded routing, so the targets have
         to grow by ``pad_size``. The tail is zero-filled, which the controller's
@@ -201,6 +226,8 @@ class TestPrepareRouterReplayInputs:
             assert (t[real_nnz:] == 0).all(), "pad tail must be zero so the duplicate fallback fires"
 
     def test_replay_is_uniform_across_r2_and_r3(self, controller):
+        # [FUNCTION DOC]
+        # R2 and R3 modes produce identical targets even with a response_mask present.
         """R3 records at the rollout backend, which reports routing for every
         token it forwarded — prompt included. So R3 needs no response-only
         gate: it takes the same path as R2."""
@@ -224,6 +251,8 @@ class TestPrepareRouterReplayInputs:
             assert torch.equal(r2, r3)
 
     def test_no_controller_is_a_noop(self):
+        # [FUNCTION DOC]
+        # With no controller the helper does nothing, even for a non-jagged batch.
         """If router_replay is disabled on the engine, the helper is a
         pure no-op even when the micro_batch is malformed."""
         engine = _make_engine(controller=None)
@@ -234,6 +263,8 @@ class TestPrepareRouterReplayInputs:
         engine._prepare_router_replay_inputs(td, {"pad_size": 0})
 
     def test_disabled_controller_is_a_noop(self, controller):
+        # [FUNCTION DOC]
+        # A controller not in record/replay leaves targets empty.
         """Same for a controller that exists but is between steps."""
         engine = _make_engine(controller)
         td = TensorDict(
@@ -250,11 +281,15 @@ class TestPrepareRouterReplayInputs:
 
 
 class TestPrepareModelOutputs:
+    # [CLASS DOC]
+    #
     """``super().prepare_model_outputs`` needs a real HF model output, so it is
     stubbed out here — these tests only cover the routed-experts addendum."""
 
     @pytest.fixture(autouse=True)
     def _stub_super(self, monkeypatch):
+        # [FUNCTION DOC]
+        # HELPER: Autouse fixture replacing FSDPEngineWithLMHead.prepare_model_outputs with a stub returning {"log_probs": None}.
         monkeypatch.setattr(
             FSDPEngineWithLMHead,
             "prepare_model_outputs",
@@ -262,6 +297,9 @@ class TestPrepareModelOutputs:
         )
 
     def test_record_output_is_unpadded_and_wrapped_per_sample(self, controller):
+        # [FUNCTION DOC]
+        # Recorded indices from three routers over tokens plus 3 pad are trimmed, stacked per layer, stored as int16 and split
+        # per sample with shapes [seq_len, L, topk] matching the fired values.
         """The recorded indices arrive as ``[nnz + pad, L, topk]``; the pad
         suffix is dropped and the rest is re-wrapped on ``input_ids`` offsets
         so ``postprocess_batch_func`` can restore batch order."""
@@ -299,6 +337,8 @@ class TestPrepareModelOutputs:
         assert torch.equal(routed.values(), expected)
 
     def test_record_output_preserves_ids_above_uint8_range(self, controller):
+        # [FUNCTION DOC]
+        # Expert ids above 255 (up to 1023) survive the record and unpad path unchanged.
         """The whole point of int16 storage: expert ids past 255 must survive the
         record -> gather -> unpad path. uint8 would wrap them silently."""
         seq_lens = [3]
@@ -315,6 +355,8 @@ class TestPrepareModelOutputs:
         assert torch.equal(model_output["routed_experts"].values(), idx.unsqueeze(1))
 
     def test_replay_output_carries_no_routed_experts(self, controller):
+        # [FUNCTION DOC]
+        # Replay mode adds no routed_experts to the output.
         """REPLAY consumes routing, it doesn't produce it."""
         controller.begin_replay()
         engine = _make_engine(controller)
@@ -325,6 +367,10 @@ class TestPrepareModelOutputs:
         assert "routed_experts" not in model_output
 
     def _replay_forward(self, controller, num_routers: int, seq_lens: list[int], L: int = _L):
+        # [FUNCTION DOC]
+        # HELPER: Arms replay with L random target slots for the total token count, fires num_routers distinct routers (kept
+        # alive so their identities differ), then calls prepare_model_outputs on a fresh engine. Outputs: the model output dict.
+        # Exceptions: propagates the RuntimeError raised when router count and slot count disagree.
         """Arm REPLAY with ``L`` layer slots, then fire ``num_routers`` routers."""
         controller.begin_replay()
         nnz = sum(seq_lens)
@@ -348,6 +394,8 @@ class TestPrepareModelOutputs:
         )
 
     def test_replay_rejects_fewer_routers_than_layer_slots(self, controller):
+        # [FUNCTION DOC]
+        # Firing fewer routers than layer slots raises RuntimeError "2 routers fired but routed_experts carries 3".
         """The DeepSeek-V4 failure mode: a family whose layers use more than one
         router class, with only some classes hooked. Targets are matched by fire
         order while the rollout indexes by absolute layer, so the unhooked layers'
@@ -359,11 +407,15 @@ class TestPrepareModelOutputs:
             self._replay_forward(controller, num_routers=_L - 1, seq_lens=[4, 6])
 
     def test_replay_accepts_one_router_per_layer_slot(self, controller):
+        # [FUNCTION DOC]
+        # One router per slot raises nothing and adds no routed_experts.
         """The contract holding is the common case and must stay silent."""
         model_output = self._replay_forward(controller, num_routers=_L, seq_lens=[4, 6])
         assert "routed_experts" not in model_output
 
     def test_no_controller_output_is_untouched(self):
+        # [FUNCTION DOC]
+        # Without a controller the output has no routed_experts.
         engine = _make_engine(controller=None)
         td = TensorDict({"input_ids": _make_jagged_input_ids([3, 4])}, batch_size=[2])
         model_output = engine.prepare_model_outputs(

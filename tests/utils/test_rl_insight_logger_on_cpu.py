@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for verl.utils.tracking.RLInsightLogger, a class-level facade over the optional rl_insight package. The
+# package is replaced by a MagicMock via a patched _get_rl_insight. Covers env-gated no-op behavior, init with
+# transfer-queue metrics registration, lazy init on log/trace_state (once even under concurrent async tasks),
+# metric registration de-duplication, finish resetting state, and graceful fallback for old rl_insight versions
+# lacking trace_span / agent_loop_session.
+
 from __future__ import annotations
 
 import asyncio
@@ -25,6 +32,9 @@ from verl.utils.tracking import RLInsightLogger
 
 @pytest.fixture(autouse=True)
 def _reset_rl_insight_logger():
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture resetting RLInsightLogger's class-level state (init flag, cached module, registered
+    # metrics, warned features) before and after each test.
     RLInsightLogger._init_done = False
     RLInsightLogger._rl_insight_module = None
     RLInsightLogger._registered_metrics.clear()
@@ -38,11 +48,16 @@ def _reset_rl_insight_logger():
 
 @pytest.fixture
 def mock_rl_insight(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Fixture returning a MagicMock rl_insight module whose trace_state acts as a no-op context manager, and
+    # patches RLInsightLogger._get_rl_insight to return it.
     module = MagicMock()
     module.metric_gauge = MagicMock()
 
     @contextmanager
     def _trace_state(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: No-op generator-based context manager accepting any arguments.
         yield
 
     module.trace_state.side_effect = _trace_state
@@ -51,6 +66,9 @@ def mock_rl_insight(monkeypatch):
 
 
 def test_apis_are_noops_when_env_disabled(monkeypatch, mock_rl_insight):
+    # [FUNCTION DOC]
+    # With the enable env var unset, init/log/trace_state/register_metrics/finish are no-ops: no rl_insight call is made
+    # and the init flag stays False.
     monkeypatch.delenv(RLInsightLogger.ENABLE_ENV, raising=False)
 
     RLInsightLogger.init(
@@ -71,6 +89,10 @@ def test_apis_are_noops_when_env_disabled(monkeypatch, mock_rl_insight):
 
 
 def test_init_registers_transfer_queue_after_client_init(monkeypatch, mock_rl_insight):
+    # [FUNCTION DOC]
+    # With the env enabled and a fake transfer_queue module in sys.modules returning a metrics endpoint, init calls
+    # rl_insight.init with the project, experiment name and trainer.rl_insight sub-config, then registers the transfer
+    # queue endpoint for Prometheus with no labels; the init flag becomes True.
     monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
     config = {
         "trainer": {"rl_insight": {"server": {"url": "http://127.0.0.1:18080"}}},
@@ -92,6 +114,9 @@ def test_init_registers_transfer_queue_after_client_init(monkeypatch, mock_rl_in
 
 
 def test_log_lazy_inits_and_writes_gauge(monkeypatch, mock_rl_insight):
+    # [FUNCTION DOC]
+    # With the env enabled, log without prior init lazily calls init with no arguments, writes a gauge for the numeric
+    # metric with "/" replaced by "_", skips the non-numeric value, and sets the init flag.
     monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
 
     RLInsightLogger.log({"reward/mean": 1.25, "bad": object()}, step=3)
@@ -102,13 +127,20 @@ def test_log_lazy_inits_and_writes_gauge(monkeypatch, mock_rl_insight):
 
 
 def test_trace_state_lazy_inits_once_under_concurrent_async_tasks(monkeypatch, mock_rl_insight):
+    # [FUNCTION DOC]
+    # Runs 16 concurrent asyncio tasks each entering trace_state; asserts init was called exactly once, trace_state
+    # 16 times, and the init flag is set.
     monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
 
     async def _one(i: int):
+        # [FUNCTION DOC]
+        # HELPER: Enters a trace_state for index i and yields to the event loop once.
         with RLInsightLogger.trace_state(f"state_{i}", state_lane_id=f"lane_{i}", step=i):
             await asyncio.sleep(0)
 
     async def _run():
+        # [FUNCTION DOC]
+        # HELPER: Gathers the 16 tasks.
         await asyncio.gather(*[_one(i) for i in range(16)])
 
     asyncio.run(_run())
@@ -119,6 +151,9 @@ def test_trace_state_lazy_inits_once_under_concurrent_async_tasks(monkeypatch, m
 
 
 def test_register_metrics_dedups_and_finish_resets(monkeypatch, mock_rl_insight):
+    # [FUNCTION DOC]
+    # Registering the same addresses/kind/labels twice calls update_prometheus_config only once; finish then calls
+    # rl_insight.finish, clears the init flag and the registered metrics set.
     monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
     addresses = ["127.0.0.1:8000", "127.0.0.1:8001"]
     labels = [{"replica": 0}, {"replica": 1}]
@@ -135,6 +170,9 @@ def test_register_metrics_dedups_and_finish_resets(monkeypatch, mock_rl_insight)
 
 
 def test_trace_span_warns_and_noops_with_old_rl_insight(monkeypatch, mock_rl_insight, caplog):
+    # [FUNCTION DOC]
+    # With an old version (0.2.1) lacking trace_span, trace_span logs a "does not support trace_span" warning and does
+    # not initialize the client.
     monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
     mock_rl_insight.__version__ = "0.2.1"
     mock_rl_insight.trace_span = None
@@ -147,6 +185,11 @@ def test_trace_span_warns_and_noops_with_old_rl_insight(monkeypatch, mock_rl_ins
 
 
 def test_agent_loop_session_falls_back_with_old_rl_insight(monkeypatch, mock_rl_insight, caplog):
+    # [FUNCTION DOC]
+    # With an old version, agent_loop_session falls back to a local session object whose identity contains a state lane
+    # id built from experiment, sample, session and trajectory 0 and the global step; finish() on it works, and a
+    # "does not support agent_loop_session" warning is logged.
+    # Side effects: resets and re-initializes the global RolloutTraceConfig singleton (not reset afterwards).
     from verl.utils.rollout_trace import RolloutTraceConfig
 
     monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")

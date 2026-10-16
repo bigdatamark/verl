@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for bucket-aligned packed-sequence padding (pad_to_length) in the FSDP and VeOmni engines. veomni modules
+# are replaced in sys.modules with MagicMock stubs (only if absent) at import so the engine modules load without VeOmni.
+# ENGINE_CLASSES parametrizes tests over both LM-head engine classes.
+
 """Bucket-aligned packed-sequence padding (``pad_to_length``) for the FSDP and VeOmni engines.
 
 Covers the three pieces that make a packed micro-batch shape-stable:
@@ -68,6 +73,8 @@ ENGINE_CLASSES = pytest.mark.parametrize(
 
 
 def _make_engine(engine_cls, pad_to_length: bool, bucket: int = 1024):
+    # [FUNCTION DOC]
+    # HELPER: Creates an engine instance without __init__ and sets pad_to_length and pad_to_length_bucket (default 1024).
     """Bare instance — ``_get_packed_pad_size`` only reads the two attributes set here,
     and a real ``__init__`` would need a process group and VeOmni's parallel_state."""
     engine = engine_cls.__new__(engine_cls)
@@ -77,7 +84,11 @@ def _make_engine(engine_cls, pad_to_length: bool, bucket: int = 1024):
 
 
 class TestPadPackedInputs:
+    # [CLASS DOC]
+    # Tests for pad_packed_inputs (right-pad of packed tensors and position ids).
     def test_pad_size_zero_is_a_noop(self):
+        # [FUNCTION DOC]
+        # Pad size 0 returns the same input and position id objects.
         input_ids = torch.arange(6).unsqueeze(0)
         position_ids = torch.tensor([[0, 1, 2, 0, 1, 2]])
 
@@ -87,6 +98,8 @@ class TestPadPackedInputs:
         assert padded_pos is position_ids
 
     def test_pad_tokens_form_their_own_varlen_segment(self):
+        # [FUNCTION DOC]
+        # Pad size 4 appends four 0 ids and position ids restarting at 0 (0..3) so the pad forms its own segment.
         input_ids = torch.arange(1, 7).unsqueeze(0)
         position_ids = torch.tensor([[0, 1, 2, 0, 1, 2]])
 
@@ -98,6 +111,8 @@ class TestPadPackedInputs:
         assert padded_pos.tolist() == [[0, 1, 2, 0, 1, 2, 0, 1, 2, 3]]
 
     def test_mrope_position_ids_are_padded_per_rope_dim(self):
+        # [FUNCTION DOC]
+        # 3-D multi-rope position ids (rope_dim, 1, nnz) are padded along the last dim for each rope dim with 0, 1, ...
         input_ids = torch.arange(3).unsqueeze(0)
         position_ids = torch.arange(3).view(1, 1, 3).repeat(4, 1, 1)  # (rope_dim, 1, total_nnz)
 
@@ -109,6 +124,8 @@ class TestPadPackedInputs:
             assert padded_pos[rope_dim, 0].tolist() == [0, 1, 2, 0, 1]
 
     def test_pad_value_and_dtype_are_preserved(self):
+        # [FUNCTION DOC]
+        # A custom pad_value (1 for temperature) is used and float dtype is kept when position ids are None.
         """Temperature divides the logits, so its pad has to be 1 rather than the default 0."""
         temperature = torch.full((1, 3), 0.7)
 
@@ -120,25 +137,35 @@ class TestPadPackedInputs:
 
 @ENGINE_CLASSES
 class TestGetPackedPadSize:
+    # [CLASS DOC]
+    #
     """``VeOmniEngine`` subclasses ``FSDPEngine`` without going through its ``__init__``,
     so both engines are checked against the same inherited helper."""
 
     def test_disabled_returns_zero(self, engine_cls):
+        # [FUNCTION DOC]
+        # pad_to_length False yields pad size 0.
         engine = _make_engine(engine_cls, pad_to_length=False)
 
         assert engine._get_packed_pad_size(700) == 0
 
     def test_rounds_up_to_the_next_bucket(self, engine_cls):
+        # [FUNCTION DOC]
+        # 700 tokens with bucket 1024 needs 324 pad tokens.
         engine = _make_engine(engine_cls, pad_to_length=True, bucket=1024)
 
         assert engine._get_packed_pad_size(700) == 324
 
     def test_exact_multiple_needs_no_pad(self, engine_cls):
+        # [FUNCTION DOC]
+        # An exact bucket multiple needs no pad.
         engine = _make_engine(engine_cls, pad_to_length=True, bucket=1024)
 
         assert engine._get_packed_pad_size(2048) == 0
 
     def test_micro_batch_over_the_token_budget_is_still_padded(self, engine_cls):
+        # [FUNCTION DOC]
+        # 12000 tokens are padded up to the next multiple of 1024 (12288).
         """The reason for bucketing rather than a single target length: ``rearrange_micro_batches``
         sizes the micro-batch count from the token budget but partitions samples to balance
         attention workload, so a skewed micro-batch can exceed the budget. It still lands on a
@@ -148,6 +175,8 @@ class TestGetPackedPadSize:
         assert engine._get_packed_pad_size(12000) == 12288 - 12000
 
     def test_padded_length_is_always_a_bucket_multiple(self, engine_cls):
+        # [FUNCTION DOC]
+        # For several lengths, length plus pad is a multiple of the 640 bucket.
         engine = _make_engine(engine_cls, pad_to_length=True, bucket=640)
 
         for packed in (1, 639, 640, 641, 10239, 10240, 12000):
@@ -156,7 +185,11 @@ class TestGetPackedPadSize:
 
 @ENGINE_CLASSES
 class TestDistillationGuard:
+    # [CLASS DOC]
+    # Tests that padding is refused for top-k distillation micro-batches.
     def test_topk_distillation_micro_batch_is_rejected(self, engine_cls):
+        # [FUNCTION DOC]
+        # prepare_model_inputs with pad_to_length and distillation_use_topk raises RuntimeError.
         engine = _make_engine(engine_cls, pad_to_length=True)
         micro_batch = TensorDict({}, batch_size=[])
         micro_batch.set_non_tensor("distillation_use_topk", True)
@@ -166,21 +199,29 @@ class TestDistillationGuard:
 
 
 class TestGatherAndUnpadPacked:
+    # [CLASS DOC]
+    #
     """Without Ulysses SP there is nothing to all-gather, so the helper degenerates to
     trimming the suffix that ``prepare_model_inputs`` appended."""
 
     @pytest.fixture
     def engine(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture returning an FSDPEngineWithLMHead without __init__ with Ulysses SP disabled.
         engine = FSDPEngineWithLMHead.__new__(FSDPEngineWithLMHead)
         engine.use_ulysses_sp = False
         return engine
 
     def test_trims_the_pad_suffix(self, engine):
+        # [FUNCTION DOC]
+        # Pad size 4 trims the last four elements.
         tensor = torch.arange(10)
 
         assert engine._gather_and_unpad_packed(tensor, 4).tolist() == [0, 1, 2, 3, 4, 5]
 
     def test_zero_pad_returns_the_input_unchanged(self, engine):
+        # [FUNCTION DOC]
+        # Pad size 0 returns the same tensor object.
         tensor = torch.arange(10)
 
         assert engine._gather_and_unpad_packed(tensor, 0) is tensor

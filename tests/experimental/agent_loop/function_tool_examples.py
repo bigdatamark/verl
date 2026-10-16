@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# HELPER: Example tools decorated with function_tool (which derives a tool schema
+# from the signature and docstring), used as fixtures by the call-tool tests.
+# Mixes sync and async functions; return values are deterministic stubs.
+
 """``@function_tool`` examples loaded by the tests.
 
 Includes both sync and async functions to exercise the dispatcher's
@@ -24,6 +30,10 @@ from verl.tools.function_tool import function_tool
 
 @function_tool
 def get_weather(city: str) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: stub weather lookup. Case-insensitive match on city against a fixed
+    # table (tokyo, san francisco, new york). Returns a mapping with temperature_c
+    # and condition; unknown cities return -273.15 / "unknown". No side effects.
     """Get the current weather for a city.
 
     Args:
@@ -42,6 +52,13 @@ def get_weather(city: str) -> dict:
 
 @function_tool
 def calculator(expression: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: safe arithmetic evaluator. Parses expression in eval mode and walks
+    # the AST recursively allowing only numeric constants, binary + - * / ** and
+    # unary minus. Returns the result as a string; any error (syntax, unsupported
+    # node, division by zero, unknown operator) is caught and returned as
+    # "ERROR: <message>" instead of raising.
+    # KNOWN ISSUE: docstring claims parentheses are supported (they are, implicitly via AST) but unary plus is not; any unsupported op yields a KeyError message rather than "unsupported node".
     """Evaluate an arithmetic expression and return the result.
 
     Supports +, -, *, /, **, parentheses, and unary minus. Use this for any
@@ -56,6 +73,9 @@ def calculator(expression: str) -> str:
     ops = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.Pow: op.pow, ast.USub: op.neg}
 
     def _eval(node):
+        # [FUNCTION DOC]
+        # HELPER: recursive evaluator for one AST node; raises ValueError for node
+        # kinds other than numeric Constant, BinOp, UnaryOp; KeyError for disallowed operators.
         if isinstance(node, ast.Constant) and isinstance(node.value, int | float):  # noqa: UP038
             return node.value
         if isinstance(node, ast.BinOp):
@@ -72,6 +92,9 @@ def calculator(expression: str) -> str:
 
 @function_tool
 async def fetch_url(url: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: async stub; yields to the event loop once then returns
+    # "<stub body for URL>". Performs no network I/O.
     """Fetch the contents of a URL (async).
 
     This is a stubbed example that demonstrates ``async def`` tools; the

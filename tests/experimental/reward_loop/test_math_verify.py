@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# GPU/Ray integration test of the rule-based "remote" reward manager: agent loop generation on the MATH dataset
+# scored by reward_fn.compute_score_math_verify across 2 reward workers. Requires 8 GPUs, local Qwen2.5-1.5B and
+# ~/data/math/train.parquet; run from repo root.
+
 import os
 
 import ray
@@ -25,6 +30,13 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 
 
 def test_agent_reward_loop_standalone():
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, composes ppo_trainer config, configures async rollout (TP=2, 2048/4096 lengths) on 8 GPUs,
+    # sets reward manager "remote" with 2 workers and the math_verify custom function, builds an agent loop manager
+    # via init_agent_loop_manager, loads one 64-sample batch, generates sequences, and prints the mean of per-sample
+    # summed rm_scores (accuracy).
+    # Side effects: Ray cluster lifecycle, GPU usage, prints.
+    # KNOWN ISSUE: test name says standalone/agent reward loop, but the file tests math_verify via the remote manager.
     ray.init(
         runtime_env={
             "env_vars": {

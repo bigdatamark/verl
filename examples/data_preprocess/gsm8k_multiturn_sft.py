@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script converting openai/gsm8k into a multi-turn SFT parquet: each row has only a
+# "messages" column with a user turn (question + "####" instruction) and an assistant turn
+# containing the full reference solution. Save dir defaults to ~/data/gsm8k_sft and is
+# tilde-expanded; optional HDFS copy.
+# KNOWN ISSUE: the save dir is expanded but not created before writing parquet.
 """
 Preprocess the GSM8k dataset to parquet format
 """
@@ -25,6 +31,9 @@ from verl.utils.hdfs_io import copy, makedirs
 
 
 def extract_solution(solution_str):
+    # [FUNCTION DOC]
+    # HELPER: Same GSM8K "####" answer extractor as gsm8k.py (asserts the marker exists, strips
+    # commas). Unused by this script's mapping function.
     solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
     assert solution is not None
     final_solution = solution.group(0)
@@ -58,7 +67,12 @@ if __name__ == "__main__":
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
+        # [FUNCTION DOC]
+        # Returns a process_fn closure bound to the split name (split itself is unused in the output).
         def process_fn(example, idx):
+            # [FUNCTION DOC]
+            # Pops question and answer and returns a record with a two-message "messages" list
+            # (user question+instruction, assistant raw answer). idx is unused.
             question_raw = example.pop("question")
 
             question = question_raw + " " + instruction_following

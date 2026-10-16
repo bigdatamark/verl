@@ -13,6 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Import shim for Megatron-Bridge: re-exports AutoBridge plus LinearForLastLayer, freeze_moe_router and
+# make_value_model. When the installed Megatron-Bridge (< v0.5.0) lacks the latter three, local fallback
+# implementations defined here are used and LinearForLastLayer is registered with AutoMapping as a replicated module.
+# Side effects on import: prints an install hint and re-raises if Megatron-Bridge is missing.
+
 try:
     from megatron.bridge import AutoBridge
 except ImportError:
@@ -28,16 +34,30 @@ except ImportError:
     from megatron.core import tensor_parallel
 
     def _ensure_model_list(model):
+        # [FUNCTION DOC]
+        # HELPER: Wraps a single model in a list; returns lists unchanged.
         return model if isinstance(model, list) else [model]
 
     class LinearForLastLayer(torch.nn.Linear):
+        # [CLASS DOC]
+        # Fallback bias-free linear output head (used for value models) returning float logits, optionally gathered from the
+        # sequence-parallel region.
         def __init__(self, input_size, output_size, *, sequence_parallel: bool):
+            # [FUNCTION DOC]
+            # Behavior: creates a Linear(input_size -> output_size) without bias and records sequence_parallel; when enabled,
+            # marks the weight as sequence-parallel so its gradients are all-reduced accordingly.
+            # Side effects: allocates the weight parameter.
             super().__init__(in_features=input_size, out_features=output_size, bias=False)
             self.sequence_parallel = sequence_parallel
             if self.sequence_parallel:
                 self.weight.sequence_parallel = True
 
         def forward(self, input_, weight=None, runtime_gather_output=None):
+            # [FUNCTION DOC]
+            # Behavior: applies the linear layer, casts to float32, and if sequence parallel gathers outputs across the sequence
+            # parallel group (no output-grad reduction).
+            # Inputs: input_ - hidden states; weight, runtime_gather_output - ignored (accepted for interface compatibility).
+            # Outputs: tuple (logits, None) mirroring Megatron's output-layer return convention.
             logits = super().forward(input_)
             logits = logits.float()
             if self.sequence_parallel:
@@ -49,9 +69,20 @@ except ImportError:
     AutoMapping.register_module_type("LinearForLastLayer", "replicated")
 
     def make_value_model(hidden_size, sequence_parallel):
+        # [FUNCTION DOC]
+        # Behavior: returns a post-creation hook that replaces output_layer with a LinearForLastLayer(hidden_size -> 1) on
+        # every model chunk that is on the last pipeline stage (per virtual stage when PP>1 with virtual pipeline).
+        # Inputs: hidden_size; sequence_parallel flag.
+        # Outputs: the hook callable.
         from megatron.core import parallel_state
 
         def hook(model):
+            # [FUNCTION DOC]
+            # HELPER: The hook: computes per-chunk last-stage flags, asserts their count matches the model chunk list, and swaps
+            # in the value head on last-stage chunks.
+            # Inputs: model - module or list of chunks. Outputs: none.
+            # Exceptions: AssertionError on length mismatch.
+            # Side effects: mutates model chunks.
             model_post_process = []
             if (
                 parallel_state.get_pipeline_model_parallel_world_size() > 1
@@ -79,6 +110,11 @@ except ImportError:
         return hook
 
     def freeze_moe_router(model):
+        # [FUNCTION DOC]
+        # Behavior: for every decoder layer of each model chunk, disables gradients on MoE router weight/bias and on shared
+        # expert gate weight/bias when present.
+        # Inputs: model - module or list of chunks. Outputs: the same model.
+        # Side effects: mutates requires_grad flags.
         for model_chunk in _ensure_model_list(model):
             if hasattr(model_chunk, "decoder") and hasattr(model_chunk.decoder, "layers"):
                 for layer in model_chunk.decoder.layers:

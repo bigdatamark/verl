@@ -17,22 +17,50 @@
 # online convert mcore weight to pure huggingface weight, no any fusion
 # including format conversion and name mapping
 # not including resharding
+# [MODULE DOC]
+# Online, name-level conversion of Megatron-core parameter names to HuggingFace parameter names
+# (no tensor fusion beyond what is described, no resharding). Each converter receives an mcore
+# parameter name plus the already-split group of tensors for it (e.g. q/k/v pieces, gate/up pieces)
+# and returns parallel lists of HF names and tensors. Converters exist for dense (Llama/Qwen2/Qwen3),
+# Qwen2-MoE, Qwen2.5-VL, DeepSeek-V3 (MLA + MoE + MTP), Mixtral and Qwen3-MoE.
+
 import torch
 from megatron.core.transformer import TransformerConfig
 from transformers import PretrainedConfig
 
 
 class McoreToHFWeightConverterBase:
+    # [CLASS DOC]
+    # Base converter storing the HF and mcore configs; subclasses implement convert_param.
     def __init__(self, hf_config: PretrainedConfig, mcore_config: TransformerConfig):
+        # [FUNCTION DOC]
+        # Behavior: stores hf_config and mcore_config on the instance.
+        # Inputs: hf_config - HF PretrainedConfig; mcore_config - mcore TransformerConfig.
+        # Outputs: none. Side effects: sets attributes.
         self.hf_config = hf_config
         self.mcore_config = mcore_config
 
     def convert_param(self, name: str, params_one_group: list[torch.Tensor]) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: abstract conversion hook.
+        # Inputs: name - mcore parameter name; params_one_group - tensors belonging to that name.
+        # Outputs: none. Exceptions: always NotImplementedError.
+        # KNOWN ISSUE: annotated to return a single Tensor, but all subclasses return a (names, tensors) tuple.
         raise NotImplementedError
 
 
 class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
+    # [CLASS DOC]
+    # Converter for dense decoder-only models with fused QKV and fused gate/up (Llama/Qwen2/Qwen3 naming).
     def _convert_attention_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Maps attention-related mcore names of layer N (third dotted component) to HF names:
+        # linear_qkv weight/bias -> q_proj, k_proj, v_proj of the same type (expects 3 tensors);
+        # linear_proj.weight -> o_proj.weight; linear_qkv.layer_norm_weight -> input_layernorm.weight;
+        # q_layernorm / k_layernorm -> self_attn.q_norm / k_norm (1 tensor each).
+        # Inputs: name; params - tensors. Outputs: (HF names list, params unchanged).
+        # Exceptions: AssertionError on tensor count mismatch; NotImplementedError for other names.
+        # Side effects: none.
         # 'decoder.layers.0.self_attention.linear_proj.weight'
         # 'decoder.layers.0.self_attention.linear_qkv.layer_norm_weight'
         # 'decoder.layers.0.self_attention.linear_qkv.weight'
@@ -63,6 +91,11 @@ class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
         return convert_names, params
 
     def _convert_mlp_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Maps dense MLP names: linear_fc1.weight -> gate_proj and up_proj (2 tensors);
+        # linear_fc1.layer_norm_weight -> post_attention_layernorm.weight; linear_fc2.weight -> down_proj.
+        # Inputs: name; params. Outputs: (names, params).
+        # Exceptions: AssertionError on count mismatch; NotImplementedError otherwise. Side effects: none.
         # 'decoder.layers.0.mlp.linear_fc1.layer_norm_weight'
         # 'decoder.layers.0.mlp.linear_fc1.weight'
         # 'decoder.layers.0.mlp.linear_fc2.weight'
@@ -84,6 +117,12 @@ class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
         return convert_names, params
 
     def convert_param(self, name: str, params_one_group: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Behavior: maps embedding, final layernorm and output layer directly (returns first tensor only);
+        # otherwise dispatches to the attention helper for names containing self_attention, or the MLP helper
+        # for names containing mlp.
+        # Inputs: name; params_one_group. Outputs: (HF names, tensors).
+        # Exceptions: NotImplementedError for unsupported names. Side effects: none.
         direct_name_mapping = {
             "embedding.word_embeddings.weight": "model.embed_tokens.weight",
             "decoder.final_layernorm.weight": "model.norm.weight",
@@ -101,7 +140,17 @@ class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
 
 
 class McoreToHFWeightConverterQwen2Moe(McoreToHFWeightConverterDense):
+    # [CLASS DOC]
+    # Qwen2-MoE converter: dense attention mapping plus MoE MLP mapping with a shared expert and gate.
     def _convert_mlp_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Maps pre_mlp_layernorm -> post_attention_layernorm; router.weight -> mlp.gate.weight;
+        # shared_experts.gate_weight -> mlp.shared_expert_gate.weight; shared_experts fc1 -> shared_expert
+        # gate_proj + up_proj (2 tensors); shared_experts fc2 -> shared_expert.down_proj; experts fc1 with
+        # suffix weightK -> experts.K gate_proj + up_proj; experts fc2 weightK -> experts.K.down_proj.
+        # Expert id is the text after the last occurrence of "weight".
+        # Inputs: name; params. Outputs: (names, params).
+        # Exceptions: AssertionError on count mismatch; NotImplementedError otherwise. Side effects: none.
         # 'decoder.layers.0.pre_mlp_layernorm.weight',
         # 'decoder.layers.0.mlp.router.weight',
         # 'decoder.layers.0.mlp.shared_experts.gate_weight',
@@ -148,7 +197,15 @@ class McoreToHFWeightConverterQwen2Moe(McoreToHFWeightConverterDense):
 
 
 class McoreToHFWeightConverterQwen2_5_VL(McoreToHFWeightConverterDense):
+    # [CLASS DOC]
+    # Qwen2.5-VL converter covering both language_model.* and vision_model.* parameter trees.
     def convert_param(self, name: str, params_one_group: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Behavior: direct mapping for LM embedding/final norm/output layer and vision patch embed, vision
+        # final layernorm (-> merger ln_q) and projection fc1/fc2 weight/bias (-> merger mlp.0 / mlp.2);
+        # otherwise dispatches to attention or MLP helpers by substring.
+        # Inputs: name; params_one_group. Outputs: (names, tensors).
+        # Exceptions: NotImplementedError for unsupported names. Side effects: none.
         direct_name_mapping = {
             "language_model.embedding.word_embeddings.weight": "model.embed_tokens.weight",
             "language_model.decoder.final_layernorm.weight": "model.norm.weight",
@@ -171,6 +228,17 @@ class McoreToHFWeightConverterQwen2_5_VL(McoreToHFWeightConverterDense):
             raise NotImplementedError(f"Unsupported parameter name: {name}")
 
     def _convert_attention_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Parses model_type and layer number from the first and fourth dotted components and maps the
+        # last three components. Language model: qkv weight/bias -> q/k/v projections (count must match),
+        # linear_proj -> o_proj, qkv layer norm -> input_layernorm. Vision model: linear_proj weight/bias ->
+        # attn.proj, qkv layer norm -> norm1; otherwise the 3 qkv pieces are concatenated along dim 0 into
+        # visual.blocks.N.attn.qkv weight or bias.
+        # Inputs: name; params. Outputs: (names, possibly replaced params list).
+        # Exceptions: AssertionError on count or unexpected name; NotImplementedError for other model types.
+        # Side effects: allocates the concatenated tensor.
+        # KNOWN ISSUE: unknown language_model attention suffixes map to None and yield a name ending in "None"
+        # instead of raising.
         model_type, _, _, layer_number = name.split(".")[:4]
 
         convert_names = []
@@ -223,6 +291,13 @@ class McoreToHFWeightConverterQwen2_5_VL(McoreToHFWeightConverterDense):
         return convert_names, params
 
     def _convert_mlp_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Maps MLP names by last three components. Language model: fc1 weight/bias -> gate/up
+        # projections, fc2 weight/bias -> down_proj, fc1 layer norm -> post_attention_layernorm (under
+        # model.layers.N). Vision model: same but under visual.blocks.N and fc1 layer norm -> norm2.
+        # Inputs: name; params. Outputs: (names, params).
+        # Exceptions: AssertionError on count mismatch; NotImplementedError for other model types.
+        # KNOWN ISSUE: unknown suffixes produce names ending in "None" rather than raising.
         model_type, _, _, layer_number = name.split(".")[:4]
 
         convert_names = []
@@ -267,7 +342,17 @@ class McoreToHFWeightConverterQwen2_5_VL(McoreToHFWeightConverterDense):
 
 
 class McoreToHFWeightConverterDpskv3(McoreToHFWeightConverterBase):
+    # [CLASS DOC]
+    # DeepSeek-V3 converter: MLA attention projections, dense or MoE MLP with shared experts and router
+    # expert bias, and a single MTP layer mapped to HF layer 61.
     def _convert_attention_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Maps attention / input layernorm names via a fixed table (input_layernorm, linear_proj ->
+        # o_proj, linear_q_proj -> q_proj, kv_down -> kv_a_proj_with_mqa, kv_up layer norm -> kv_a_layernorm,
+        # kv_up -> kv_b_proj, q_down -> q_a_proj, q_up -> q_b_proj, q_up layer norm -> q_a_layernorm), using
+        # the substring after ".N." as key.
+        # Inputs: name; params (exactly one tensor). Outputs: (names, params).
+        # Exceptions: AssertionError if not one tensor; KeyError for unmapped names. Side effects: none.
         # mcore
         # 'decoder.layers.0.input_layernorm.weight'
         # 'decoder.layers.0.self_attention.linear_proj.weight'
@@ -307,6 +392,13 @@ class McoreToHFWeightConverterDpskv3(McoreToHFWeightConverterBase):
         return convert_names, params
 
     def _convert_mlp_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Maps MLP names using a table (dense fc1/fc2/layer norm, shared experts fc1/fc2,
+        # pre_mlp_layernorm, router weight -> mlp.gate.weight, router expert_bias ->
+        # mlp.gate.e_score_correction_bias), list entries meaning split tensors; otherwise routed experts
+        # fc1 weightK -> experts.K gate/up, fc2 weightK -> experts.K down_proj.
+        # Inputs: name; params. Outputs: (names, params).
+        # Exceptions: AssertionError on count mismatch; NotImplementedError for unknown names.
         # mcore dense
         # 'decoder.layers.0.mlp.linear_fc1.layer_norm_weight'
         # 'decoder.layers.0.mlp.linear_fc2.weight'
@@ -380,6 +472,13 @@ class McoreToHFWeightConverterDpskv3(McoreToHFWeightConverterBase):
         return convert_names, params
 
     def _convert_mtp_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Converts MTP parameters: enorm, hnorm, eh_proj and final_layernorm map directly to
+        # model.layers.61.*; transformer_layer parameters are renamed to decoder.layers.61 and routed through
+        # the attention or MLP helper.
+        # Inputs: name; params. Outputs: (names, params).
+        # Exceptions: AssertionError unless mtp_num_layers is 1, num_layers is 61, and name is a
+        # transformer_layer param; NotImplementedError otherwise.
         assert self.mcore_config.mtp_num_layers == 1, "only support one mtp layer for now"
         assert self.mcore_config.num_layers == 61, "only support 61 layers for now"
         direct_name_mapping = {
@@ -402,6 +501,11 @@ class McoreToHFWeightConverterDpskv3(McoreToHFWeightConverterBase):
         return convert_names, params
 
     def convert_param(self, name: str, params_one_group: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Behavior: direct maps embedding / final norm / output layer; then dispatches names containing mtp,
+        # attention (self_attention or input_layernorm.weight) or mlp to the matching helper.
+        # Inputs: name; params_one_group. Outputs: (names, tensors).
+        # Exceptions: NotImplementedError for unsupported names.
         direct_name_mapping = {
             "embedding.word_embeddings.weight": "model.embed_tokens.weight",
             "decoder.final_layernorm.weight": "model.norm.weight",
@@ -420,7 +524,14 @@ class McoreToHFWeightConverterDpskv3(McoreToHFWeightConverterBase):
 
 
 class McoreToHFWeightConverterMixtral(McoreToHFWeightConverterDense):
+    # [CLASS DOC]
+    # Mixtral converter: dense attention mapping, MoE MLP named block_sparse_moe with w1/w3/w2 experts.
     def _convert_mlp_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Maps pre_mlp_layernorm -> post_attention_layernorm; router -> block_sparse_moe.gate.weight;
+        # experts fc1 weightK -> experts.K w1 and w3; experts fc2 weightK -> experts.K.w2.
+        # Inputs: name; params. Outputs: (names, params).
+        # Exceptions: NotImplementedError for others (no tensor-count checks). Side effects: none.
         # decoder.layers.0.mlp.router.weight
         # decoder.layers.0.mlp.experts.linear_fc1.weight0 - weight7
         # decoder.layers.0.mlp.experts.linear_fc2.weight0 - weight7
@@ -444,7 +555,14 @@ class McoreToHFWeightConverterMixtral(McoreToHFWeightConverterDense):
 
 
 class McoreToHFWeightConverterQwen3Moe(McoreToHFWeightConverterDense):
+    # [CLASS DOC]
+    # Qwen3-MoE converter: dense attention mapping (including q/k norms), MoE MLP without shared experts.
     def _convert_mlp_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Maps pre_mlp_layernorm -> post_attention_layernorm; router -> mlp.gate.weight; experts fc1
+        # weightK -> experts.K gate_proj + up_proj (2 tensors); fc2 weightK -> experts.K.down_proj.
+        # Inputs: name; params. Outputs: (names, params).
+        # Exceptions: AssertionError on count mismatch; NotImplementedError otherwise.
         # qwen3 moe no share expert
 
         # 'decoder.layers.0.pre_mlp_layernorm.weight',

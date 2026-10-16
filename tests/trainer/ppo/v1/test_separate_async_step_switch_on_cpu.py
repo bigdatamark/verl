@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Uses recording fakes for the hybrid/standalone checkpoint managers and replay buffer, with balancer
+# hooks replaced by closures that log into a shared events list, to assert exact call order and counts.
+# Also covers HybridRolloutSwitchConfig validation, the inventory and cost gates that decide whether to
+# lend the engine, threshold clamping, and the adaptive threshold controller (step up 0.05, step down
+# 0.025, release after 2 calm steps, cost window 3).
+
 """CPU-only unit tests for ``separate_async``'s once-per-global-step hybrid engine switching.
 
 The hybrid engine shares GPUs with training, so every round trip costs a weight restore on the way
@@ -33,7 +40,12 @@ from verl.utils.config import omega_conf_to_dataclass
 
 
 class _RecordingCheckpointManager:
+    # [CLASS DOC]
+    # HELPER: fake checkpoint manager that appends "<name>_<action>" to a shared events list and counts calls.
     def __init__(self, name: str, events: list[str]):
+        # [FUNCTION DOC]
+        # HELPER: stores name and events list; initializes update step list, resume/abort/sleep counters and the
+        # list of abort reject_request flags.
         self.name = name
         self.events = events
         self.update_calls: list[int] = []
@@ -43,39 +55,57 @@ class _RecordingCheckpointManager:
         self.sleep_calls = 0
 
     def update_weights(self, global_steps: int):
+        # [FUNCTION DOC]
+        # HELPER: logs "<name>_update", records global_steps, returns an empty mapping.
         self.events.append(f"{self.name}_update")
         self.update_calls.append(global_steps)
         return {}
 
     def resume_generation_replicas(self):
+        # [FUNCTION DOC]
+        # HELPER: logs "<name>_resume" and increments the resume counter.
         self.events.append(f"{self.name}_resume")
         self.resume_calls += 1
 
     def abort_replicas(self, reject_request: bool = False):
+        # [FUNCTION DOC]
+        # HELPER: logs "<name>_abort", increments the counter and records the reject_request flag (default False).
         self.events.append(f"{self.name}_abort")
         self.abort_calls += 1
         self.abort_reject_requests.append(reject_request)
 
     def sleep_replicas(self):
+        # [FUNCTION DOC]
+        # HELPER: logs "<name>_sleep" and increments the sleep counter.
         self.events.append(f"{self.name}_sleep")
         self.sleep_calls += 1
 
 
 class _RecordingReplayBuffer:
+    # [CLASS DOC]
+    # HELPER: fake replay buffer (poll_interval 1.0) that records wait targets and returns configured
+    # eviction metrics and a fixed sampleable count.
     poll_interval = 1.0
 
     def __init__(self, eviction_metrics: dict | None = None, sampleable_count: int = 0):
+        # [FUNCTION DOC]
+        # HELPER: initializes wait-target list, count-call counter, eviction metrics (default empty) and sampleable count.
         self.wait_calls: list[int] = []
         self.count_calls = 0
         self.eviction_metrics = eviction_metrics or {}
         self.sampleable_count = sampleable_count
 
     def wait_for_sampleable(self, global_steps: int, partition_id: str, target_count: int) -> tuple[set[str], dict]:
+        # [FUNCTION DOC]
+        # HELPER: records target_count and returns an empty key set plus a copy of the eviction metrics; step and
+        # partition are ignored.
         del global_steps, partition_id
         self.wait_calls.append(target_count)
         return set(), dict(self.eviction_metrics)
 
     def get_sampleable_count(self, global_steps: int, partition_id: str) -> int:
+        # [FUNCTION DOC]
+        # HELPER: increments count_calls and returns the configured sampleable count.
         del global_steps, partition_id
         self.count_calls += 1
         return self.sampleable_count
@@ -93,6 +123,15 @@ def _trainer(
     eviction_metrics: dict | None = None,
     sampleable_count: int = 0,
 ) -> PPOTrainerSeparateAsync:
+    # [FUNCTION DOC]
+    # HELPER: builds an uninitialized PPOTrainerSeparateAsync with a 2x8 GPU config (no disaggregation), the given
+    # batch size, sync step, global/total steps, no profiling, empty timing, ROLLOUT mode, a recording replay
+    # buffer, recording hybrid ("hybrid") and standalone ("standalone") checkpoint managers sharing
+    # trainer.events, balancer hooks (add, remove, clear-sticky returning {"cleared_entries": 7}) that log to
+    # both events and balancer_calls, and a HybridRolloutSwitchConfig from the given options. Calls
+    # _init_hybrid_rollout_state when switching is enabled.
+    # Inputs: keyword-only options listed in the signature. Outputs: the trainer.
+    # Exceptions: propagates ValueError from config/state validation (e.g. bad ratio).
     trainer = object.__new__(PPOTrainerSeparateAsync)
     trainer.config = OmegaConf.create(
         {
@@ -122,14 +161,20 @@ def _trainer(
     trainer.balancer_calls: list[str] = []
 
     def add_replicas():
+        # [FUNCTION DOC]
+        # HELPER: logs "add" to events and balancer_calls.
         trainer.events.append("add")
         trainer.balancer_calls.append("add")
 
     def remove_replicas():
+        # [FUNCTION DOC]
+        # HELPER: logs "remove" to events and balancer_calls.
         trainer.events.append("remove")
         trainer.balancer_calls.append("remove")
 
     def clear_sticky():
+        # [FUNCTION DOC]
+        # HELPER: logs "clear" and returns {"cleared_entries": 7}.
         trainer.events.append("clear")
         trainer.balancer_calls.append("clear")
         return {"cleared_entries": 7}
@@ -152,6 +197,12 @@ def _trainer(
 
 
 def _construct_trainer(monkeypatch, *, replay_buffer, enable_switch: bool = True, disaggregation: bool = False):
+    # [FUNCTION DOC]
+    # HELPER: runs the real PPOTrainerSeparateAsync constructor with PPOTrainer.__init__ patched to set only the
+    # config and the given replay buffer; config has 1x8 GPUs, mini-batch 16, nccl checkpoint engine, sync
+    # step 4, and the given enable_switch / disaggregation flags.
+    # Inputs: monkeypatch, keyword-only replay_buffer, enable_switch (True), disaggregation (False).
+    # Outputs: the trainer. Exceptions: propagates constructor validation errors.
     config = OmegaConf.create(
         {
             "data": {"train_batch_size": 64},
@@ -182,6 +233,8 @@ def _construct_trainer(monkeypatch, *, replay_buffer, enable_switch: bool = True
     )
 
     def mock_base_init(trainer, trainer_config):
+        # [FUNCTION DOC]
+        # HELPER: replacement base initializer that stores the config and the supplied replay buffer on the trainer.
         trainer.config = trainer_config
         trainer.replay_buffer = replay_buffer
 
@@ -190,6 +243,9 @@ def _construct_trainer(monkeypatch, *, replay_buffer, enable_switch: bool = True
 
 
 def _run_step(trainer: PPOTrainerSeparateAsync, *, sample_wait_seconds: float) -> None:
+    # [FUNCTION DOC]
+    # HELPER: runs one global step: on_step_begin, the wait-and-switch, sets the measured sample wait seconds,
+    # then on_step_end. Side effects: mutates trainer state.
     """Drive one global step's hooks, with the mini-batches blocked for the given total."""
     trainer.on_step_begin()
     trainer._wait_for_sampleable_and_switch()
@@ -198,6 +254,8 @@ def _run_step(trainer: PPOTrainerSeparateAsync, *, sample_wait_seconds: float) -
 
 
 def test_hybrid_rollout_switch_config_target_instantiates_dataclass():
+    # [FUNCTION DOC]
+    # A _target_ config converts into a HybridRolloutSwitchConfig with ratio 0.25.
     config = OmegaConf.create(
         {
             "_target_": "verl.trainer.config.HybridRolloutSwitchConfig",
@@ -213,11 +271,19 @@ def test_hybrid_rollout_switch_config_target_instantiates_dataclass():
 
 @pytest.mark.parametrize("window_size", [0, -1])
 def test_hybrid_rollout_switch_config_rejects_nonpositive_cost_window(window_size):
+    # [FUNCTION DOC]
+    # Window size 0 or -1 raises ValueError. Inputs: window_size parameter.
     with pytest.raises(ValueError, match="switch_cost_window_size must be positive"):
         HybridRolloutSwitchConfig(switch_cost_window_size=window_size)
 
 
 def test_step_lends_the_engine_out_and_reclaims_it_exactly_once():
+    # [FUNCTION DOC]
+    # From TRAINER mode: on_step_end lends the engine (ROLLOUT mode; standalone and hybrid weights updated
+    # at step 1; hybrid resumed; balancer add then clear; event order add, clear, standalone_update,
+    # hybrid_update, hybrid_resume; timing and one rollout-switch cost recorded; no decision cost metrics).
+    # Next step begin + wait: waits for 16 samples, aborts with reject_request True, sleeps once, removes from
+    # balancer, records trainer-switch cost. Three further sample begin/end cycles do not switch again.
     trainer = _trainer()
     trainer.current_mode = HybridEngineMode.TRAINER
 
@@ -258,8 +324,13 @@ def test_step_lends_the_engine_out_and_reclaims_it_exactly_once():
 
 
 def test_switch_to_rollout_timing_accumulates_prepare_and_wake(monkeypatch):
+    # [FUNCTION DOC]
+    # Patches marked_timer with a recorder adding 1.0 per use; asserts switch_to_rollout timing is 2.0 (two
+    # timed phases) and update_weights 1.0. Inputs: monkeypatch.
     @contextmanager
     def recording_timer(name, timing_raw, **_kwargs):
+        # [FUNCTION DOC]
+        # HELPER: context manager that, after the block, adds 1.0 to timing_raw[name]. Extra kwargs ignored.
         yield
         timing_raw[name] = timing_raw.get(name, 0.0) + 1.0
 
@@ -274,6 +345,9 @@ def test_switch_to_rollout_timing_accumulates_prepare_and_wake(monkeypatch):
 
 
 def test_step_begin_reclaims_hybrid_before_submission_when_inventory_is_ready():
+    # [FUNCTION DOC]
+    # With 16 samples already buffered, on_step_begin reclaims the engine immediately (one count query, no
+    # wait, abort and sleep once, zero switch_wait) and the subsequent wait returns empty metrics.
     trainer = _trainer(sampleable_count=16)
 
     trainer.on_step_begin()
@@ -289,6 +363,8 @@ def test_step_begin_reclaims_hybrid_before_submission_when_inventory_is_ready():
 
 
 def test_wait_for_sampleable_is_a_noop_once_the_engine_is_training():
+    # [FUNCTION DOC]
+    # In TRAINER mode the wait returns empty metrics without waiting or balancer calls.
     trainer = _trainer()
     trainer.current_mode = HybridEngineMode.TRAINER
 
@@ -298,6 +374,8 @@ def test_wait_for_sampleable_is_a_noop_once_the_engine_is_training():
 
 
 def test_eviction_metrics_from_the_wait_reach_the_step():
+    # [FUNCTION DOC]
+    # Eviction metrics returned by the replay-buffer wait are returned by prepare_step (batch submission stubbed).
     metrics = {"training/off_policy/evicted_samples": 3}
     trainer = _trainer(eviction_metrics=metrics)
     trainer._add_batch_to_generate = lambda: None
@@ -307,6 +385,9 @@ def test_eviction_metrics_from_the_wait_reach_the_step():
 
 
 def test_disabled_switching_reclaims_the_engine_without_waiting():
+    # [FUNCTION DOC]
+    # With switching disabled: step begin reclaims (TRAINER mode, sleep once) without waiting; step end does not
+    # lend the engine nor update hybrid weights.
     trainer = _trainer(enable_switch=False)
 
     trainer.on_step_begin()
@@ -321,6 +402,8 @@ def test_disabled_switching_reclaims_the_engine_without_waiting():
 
 
 def test_last_step_does_not_lend_the_engine_out():
+    # [FUNCTION DOC]
+    # On the final step only standalone weights are updated (step 3) and mode stays TRAINER.
     trainer = _trainer(global_steps=3, total_training_steps=3)
     trainer.current_mode = HybridEngineMode.TRAINER
 
@@ -332,6 +415,8 @@ def test_last_step_does_not_lend_the_engine_out():
 
 
 def test_inventory_gate_skips_lending_when_the_target_is_already_buffered():
+    # [FUNCTION DOC]
+    # With 16 buffered, step end does not lend; decision metrics remaining 0 and should_switch 0.
     trainer = _trainer(sampleable_count=16)
     trainer.current_mode = HybridEngineMode.TRAINER
 
@@ -346,6 +431,9 @@ def test_inventory_gate_skips_lending_when_the_target_is_already_buffered():
 
 
 def test_cost_gate_skips_lending_when_the_remaining_work_is_cheaper_to_fill_on_standalone():
+    # [FUNCTION DOC]
+    # 15 buffered (1 remaining), per-sample time 2s, switch costs 3+4=7: scaling factor 2, benefit 1.0 < 7 so no
+    # lending; asserts the decision metrics.
     trainer = _trainer(sampleable_count=15)
     trainer.current_mode = HybridEngineMode.TRAINER
     trainer._wait_seconds = 2.0
@@ -365,6 +453,8 @@ def test_cost_gate_skips_lending_when_the_remaining_work_is_cheaper_to_fill_on_s
 
 
 def test_cost_gate_lends_when_the_remaining_work_is_more_expensive_than_the_switch():
+    # [FUNCTION DOC]
+    # Per-sample time 16s makes benefit 8 > 7: hybrid weights updated at step 1 and should_switch 1.
     trainer = _trainer(sampleable_count=15)
     trainer.current_mode = HybridEngineMode.TRAINER
     trainer._wait_seconds = 16.0
@@ -379,6 +469,8 @@ def test_cost_gate_lends_when_the_remaining_work_is_more_expensive_than_the_swit
 
 
 def test_switch_cost_window_forgets_cold_start():
+    # [FUNCTION DOC]
+    # With window 3 only the last three costs count: mean(2,4,6) + mean(1,3,5) = 7.
     trainer = _trainer()
     trainer._to_rollout_costs.extend([100.0, 2.0, 4.0, 6.0])
     trainer._to_trainer_costs.extend([50.0, 1.0, 3.0, 5.0])
@@ -399,6 +491,9 @@ def test_switch_cost_window_forgets_cold_start():
     ],
 )
 def test_threshold_is_clamped_to_between_one_mini_batch_and_the_batch(ratio, parameter_sync_step, expected):
+    # [FUNCTION DOC]
+    # Parametrized: threshold = ratio x batch clamped to [batch/sync_step, batch]; with sync step 1 it is the
+    # whole batch. Inputs: ratio, parameter_sync_step, expected.
     trainer = _trainer(switch_threshold_ratio=ratio, parameter_sync_step=parameter_sync_step)
 
     assert trainer._switch_threshold() == expected
@@ -406,27 +501,37 @@ def test_threshold_is_clamped_to_between_one_mini_batch_and_the_batch(ratio, par
 
 @pytest.mark.parametrize("ratio", [0.0, -0.1, 1.5])
 def test_switching_rejects_a_ratio_outside_the_unit_interval(ratio):
+    # [FUNCTION DOC]
+    # Ratios 0, -0.1, 1.5 raise ValueError mentioning switch_threshold_ratio.
     with pytest.raises(ValueError, match="switch_threshold_ratio"):
         _trainer(switch_threshold_ratio=ratio)
 
 
 def test_switching_rejects_a_replay_buffer_that_cannot_report_depth(monkeypatch):
+    # [FUNCTION DOC]
+    # A replay buffer lacking wait_for_sampleable raises TypeError at construction.
     with pytest.raises(TypeError, match="wait_for_sampleable"):
         _construct_trainer(monkeypatch, replay_buffer=SimpleNamespace())
 
 
 def test_switching_rejects_rollout_disaggregation(monkeypatch):
+    # [FUNCTION DOC]
+    # Rollout disaggregation enabled raises ValueError at construction.
     with pytest.raises(ValueError, match="does not support rollout disaggregation"):
         _construct_trainer(monkeypatch, replay_buffer=_RecordingReplayBuffer(), disaggregation=True)
 
 
 def test_disabled_switching_skips_custom_replay_buffer_validation(monkeypatch):
+    # [FUNCTION DOC]
+    # With switching disabled an incapable replay buffer is accepted.
     trainer = _construct_trainer(monkeypatch, replay_buffer=SimpleNamespace(), enable_switch=False)
 
     assert trainer.hybrid_rollout_config.enable_switch is False
 
 
 def test_adaptive_threshold_increases_after_trainer_idle():
+    # [FUNCTION DOC]
+    # Three idle steps (2s sample wait) produce ratios 0.5, 0.55, 0.6 (first step unchanged).
     trainer = _trainer(adaptive_switch_threshold=True, switch_threshold_ratio=0.5)
 
     ratios = []
@@ -438,6 +543,8 @@ def test_adaptive_threshold_increases_after_trainer_idle():
 
 
 def test_adaptive_threshold_decreases_after_calm_release_interval():
+    # [FUNCTION DOC]
+    # Four calm steps produce 0.5, 0.475, 0.45, 0.425.
     trainer = _trainer(adaptive_switch_threshold=True, switch_threshold_ratio=0.5)
 
     ratios = []
@@ -449,6 +556,8 @@ def test_adaptive_threshold_decreases_after_calm_release_interval():
 
 
 def test_threshold_direction_change_resets_hysteresis():
+    # [FUNCTION DOC]
+    # Three calm, one idle, one calm step end at ratio 0.45.
     trainer = _trainer(adaptive_switch_threshold=True, switch_threshold_ratio=0.5)
 
     for _ in range(3):
@@ -460,6 +569,8 @@ def test_threshold_direction_change_resets_hysteresis():
 
 
 def test_alternating_idle_and_calm_does_not_move_threshold():
+    # [FUNCTION DOC]
+    # Alternating idle/calm steps keep the ratio at 0.5.
     trainer = _trainer(adaptive_switch_threshold=True, switch_threshold_ratio=0.5)
 
     for sample_wait_seconds in [2.0, 0.0] * 4:
@@ -469,6 +580,9 @@ def test_alternating_idle_and_calm_does_not_move_threshold():
 
 
 def test_trainer_idle_is_reported():
+    # [FUNCTION DOC]
+    # One idle step reports the idle metric 1.0, step threshold 32, recorded wait 2.0 and unchanged ratio
+    # with adaptation disabled.
     trainer = _trainer(switch_threshold_ratio=0.5)
 
     _run_step(trainer, sample_wait_seconds=2.0)

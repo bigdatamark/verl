@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Rollout side of fully-async PPO. Defines a server manager that handles hybrid (trainer-GPU, normally sleeping)
+# and standalone rollout replicas, a single-sample agent loop manager, and the FullyAsyncRollouter Ray actor
+# that streams prompts through generation and pushes each finished sample into the message queue, pausing
+# when the queue is full or staleness exceeds its budget.
+# Side effects on import: creates a module logger whose level comes from VERL_LOGGING_LEVEL (default WARN).
+
 import asyncio
 import collections
 import logging
@@ -52,6 +59,11 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class FullyAsyncLLMServerManager(LLMServerManager):
+    # [CLASS DOC]
+    # Server manager that keeps three extra structures: all registered hybrid replicas keyed by resource id
+    # ("hybrid_<i>"), the currently active subset, and the active subset's server addresses; plus Prometheus
+    # addresses and last add/remove timestamps. Hybrid replicas are added/removed from the global load balancer
+    # at runtime.
     """Extension of :class:`LLMServerManager` for fully async training with hybrid scheduling."""
 
     def __init__(
@@ -60,6 +72,11 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         worker_group: RayWorkerGroup = None,
         rollout_resource_pool: RayResourcePool = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: calls parent init, then creates empty hybrid/alive/address mappings, empty Prometheus address list,
+        # and zero timestamps.
+        # Inputs: config; optional worker_group (trainer worker group backing hybrid replicas); optional rollout pool.
+        # Outputs: none.
         super().__init__(config, worker_group, rollout_resource_pool)
         # Pre-registered hybrid replicas: bound at init time but still sleeping.
         # Keyed by resource_id; populated during _initialize_llm_servers().
@@ -76,6 +93,18 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         self.last_hybrid_remove_time: float = 0.0
 
     async def _initialize_llm_servers(self, start_rank: int = 0):
+        # [FUNCTION DOC]
+        # HELPER: Two-phase server initialization overriding the parent.
+        # Behavior: Phase 1 (only if a worker group exists): run the parent init from rank 0 to create hybrid replicas,
+        # move every created replica into the hybrid mapping as "hybrid_<index>", remember their addresses for
+        # Prometheus, then clear the parent's replica/handle/address lists. Phase 2: temporarily set worker_group to none
+        # so the parent takes its standalone path, starting at rank equal to the hybrid count; if
+        # standalone_gpu_memory_utilization and gpu_memory_utilization are both configured, temporarily override the
+        # latter with the former; always restore both in a finally block. Then, if Prometheus is enabled, require log
+        # stats to be enabled and update the Prometheus config with hybrid plus standalone addresses. Logs counts.
+        # Inputs: start_rank - ignored (phases choose their own ranks). Outputs: none.
+        # Exceptions: ValueError when Prometheus is enabled but disable_log_stats is true; parent init errors.
+        # Side effects: creates Ray server actors; mutates rollout config temporarily; writes Prometheus config.
         # ── Step 1: hybrid replicas first (replica_rank 0 … N_e-1) ──────────
         # Use parent class to create + init_hybrid all hybrid replicas, then
         # migrate them from rollup_replicas → hybrid_replicas (sleeping, not
@@ -142,6 +171,16 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         )
 
     async def add_replicas(self, resource_ids: list[str]) -> int:
+        # [FUNCTION DOC]
+        # Behavior: for each requested id, skip (with warning) if already active, skip (with error log) if not
+        # registered; collect address-to-handle pairs. If none, return 0. Otherwise one RPC to the global load balancer
+        # to add all servers, then for each valid id append its handle/address to the server lists (if not present),
+        # append the replica to rollout_replicas (if not present), and record it in alive mappings; update last add time.
+        # Inputs: resource_ids - list of hybrid ids. Outputs: count added (0 on failure).
+        # Exceptions: any exception from the RPC/tracking is caught, logged, and 0 returned.
+        # Side effects: load balancer and local state mutation; prints.
+        # KNOWN ISSUE: active hybrid replicas are appended to rollout_replicas, contradicting get_standalone_replicas'
+        # claim that rollout_replicas holds only standalone replicas and causing get_active_server_count to double-count.
         """Activate multiple pre-registered hybrid replicas in a single batch RPC.
 
         Uses ``batch_add_servers`` on the GlobalRequestLoadBalancer for atomic
@@ -204,6 +243,13 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             return 0
 
     async def remove_replicas(self, resource_ids: list[str]) -> int:
+        # [FUNCTION DOC]
+        # Behavior: for each id, skip with warning if not active; collect its address. If none, return 0. Otherwise one RPC
+        # to remove those server ids from the load balancer, then for each valid id remove its address and the handle at
+        # the same position from the server lists, remove the replica from rollout_replicas, and drop it from the alive
+        # mappings; update last remove time.
+        # Inputs: resource_ids. Outputs: count removed (0 on failure).
+        # Exceptions: caught and logged, returning 0. Side effects: load balancer and local state mutation; prints.
         """Deactivate multiple active hybrid replicas in a single batch RPC.
 
         Uses ``batch_remove_servers`` on the GlobalRequestLoadBalancer for atomic
@@ -262,14 +308,20 @@ class FullyAsyncLLMServerManager(LLMServerManager):
     # Statistics / introspection
     # -------------------------------------------------------------------------
     def get_num_hybrid_replicas(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns the number of active hybrid replicas. Outputs: int.
         """Return the number of currently active hybrid replicas."""
         return len(self.alive_replicas)
 
     def get_hybrid_replicas_info(self) -> list[dict]:
+        # [FUNCTION DOC]
+        # Behavior: returns a list of records with resource_id and server_address for each active hybrid replica.
         """Return metadata for all active hybrid replicas."""
         return [{"resource_id": rid, "server_address": addr} for rid, addr in self.alive_addresses.items()]
 
     def get_hybrid_statistics(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: returns a mapping with active hybrid count and last add/remove timestamps under "hybrid/" keys.
         """Return hybrid-specific counters for monitoring."""
         return {
             "hybrid/num_hybrid_replicas": len(self.alive_replicas),
@@ -278,10 +330,16 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         }
 
     def get_active_server_count(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns length of rollout_replicas plus number of active hybrid replicas. Outputs: int.
+        # KNOWN ISSUE: add_replicas also puts active hybrid replicas into rollout_replicas, so they are counted twice.
         """Total active rollout servers (standalone + hybrid)."""
         return len(self.rollout_replicas) + len(self.alive_replicas)
 
     def get_standalone_replicas(self) -> list:
+        # [FUNCTION DOC]
+        # Behavior: returns rollout_replicas as-is. Outputs: list.
+        # KNOWN ISSUE: after add_replicas this list also contains active hybrid replicas, contrary to the docstring.
         """Return standalone-only replicas (hybrid replicas excluded).
 
         ``rollout_replicas`` only ever holds standalone replicas; hybrid
@@ -290,6 +348,9 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         return self.rollout_replicas
 
     def get_client(self, client_cls=FullyAsyncLLMServerClient, **kwargs) -> LLMServerClient:
+        # [FUNCTION DOC]
+        # Behavior: computes only_hybrid as "rollout_replicas is empty" and delegates to the parent get_client with that
+        # flag, default client class FullyAsyncLLMServerClient, and extra kwargs. Outputs: an LLM server client.
         """Override to automatically inject ``only_hybrid`` into the client.
 
         When there are no standalone replicas, hybrid replicas are the sole
@@ -303,8 +364,15 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
+    # [CLASS DOC]
+    # Agent loop manager variant that generates one sample at a time by dispatching to agent loop workers in
+    # round-robin order.
     @SkipManager.annotate(role="async_rollout")
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # Behavior: picks the next worker round-robin and awaits its remote generate_sequences call (bridging the Ray
+        # future into asyncio). Inputs: prompts - single-sample DataProto. Outputs: generated DataProto.
+        # Exceptions: propagates remote errors. Decorated for skip-manager "async_rollout" role.
         """Split input batch and dispatch to agent loop workers.
 
         Args:
@@ -317,6 +385,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         return await asyncio.wrap_future(output_future.future())
 
     def _select_best_worker(self):
+        # [FUNCTION DOC]
+        # HELPER: Lazily initializes a worker index to 0, returns the worker at that index, and advances it modulo the
+        # number of workers. Side effects: mutates the index attribute.
         """Select the best worker, simple round-robin load balancing"""
         if not hasattr(self, "_worker_index"):
             self._worker_index = 0
@@ -328,6 +399,12 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
 @ray.remote(num_cpus=10, max_concurrency=100)
 class FullyAsyncRollouter(SeparateRayPPOTrainer):
+    # [CLASS DOC]
+    # Ray actor (10 CPUs, up to 100 concurrent calls) that continuously generates samples. Reuses the separated
+    # PPO trainer for dataset/worker utilities. Key state: dataloader, staleness_samples (samples generated or queued
+    # since last parameter update), max_required_samples budget, max_concurrent_samples, pending queue of prompts,
+    # set of active generation tasks, pause/resume event, per-step counters and a history of (time, active count,
+    # capacity) used for resource utilization metrics.
     """
     Asynchronous sample generator, responsible for continuously generating training samples
     and putting them into MessageQueue
@@ -341,6 +418,18 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         processor=None,
         device_name=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores tokenizer/processor/config; asserts no hybrid engine, train_batch_size 0, gen_batch_size 1,
+        # staleness_threshold at least 0, trigger_parameter_sync_step at least 1; determines reward model need and, if
+        # needed, asserts the RM uses its own resource pool; disables reference policy and critic; sets device; creates
+        # a validation generations logger; reads prefix-grouper flag; initializes dump executor; builds train/val
+        # datasets, sampler, validates config, creates dataloaders; total_rollout_steps is dataloader length times
+        # epochs, capped by rollout.total_rollout_steps if set; required_samples is ppo_mini_batch_size times
+        # require_batches; initializes counters, global_steps 1, completed steps 1, timing, pause/running flags,
+        # dataloader lock, pending queue (capacity 128), active task set and the utilization history seeded with a
+        # zero-capacity point.
+        # Inputs: config; tokenizer; optional processor; optional device_name.
+        # Exceptions: AssertionError for invalid config; ValueError from config validation.
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
         self.processor = processor
@@ -476,6 +565,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self._active_count_history: list[tuple[float, int, int]] = [(time.time(), 0, 0)]
 
     def _init_async_objects(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates the state lock and the resume event (initially set). Must run inside the actor's event loop.
         # Initialize asyncio synchronization primitives.
         # `lock` protects shared state: paused / active_tasks / staleness_samples / timing fields.
         self.lock = asyncio.Lock()
@@ -484,11 +575,20 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self._resume_event.set()
 
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
+        # [FUNCTION DOC]
+        # Behavior: stores the message queue client under the lock. Outputs: none.
         """Set message queue client"""
         async with self.lock:
             self.message_queue_client = message_queue_client
 
     async def set_max_required_samples(self):
+        # [FUNCTION DOC]
+        # Behavior: under the lock computes max_required_samples as required_samples times (staleness_threshold+1) times
+        # trigger_parameter_sync_step; total_train_steps as total_rollout_steps divided by (required_samples times
+        # trigger step), truncated; max_concurrent_samples as active server count times per-replica concurrency, capped
+        # by max_required_samples; max_queue_size equal to max_required_samples. Logs, then if the utilization history
+        # has only its seed point, replaces its capacity with the real max_concurrent_samples.
+        # Outputs: none. Side effects: state mutation, print.
         async with self.lock:
             self.max_required_samples = int(
                 self.required_samples
@@ -524,16 +624,29 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 self._active_count_history[0] = (t0, active0, self.max_concurrent_samples)
 
     def get_replicas(self):
+        # [FUNCTION DOC]
+        # Behavior: returns the server manager's active replicas.
         """Get rollout worker group"""
         return self.llm_server_manager.get_replicas()
 
     def get_max_queue_size(self):
+        # [FUNCTION DOC]
+        # Behavior: returns max_queue_size (none before set_max_required_samples).
         return self.max_queue_size
 
     def get_total_train_steps(self):
+        # [FUNCTION DOC]
+        # Behavior: returns total_train_steps (none before set_max_required_samples).
         return self.total_train_steps
 
     def _compute_rollout_resource_utilization(self) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Appends a closing point (now, active count, current capacity or 0) to the history, logs the raw
+        # history, and computes a time- and capacity-weighted utilization: for each consecutive pair of points with
+        # positive duration and positive capacity, add duration times capacity times min(1, active/capacity) to a
+        # numerator and duration times capacity to a denominator. Returns numerator/denominator, or 0 when the
+        # denominator is 0. Then resets the history to a single point (now, active count, capacity).
+        # Outputs: float in [0,1]. Side effects: mutates history; prints.
         """Estimate rollout-resource utilization over the just-finished rollouter step
         (the window between the previous and current reset_staleness() call), using the
         event-driven (active_count, max_concurrent) history recorded by _record_active_count().
@@ -592,6 +705,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         return utilization
 
     async def reset_staleness(self):
+        # [FUNCTION DOC]
+        # Behavior: under the lock: unpauses and sets the resume event; sets staleness_samples to the number of active
+        # tasks plus the current message queue size; computes version time (since step start, at least 1e-6), active
+        # time (until idle start if idle began after step start, else whole window) and idle ratio; if any samples were
+        # generated this step, increments completed steps and appends (completed steps, count) to the history; records
+        # step sample count, resets it to 0; computes rollout resource utilization; logs; resets step start time.
+        # Outputs: mapping of timing/metric names to floats.
+        # Side effects: state mutation; remote queue-size call; prints.
         """
         Reset staleness samples after parameter update.
         Returns timing_raw dictionary for metrics.
@@ -638,14 +759,21 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         return timing_raw
 
     async def _start_profiling(self):
+        # [FUNCTION DOC]
+        # HELPER: Awaits start of profiling on all replicas via the server manager.
         """Start rollout profiling on all replicas via LLMServerManager after weight sync."""
         await self.llm_server_manager.start_profile()
 
     async def _stop_profiling(self):
+        # [FUNCTION DOC]
+        # HELPER: Awaits stop of profiling on all replicas via the server manager.
         """Stop rollout profiling on all replicas before the next weight sync."""
         await self.llm_server_manager.stop_profile()
 
     def do_validate(self):
+        # [FUNCTION DOC]
+        # Behavior: runs the inherited validation inside a timer and returns the merged timing and validation metrics.
+        # Outputs: mapping of metric names to values.
         """Run validation and return metrics"""
         timing_raw = {}
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
@@ -653,6 +781,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         return timing_raw | val_metrics
 
     async def save_checkpoint(self, local_global_step_folder: str):
+        # [FUNCTION DOC]
+        # Behavior: creates the folder, snapshots the train dataloader state under the dataloader lock, and saves it
+        # with torch to "data.pt" in the folder. In-flight samples are not saved (they will be lost on resume).
+        # Inputs: local_global_step_folder - path. Outputs: none. Side effects: filesystem write, print.
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
         # (pending/cancel/result queue and message queue).
         # Therefore, directly saving the state of the dataloader will result in losing these
@@ -669,6 +801,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         print(f"[FullyAsyncRollouter] Saved dataloader checkpoint to {dataloader_local_path}")
 
     def load_checkpoint(self):
+        # [FUNCTION DOC]
+        # Behavior: returns 0 when resume_mode is "disable". Raises if an HDFS dir is configured. Otherwise finds the latest
+        # checkpoint under default_local_dir (made absolute). In "auto" mode returns 0 if none found; in "resume_path"
+        # mode asserts the path is a string containing "global_step_" and uses it (made absolute); other modes raise.
+        # Parses the trainer step from the folder name and sets global_steps to that step times required_samples times
+        # trigger step, plus 1. Loads the dataloader state from "data.pt" if present, else warns.
+        # Outputs: 0 on early exits, otherwise none.
+        # Exceptions: NotImplementedError for HDFS; AssertionError for bad resume path; ValueError for unknown mode.
+        # Side effects: mutates global_steps and dataloader state; reads files; prints.
         """Load checkpoint including dataloader state based on resume mode"""
 
         if self.config.trainer.resume_mode == "disable":
@@ -727,12 +868,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             )
 
     def _validate_config(self):
+        # [FUNCTION DOC]
+        # HELPER: Raises ValueError if async_training config is missing; asserts rollout calculate_log_probs is enabled.
         # Validate asynchronous training configuration
         if not hasattr(self.config, "async_training"):
             raise ValueError("[FullyAsyncRollouter] Missing async_training configuration")
         assert self.config.actor_rollout_ref.rollout.calculate_log_probs, "must rollout calculate log_probs"
 
     async def init_workers(self):
+        # [FUNCTION DOC]
+        # Behavior: creates async primitives, worker classes, reward loop manager, optional teacher model manager,
+        # the async rollout manager, and initializes the skip manager from config. Outputs: none.
         """Initialize distributed training workers using Ray backend.
 
         Creates:
@@ -747,6 +893,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         SkipManager.init(self.config)
 
     async def _create_reward_loop_manager(self):
+        # [FUNCTION DOC]
+        # HELPER: Constructs a RewardLoopManager (with no RM resource pool) in a thread executor, since its constructor
+        # runs its own event loop; stores it. Side effects: creates reward workers.
         """Create RewardLoopManager for the rollouter.
 
         TODO: RewardModelManager.__init__ uses asyncio.run() which forces us to use
@@ -764,6 +913,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         )
 
     async def _create_teacher_model_manager(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets teacher manager to none; if distillation is enabled, builds a single "teacher_pool" resource pool
+        # of n_gpus_per_node per node across nnodes, maps the TeacherModel role to it, creates it, and constructs a
+        # MultiTeacherModelManager in a thread executor.
+        # Exceptions: AssertionError if distillation n_gpus_per_node is not positive.
+        # Side effects: allocates Ray resource pool and teacher workers.
         """Create MultiTeacherModelManager for distillation if enabled.
 
         Allocates a big resource pool for all teachers and passes it to
@@ -800,14 +955,20 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             )
 
     def _create_actor_rollout_classes(self):
+        # [FUNCTION DOC]
+        # HELPER: No-op override; rollout workers are created by the agent loop instead.
         # Skip rollout creation and let agentloop handle it
         pass
 
     def _create_reward_model_class(self):
+        # [FUNCTION DOC]
+        # HELPER: No-op override; reward models are managed by the reward loop manager.
         # In fully async mode, RM is managed by RewardLoopManager (standalone). Skip worker group creation for RM.
         pass
 
     def _create_continuous_iterator(self):
+        # [FUNCTION DOC]
+        # HELPER: Generator yielding (epoch, batch) pairs over all batches for each configured epoch.
         """
         Create a continuous data iterator across epoch
         """
@@ -817,6 +978,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 yield epoch, batch_dict
 
     async def _init_async_rollout_manager(self):
+        # [FUNCTION DOC]
+        # HELPER: Determines whether reward computation streams alongside rollout (no RM, or RM with its own pool) and
+        # passes reward workers accordingly; asserts rollout mode is "async"; creates the FullyAsyncLLMServerManager with
+        # the hybrid worker group, then the FullyAsyncAgentLoopManager with its client, reward worker handles and an
+        # optional teacher client. Exceptions: AssertionError if rollout mode is not async.
         """
         Create the server manager and agent loop manager for fully async training.
 
@@ -857,6 +1023,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     # Add samples to the pending_queue
     async def _feed_samples(self):
+        # [FUNCTION DOC]
+        # HELPER: Producer coroutine. For each batch from the continuous iterator, prepares single-sample generation data,
+        # wraps it in a RolloutSample with id "sample_<epoch>_<global_steps>" and empty status, and puts it in the pending
+        # queue (blocking when full). Stops after the sample whose global_steps reached total_rollout_steps, otherwise
+        # increments global_steps. Finally puts a none end signal and logs.
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
@@ -890,6 +1061,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
 
     def _record_active_count(self):
+        # [FUNCTION DOC]
+        # HELPER: Appends (now, active task count, capacity or 0) to the utilization history.
         """Append current (len(self.active_tasks), max_concurrent_samples) to the history used
         for computing dynamic_resource/rollout_resource_utilization. Call this right after any
         change (increase or decrease) to self.active_tasks, AND whenever max_concurrent_samples
@@ -900,6 +1073,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self._active_count_history.append((time.time(), len(self.active_tasks), max_concurrent))
 
     async def _processor_worker(self):
+        # [FUNCTION DOC]
+        # HELPER: Consumer coroutine. Loop: if paused or the pause condition holds, mark paused and clear the resume event,
+        # then drain: repeatedly wait for any active task or the resume event; remove/await finished tasks under the lock
+        # and record counts; break early on resume. If still not resumed, record idle start and wait for resume; cancel the
+        # resume waiter on exit; restart loop. Otherwise take the next sample from the pending queue (marking task done)
+        # and increment staleness_samples. On the end signal, wait for all active tasks to finish and exit. While active
+        # tasks reach max_concurrent_samples, wait for at least one to finish. If paused, wait for resume. Then under the
+        # lock create a task processing the sample (registered in the active set) and record counts.
+        # Exceptions: propagates exceptions raised by awaited finished tasks.
+        # KNOWN ISSUE: staleness_samples is also incremented for the none end signal.
         """
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
         """
@@ -989,6 +1172,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 self._record_active_count()
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
+        # [FUNCTION DOC]
+        # HELPER: Sets the sample's uid array to "uid_<sample_id>" for each row, awaits single-sample generation,
+        # replaces the batch with the output, re-sets the uid, attaches current statistics as rollout status, serializes
+        # the sample with cloudpickle and puts it into the message queue. Increments generated counters on success or the
+        # dropped counter on failure; always increments processed count.
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
         # Embed sample_id into prompts for skip management
@@ -1015,6 +1203,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.processed_sample_count += 1
 
     async def _streaming_generation_main(self):
+        # [FUNCTION DOC]
+        # HELPER: Ensures the rollout manager exists, starts feed and processor tasks, waits for the first to finish;
+        # re-raises its exception; raises RuntimeError if the processor ended before the feed. Then awaits the processor
+        # and joins the pending queue. Finally cancels any unfinished tasks, clears references, sends a none sample to the
+        # message queue as finish signal, and sets running false under the lock.
+        # Exceptions: re-raises task exceptions and RuntimeError.
         """The main entry method for stream processing"""
 
         if self.async_rollout_manager is None:
@@ -1074,6 +1268,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 self.running = False
 
     async def fit(self):
+        # [FUNCTION DOC]
+        # Behavior: requires a message queue client (ValueError otherwise); under the lock clears pause, sets running and
+        # the resume event; starts the generation main and monitor tasks and gathers them with exceptions captured; in
+        # finally cancels any unfinished task and gathers again. Logs completion.
+        # Outputs: none.
+        # KNOWN ISSUE: because gather uses return_exceptions, errors from generation/monitor are swallowed silently and the
+        # except branch is effectively unreachable.
         """
         Start the async rollouter - entry point that sets up and runs async tasks
         Main async fit method that coordinates all coroutines
@@ -1111,6 +1312,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         print("[FullyAsyncRollouter] Rollouter fit completed")
 
     async def _async_monitor_loop(self):
+        # [FUNCTION DOC]
+        # HELPER: Every 10 s while running: every 60 s print statistics; if paused and the pause condition no longer holds,
+        # unpause and set the resume event under the lock. Exits when running is false.
         """
         Async coroutine for monitoring:
         Function 1: Log information output
@@ -1140,6 +1344,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     self._resume_event.set()
 
     async def _should_pause_generation(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Returns True (logging only on transition) when message queue size is at least max_queue_size or
+        # staleness_samples is at least max_required_samples; otherwise False. Side effects: remote stats call.
         """Determine whether the build should be paused"""
         queue_stats = await self.message_queue_client.get_statistics()
         queue_size = queue_stats["queue_size"]
@@ -1164,6 +1371,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         return False
 
     async def get_statistics(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: returns a mapping of monitor, count and static statistics: active task count, pending queue size,
+        # message queue size, generated/staleness/dropped counts, required and max samples, staleness threshold, max queue
+        # size, max concurrency. Side effects: remote stats call.
         queue_stats = await self.message_queue_client.get_statistics()
 
         stats = {
@@ -1189,20 +1400,30 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     # Elastic worker group injection
     # -------------------------------------------------------------------------
     def set_hybrid_worker_group(self, worker_group: RayWorkerGroup):
+        # [FUNCTION DOC]
+        # Behavior: stores the worker group used for hybrid replicas (must be called before init_workers).
         """Inject the hybrid worker group."""
         self._hybrid_worker_group = worker_group
 
     def get_hybrid_worker_group(self):
+        # [FUNCTION DOC]
+        # Behavior: returns the stored hybrid worker group or none.
         """Return the worker group for hybrid replicas."""
         return self._hybrid_worker_group
 
     async def add_replicas(self, resource_ids: list[str]) -> int:
+        # [FUNCTION DOC]
+        # Behavior: delegates activation to the server manager; if any were added, recomputes max concurrency.
+        # Outputs: number added.
         n = await self.llm_server_manager.add_replicas(resource_ids)
         if n > 0:
             self._update_max_concurrent_samples()
         return n
 
     async def remove_replicas(self, resource_ids: list[str]) -> int:
+        # [FUNCTION DOC]
+        # Behavior: delegates removal to the server manager; if any were removed, recomputes max concurrency.
+        # Outputs: number removed.
         n = await self.llm_server_manager.remove_replicas(resource_ids)
         if n > 0:
             self._update_max_concurrent_samples()
@@ -1211,6 +1432,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     async def rebalance_requests(
         self, wait_inflight_timeout_s: float = 30.0, wait_inflight_poll_interval_s: float = 0.2
     ) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: four steps: clear the load balancer's sticky routing cache (keep its diagnostics result); abort all
+        # requests on all active replicas concurrently; poll the load balancer's total in-flight count every poll interval
+        # until zero or timeout (log on timeout, no error); resume generation on the same replicas.
+        # Inputs: wait_inflight_timeout_s; wait_inflight_poll_interval_s. Outputs: the sticky-cache diagnostics mapping
+        # (with cleared_entries and server_loads). Side effects: aborts requests (clients retry), remote calls, prints.
         """Redistribute in-flight requests evenly across all active replicas.
 
         This performs a full rebalance cycle:
@@ -1272,6 +1499,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         return result
 
     def _update_max_concurrent_samples(self):
+        # [FUNCTION DOC]
+        # HELPER: If max_required_samples is unset, return. Otherwise set max_concurrent_samples to active replica count
+        # times per-replica concurrency, capped by max_required_samples, log, and record a utilization history point.
         """Recompute max_concurrent_samples based on current active replica count.
 
         This is called whenever rollout resources are dynamically activated/deactivated
@@ -1294,10 +1524,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self._record_active_count()
 
     def get_hybrid_replica(self, resource_id: str):
+        # [FUNCTION DOC]
+        # Behavior: returns the registered hybrid replica for an id, or none.
         """Return the RolloutReplica object for a registered hybrid resource."""
         return self.llm_server_manager.hybrid_replicas.get(resource_id)
 
     def get_all_hybrid_replicas(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: returns a shallow copy of the hybrid replica mapping (all registered, sleeping or active).
         """Return all registered hybrid replicas (sleeping + active)."""
         return dict(self.llm_server_manager.hybrid_replicas)
 
@@ -1305,32 +1539,46 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     # Statistics / introspection – delegate to llm_server_manager
     # -------------------------------------------------------------------------
     async def get_hybrid_statistics(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: returns the general statistics merged with hybrid statistics.
         """Combined rollout + hybrid statistics."""
         base_stats = await self.get_statistics()
         hybrid_stats = self.llm_server_manager.get_hybrid_statistics()
         return {**base_stats, **hybrid_stats}
 
     def get_num_active_replicas(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns the server manager's active server count.
         """Total active rollout replicas (standalone + active hybrid)."""
         return self.llm_server_manager.get_active_server_count()
 
     def get_standalone_replicas(self) -> list:
+        # [FUNCTION DOC]
+        # Behavior: returns the server manager's standalone replica list.
         """Return standalone-only replicas (hybrid replicas excluded)."""
         return self.llm_server_manager.get_standalone_replicas()
 
     def get_hybrid_replicas_info(self) -> list[dict]:
+        # [FUNCTION DOC]
+        # Behavior: returns the server manager's active hybrid replica metadata.
         """Metadata for all active hybrid replicas."""
         return self.llm_server_manager.get_hybrid_replicas_info()
 
     def get_total_produced_samples(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns total_generated_samples.
         """Total samples produced (uses base class counter)."""
         return self.total_generated_samples
 
     def get_completed_steps(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: returns the completed parameter-sync step counter.
         """Number of param-sync steps completed (monotonically increasing)."""
         return self._completed_steps
 
     async def get_sample_collection_ratio(self) -> float:
+        # [FUNCTION DOC]
+        # Behavior: returns message queue size divided by required_samples, logging the values. Outputs: float.
         """Return the fraction of required samples already collected for the current step."""
         queue_size = await self.message_queue_client.get_queue_size()
         ratio = queue_size / self.required_samples
@@ -1347,6 +1595,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         poll_interval: float = 1.0,
         timeout: float | None = None,
     ) -> int:
+        # [FUNCTION DOC]
+        # Behavior: polls the message queue size every poll_interval seconds; returns the size once it reaches
+        # required_count; raises TimeoutError once elapsed time reaches timeout (if given).
+        # Inputs: required_count; poll_interval; optional timeout. Outputs: observed queue size.
+        # KNOWN ISSUE: docstring says a none required_count defaults to required_samples, but the code does not handle
+        # none and the comparison would fail.
         """Block until the message queue contains at least ``required_count`` samples.
 
         Polls ``message_queue_client.get_queue_size()`` every ``poll_interval``

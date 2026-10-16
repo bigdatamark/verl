@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Rate-limited reward manager for API-backed reward functions (e.g. LLM-as-judge). Provides an async token bucket and
+# a manager, registered as "rate_limited" in both the reward-loop and legacy reward manager registries, that applies
+# global (class-level) concurrency, requests-per-minute and tokens-per-minute limits plus a per-call timeout.
+# Side effects on import: registry registration; module logger.
+
 import asyncio
 import inspect
 import logging
@@ -30,6 +36,10 @@ logger = logging.getLogger(__file__)
 
 
 class AsyncTokenBucket:
+    # [CLASS DOC]
+    # Token bucket with continuous refill at rate_limit tokens/second up to max_tokens; supports fractional and oversized
+    # requests. State: rate, capacity, current tokens (starts full), last update timestamp (event loop time, lazily set),
+    # and an asyncio lock.
     """Async token bucket for rate limiting with variable token consumption.
 
     The token bucket algorithm is a classic rate limiting technique that allows
@@ -81,6 +91,9 @@ class AsyncTokenBucket:
     """
 
     def __init__(self, rate_limit: float, max_tokens: float = None):
+        # [FUNCTION DOC]
+        # Behavior: stores rate; capacity is max_tokens or, if falsy, the rate; tokens start at capacity; no last update yet;
+        # creates the lock. Inputs: rate_limit - tokens/second; optional max_tokens.
         self.rate_limit = rate_limit
         self.max_tokens = max_tokens or rate_limit
         self.tokens = self.max_tokens
@@ -88,6 +101,12 @@ class AsyncTokenBucket:
         self.lock = asyncio.Lock()
 
     async def acquire(self, num_tokens: float = 1.0) -> None:
+        # [FUNCTION DOC]
+        # Behavior: Oversized request (more than capacity): under the lock refill based on elapsed time, compute the wait as
+        # the shortfall divided by rate, subtract the full request (balance may go negative), update timestamp; then sleep the
+        # wait outside the lock and return. Normal request: loop - under the lock refill and update timestamp; if enough tokens,
+        # subtract and return; else compute the wait for the shortfall; sleep outside the lock and retry.
+        # Inputs: num_tokens - float (default 1). Outputs: none. Never raises; may wait indefinitely.
         """Acquire tokens from the bucket, waiting if necessary.
 
         This method will block (using asyncio.sleep) until sufficient tokens
@@ -172,6 +191,10 @@ class AsyncTokenBucket:
 @register_manager("rate_limited")
 @register_manager_legacy("rate_limited")
 class RateLimitedRewardManager(RewardManagerBase):
+    # [CLASS DOC]
+    # Reward manager enforcing global rate limits shared by all instances in the process. Class-level state: semaphore and
+    # max concurrency, optional RPM and TPM token buckets with their limits, estimated tokens per request, and init flag.
+    # Each sample: acquire RPM token, acquire TPM tokens, then compute under the semaphore with a timeout.
     """Reward manager with rate limiting for API-based reward functions.
 
     This manager implements a sophisticated three-layer rate limiting system
@@ -263,6 +286,13 @@ class RateLimitedRewardManager(RewardManagerBase):
 
     @classmethod
     def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer):
+        # [FUNCTION DOC]
+        # Behavior: if already initialized, compares incoming reward.max_rpm/max_tpm with the stored ones and warns when they
+        # differ (and any is set), then returns without changes. Otherwise calls the base hook, reads from config.reward:
+        # max_concurrent (default 1) to build the semaphore; max_rpm to build an RPM bucket with rate and capacity rpm/60 (none
+        # if unset); max_tpm and estimated_tokens_per_request (default 2000) to build a TPM bucket with rate and capacity tpm/60;
+        # logs the configuration; marks initialized.
+        # Inputs: config; tokenizer (unused). Side effects: mutates class-level state.
         """Initialize class state shared across all instances."""
         # Check if already initialized before calling parent.
         #
@@ -350,6 +380,11 @@ class RateLimitedRewardManager(RewardManagerBase):
         reward_fn_key: str | None = None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: substitutes an empty reward config when config is none (legacy callers); raises TypeError if tokenizer is
+        # none; base init (which runs class init); chooses compute_score or the default, detects async; stores router address
+        # and RM tokenizer; timeout from reward.timeout (default 300 s). Legacy kwargs are accepted and ignored.
+        # Exceptions: TypeError for missing tokenizer.
         # When called via the legacy AbstractRewardManager signature, `config` may be absent.
         # In that case we fall back to an empty config so training can proceed.
         if config is None:
@@ -367,6 +402,10 @@ class RateLimitedRewardManager(RewardManagerBase):
     async def _compute_reward(
         self, data_source: str, solution_str: str, ground_truth: str, extra_info: dict
     ) -> dict | float:
+        # [FUNCTION DOC]
+        # HELPER: Calls the score function with data_source, solution string, ground truth and extra_info (plus router address
+        # and RM tokenizer when a router exists): awaited directly if async, otherwise run in an executor.
+        # Outputs: mapping or float score.
         extra_reward_kwargs = (
             {
                 "reward_router_address": self.reward_router_address,
@@ -396,6 +435,14 @@ class RateLimitedRewardManager(RewardManagerBase):
             )
 
     async def run_single(self, data: DataProto) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: takes the last item, decodes valid response tokens, reads data_source, ground truth, extra_info (merging
+        # tool_extra_fields items into it if present), then acquires RPM (1 token) and TPM (estimated tokens) if enabled, and
+        # under the semaphore computes the score with the timeout. Mapping results give "score" and all entries as extra info;
+        # scalars give score and "acc". On timeout, score 0 with timeout and acc 0 flags; on any other error, score 0 with the
+        # error message and acc 0.
+        # Outputs: mapping with reward_score and reward_extra_info.
+        # KNOWN ISSUE: extra_info from the sample is mutated in place when tool_extra_fields exist.
         data = data[-1:]  # for multi-sequence outputs, we only compute reward based on the last sequence
         data_item = data[0]
 
@@ -469,6 +516,13 @@ class RateLimitedRewardManager(RewardManagerBase):
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}
 
     def __call__(self, data: DataProto, return_dict: bool = False):
+        # [FUNCTION DOC]
+        # Behavior: legacy synchronous interface. If rm_scores already exist, returns them (with extra info built from
+        # meta_info reward_extra_keys when return_dict). Otherwise runs run_single for every single-item slice concurrently on
+        # the manager's event loop (blocking), writes each score at the last valid response position of a zero float tensor
+        # shaped like responses, and collects extra-info values into per-key lists.
+        # Inputs: data; return_dict - bool. Outputs: reward tensor, or mapping with reward_tensor and reward_extra_info.
+        # Exceptions: fails if called while that event loop is already running.
         """Make the manager callable like traditional reward managers.
 
         This method provides compatibility with the existing reward manager interface
@@ -504,6 +558,8 @@ class RateLimitedRewardManager(RewardManagerBase):
 
         # Process each data item through the async event loop
         async def process_batch():
+            # [FUNCTION DOC]
+            # HELPER: Coroutine gathering run_single over every single-item slice of data, returning results in order.
             tasks = []
             for i in range(len(data)):
                 data_item = data[i : i + 1]  # Get single item as DataProto slice

@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Top-k forward-KL distillation loss for Megatron actors where student logits are sharded across the vocab by
+# tensor parallelism (TP) and sequences are split across context parallelism (CP). Implements a custom autograd
+# function so the loss and its gradient are computed without gathering full-vocab logits.
+
 
 from typing import Optional
 
@@ -27,6 +32,11 @@ from verl.workers.config import DistillationConfig, DistillationLossConfig
 def vocab_parallel_log_softmax(
     vp_logits: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: numerically stable log-softmax over a vocab-sharded last dim: computes local max via Megatron's helper
+    # (which also casts to float), all-reduces MAX across the TP group, subtracts it, sums exponentials locally,
+    # all-reduces SUM, and subtracts the log of the global sum.
+    # Inputs: vp_logits (..., vocab_shard). Outputs: local shard of global log-probs. Side effects: two TP collectives.
     """
     1. Converts logits to float (in calculate_logits_max)
     2. Finds max logit across all partitions
@@ -56,6 +66,10 @@ def vocab_parallel_log_softmax(
 
 
 class _VocabParallelKLDivergence(torch.autograd.Function):
+    # [CLASS DOC]
+    # HELPER: Custom autograd function computing per-token forward KL (teacher top-k vs vocab-parallel student) plus
+    # non-differentiable diagnostics (student mass on teacher top-k, teacher top-k mass, overlap count and overlap
+    # advantage). Gradient is returned only for the student logits.
     """
     Adapted from:
       https://github.com/verl-project/verl-recipe/blob/ccdb8d140dfc540761a9b209b854dbd2c0011e7e/gkd/megatron/megatron_kl_loss.py.
@@ -69,6 +83,24 @@ class _VocabParallelKLDivergence(torch.autograd.Function):
         target_topk_indices: torch.Tensor,
         log_prob_min_clamp: Optional[float],
     ):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: computes student global log-probs/probs on the local shard; determines this TP rank's vocab
+        # range; builds a mask of teacher top-k ids (global coordinates) that fall in it and converts them to local indices
+        # (out-of-shard set to dummy index 0). Optionally clamps teacher log-probs at log_prob_min_clamp, computes teacher
+        # probs and total teacher top-k mass (before shard masking), then zeroes teacher probs/log-probs for out-of-shard
+        # entries. Gathers student log-probs at the local indices. Active (gradient-receiving) mask = in-shard entries, and,
+        # when clamping, only those whose student log-prob exceeds the clamp; with clamping the student log-probs are
+        # clamped and the teacher mass over active entries is all-reduced across TP, else the full teacher mass is used.
+        # Student log-probs for out-of-shard entries are zeroed. Per-token KL = sum of teacher prob times (teacher logp
+        # minus student logp), all-reduced SUM across TP. Saves student probs, teacher probs, local indices, active mask and
+        # active mass for backward. Student mass on teacher top-k is the all-reduced sum of exp of student logp on in-shard
+        # entries. Student global top-k ids: local top-k (bounded by shard size) shifted to global, all-gathered across TP,
+        # then the best topk selected. Per-entry KL is all-reduced and the overlap count / mean negative KL on overlapping
+        # entries computed as in the FSDP version. Diagnostics are detached and marked non-differentiable.
+        # Inputs: ctx; vp_logits (b, s, vocab_shard); target_topk_logps and target_topk_indices (b, s, topk), global ids;
+        # log_prob_min_clamp optional float.
+        # Outputs: tuple(per-token KL, student top-k mass, teacher top-k mass, overlap count, overlap token advantage), each (b, s).
+        # Side effects: multiple TP all-reduce/all-gather collectives (all TP ranks must call it).
         """
         NOTE:
           - `target_topk_*` (indices/logprobs) are in *global vocab* coordinates.
@@ -224,6 +256,13 @@ class _VocabParallelKLDivergence(torch.autograd.Function):
         grad_overlap_count: torch.Tensor,
         grad_overlap_token_advantage: torch.Tensor,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: gradient of the per-token loss with respect to local logits: starts from student probs scaled
+        # by the active teacher mass, then scatter-adds the negative teacher probs at active local indices (duplicates
+        # accumulate, dummy index 0 contributions are zeroed by the mask), and multiplies by the incoming loss gradient.
+        # Gradients for diagnostic outputs are ignored.
+        # Inputs: ctx; gradient tensors for the five outputs. Outputs: (logit gradient, None, None, None).
+        # Side effects: none (no collectives needed since active mass was reduced in forward).
         """
         Backprop for the per-token loss:
             L = sum_{i in S} q_i * (log q_i - clamp(log p_i))
@@ -268,6 +307,15 @@ def compute_forward_kl_topk(
     config: DistillationConfig,
     data_format: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: asserts teacher inputs are nested; splits them for CP using the THD preprocessing helper when
+    # data_format is "thd", else the BSHD helper (taking the first returned value), asserts the first two dims match
+    # the student logits, and applies the vocab-parallel KL autograd function with log_prob_min_clamp from the
+    # distillation loss config.
+    # Inputs: student_logits (bsz, seqlen/cp, vocab/tp); nested teacher top-k log-probs and ids; config; data_format.
+    # Outputs: mapping with distillation_losses, student_mass, teacher_mass, overlap_count, overlap_token_advantage.
+    # Exceptions: AssertionError for non-nested inputs or shape mismatch.
+    # KNOWN ISSUE: annotated to return a 3-tuple but returns a mapping of five tensors.
     """Compute forward KL distillation loss using top-k log probabilities.
 
     Args:

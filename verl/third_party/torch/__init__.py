@@ -85,3 +85,6 @@
 # CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
+
+# [PACKAGE DOC]
+# Vendored subset of PyTorch (license header only). Contains no code; exists to host the distributed subpackage.

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for verl.workers.engine.utils.prepare_micro_batches with dynamic batch size and a force_group_size
+# constraint (see module docstring for the properties verified).
+# KNOWN ISSUE: the docstring promises that the per-micro-batch token budget is verified, but no test asserts that
+# any micro-batch's token count stays within max_token_len_per_gpu (only the over-budget single-group error case).
+
 """
 Tests for prepare_micro_batches with force_group_size > 1 and use_dynamic_bsz=True.
 
@@ -33,6 +39,10 @@ from verl.workers.engine.utils import prepare_micro_batches
 
 
 def _make_batch(seq_lens: list[int], force_group_size: int, max_token_len_per_gpu: int) -> TensorDict:
+    # [FUNCTION DOC]
+    # HELPER: Builds a right-padded TensorDict with random input_ids and an attention mask whose row i has seq_lens[i]
+    # ones, and attaches non-tensor metadata use_dynamic_bsz True, sp_size 1, force_group_size and
+    # max_token_len_per_gpu. Outputs: the TensorDict.
     """Build a minimal TensorDict accepted by prepare_micro_batches.
 
     Args:
@@ -69,6 +79,10 @@ def _make_batch(seq_lens: list[int], force_group_size: int, max_token_len_per_gp
 
 
 def _verify_group_integrity(batch_idx_list: list[list[int]], force_group_size: int, batch_size: int):
+    # [FUNCTION DOC]
+    # HELPER: Maps each original index in batch_idx_list to its micro-batch id, asserting no index appears twice and that
+    # every index 0..batch_size-1 is covered, then asserts each consecutive block of force_group_size indices maps to a
+    # single micro-batch. Exceptions: AssertionError on violation. Outputs: none.
     """Assert that every group of force_group_size consecutive samples stays together.
 
     Args:
@@ -98,6 +112,9 @@ def _verify_group_integrity(batch_idx_list: list[list[int]], force_group_size: i
 
 
 def test_force_group_size_2_basic():
+    # [FUNCTION DOC]
+    # 8 samples in groups of 2 with budget 220: asserts index lists are returned, at least one micro-batch exists, and
+    # group integrity holds.
     """Basic test: batch_size=8, force_group_size=2, dynamic bsz enabled."""
     # 4 groups of 2; alternating short/long sequences within each group.
     seq_lens = [50, 60, 80, 90, 40, 45, 100, 110]
@@ -115,6 +132,8 @@ def test_force_group_size_2_basic():
 
 
 def test_force_group_size_4_basic():
+    # [FUNCTION DOC]
+    # 16 samples in groups of 4 with budget 850: same assertions as the basic case.
     """Test with force_group_size=4 (e.g., 4 responses per prompt in RM training)."""
     # 4 groups of 4 samples each.
     seq_lens = [
@@ -149,6 +168,9 @@ def test_force_group_size_4_basic():
 
 
 def test_force_group_size_reconstruction():
+    # [FUNCTION DOC]
+    # Concatenates the micro-batches' input_ids and inverts the flattened index lists to reorder rows; asserts the
+    # reconstruction equals the original input_ids.
     """Verify that micro-batches can be reconstructed back to the original batch order."""
     seq_lens = [80, 85, 120, 130, 60, 65, 200, 210]
     force_group_size = 2
@@ -173,6 +195,8 @@ def test_force_group_size_reconstruction():
 
 
 def test_force_group_size_single_micro_batch():
+    # [FUNCTION DOC]
+    # With a very large budget, asserts exactly one micro-batch containing all 8 samples, and group integrity.
     """When all samples fit in one micro-batch, grouping constraint is trivially satisfied."""
     seq_lens = [10, 12, 15, 11, 8, 9, 14, 13]
     force_group_size = 2
@@ -190,6 +214,8 @@ def test_force_group_size_single_micro_batch():
 
 
 def test_force_group_size_large_group():
+    # [FUNCTION DOC]
+    # 18 samples in groups of 3 with budget 650: same assertions as the basic case.
     """Test with a larger batch and force_group_size=3."""
     # 6 groups of 3 samples each.
     seq_lens = [
@@ -226,6 +252,8 @@ def test_force_group_size_large_group():
 
 
 def test_force_group_size_1_unchanged():
+    # [FUNCTION DOC]
+    # force_group_size 1 (no grouping): asserts every sample index appears exactly once across micro-batches.
     """force_group_size=1 should behave identically to the default (no grouping constraint)."""
     seq_lens = [100, 200, 50, 150, 80, 120]
     force_group_size = 1
@@ -243,6 +271,9 @@ def test_force_group_size_1_unchanged():
 
 
 def test_force_group_exceeding_token_limit_raises():
+    # [FUNCTION DOC]
+    # A single group of two samples totalling 410 tokens with a 300 budget raises ValueError ("forced group exceeds
+    # max_token_len").
     batch = _make_batch(seq_lens=[200, 210], force_group_size=2, max_token_len_per_gpu=300)
 
     with pytest.raises(ValueError, match="forced group exceeds max_token_len"):

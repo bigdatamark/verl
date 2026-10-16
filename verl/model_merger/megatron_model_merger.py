@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Megatron backend for the model merger: builds an mcore GPT model with pipeline parallelism equal to the process
+# world size (TP=1), loads the dist_checkpoint into it, renames Megatron parameters to HuggingFace names (splitting
+# fused QKV and gate/up weights), and saves (optionally sharded across ranks) or validates the HF model.
+
 import json
 import os
 import warnings
@@ -52,10 +57,21 @@ from .output_validation import validate_hf_model_output
 
 @contextmanager
 def noop_context() -> Any:
+    # [FUNCTION DOC]
+    # HELPER: A context manager that does nothing; used in place of init_empty_weights when CPU initialization is off.
     yield
 
 
 def get_dynamic_pipeline_shards(layer_num: int, pp_size: int) -> list[int]:
+    # [FUNCTION DOC]
+    # Behavior: computes per-stage layer counts for pipeline parallelism. pp_size 1 -> all layers; pp_size 2 -> floor half
+    # then the rest. Otherwise, for each candidate middle-stage size m, sets first/last stage sizes to split the remaining
+    # layers (layer_num - m*(pp_size-2)) as floor/ceil halves, keeping candidates where both are in (0, m], and picks the
+    # one with smallest difference between first-stage size and m.
+    # Inputs: layer_num - total layers; pp_size - pipeline stages.
+    # Outputs: list of layer counts per stage summing to layer_num.
+    # Exceptions: ValueError if layer_num < pp_size or pp_size < 1; IndexError if no candidate is valid; AssertionError
+    # if the sum mismatches.
     """Calculate the pipeline sharding configuration for Megatron-LM.
 
     Args:
@@ -100,6 +116,10 @@ def get_dynamic_pipeline_shards(layer_num: int, pp_size: int) -> list[int]:
 
 
 class MegatronModelMerger(BaseModelMerger):
+    # [CLASS DOC]
+    # Megatron checkpoint merger. Each process is one pipeline stage; holds rank, world_size, hf_config, the
+    # Megatron->HF name mapping (params_mapping, ordered so longer overlapping keys are matched first) and, after loading,
+    # pipeline_shards.
     """
     Model merger for Megatron-LM distributed checkpoints.
 
@@ -142,6 +162,12 @@ class MegatronModelMerger(BaseModelMerger):
     """
 
     def __init__(self, config: ModelMergerConfig):
+        # [FUNCTION DOC]
+        # Behavior: calls base init, sets default single-process distributed env vars if WORLD_SIZE is unset, sets NUMA
+        # affinity, initializes the NCCL/HCCL process group, selects the local device, initializes Megatron model parallel
+        # (TP=1, PP=world_size, CP=1, EP=1), seeds model-parallel RNG, loads the HF config (printed), and builds the name
+        # mapping; for Qwen2MoE, shared-expert mappings use the singular "shared_expert" names plus the shared-expert gate.
+        # Side effects: mutates os.environ; creates a global process group and Megatron parallel state; selects device.
         super().__init__(config)
         # Currently we use only 1 rank to merge the dist_ckpt, we will move to multi-process save shortly afterwards
         if "WORLD_SIZE" not in os.environ:
@@ -219,6 +245,16 @@ class MegatronModelMerger(BaseModelMerger):
             self.params_mapping["mlp.shared_experts.gate_weight"] = "mlp.shared_expert_gate.weight"
 
     def _load_state_dicts(self, model_ckpt_path: str) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Builds the mcore model for this pipeline stage and loads its weights from the dist checkpoint.
+        # Behavior: computes pipeline_shards for num_hidden_layers over world_size; converts HF config to an mcore
+        # TransformerConfig in bfloat16, passing first-stage layer count when PP>1 and last-stage when PP>2; sets CPU
+        # initialization flag; builds the model (under init_empty_weights if CPU init, then materialized empty on CPU) with
+        # tied embeddings per hf_config; collects each virtual stage's sharded state dict under "model" or "model{i}", loads
+        # via dist checkpointing and returns the loaded dicts as a list in virtual-stage order.
+        # Inputs: model_ckpt_path - dist checkpoint directory.
+        # Outputs: list of state dicts (one per virtual pipeline stage).
+        # Side effects: sets self.pipeline_shards; allocates model memory; sets Megatron virtual pipeline rank; prints.
         """_summary_
         Use Megatron dist_checkpointing to load the model state dicts from the checkpoint directory.
 
@@ -244,6 +280,9 @@ class MegatronModelMerger(BaseModelMerger):
 
         # init megatron model
         def megatron_model_provider(pre_process, post_process):
+            # [FUNCTION DOC]
+            # HELPER: Model provider for get_model: initializes the mcore model for the given pre/post-process flags (non-value
+            # model, embeddings tied per hf_config). Outputs: the mcore model module.
             from verl.models.mcore import init_mcore_model
 
             parallel_model = init_mcore_model(
@@ -287,6 +326,12 @@ class MegatronModelMerger(BaseModelMerger):
         return model_state_dict_list
 
     def _check_megatron_state_key(self, key: str) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Validates a Megatron state key. Keys starting with "model." are rejected; keys containing
+        # "embedding.word_embeddings" or "output_layer" are accepted (printing a skip message); all others must start with
+        # "decoder".
+        # Exceptions: ValueError for invalid keys.
+        # KNOWN ISSUE: annotated to return bool but always returns None.
         """
         Checks if the key is a valid Megatron state key.
 
@@ -314,6 +359,14 @@ class MegatronModelMerger(BaseModelMerger):
     def _split_tensors(
         self, key: str, tensor: torch.Tensor, config: PretrainedConfig, is_value_model: bool = False
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Splits fused tensors. "linear_fc1.weight" keys are chunked in half into [gate, up]. QKV keys
+        # ("self_attention.linear_qkv." without "layer_norm") are interpreted as num_key_value_heads groups each laid out as
+        # [q heads for that group, k, v]; each group is split and q/k/v parts are concatenated across groups into [q, k, v].
+        # Other tensors are returned as a single-element list.
+        # Inputs: key - Megatron name; tensor; config - HF config (num_attention_heads, num_key_value_heads); is_value_model - unused.
+        # Outputs: list of 1, 2, or 3 tensors.
+        # Exceptions: AssertionError if heads are not divisible or tensor rows not divisible by (q_per_kv + 2).
         """
         Splits a tensor into multiple tensors based on the name.
         This is used to handle qkv and gate_up tensors.
@@ -357,6 +410,18 @@ class MegatronModelMerger(BaseModelMerger):
             return [tensor]
 
     def _merge_state_dicts(self, model_state_dict_list: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Converts the loaded Megatron state dicts into a single HF-named state dict for this rank.
+        # Behavior: starting layer offset is the cumulative layer count of previous pipeline ranks. For each virtual-stage
+        # dict, skips "extra_state" keys and output_layer keys when tie_word_embedding is set, validates the key, maps the
+        # name; for names under "model.layers." rewrites the local layer index (third dotted component) to the global one
+        # and tracks the max local index; otherwise warns. Expert weights named like "mlp.experts.X_proj.weight{id}" are
+        # rewritten to "mlp.experts.{id}.X_proj.weight". Fused tensors are split and stored with "qkv" replaced by q/k/v or
+        # "gate_up" replaced by gate/up. After each virtual stage, the offset advances by the max local index + 1.
+        # Inputs: model_state_dict_list - list of Megatron state dicts.
+        # Outputs: mapping HF name -> tensor.
+        # Exceptions: AssertionError if a name cannot be mapped; ValueError from key validation.
+        # Side effects: prints per-key conversion info and warnings.
         state_dict = {}
         layers_cum = 0
         if self.world_size > 1:
@@ -421,6 +486,19 @@ class MegatronModelMerger(BaseModelMerger):
         return state_dict
 
     def save_hf_model_and_tokenizer(self, merged_state_dict):
+        # [FUNCTION DOC]
+        # Behavior: with a single process, delegates to the base implementation. Otherwise each rank saves its own keys into
+        # safetensors shards: splits its keys into (layers on this rank * saves_per_layer) chunks (saves_per_layer is 1 if
+        # the model has fewer than 30 layers, else 2), names files model-{idx}-of-{total}.safetensors with idx offset by the
+        # rank's starting layer, sums element counts across ranks via all-reduce and gathers all key->file indexes. Rank 0
+        # then writes model.safetensors.index.json (total_size set to the element count), model config, generation config,
+        # processor and tokenizer, and validates the output.
+        # Inputs: merged_state_dict - this rank's HF-named tensors.
+        # KNOWN ISSUE: metadata total_size is the total number of elements, not bytes as the HF index format expects.
+        # KNOWN ISSUE: the chunk-count assertion message has expected/actual swapped, and the check is always true because
+        # array_split always returns the requested number of chunks (possibly empty, producing empty shard files).
+        # KNOWN ISSUE: unlike the single-process path, LoRA adapters are not extracted and tied keys are not dropped.
+        # Side effects: writes files; collective communication; prints.
         if self.world_size == 1:
             return super().save_hf_model_and_tokenizer(merged_state_dict)
 
@@ -493,6 +571,11 @@ class MegatronModelMerger(BaseModelMerger):
             validate_hf_model_output(self.config.target_dir)
 
     def merge_and_save(self):
+        # [FUNCTION DOC]
+        # Behavior: resolves the dist checkpoint path under local_dir, loads and merges state dicts, then for "test" validates
+        # against test_hf_dir, or for "merge" saves and (rank 0 only) uploads when hf_upload is set.
+        # Exceptions: ValueError if test_hf_dir missing in test mode or unknown operation.
+        # Side effects: reads checkpoint; writes output; may upload.
         from verl.utils.megatron_utils import get_model_dist_checkpoint_path
 
         model_ckpt_path = get_model_dist_checkpoint_path(self.config.local_dir)
@@ -513,6 +596,12 @@ class MegatronModelMerger(BaseModelMerger):
             raise ValueError(f"Unknown operation: {self.config.operation}")
 
     def _validate_state_dict(self, state_dict: dict[str, torch.Tensor]):
+        # [FUNCTION DOC]
+        # HELPER: Loads test_hf_dir/model.safetensors and compares each merged tensor. Skips empty names, biases absent from the
+        # reference, rotary inv_freq entries, and lm_head when value model or tied embeddings. Asserts dtype equality and
+        # closeness on CPU (atol 1e-2, rtol 5e-2).
+        # Exceptions: RuntimeError for keys missing in the reference; AssertionError on mismatch.
+        # KNOWN ISSUE: only supports a single-file reference model.safetensors (not sharded references).
         """
         Compares the merged Megatron state_dict against a reference safetensors model.
         Applies necessary name mappings from Megatron to Hugging Face conventions using _replace_name.
@@ -535,6 +624,10 @@ class MegatronModelMerger(BaseModelMerger):
             torch.testing.assert_close(loaded_weight.to("cpu"), param, atol=1e-2, rtol=5e-2)
 
     def _replace_name(self, megatron_name: str, name_mapping: dict[str, str]) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Finds the first mapping entry whose Megatron substring is in the name, replaces "decoder" with "model" and
+        # the matched substring with the HF substring.
+        # Outputs: the HF name, or None if no entry matches (despite the str annotation).
         for m_name, v_name in name_mapping.items():
             if m_name not in megatron_name:
                 continue
@@ -547,4 +640,6 @@ class MegatronModelMerger(BaseModelMerger):
         return None  # Return None if no mapping found
 
     def cleanup(self):
+        # [FUNCTION DOC]
+        # Behavior: destroys the default torch distributed process group. Side effects: tears down distributed state.
         torch.distributed.destroy_process_group()

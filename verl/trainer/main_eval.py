@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Hydra entry point (config "evaluation") for offline scoring of a parquet file of generated responses with a custom
+# reward function. Prints mean score per data source as "test_score/<data_source>".
+
 """
 Offline evaluate the performance of a generated file using reward model and ground truth verifier.
 The input is a parquet file that contains N generated sequences and (optional) the ground truth.
@@ -32,6 +37,11 @@ from verl.utils.fs import copy_to_local
 
 @ray.remote
 def process_item(config, data_source, response_lst, reward_data):
+    # [FUNCTION DOC]
+    # HELPER: Ray remote task. Behavior: loads the custom reward function from config, scores each response against
+    # reward_data's "ground_truth" via reward_fn(data_source, response, ground_truth), returns the mean.
+    # Inputs: config; data_source; response_lst - iterable of responses for one prompt; reward_data - mapping with
+    # ground_truth. Outputs: (data_source, mean score). Exceptions: KeyError if ground_truth missing; reward fn errors.
     reward_fn = get_custom_reward_fn(config)
     ground_truth = reward_data["ground_truth"]
     score_lst = [reward_fn(data_source, r, ground_truth) for r in response_lst]
@@ -40,6 +50,12 @@ def process_item(config, data_source, response_lst, reward_data):
 
 @hydra.main(config_path="config", config_name="evaluation", version_base=None)
 def main(config):
+    # [FUNCTION DOC]
+    # Behavior: copies the data file locally (optionally to shared memory), reads parquet, selects response, data-source
+    # and reward-model columns by configured keys; initializes Ray if needed with ray_kwargs.ray_init; launches one remote
+    # scoring task per row; collects results as they finish (progress bar), grouping per-row mean scores by data source;
+    # prints a mapping of "test_score/<source>" to the mean of row means.
+    # Inputs: Hydra config. Outputs: None. Side effects: file copy, Ray init, stdout printing.
     local_path = copy_to_local(config.data.path, use_shm=config.data.get("use_shm", False))
     dataset = pd.read_parquet(local_path)
     responses = dataset[config.data.response_key]

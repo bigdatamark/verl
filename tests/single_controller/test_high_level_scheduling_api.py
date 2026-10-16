@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Multi-GPU Ray test of the high-level scheduling API: several worker groups sharing one resource pool, and merged
+# resource pools, checking each worker's CUDA_VISIBLE_DEVICES assignment.
+
 import gc
 import time
 
@@ -24,14 +29,26 @@ from verl.utils.device import get_device_name
 @ray.remote
 class TestActor(Worker):
     # TODO: pass *args and **kwargs is bug prone and not very convincing
+    # [CLASS DOC]
+    # HELPER: Worker that forwards an optional cuda_visible_devices to the base Worker and can report its node id.
     def __init__(self, cuda_visible_devices=None) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls base Worker init with cuda_visible_devices passed positionally.
         super().__init__(cuda_visible_devices)
 
     def get_node_id(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns the Ray node id of the current actor process.
         return ray.get_runtime_context().get_node_id()
 
 
 def test():
+    # [FUNCTION DOC]
+    # Behavior: inits Ray; with one pool over all GPUs creates actor/critic/ref groups and asserts each sees devices
+    # "0".."n-1"; deletes them, removes placement groups and sleeps 5s; then creates two half pools, merges them,
+    # checks world sizes, and asserts groups on the merged pool see all GPUs while the ref group on the second half pool
+    # sees "half".."n-1".
+    # Side effects: starts/stops Ray, sleeps, removes placement groups, prints.
     import torch
 
     ray.init()

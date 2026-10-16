@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# GPU integration test for real rollout server adapters (vLLM/SGLang selected by
+# env ROLLOUT_NAME) with a standalone LLM server, an FSDP trainer worker group
+# and an nccl checkpoint engine. Verifies global_steps tagging of generation
+# outputs, abort-on-weight-update behavior without resume, and partial-rollout
+# resume tracking min/max global steps. Needs 4 GPUs and local Qwen3-VL-2B-Instruct.
+
 import asyncio
 import os
 
@@ -32,6 +40,12 @@ from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServer
 
 @pytest.fixture
 def init_config() -> DictConfig:
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture. Composes Hydra ppo_trainer from verl/trainer/config
+    # (relative to cwd) with async_training.partial_rollout=True, then overrides model
+    # path, rollout name from env ROLLOUT_NAME, max_num_seqs 256, response_length 4096,
+    # nccl checkpoint backend, 1 node x 4 GPUs. Outputs: DictConfig.
+    # Exceptions: KeyError if ROLLOUT_NAME is unset.
     from hydra import compose, initialize_config_dir
 
     with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
@@ -59,6 +73,10 @@ async def _run_update_weights_with_global_steps_none(
     checkpoint_manager: CheckpointEngineManager,
     tokenizer: PreTrainedTokenizer,
 ):
+    # [FUNCTION DOC]
+    # HELPER: syncs weights with global_steps None, generates one chat prompt and
+    # asserts the output was not aborted and its extra_fields global_steps is None.
+    # Side effects: prints decoded response.
     await checkpoint_manager.update_weights(global_steps=None)
     prompt = [{"role": "user", "content": "How to make a sandwich?"}]
     prompt_ids = normalize_token_ids(tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True))
@@ -88,6 +106,12 @@ async def _run_server_manager_without_resume(
     prompts: list[list[dict]],
     tokenizer: PreTrainedTokenizer,
 ):
+    # [FUNCTION DOC]
+    # HELPER: for each step from initial_steps over train_steps: launch generation
+    # tasks for all prompts, sleep 2s, update weights with that step (interrupting
+    # generation), gather outputs and assert each was aborted and tagged with the
+    # previous step (step - 1). Prints the first response per step.
+    # KNOWN ISSUE: the loop variable global_steps is reassigned inside the output loop; harmless only because range iteration resets it and expected_steps is computed beforehand.
     for global_steps in range(initial_steps, initial_steps + train_steps):
         tasks = []
         for i, prompt in enumerate(prompts):
@@ -131,6 +155,11 @@ async def _run_server_manager_with_resume(
     prompts: list[list[dict]],
     tokenizer: PreTrainedTokenizer,
 ):
+    # [FUNCTION DOC]
+    # HELPER: launches generation for all prompts once using the fully-async client
+    # (which resumes after aborts), then performs train_steps weight updates 2s apart,
+    # gathers outputs and asserts each has min_global_steps = initial_steps - 1,
+    # max_global_steps greater than that, and was not aborted. Prints the first response.
     # 1. rollout generate responses
     tasks = []
     for i, prompt in enumerate(prompts):
@@ -177,6 +206,13 @@ async def _run_server_manager_with_resume(
 
 @pytest.mark.asyncio
 async def test_server_adapter(init_config):
+    # [FUNCTION DOC]
+    # Behavior: init Ray with tokenizer/NCCL/vLLM env vars; create trainer group over
+    # a single-node pool and reset it; create a standalone LLMServerManager and a
+    # CheckpointEngineManager over its replicas; with 16 long-article prompts, run the
+    # global_steps-None check, then a step-0 sync, the no-resume check (steps 1..3),
+    # and the resume check (steps 4..6) with FullyAsyncLLMServerClient. Shuts down Ray.
+    # Inputs: init_config fixture. Side effects: GPU/Ray resources, model loading.
     ray.init(
         runtime_env={
             "env_vars": {

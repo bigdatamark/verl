@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests for rollout MoE load-balance metrics in metric_utils. routed_experts tensors have shape
+# (batch, positions, layers, top-k) holding expert ids; the response occupies the trailing positions
+# aligned with response_mask. The final valid response position of each sequence holds filler (the last
+# sampled token is never fed back through the model) and must be excluded. Per layer, expert loads are
+# compared with the uniform mean to produce max/min/avg violation metrics under "rollout/moe/...".
+# Also covers the cross-step accumulator, interval gating, optional routed_experts retrieval from a
+# key-value store, and inference of the expert count from model configs.
+
 import math
 from types import SimpleNamespace
 
@@ -30,6 +39,10 @@ from verl.trainer.ppo.metric_utils import (
 
 
 def test_rollout_moe_load_balance_metrics_response_tokens_only():
+    # [FUNCTION DOC]
+    # 7 positions, 2 layers, top-2, response length 5: only the 4 real response records count. Layer 0 is
+    # perfectly balanced (all violations 0); layer 1 routes everything to expert 2 (max 3, min -1, avg 1.5);
+    # global max 3 and average of layer averages 0.75.
     # The last valid response position holds zero-filler, not a routing
     # record: the final sampled token never re-enters the model. Metrics must
     # come from the four real records only.
@@ -66,6 +79,8 @@ def test_rollout_moe_load_balance_metrics_response_tokens_only():
 
 
 def test_rollout_moe_load_balance_metrics_skips_invalid_inputs():
+    # [FUNCTION DOC]
+    # Asserts an empty result for: no routed_experts, a 3-D (wrong rank) tensor, and num_experts None.
     assert compute_rollout_moe_load_balance_metrics(None, torch.ones(1, 1), 4) == {}
     assert compute_rollout_moe_load_balance_metrics(torch.zeros(1, 1, 1, dtype=torch.long), torch.ones(1, 1), 4) == {}
     assert (
@@ -75,6 +90,10 @@ def test_rollout_moe_load_balance_metrics_skips_invalid_inputs():
 
 
 def test_rollout_moe_load_balance_metrics_last_token_filler_is_ignored():
+    # [FUNCTION DOC]
+    # Uses the private _compute_rollout_moe_load_counts helper; appends a filler slot of value 0 or 3 after
+    # three real records and asserts per-layer counts equal the bincount of the real records only (expert 0
+    # has zero load, i.e. no phantom assignments).
     # The final sampled token has no routing record; whatever the batch
     # assembly left in its slot must not reach the counts. The default
     # zero-fill would otherwise credit expert 0 with layers * topk phantom
@@ -93,6 +112,8 @@ def test_rollout_moe_load_balance_metrics_last_token_filler_is_ignored():
 
 
 def test_rollout_moe_load_balance_metrics_survive_negative_filler():
+    # [FUNCTION DOC]
+    # A -1 sentinel in the dropped last slot must not trip the expert-id range check; asserts non-empty metrics.
     # A -1 sentinel in the never-routed last slot must not disable the whole
     # metric via the expert-id range guard.
     real = torch.tensor([[[[1, 2]], [[3, 1]]]], dtype=torch.long)
@@ -109,6 +130,9 @@ def test_rollout_moe_load_balance_metrics_survive_negative_filler():
 
 
 def test_rollout_moe_load_balance_metrics_drop_last_valid_per_sequence():
+    # [FUNCTION DOC]
+    # Ragged batch of 2 (response lengths 4 and 2): each sequence drops its own last valid position; asserts
+    # counts [0,1,2,1].
     # Ragged batch: each sequence drops its own final valid position, not a
     # shared column.
     routed_experts = torch.zeros(2, 4, 1, 1, dtype=torch.long)
@@ -124,6 +148,8 @@ def test_rollout_moe_load_balance_metrics_drop_last_valid_per_sequence():
 
 
 def test_rollout_moe_load_balance_metrics_single_token_response_yields_nothing():
+    # [FUNCTION DOC]
+    # A one-token response has no real records; asserts empty metrics.
     # A one-token response consists solely of the never-routed final token.
     routed_experts = torch.zeros(1, 1, 1, 1, dtype=torch.long)
     response_mask = torch.ones(1, 1, dtype=torch.bool)
@@ -132,6 +158,8 @@ def test_rollout_moe_load_balance_metrics_single_token_response_yields_nothing()
 
 
 def test_rollout_moe_load_balance_metrics_zero_width_response_mask_yields_nothing():
+    # [FUNCTION DOC]
+    # A zero-width response mask must not crash nor select the whole tensor; asserts empty metrics.
     # A zero-width response mask must not crash (amax over an empty dim, and
     # routed_experts[:, -0:] would silently select the whole tensor).
     routed_experts = torch.zeros(1, 3, 1, 1, dtype=torch.long)
@@ -141,6 +169,10 @@ def test_rollout_moe_load_balance_metrics_zero_width_response_mask_yields_nothin
 
 
 def test_rollout_moe_load_balance_accumulator_spans_updates():
+    # [FUNCTION DOC]
+    # Four updates each assigning one token to a different expert; asserts each update returns truthy, total
+    # assignments is 4, popped metrics are perfectly balanced, and after popping the accumulator is reset
+    # (0 assignments, compute returns empty).
     accumulator = RolloutMoELoadBalanceMetricsAccumulator()
     # one real record plus the trailing filler slot of the final sampled token
     response_mask = torch.tensor([[True, True]], dtype=torch.bool)
@@ -160,6 +192,10 @@ def test_rollout_moe_load_balance_accumulator_spans_updates():
 
 
 def test_rollout_moe_load_balance_accumulator_infers_num_experts(monkeypatch):
+    # [FUNCTION DOC]
+    # Accumulator built with a model_config and infer_rollout_moe_num_experts patched to read "num_experts";
+    # asserts update without explicit num_experts succeeds and counts 1 assignment.
+    # Inputs: monkeypatch.
     accumulator = RolloutMoELoadBalanceMetricsAccumulator(model_config={"num_experts": 4})
     response_mask = torch.tensor([[True, True]], dtype=torch.bool)
     routed_experts = torch.tensor([[[[1]], [[0]]]], dtype=torch.long)
@@ -175,6 +211,9 @@ def test_rollout_moe_load_balance_accumulator_infers_num_experts(monkeypatch):
 
 
 def test_compute_moe_lb_metrics_accumulates_until_interval():
+    # [FUNCTION DOC]
+    # With interval 2: at step 1 returns empty (accumulates); at step 2 returns metrics including
+    # routed_experts_found 1.0 and routed_expert_assignments 4 (2 per step), and resets the accumulator.
     accumulator = RolloutMoELoadBalanceMetricsAccumulator(model_config={"num_experts": 2})
     batch = SimpleNamespace(
         batch={
@@ -193,9 +232,17 @@ def test_compute_moe_lb_metrics_accumulates_until_interval():
 
 
 def test_get_metric_data_with_optional_routed_experts_falls_back():
+    # [FUNCTION DOC]
+    # Fake KV getter raising ValueError when routed_experts is requested. First call: tries with routed_experts,
+    # falls back to plain fields, sets retry-after step to 2 and records the "missing_routed_experts" warning
+    # key. Second call at the same step skips routed_experts entirely. Call at step 2 retries with it again and
+    # falls back once more. Asserts returned data and the exact sequence of requested field lists.
     calls = []
 
     def fake_kv_batch_get(keys, partition_id, select_fields):
+        # [FUNCTION DOC]
+        # HELPER: records select_fields; raises ValueError if "routed_experts" is among them, else returns a
+        # mapping {"responses": "ok"}. keys and partition_id are ignored.
         calls.append(select_fields)
         if "routed_experts" in select_fields:
             raise ValueError("field routed_experts not found")
@@ -252,6 +299,8 @@ def test_get_metric_data_with_optional_routed_experts_falls_back():
 
 
 def test_rollout_moe_load_balance_accumulator_uses_keyed_warnings(monkeypatch):
+    # [FUNCTION DOC]
+    # Patches logger.warning to collect messages; asserts warn_skip_once logs only the first message per key.
     accumulator = RolloutMoELoadBalanceMetricsAccumulator()
     messages = []
     monkeypatch.setattr(metric_utils.logger, "warning", lambda message: messages.append(message))
@@ -264,6 +313,10 @@ def test_rollout_moe_load_balance_accumulator_uses_keyed_warnings(monkeypatch):
 
 
 def test_infer_moe_num_experts_from_nested_config():
+    # [FUNCTION DOC]
+    # Asserts expert count is found in nested hf_config.text_config.num_experts and
+    # override_config.model_config.n_routed_experts; num_local_experts is honored only for mixtral and gpt_oss
+    # model types (None otherwise, including qwen3_moe); num_experts takes precedence over num_local_experts.
     assert infer_moe_num_experts({"hf_config": {"text_config": {"num_experts": 4}}}) == 4
     assert infer_moe_num_experts({"override_config": {"model_config": {"n_routed_experts": 8}}}) == 8
     assert infer_moe_num_experts({"num_local_experts": 2}) is None
@@ -274,6 +327,8 @@ def test_infer_moe_num_experts_from_nested_config():
 
 
 def test_get_hf_config_override_kwargs_unwraps_nested_model_config():
+    # [FUNCTION DOC]
+    # Asserts a nested "model_config" mapping is unwrapped, a flat mapping is returned as is, and empty stays empty.
     assert get_hf_config_override_kwargs({"model_config": {"max_position_embeddings": 32768}}) == {
         "max_position_embeddings": 32768
     }
@@ -282,6 +337,11 @@ def test_get_hf_config_override_kwargs_unwraps_nested_model_config():
 
 
 def test_infer_rollout_moe_num_experts_with_nested_override_config(monkeypatch):
+    # [FUNCTION DOC]
+    # Patches copy_to_local (identity), update_model_config (applies max_position_embeddings) and
+    # AutoConfig.from_pretrained (namespace with num_experts 64); asserts the inferred count is 64 when the
+    # override config is nested under model_config.
+    # Inputs: monkeypatch.
     model_config = {
         "path": "dummy-model",
         "override_config": {"model_config": {"max_position_embeddings": 32768}},
@@ -290,6 +350,8 @@ def test_infer_rollout_moe_num_experts_with_nested_override_config(monkeypatch):
     monkeypatch.setattr(metric_utils, "copy_to_local", lambda path, use_shm=False: path)
 
     def fake_update_model_config(config, override_config):
+        # [FUNCTION DOC]
+        # HELPER: sets config.max_position_embeddings from the override mapping. Side effects: mutates config.
         config.max_position_embeddings = override_config["max_position_embeddings"]
 
     monkeypatch.setattr(metric_utils, "update_model_config", fake_update_model_config)

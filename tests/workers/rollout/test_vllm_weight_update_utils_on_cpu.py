@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for vLLM weight-update helpers: split_buffer_updates / apply_buffer_updates (routing incoming weights
+# that name registered buffers, e.g. MoE e_score_correction_bias, to direct buffer copies instead of load_weights),
+# and vLLMColocateWorkerExtension._update_weights applying params and buffers to the main model and an MTP drafter.
+# The modules under test are loaded directly from their source files, with vllm and heavy verl dependencies stubbed,
+# at import time of this test module.
+
 import importlib.util
 import sys
 import types
@@ -23,6 +30,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _load_weight_update_utils():
+    # [FUNCTION DOC]
+    # HELPER: Loads verl/workers/rollout/vllm_rollout/weight_update_utils.py from disk as a standalone module named
+    # "weight_update_utils" (not registered in sys.modules) and executes it. Outputs: the module object.
+    # Exceptions: AssertionError if the spec or loader is missing.
+    # KNOWN ISSUE: the spec None-check happens after module_from_spec has already used the spec, so a missing file would
+    # fail with a different error before the assertion.
     module_path = _REPO_ROOT / "verl/workers/rollout/vllm_rollout/weight_update_utils.py"
     spec = importlib.util.spec_from_file_location("weight_update_utils", module_path)
     module = importlib.util.module_from_spec(spec)
@@ -37,6 +50,14 @@ split_buffer_updates = _weight_update_utils.split_buffer_updates
 
 
 def _load_vllm_rollout_utils():
+    # [FUNCTION DOC]
+    # HELPER: Loads verl/workers/rollout/vllm_rollout/utils.py under its real module name while temporarily installing
+    # fake modules in sys.modules for vllm, vllm.outputs, verl.third_party.vllm (sleep level 1, version "0.8.0"),
+    # verl.utils.vllm (fake LoRA request, no-op hijack, identity weight-name resolver), its patch and quant-utils
+    # submodules (no-ops, non-quantized, passthrough load), and the already loaded weight_update_utils.
+    # Outputs: the executed module. Side effects: sys.modules entries for the faked names are restored (or removed)
+    # afterwards, even on error; other modules imported during execution remain loaded.
+    # Exceptions: AssertionError if the spec/loader is missing (same ordering issue as the sibling loader).
     """Load vllm_rollout/utils.py with heavyweight deps stubbed.
 
     Injected ``sys.modules`` entries are restored afterwards so the fakes do not
@@ -49,6 +70,8 @@ def _load_vllm_rollout_utils():
     fake_outputs = types.ModuleType("vllm.outputs")
 
     class _FakeRequestOutput:
+        # [CLASS DOC]
+        # HELPER: Empty placeholder for vllm.outputs.RequestOutput.
         pass
 
     fake_outputs.RequestOutput = _FakeRequestOutput
@@ -62,11 +85,17 @@ def _load_vllm_rollout_utils():
     fake_vllm_utils = types.ModuleType("verl.utils.vllm")
 
     class _FakeTensorLoRARequest:
+        # [CLASS DOC]
+        # HELPER: Empty placeholder for TensorLoRARequest.
         pass
 
     class _FakeVLLMHijack:
+        # [CLASS DOC]
+        # HELPER: Placeholder for VLLMHijack with a no-op hijack.
         @staticmethod
         def hijack():
+            # [FUNCTION DOC]
+            # HELPER: Does nothing; returns None.
             return None
 
     fake_vllm_utils.TensorLoRARequest = _FakeTensorLoRARequest
@@ -119,31 +148,50 @@ vLLMColocateWorkerExtension = _vllm_rollout_utils.vLLMColocateWorkerExtension
 
 
 class _ToyBlock(torch.nn.Module):
+    # [CLASS DOC]
+    # HELPER: Module with a bias-free 4x4 linear layer and a registered zero float32 buffer e_score_correction_bias of size 4.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates the linear layer and registers the buffer.
         super().__init__()
         self.linear = torch.nn.Linear(4, 4, bias=False)
         self.register_buffer("e_score_correction_bias", torch.zeros(4, dtype=torch.float32))
 
 
 class _ToyModel(torch.nn.Module):
+    # [CLASS DOC]
+    # HELPER: Model whose parameter names follow "model.layers.0.*", containing one _ToyBlock.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds a nested container module holding a one-element layer list.
         super().__init__()
         self.model = torch.nn.Module()
         self.model.layers = torch.nn.ModuleList([_ToyBlock()])
 
 
 class _FakeVllmConfig:
+    # [CLASS DOC]
+    # HELPER: Holds only speculative_config.
     def __init__(self, speculative_config=None):
+        # [FUNCTION DOC]
+        # HELPER: Stores speculative_config (default None).
         self.speculative_config = speculative_config
 
 
 class _FakeModelRunner:
+    # [CLASS DOC]
+    # HELPER: Stand-in for vLLM's model runner exposing model and vllm_config.
     def __init__(self, inner_model, speculative_config=None):
+        # [FUNCTION DOC]
+        # HELPER: Stores the inner model and a fake config with the given speculative_config.
         self.model = inner_model
         self.vllm_config = _FakeVllmConfig(speculative_config=speculative_config)
 
 
 def test_split_buffer_updates_routes_registered_buffers():
+    # [FUNCTION DOC]
+    # A weight list with one parameter and one buffer splits into one param update and one buffer update; the returned
+    # named-buffer map contains the buffer name.
     model = _ToyModel()
     weights = [
         ("model.layers.0.linear.weight", torch.ones(4, 4, dtype=torch.float32)),
@@ -158,6 +206,8 @@ def test_split_buffer_updates_routes_registered_buffers():
 
 
 def test_apply_buffer_updates_copies_buffer_values():
+    # [FUNCTION DOC]
+    # Applying one buffer update returns count 1 and copies the values into the buffer.
     model = _ToyModel()
     updates = [("model.layers.0.e_score_correction_bias", torch.arange(4, dtype=torch.float32) + 1)]
 
@@ -170,6 +220,8 @@ def test_apply_buffer_updates_copies_buffer_values():
 
 
 def test_apply_buffer_updates_ignores_non_buffer_weights():
+    # [FUNCTION DOC]
+    # Applying a parameter name returns 0 and leaves the buffer untouched.
     model = _ToyModel()
     weights = [("model.layers.0.linear.weight", torch.ones(4, 4, dtype=torch.float32))]
 
@@ -180,11 +232,17 @@ def test_apply_buffer_updates_ignores_non_buffer_weights():
 
 
 def test_vllm_update_weights_loads_params_and_buffers():
+    # [FUNCTION DOC]
+    # _update_weights on a worker built without __init__ passes only parameter names to model.load_weights, calls
+    # apply_buffer_updates with a non-None named-buffer map (spied by temporarily replacing the module attribute,
+    # restored in a finally), and copies buffer values.
     model = _ToyModel()
     loaded_param_names = []
     apply_named_buffers = []
 
     def _fake_load_weights(weights):
+        # [FUNCTION DOC]
+        # HELPER: Records the names of weights passed to load_weights.
         loaded_param_names.extend(name for name, _ in weights)
 
     model.load_weights = _fake_load_weights
@@ -192,6 +250,8 @@ def test_vllm_update_weights_loads_params_and_buffers():
     original_apply_buffer_updates = _vllm_rollout_utils.apply_buffer_updates
 
     def _spy_apply_buffer_updates(inner_model, buffer_updates, named_buffers=None):
+        # [FUNCTION DOC]
+        # HELPER: Records the named_buffers argument and delegates to the original apply_buffer_updates, returning its count.
         apply_named_buffers.append(named_buffers)
         return original_apply_buffer_updates(inner_model, buffer_updates, named_buffers=named_buffers)
 
@@ -218,6 +278,8 @@ def test_vllm_update_weights_loads_params_and_buffers():
 
 
 def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
+    # [FUNCTION DOC]
+    # With an MTP speculative config and a drafter, buffer updates are applied to both main and drafter models.
     """When an MTP drafter is synced, its registered buffers must be updated too."""
     main_model = _ToyModel()
     drafter_model = _ToyModel()
@@ -225,11 +287,17 @@ def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
     drafter_model.load_weights = lambda weights: None
 
     class _SpecConfig:
+        # [CLASS DOC]
+        # HELPER: Fake speculative config with method "mtp" and a non-null draft model config.
         method = "mtp"
         draft_model_config = object()
 
     class _Drafter:
+        # [CLASS DOC]
+        # HELPER: Fake drafter exposing a model attribute.
         def __init__(self, m):
+            # [FUNCTION DOC]
+            # HELPER: Stores the drafter model.
             self.model = m
 
     worker = object.__new__(vLLMColocateWorkerExtension)

@@ -10,6 +10,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Unit test for verl.utils.debug.metrics.calculate_debug_metrics, which compares rollout log-probs with
+# trainer (old) log-probs under a loss mask.
 
 import unittest
 
@@ -20,7 +23,14 @@ from verl.utils.debug.metrics import calculate_debug_metrics
 
 
 class TestMetrics(unittest.TestCase):
+    # [CLASS DOC]
+    # Test case container for debug metrics computation.
     def test_calculate_debug_metrics(self):
+        # [FUNCTION DOC]
+        # Behavior: builds a DataProto with fixed 2x10 tensors for rollout_log_probs and old_log_probs, a 0/1 loss_mask
+        # and a zero "responses" tensor of shape (2, 10); computes debug metrics, prints them, and asserts
+        # "training/rollout_probs_diff_valid" equals 1.
+        # Inputs: self. Outputs: none. Exceptions: AssertionError. Side effects: prints metrics.
         data = DataProto.from_dict(
             {
                 "rollout_log_probs": torch.tensor(

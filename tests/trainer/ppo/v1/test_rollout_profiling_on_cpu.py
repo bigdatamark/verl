@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Verifies when rollout server managers and worker groups start/stop profiling in sync, colocate_async
+# and separate_async trainers: only on profiled steps, rollout profiling closed right after sampling
+# (after replicas sleep), each distinct worker group driven exactly once, and continuous-step profiling
+# not restarted. Trainers are built via __new__ with MagicMock collaborators; call ordering is checked by
+# attaching mocks to a parent MagicMock.
+
 """Tests for the rollout profiler lifecycle across V1 trainer modes."""
 
 from types import SimpleNamespace
@@ -26,14 +33,28 @@ from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
 
 
 class _StubTrainer(PPOTrainer):
+    # [CLASS DOC]
+    # HELPER: concrete PPOTrainer with no-op on_step_end/on_sample_end hooks.
     def on_step_end(self):
+        # [FUNCTION DOC]
+        # HELPER: no-op.
         pass
 
     def on_sample_end(self):
+        # [FUNCTION DOC]
+        # HELPER: no-op.
         pass
 
 
 def _trainer(cls, **managers):
+    # [FUNCTION DOC]
+    # HELPER: creates an uninitialized instance of cls with profiler config (non-continuous, steps [1]), global
+    # step 1 of 10 total, the current step profiled and neighbours not, no reference policy or critic, mocked
+    # actor_rollout_wg and checkpoint_manager, plus any extra attributes given as keyword args (e.g. server
+    # managers). trainer_mode is "sync" for PPOTrainerSync and PPOTrainerColocateAsync, else "separate_async".
+    # KNOWN ISSUE: the colocate-async trainer is given trainer_mode "sync"; possibly intentional but it means
+    # mode-dependent branches see sync mode.
+    # Inputs: cls - trainer class; managers - attribute name to object. Outputs: the trainer.
     trainer = cls.__new__(cls)
     trainer.config = OmegaConf.create({"global_profiler": {"profile_continuous_steps": False, "steps": [1]}})
     trainer.global_steps = 1
@@ -55,6 +76,10 @@ def _trainer(cls, **managers):
 
 
 def _prepare_separate_step_end(trainer):
+    # [FUNCTION DOC]
+    # HELPER: sets attributes required by the separate-async on_step_end: hybrid rollout config with switching
+    # disabled, empty timing_raw, and a mocked standalone checkpoint manager whose update_weights returns {}.
+    # Side effects: mutates trainer.
     trainer.hybrid_rollout_config = SimpleNamespace(enable_switch=False)
     trainer.timing_raw = {}
     trainer.standalone_checkpoint_manager = MagicMock()
@@ -62,6 +87,8 @@ def _prepare_separate_step_end(trainer):
 
 
 def test_profiled_step_starts_rollout_engines():
+    # [FUNCTION DOC]
+    # _start_profiling on a profiled step calls the server manager's start_profile once.
     manager = MagicMock()
     trainer = _trainer(_StubTrainer, llm_server_manager=manager)
 
@@ -70,6 +97,8 @@ def test_profiled_step_starts_rollout_engines():
 
 
 def test_unprofiled_step_leaves_rollout_engines_alone():
+    # [FUNCTION DOC]
+    # On an unprofiled step neither start nor stop is called on the server manager.
     manager = MagicMock()
     trainer = _trainer(_StubTrainer, llm_server_manager=manager)
     trainer.curr_step_profile = False
@@ -82,6 +111,9 @@ def test_unprofiled_step_leaves_rollout_engines_alone():
 
 
 def test_continuous_steps_leave_the_open_collection_running():
+    # [FUNCTION DOC]
+    # With continuous profiling and the previous step profiled, start does not call step_profile/start_profile
+    # on the worker group nor start_profile on the server manager.
     # With profile_continuous_steps the collection opened by the previous step stays open, so a
     # continuing step must not restart it. Step boundaries are no longer marked at the trainer
     # level: the profiler is advanced once per update mini-batch inside the workers instead.
@@ -99,6 +131,9 @@ def test_continuous_steps_leave_the_open_collection_running():
 
 
 def test_sync_stops_rollout_after_sampling():
+    # [FUNCTION DOC]
+    # Sync trainer: after submitting a batch (parent submission patched) and on_sample_end, the call order is
+    # submit, sleep replicas, stop rollout profile; start_profile is never called there.
     manager = MagicMock()
     trainer = _trainer(PPOTrainerSync, llm_server_manager=manager)
     calls = MagicMock()
@@ -115,6 +150,8 @@ def test_sync_stops_rollout_after_sampling():
 
 
 def test_sync_skips_rollout_stop_on_unprofiled_step():
+    # [FUNCTION DOC]
+    # On an unprofiled step on_sample_end only sleeps replicas and does not stop profiling.
     manager = MagicMock()
     trainer = _trainer(PPOTrainerSync, llm_server_manager=manager)
     trainer.curr_step_profile = False
@@ -129,6 +166,8 @@ def test_sync_skips_rollout_stop_on_unprofiled_step():
 
 
 def test_shared_worker_group_is_profiled_once():
+    # [FUNCTION DOC]
+    # When ref and critic worker groups alias actor_rollout_wg, start/stop are called once each on it.
     # In the hybrid engine ref_policy_wg (and sometimes critic_wg) is the *same* worker group
     # object as actor_rollout_wg. Each start/stop_profile round-trips to every rank and, on stop,
     # runs the finish hook (e.g. the user's trace-upload command). If profiling drove the shared
@@ -149,6 +188,8 @@ def test_shared_worker_group_is_profiled_once():
 
 
 def test_distinct_worker_groups_are_each_profiled_once():
+    # [FUNCTION DOC]
+    # Separate actor, ref and critic worker groups are each started and stopped exactly once.
     # When the reference/critic run in their own worker groups they must still be driven -- the
     # dedup only skips *aliases* of actor_rollout_wg, never genuinely separate processes.
     manager = MagicMock()
@@ -167,6 +208,9 @@ def test_distinct_worker_groups_are_each_profiled_once():
 
 
 def test_separate_async_closes_hybrid_and_standalone_rollout_once():
+    # [FUNCTION DOC]
+    # Separate-async: after start, stop and on_step_end, both the hybrid and standalone server managers were
+    # started and stopped exactly once.
     hybrid, standalone = MagicMock(), MagicMock()
     trainer = _trainer(
         PPOTrainerSeparateAsync,
@@ -185,6 +229,8 @@ def test_separate_async_closes_hybrid_and_standalone_rollout_once():
 
 
 def test_colocate_async_stops_rollout_only_after_replicas_sleep():
+    # [FUNCTION DOC]
+    # Colocate-async: on_sample_end then _stop_profiling produce abort, sleep, stop in that order, stop once.
     manager = MagicMock()
     trainer = _trainer(PPOTrainerColocateAsync, llm_server_manager=manager)
     calls = MagicMock()
@@ -200,6 +246,10 @@ def test_colocate_async_stops_rollout_only_after_replicas_sleep():
 
 
 def test_rollout_stops_before_the_first_training_stage():
+    # [FUNCTION DOC]
+    # Sync _step_once with mocked replay buffer and training stages: asserts the order rollout start, rollout
+    # stop, balance batch, old log prob, advantage, update actor, and that the final _stop_profiling does not
+    # stop the rollout profile a second time.
     manager = MagicMock()
     trainer = _trainer(PPOTrainerSync, llm_server_manager=manager)
     calls = MagicMock()

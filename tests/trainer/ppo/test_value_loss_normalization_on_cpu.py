@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Constants: _CLIP is the value clip range (0.5); _MODES lists all loss aggregation modes tested.
 """CPU tests for critic value-loss normalization across micro-batches.
 
 The actor loss (`ppo_loss`) forwards the global batch normalization info -- ``dp_size``,
@@ -35,6 +38,12 @@ _MODES = ["token-mean", "seq-mean-token-sum", "seq-mean-token-sum-norm", "seq-me
 
 
 def _make_value_batch(batch_size, resp_len, seed=0, lengths=None):
+    # [FUNCTION DOC]
+    # HELPER: builds seeded random vpreds, values and returns of shape (batch_size, resp_len) plus a
+    # response mask: all ones when lengths is None, otherwise row i has ones in its first lengths[i] positions.
+    # Inputs: batch_size, resp_len, seed (default 0), optional per-row lengths list.
+    # Outputs: tuple (vpreds, values, returns, response_mask) -- note the order: values before returns.
+    # Side effects: none (uses a local generator).
     g = torch.Generator().manual_seed(seed)
     vpreds = torch.randn(batch_size, resp_len, generator=g)
     values = torch.randn(batch_size, resp_len, generator=g)
@@ -49,6 +58,9 @@ def _make_value_batch(batch_size, resp_len, seed=0, lengths=None):
 
 
 def _global_kwargs(mask, mode, dp_size=1):
+    # [FUNCTION DOC]
+    # HELPER: returns the normalization kwargs the critic forwards: loss_agg_mode, dp_size, batch_num_tokens
+    # (total mask sum) and global_batch_size (number of rows). Inputs: mask, mode, dp_size (default 1).
     """The normalization info ``value_loss`` forwards to ``compute_value_loss`` for the given mode.
 
     ``loss_scale_factor`` stays at its default (None), which ``value_loss`` reads from
@@ -66,6 +78,15 @@ def _global_kwargs(mask, mode, dp_size=1):
 
 
 def _accumulate(vpreds, returns, values, mask, num_micro_batches, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: splits the batch into num_micro_batches equal contiguous chunks, computes the value loss on each
+    # with the clip range and given kwargs, and returns the sum of the losses.
+    # Inputs: vpreds, returns, values, mask, num_micro_batches, extra kwargs. Outputs: summed loss tensor.
+    # KNOWN ISSUE: parameter order is (vpreds, returns, values, ...) but every caller passes
+    # (vpreds, values, returns, ...) as unpacked from _make_value_batch, so returns and values are swapped
+    # relative to the "whole" reference computations, which pass them in the correct order. The
+    # comparisons then mix two different losses; the tests would only pass if the loss were symmetric in
+    # returns/values, which the clipped value loss is not.
     """Sum the per-micro-batch value losses -- what gradient accumulation feeds to the optimizer."""
     batch_size = mask.shape[0]
     step = batch_size // num_micro_batches
@@ -85,6 +106,9 @@ def _accumulate(vpreds, returns, values, mask, num_micro_batches, **kwargs):
 @pytest.mark.parametrize("mode", _MODES)
 @pytest.mark.parametrize("num_micro_batches", [1, 2, 4])
 def test_value_loss_microbatch_invariant_all_modes(mode, num_micro_batches):
+    # [FUNCTION DOC]
+    # Parametrized over every mode and 1/2/4 micro-batches on an 8x10 full mask: asserts the summed
+    # micro-batch loss with global kwargs equals the whole-batch loss. (See _accumulate known issue.)
     """With the global normalization forwarded, summing the per-micro-batch value losses equals the
     whole-mini-batch value loss for every ``loss_agg_mode``, regardless of the micro-batch split."""
     batch_size, resp_len = 8, 10
@@ -101,6 +125,9 @@ def test_value_loss_microbatch_invariant_all_modes(mode, num_micro_batches):
 @pytest.mark.parametrize("mode", ["token-mean", "seq-mean-token-sum", "seq-mean-token-mean"])
 @pytest.mark.parametrize("num_micro_batches", [2, 4])
 def test_value_loss_microbatch_invariant_variable_length(mode, num_micro_batches):
+    # [FUNCTION DOC]
+    # Same invariance with ragged lengths on 8x12 for the three modes not depending on padded width, with 2 or
+    # 4 micro-batches.
     """Invariance also holds with ragged (variable-length) responses, the realistic case."""
     batch_size, resp_len = 8, 12
     lengths = [12, 7, 3, 11, 5, 9, 2, 6]
@@ -115,6 +142,9 @@ def test_value_loss_microbatch_invariant_variable_length(mode, num_micro_batches
 
 @pytest.mark.parametrize("dp_size", [2, 4])
 def test_value_loss_dp_size_matches_global_mean_after_fsdp_reduce(dp_size):
+    # [FUNCTION DOC]
+    # Splits the batch into dp_size shards, each computing loss with dp_size and the global token count;
+    # asserts the mean across shards (modelling FSDP gradient averaging) equals the single-rank global loss.
     """The ``dp_size`` multiplier is correct: each rank normalizes by the global token count and
     multiplies by ``dp_size``; FSDP mean-reduces gradients across ranks, recovering the global
     token-mean. Models that reduction on CPU by splitting the batch into ``dp_size`` shards."""
@@ -143,6 +173,9 @@ def test_value_loss_dp_size_matches_global_mean_after_fsdp_reduce(dp_size):
 
 
 def test_vf_loss_metric_sum_aggregation_reports_global_mean():
+    # [FUNCTION DOC]
+    # Computes per-micro-batch globally-normalized losses, records each as a SUM-aggregated Metric under
+    # "critic/vf_loss" via append_to_dict, reduces with reduce_metrics and asserts it equals the whole loss.
     """The reported ``critic/vf_loss`` metric: because ``reduce_metrics`` averages plain-float
     metrics across micro-batches, a globally-normalized (partial-sum) loss must be aggregated with
     SUM to report the global-batch mean. Exercises the real append/reduce path ``value_loss`` uses."""
@@ -170,6 +203,8 @@ def test_vf_loss_metric_sum_aggregation_reports_global_mean():
 
 
 def test_loss_scale_factor_is_forwarded():
+    # [FUNCTION DOC]
+    # In "seq-mean-token-sum-norm" mode, asserts loss with loss_scale_factor 5 is exactly twice that with 10.
     """``loss_scale_factor`` reaches ``agg_loss`` for the "seq-mean-token-sum-norm" mode: halving it
     doubles the loss, confirming the plumbing (not just a silently-ignored kwarg)."""
     batch_size, resp_len = 8, 10
@@ -187,6 +222,8 @@ def test_loss_scale_factor_is_forwarded():
 
 
 def test_vf_clipfrac_unaffected_by_normalization():
+    # [FUNCTION DOC]
+    # Asserts the clip-fraction output is identical with and without dp_size/global token normalization.
     """The normalization args only change the loss scalar, not the clip-fraction statistic."""
     batch_size, resp_len = 8, 10
     vpreds, values, returns, mask = _make_value_batch(batch_size, resp_len)
@@ -201,6 +238,9 @@ def test_vf_clipfrac_unaffected_by_normalization():
 
 @pytest.mark.parametrize("num_micro_batches", [2, 4])
 def test_value_loss_without_global_info_is_microbatch_dependent(num_micro_batches):
+    # [FUNCTION DOC]
+    # Documents legacy behavior: without global info each micro-batch normalizes locally, so the accumulated
+    # loss equals num_micro_batches times the whole loss and differs from it.
     """Pre-fix behavior / default-kwargs back-compat: without the global token count,
     ``compute_value_loss`` normalizes by the local micro-batch token count, so the accumulated loss
     is inflated by the micro-batch count (and would change with the micro-batch count, e.g. when
@@ -217,6 +257,10 @@ def test_value_loss_without_global_info_is_microbatch_dependent(num_micro_batche
 
 @pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
 def test_value_loss_gradient_invariant_to_microbatch_split(device):
+    # [FUNCTION DOC]
+    # Float64 autograd check on CPU (and CUDA if available): backpropagates the whole loss into one copy of
+    # vpreds and the 4 micro-batch losses into another, asserting the accumulated gradients match.
+    # Side effects: populates .grad on the local tensors.
     """Real-autograd check on the actual gradient (not just the loss scalar): backpropagating the
     per-micro-batch value losses accumulates into ``vpreds.grad`` exactly the whole-mini-batch
     gradient when the global token count is forwarded -- so the critic optimizer step is invariant to

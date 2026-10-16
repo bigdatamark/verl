@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Ray-based trajectory tracker for dumping intermediate tensors to HDFS for offline comparison. Enabled by env VERL_ENABLE_TRACKER=1; destination from VERL_TRACKER_HDFS_DIR; verbosity from VERL_TRACKER_VERBOSE. A single detached named actor "global_tracker" queues uploads. Also defines remote_copy, a Ray remote wrapper around hdfs copy. The __main__ block is a manual smoke test.
+
 """
 Trajectory tracker can be inserted into code to save the intermediate results.
 The results will be dump to hdfs for offline comparison.
@@ -32,6 +35,12 @@ remote_copy = ray.remote(copy)
 
 @ray.remote
 def save_to_hdfs(data: io.BytesIO, name, hdfs_dir, verbose):
+    # [FUNCTION DOC]
+    # HELPER: Ray remote task that writes the buffer to a temp file name.pth and copies it into hdfs_dir.
+    # Inputs: data - BytesIO buffer; name - file stem; hdfs_dir - destination; verbose - print before upload.
+    # Outputs: none.
+    # Exceptions: copy errors are caught and printed.
+    # Side effects: temp file I/O, HDFS write, printing.
     filename = name + ".pth"
     with tempfile.TemporaryDirectory() as tmpdirname:
         local_filepath = os.path.join(tmpdirname, filename)
@@ -49,7 +58,12 @@ def save_to_hdfs(data: io.BytesIO, name, hdfs_dir, verbose):
 
 @ray.remote
 class TrajectoryTracker:
+    # [CLASS DOC]
+    # Ray actor holding a FIFO queue of pending save_to_hdfs task references.
     def __init__(self, hdfs_dir, verbose) -> None:
+        # [FUNCTION DOC]
+        # Stores hdfs_dir and verbose, creates the HDFS directory, initializes an empty deque of pending futures.
+        # Side effects: HDFS mkdir.
         self.hdfs_dir = hdfs_dir
         makedirs(hdfs_dir)
         self.verbose = verbose
@@ -58,15 +72,24 @@ class TrajectoryTracker:
 
     def dump(self, data: io.BytesIO, name):
         # get a temp file and write to it
+        # [FUNCTION DOC]
+        # Launches a save_to_hdfs remote task for the buffer and appends its future to the queue (non-blocking).
+        # Inputs: data - BytesIO; name - file stem.
         self.handle.append(save_to_hdfs.remote(data, name, self.hdfs_dir, self.verbose))
 
     def wait_for_hdfs(self):
+        # [FUNCTION DOC]
+        # Blocks until all queued upload futures complete, popping them in FIFO order.
         while len(self.handle) != 0:
             future = self.handle.popleft()
             ray.get(future)
 
 
 def dump_data(data, name):
+    # [FUNCTION DOC]
+    # Behavior: no-op unless VERL_ENABLE_TRACKER is "1"; otherwise serializes data with torch.save into a buffer and sends it to the global tracker actor, waiting for the dump call to be enqueued.
+    # Inputs: data - any torch-serializable object; name - file stem.
+    # Side effects: creates/gets the tracker actor, triggers asynchronous HDFS upload.
     enable = os.getenv("VERL_ENABLE_TRACKER", "0") == "1"
     if not enable:
         return
@@ -77,6 +100,10 @@ def dump_data(data, name):
 
 
 def get_trajectory_tracker():
+    # [FUNCTION DOC]
+    # Behavior: reads env config and gets-or-creates the detached named Ray actor "global_tracker".
+    # Outputs: actor handle.
+    # Exceptions: AssertionError if VERL_TRACKER_HDFS_DIR unset.
     hdfs_dir = os.getenv("VERL_TRACKER_HDFS_DIR", default=None)
     verbose = os.getenv("VERL_TRACKER_VERBOSE", default="0") == "1"
     assert hdfs_dir is not None
@@ -93,6 +120,8 @@ if __name__ == "__main__":
 
     @ray.remote
     def process(iter):
+        # [FUNCTION DOC]
+        # HELPER: Test-only Ray task that dumps a random tensor dict named after the iteration.
         data = {"obs": torch.randn(10, 20)}
         dump_data(data, f"process_{iter}_obs")
 

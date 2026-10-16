@@ -12,19 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests for the private helper _settle_session_tasks in the v1 transfer-queue agent loop, which awaits a
+# group of asyncio session tasks and collects their exceptions instead of propagating on first failure.
+
 import asyncio
 
 from verl.trainer.ppo.v1.agent_loop_tq import _settle_session_tasks
 
 
 def test_settle_session_tasks_waits_for_siblings_after_failure():
+    # [FUNCTION DOC]
+    # Behavior: runs an event loop with one task that raises immediately and one that sleeps briefly then sets
+    # an event; asserts the helper waited for the sibling (event set), all tasks are done, and exactly one
+    # RuntimeError was returned in the error list.
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on mismatch. Side effects: runs asyncio.run.
     async def run():
+        # [FUNCTION DOC]
+        # HELPER: async body of the test; creates the two tasks, awaits the helper and performs the asserts.
+        # Inputs: none. Outputs: none. Side effects: sets the shared event via the sibling task.
         settled = asyncio.Event()
 
         async def fail():
+            # [FUNCTION DOC]
+            # HELPER: coroutine that immediately raises RuntimeError("session failed").
             raise RuntimeError("session failed")
 
         async def finish_later():
+            # [FUNCTION DOC]
+            # HELPER: coroutine that sleeps 0.01s then sets the enclosing event to signal completion.
             await asyncio.sleep(0.01)
             settled.set()
 

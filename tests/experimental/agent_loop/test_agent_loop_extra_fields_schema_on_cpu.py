@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for agent-loop output schema stability: AgentLoopOutput.as_dict
+# extra_fields handling and teacher-field promotion, AgentLoopWorker passing only
+# the hf_model_type string to Hydra-instantiated agent loops, the stable set of
+# non-tensor keys after AgentLoopWorker._postprocess, read-only routed_experts
+# handling in _agent_loop_postprocess, and _pad_token_ids using the tokenizer's
+# pad id for empty inputs. Uses fake server manager / tokenizer objects.
+
 from __future__ import annotations
 
 import warnings
@@ -37,6 +45,8 @@ from verl.workers.rollout.replica import TokenOutput
 
 
 class _FakeServerManager:
+    # [CLASS DOC]
+    # HELPER: fake LLM server client returning deterministic short generations.
     async def generate(
         self,
         request_id: str,
@@ -49,6 +59,9 @@ class _FakeServerManager:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> TokenOutput:
+        # [FUNCTION DOC]
+        # HELPER: async; ignores everything but prompt_ids and returns a TokenOutput
+        # whose token_ids are the last prompt id followed by 11, 12, 13, with four zero log-probs.
         del request_id, sampling_params, image_data, video_data, audio_data, mm_processor_kwargs, kwargs
         # Return a short, deterministic "generation" for testing.
         return TokenOutput(token_ids=prompt_ids[-1:] + [11, 12, 13], log_probs=[0.0, 0.0, 0.0, 0.0])
@@ -64,6 +77,8 @@ class _FakeServerManager:
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
     ) -> tuple[list[int], list[float], bool]:
+        # [FUNCTION DOC]
+        # HELPER: async; returns (last prompt id + [21, 22], matching zero log-probs, False meaning not cancelled).
         del request_id, sampling_params, image_data, video_data, audio_data, mm_processor_kwargs
         # Return a short partial generation and "not cancelled".
         response_ids = prompt_ids[-1:] + [21, 22]
@@ -72,6 +87,8 @@ class _FakeServerManager:
 
 
 class _FakeTokenizer:
+    # [CLASS DOC]
+    # HELPER: minimal tokenizer with right padding by default.
     padding_side = "right"
 
     def apply_chat_template(
@@ -83,6 +100,8 @@ class _FakeTokenizer:
         tokenize: bool = True,
         **kwargs,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: ignores inputs and always returns prompt ids [101, 102].
         del messages, tools, add_generation_prompt, tokenize, kwargs
         # Minimal tokenization: return a small prompt.
         return [101, 102]
@@ -96,6 +115,11 @@ class _FakeTokenizer:
         return_tensors: str,
         return_attention_mask: bool,
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: truncates input_ids to max_length (keeping the tail for left padding,
+        # head otherwise), pads with 0 on padding_side, and returns a mapping with a
+        # 1 x max_length long tensor "input_ids" and, if requested, "attention_mask"
+        # (1 for real tokens, 0 for padding).
         del padding, return_tensors
         input_ids = encoded_inputs["input_ids"]
         if len(input_ids) > max_length:
@@ -118,11 +142,15 @@ class _FakeTokenizer:
         return output
 
     def decode(self, ids: list[int] | torch.Tensor, skip_special_tokens: bool = True) -> str:
+        # [FUNCTION DOC]
+        # HELPER: always returns "<decoded>".
         del ids, skip_special_tokens
         return "<decoded>"
 
 
 def _make_agent_loop_output() -> AgentLoopOutput:
+    # [FUNCTION DOC]
+    # HELPER: builds an AgentLoopOutput with prompt [101,102], response [11,12], mask [1,1], default metrics and default extra_fields.
     return AgentLoopOutput(
         prompt_ids=[101, 102],
         response_ids=[11, 12],
@@ -132,12 +160,16 @@ def _make_agent_loop_output() -> AgentLoopOutput:
 
 
 def test_agent_loop_output_as_dict_handles_default_extra_fields():
+    # [FUNCTION DOC]
+    # Behavior: as_dict of a default output has extra_fields equal to an empty mapping.
     fields = _make_agent_loop_output().as_dict()
 
     assert fields["extra_fields"] == {}
 
 
 def test_agent_loop_output_as_dict_preserves_mutated_default_extra_fields():
+    # [FUNCTION DOC]
+    # Behavior: mutations of the default extra_fields mapping are reflected in as_dict.
     output = _make_agent_loop_output()
     output.extra_fields["raw_prompt"] = [{"role": "user", "content": "hello"}]
 
@@ -147,6 +179,10 @@ def test_agent_loop_output_as_dict_preserves_mutated_default_extra_fields():
 
 
 def test_agent_loop_output_as_dict_promotes_teacher_fields_without_mutating_model():
+    # [FUNCTION DOC]
+    # Behavior: teacher_ids/teacher_logprobs in extra_fields are promoted to top-level
+    # keys of as_dict and removed from its extra_fields, while the model's own
+    # extra_fields still contain them (no mutation).
     output = _make_agent_loop_output()
     output.extra_fields.update(
         {
@@ -167,15 +203,27 @@ def test_agent_loop_output_as_dict_promotes_teacher_fields_without_mutating_mode
 
 @pytest.mark.asyncio
 async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: monkeypatches hydra instantiate (capturing kwargs), rollout tracing
+    # (null context) and registers a test agent name; builds a bare AgentLoopWorker
+    # with hf_model_type "qwen2_5_vl" and a passthrough postprocess, runs
+    # _run_agent_loop and asserts the agent loop result is returned unchanged,
+    # hf_model_type was passed as that string, and no hf_config kwarg was passed.
     captured_kwargs: dict[str, Any] = {}
     expected_output = object()
 
     class _FakeAgentLoop:
+        # [CLASS DOC]
+        # HELPER: fake agent loop whose run returns the sentinel output.
         async def run(self, sampling_params: dict[str, Any], **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: async; returns the expected sentinel object.
             del sampling_params, kwargs
             return expected_output
 
     def fake_instantiate(*, config, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: replacement for hydra instantiate; records kwargs (minus config) and returns a fake agent loop.
         del config
         captured_kwargs.update(kwargs)
         return _FakeAgentLoop()
@@ -194,6 +242,8 @@ async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeyp
     worker.tools = []
 
     async def passthrough_postprocess(output, validate, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: async; returns output unchanged.
         del validate, kwargs
         return output
 
@@ -211,6 +261,8 @@ async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeyp
 
 
 def _pad_1d(ids: list[int], *, length: int, pad_id: int = 0) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: right-pads ids with pad_id to length, or truncates to length if longer.
     if len(ids) > length:
         return ids[:length]
     return ids + [pad_id] * (length - len(ids))
@@ -227,6 +279,13 @@ def _to_internal(
     prompt_len: int,
     response_len: int,
 ) -> _InternalAgentLoopOutput:
+    # [FUNCTION DOC]
+    # HELPER: converts raw agent-loop output lists into an _InternalAgentLoopOutput:
+    # right-pads prompt/response ids and response mask to prompt_len/response_len,
+    # builds attention mask (1 for real tokens of each part), input_ids as
+    # prompt+response, position_ids 0..seq_len-1, each as a 1 x N long tensor;
+    # logprobs, routed experts, multimodal data and reward score set to None.
+    # KNOWN ISSUE: prompts are right-padded here, whereas real agent loops left-pad prompts; acceptable only because the test passes exact lengths.
     prompt_ids = _pad_1d(output_prompt_ids, length=prompt_len, pad_id=0)
     response_ids = _pad_1d(output_response_ids, length=response_len, pad_id=0)
     response_mask = _pad_1d(output_response_mask, length=response_len, pad_id=0)
@@ -241,6 +300,8 @@ def _to_internal(
     position_ids = list(range(seq_len))
 
     def t(x: list[int]) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: wraps a list as a 1 x N long tensor.
         return torch.tensor([x], dtype=torch.long)
 
     return _InternalAgentLoopOutput(
@@ -263,6 +324,13 @@ def _to_internal(
 
 @pytest.mark.asyncio
 async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu():
+    # [FUNCTION DOC]
+    # Behavior: runs a SingleTurnAgentLoop on a minimal config with the fake server
+    # and tokenizer, asserts turn_scores and tool_rewards default to empty lists,
+    # converts to internal form and runs AgentLoopWorker._postprocess on a dummy
+    # worker (no reward handles, no distillation); asserts the merged batch's
+    # non-tensor fields turn_scores, tool_rewards, min_global_steps,
+    # max_global_steps and extras exist with shape (1,), and list fields are empty lists.
     # Minimal config surface used by the agent loops.
     config = OmegaConf.create(
         {
@@ -351,7 +419,16 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
 
 @pytest.mark.asyncio
 async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
+    # [FUNCTION DOC]
+    # Behavior: builds a dummy worker borrowing the needed AgentLoopWorker methods
+    # (prompt/response length 4), passes an output whose routed_experts is a
+    # read-only int64 numpy array of shape (4,2,1), with the non-writable-array
+    # UserWarning promoted to an error, and asserts the result's routed_experts is
+    # int16 with shape (1,8,2,1), the real values placed at positions 2..5
+    # (after the left-padded prompt) and zeros elsewhere.
     class _DummyWorker:
+        # [CLASS DOC]
+        # HELPER: minimal stand-in for AgentLoopWorker exposing only the methods and attributes postprocess uses.
         _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
         _compute_position_ids = AgentLoopWorker._compute_position_ids
         _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
@@ -361,6 +438,8 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
         distillation_enabled = False
 
         def __init__(self):
+            # [FUNCTION DOC]
+            # HELPER: sets fake tokenizer, rollout lengths 4/4, no processor, empty mm kwargs, no reward handles.
             self.tokenizer = _FakeTokenizer()
             self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 4})
             self.processor = None
@@ -405,6 +484,8 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
 
 
 class _FakeTokenizerCustomPad:
+    # [CLASS DOC]
+    # HELPER: tokenizer with pad_token_id 42 whose pad always right-pads with 0.
     """A minimal tokenizer with a non-zero pad_token_id for testing."""
 
     pad_token_id = 42
@@ -419,6 +500,10 @@ class _FakeTokenizerCustomPad:
         return_tensors: str,
         return_attention_mask: bool,
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: right-pads input_ids with 0 to max_length (no truncation) and returns
+        # input_ids and optionally attention_mask as 1 x max_length long tensors.
+        # Note: deliberately pads with 0 so the test can detect whether the worker relies on pad() for empty inputs.
         del padding, return_tensors
         input_ids = encoded_inputs["input_ids"]
         pad_len = max_length - len(input_ids)
@@ -432,6 +517,9 @@ class _FakeTokenizerCustomPad:
 
 @pytest.mark.asyncio
 async def test_agent_loop_pad_token_ids_empty_with_non_zero_pad_id():
+    # [FUNCTION DOC]
+    # Behavior: calling _pad_token_ids with an empty token list, max length 8 and
+    # right padding must yield input_ids filled with 42 and an all-zero attention mask.
     """Regression test: empty token list uses tokenizer's pad_token_id (not hardcoded 0)."""
     worker = type(
         "_DummyWorker",

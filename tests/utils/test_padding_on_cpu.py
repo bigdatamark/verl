@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for verl.workers.utils.padding conversions between padded (left/right padded batch) and no-padding
+# (jagged nested) layouts: left_right_2_no_padding, no_padding_2_padding (extracts the response window shifted
+# left by one for log-prob alignment), build_attention_mask_from_nested, embeds_padding_2_no_padding, and
+# response_from_nested / response_to_nested. Can also be run as a script calling every test except the attention
+# mask test.
+
 import random
 
 import torch
@@ -27,6 +34,11 @@ from verl.workers.utils.padding import (
 
 
 def test_padding_conversion_with_log_probs():
+    # [FUNCTION DOC]
+    # Builds a 4-sample padded TensorDict with varied attention lengths plus padded log-prob-like tensors
+    # (old_log_probs, ref_log_prob, rollout_log_probs over the full sequence, advantages over the response).
+    # After left_right_2_no_padding asserts input_ids and position_ids become nested, the log-prob-like tensors stay
+    # dense with their original shapes, and each nested input row has as many elements as its valid length.
     """Test that log probability tensors remain in padded format after conversion
 
     This test verifies the fix for the bug where ratio values were ~451,728 instead of ~1.0.
@@ -105,6 +117,9 @@ def test_padding_conversion_with_log_probs():
 
 
 def test_padding_conversion_without_log_probs():
+    # [FUNCTION DOC]
+    # Minimal all-ones-mask batch without log-prob keys: asserts input_ids/position_ids become nested and no
+    # log-prob keys are introduced.
     """Test that padding conversion works correctly when log prob tensors are not present"""
     batch_size = 4
     max_seq_len = 128
@@ -136,6 +151,10 @@ def test_padding_conversion_without_log_probs():
 
 
 def test_padding_roundtrip():
+    # [FUNCTION DOC]
+    # Full-length sequences of tokens 1..64 with prompts/responses of 32 each: converts to nested and back with
+    # no_padding_2_padding, asserting a (batch, response_len) result equal to 32..63 (response tokens shifted left by
+    # one position, i.e. the values at the positions predicting each response token).
     """Test that converting from padding to nested and back preserves values in the response region"""
     batch_size = 2
     max_seq_len = 64
@@ -184,6 +203,10 @@ def test_padding_roundtrip():
 
 
 def test_no_padding_2_padding_varying_lengths():
+    # [FUNCTION DOC]
+    # Varied prompt/response lengths (right padded): builds nested float "log-probs" equal to the token values and
+    # asserts no_padding_2_padding returns, for each sample's first resp_len slots, values prompt_len ..
+    # prompt_len + resp_len - 1. Prints a success line.
     """Test no_padding_2_padding with varied prompt/response lengths."""
     batch_size = 4
     max_seq_len = 100
@@ -247,6 +270,9 @@ def test_no_padding_2_padding_varying_lengths():
 
 
 def test_build_attention_mask_from_nested_uses_full_sequence_lengths():
+    # [FUNCTION DOC]
+    # Asserts build_attention_mask_from_nested for rows of length 5 and 3 with max_seq_len 5 returns an int32 mask of
+    # ones for each row's full length and zeros afterward.
     input_ids = torch.nested.as_nested_tensor(
         [
             torch.tensor([11, 12, 13, 14, 15]),
@@ -268,6 +294,9 @@ def test_build_attention_mask_from_nested_uses_full_sequence_lengths():
 
 
 def test_embeds_padding_2_no_padding_varying_lengths():
+    # [FUNCTION DOC]
+    # Right-padded prompt embeddings with valid lengths 20, 15, 10 (given by prompt_embeds_mask) are converted;
+    # asserts the result is nested and each sample equals the unpadded slice of the original.
     """Test that padding tokens are stripped correctly when sequences have different valid lengths."""
     batch_size = 3
     max_seq_len = 20
@@ -305,6 +334,10 @@ def test_embeds_padding_2_no_padding_varying_lengths():
 
 
 def test_response_from_nested():
+    # [FUNCTION DOC]
+    # Random-length nested log-probs and shorter random response masks: asserts response_from_nested returns, per
+    # sample, the slice ending one before the last element with response length entries (the last response_len
+    # positions shifted left by one). Uses unseeded random lengths.
     batch_size = 10
     log_probs = [torch.rand(random.randint(2, 100)) for _ in range(batch_size)]
     log_probs_nt = torch.nested.as_nested_tensor(
@@ -324,6 +357,9 @@ def test_response_from_nested():
 
 
 def test_response_to_nested():
+    # [FUNCTION DOC]
+    # Dense (batch, 100) log-probs with random response lengths: asserts response_to_nested returns the first
+    # response_len entries of each row as a nested tensor. Uses unseeded random lengths.
     batch_size = 10
     log_probs = torch.rand(batch_size, 100)
     response_mask = [torch.ones(random.randint(1, log_probs[i].shape[0] - 1)) for i in range(batch_size)]

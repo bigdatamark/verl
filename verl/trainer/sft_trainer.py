@@ -13,6 +13,11 @@
 # limitations under the License.
 
 
+# [MODULE DOC]
+# SPMD (torchrun-style) supervised fine-tuning trainer built on the engine-based TrainingWorker. Sets NCCL_DEBUG=WARN
+# and TOKENIZERS_PARALLELISM=true at import time. Provides SFTTrainer, a run_sft entry, a Hydra main using config
+# "sft_trainer_engine", and create_sft_dataset (custom or MultiTurnSFTDataset).
+
 import os
 from functools import partial
 
@@ -48,10 +53,20 @@ logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
 
 class SFTTrainer:
+    # [CLASS DOC]
+    # SFT trainer running in every process of an initialized torch.distributed group. Builds configs, datasets, engine,
+    # stateful dataloaders and a CheckpointHandler, resumes from checkpoint, and runs an epoch/step training loop with
+    # periodic validation, checkpointing, profiling and metric tracking.
     def __init__(
         self,
         config,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores config and rank, then in order builds configs, datasets, engine, dataloaders, initializes engine
+        # schedule/frequencies, builds the checkpoint handler, and loads a checkpoint (resume_global_step = returned step).
+        # Sets device_name from config.trainer.device; rank 0 prints config; logs GPU memory before/after.
+        # Inputs: config - full OmegaConf trainer config. Outputs: none.
+        # Exceptions: requires torch.distributed initialized; propagates build/load errors.
         self.config = config
 
         log_gpu_memory_usage(f"rank {torch.distributed.get_rank()}: Before SFTTrainer init", logger=logger)
@@ -80,6 +95,10 @@ class SFTTrainer:
         log_gpu_memory_usage(f"rank {self.rank}: After SFTTrainer init", logger=logger)
 
     def _build_ckpt_handler(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates CheckpointHandler with engine, train dataloader, default_local_dir and optional trainer settings
+        # (resume_mode default "auto", resume_from_path, max_ckpt_to_keep, default_hdfs_dir) plus LoRA metadata.
+        # Inputs/Outputs: none. Side effects: sets self.ckpt_handler.
         resume_mode = getattr(self.config.trainer, "resume_mode", "auto")
         resume_from_path = getattr(self.config.trainer, "resume_from_path", None)
         max_ckpt_to_keep = getattr(self.config.trainer, "max_ckpt_to_keep", None)
@@ -98,6 +117,10 @@ class SFTTrainer:
         )
 
     def _get_lora_train_meta(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns None unless LoRA is active (lora_adapter_path set or lora_rank > 0). Otherwise returns a dict with
+        # "r" (lora_rank), "lora_alpha" (int; 0 with a rank-0 warning if unset, warning also if 0), and "task_type"
+        # (default "CAUSAL_LM") for checkpoint metadata. Inputs: none. Outputs: dict or None. Side effects: logging.
         lora_adapter_path = self.config.model.get("lora_adapter_path", None)
         lora_rank = int(getattr(self.config.model, "lora_rank", 0) or 0)
 
@@ -136,6 +159,9 @@ class SFTTrainer:
         }
 
     def _build_config(self):
+        # [FUNCTION DOC]
+        # HELPER: Converts model, engine, optim, checkpoint and profiler config sections to dataclasses, reads
+        # trainer.profile_interval and validates it. Inputs/Outputs: none. Side effects: sets attributes.
         from verl.utils.config import omega_conf_to_dataclass
 
         self.model_config = omega_conf_to_dataclass(self.config.model)
@@ -149,6 +175,9 @@ class SFTTrainer:
         self._validate_profiler_interval()
 
     def _validate_profiler_interval(self):
+        # [FUNCTION DOC]
+        # HELPER: Asserts profile interval has 2 entries with end >= start (and end < 0 if start < 0); stores start/end steps.
+        # Exceptions: AssertionError on invalid interval.
         assert len(self.profiler_interval) == 2
         self.start_profile_step = self.profiler_interval[0]
         self.end_profile_step = self.profiler_interval[1]
@@ -157,6 +186,9 @@ class SFTTrainer:
             assert self.end_profile_step < 0
 
     def _build_engine(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds the loss function (sft_loss with config None), a language_model TrainingWorkerConfig from the
+        # dataclass configs, a TrainingWorker with that loss, and exposes its engine as self.engine. Inputs/Outputs: none.
         from verl.workers.engine_workers import TrainingWorkerConfig
         from verl.workers.utils.losses import sft_loss
 
@@ -177,6 +209,12 @@ class SFTTrainer:
         self.engine = self.training_client.engine
 
     def _init_engine(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets total_training_steps (config value or dataloader length times total_epochs) and writes it into the
+        # optimizer config; sets steps_per_epoch; resolves save_freq/test_freq where "after_each_epoch" means steps_per_epoch;
+        # resets the training client (initializes model/optimizer). Inputs/Outputs: none.
+        # KNOWN ISSUE: optimizer_config.total_training_steps is patched after _build_engine already passed the config to the
+        # worker; this relies on the worker reading the same object lazily at reset().
         # patch optimizer config
         if self.config.trainer.total_training_steps is not None:
             self.total_training_steps = self.config.trainer.total_training_steps
@@ -198,6 +236,9 @@ class SFTTrainer:
         self.training_client.reset()
 
     def _build_dataset(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds train dataset (train_max_samples, default -1) and optional val dataset (val_max_samples) via
+        # create_sft_dataset using the model config tokenizer/processor. Inputs/Outputs: none. Side effects: sets datasets.
         config = self.config
         tokenizer = self.model_config.tokenizer
         processor = self.model_config.processor
@@ -222,6 +263,10 @@ class SFTTrainer:
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
     def _build_dataloader(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds distributed samplers over the engine's data-parallel rank/size (train shuffled, val unshuffled, both
+        # drop_last) and StatefulDataLoaders with per-DP batch size train_batch_size // dp_size, SFTTensorCollator(pad_mode),
+        # configured num_workers, pin_memory off. val_dataloader is None without a val dataset. Inputs/Outputs: none.
         # build dataset
         config = self.config
         # build dataloader
@@ -270,6 +315,11 @@ class SFTTrainer:
             self.val_dataloader = None
 
     def _get_batch_seqlens(self, data):
+        # [FUNCTION DOC]
+        # HELPER: Computes per-sample sequence lengths (nested input_ids offset differences, else attention-mask row sums),
+        # moves them to device, and if DP size > 1 with a DP group all-gathers them across the DP group.
+        # Inputs: data - tensordict batch. Outputs: list of int lengths (global batch if gathered, else local).
+        # KNOWN ISSUE: allocates an unused output tensor before the early-return check (dead code).
         # mean over dp group
         is_nested = data["input_ids"].is_nested
         if is_nested:
@@ -306,6 +356,20 @@ class SFTTrainer:
         return batch_seqlens
 
     def fit(self):
+        # [FUNCTION DOC]
+        # Behavior: main training loop. Creates Tracking on the logging rank (model-parallel output source with DP rank 0).
+        # Starts from resume_global_step, computing start epoch; meta info (remove padding, dynamic bsz, token limits,
+        # micro batch size, temperature 1.0, global batch size, pad mode, pad token id) is attached to every batch.
+        # Per epoch: sets sampler epoch, empties cache. Per step: increments global step, builds tensordict, computes batch
+        # seqlens and attaches them plus update_lr_scheduler; starts/stops profiling at configured steps and advances the
+        # profiler each step; trains one batch; on output ranks renames loss/grad_norm/lr/mfu to "train/..." and adds global
+        # and cumulative token counts (billions), logging on DP rank 0. Validates on last step (if a val loader exists) or every
+        # test_freq steps: averages infer_batch losses, all-reduces mean over DP, logs val/loss, barriers. Saves checkpoint on
+        # last step or every save_freq steps. Returns after the last step printing summary.
+        # Inputs/Outputs: none. Side effects: training, logging, checkpoint files, distributed collectives.
+        # KNOWN ISSUE: validation condition is evaluated as (last step and val loader) OR (test_freq > 0 and valid step), so
+        # with no val loader a test_freq step iterates over None; also a test_freq or save_freq of 0 causes modulo-by-zero.
+        # KNOWN ISSUE: train_time is never updated, so the printed total time is always 0.
         is_logging = self.engine.is_mp_src_rank_with_outputs() and self.engine.get_data_parallel_rank() == 0
 
         # TODO: add a unified tracking
@@ -450,6 +514,9 @@ class SFTTrainer:
 
 
 def run_sft(config):
+    # [FUNCTION DOC]
+    # Behavior: initializes the global process group, builds SFTTrainer, runs fit, destroys the process group.
+    # Inputs: config. Outputs: none.
     from verl.utils.distributed import initialize_global_process_group
 
     initialize_global_process_group()
@@ -460,12 +527,18 @@ def run_sft(config):
 
 @hydra.main(config_path="config", config_name="sft_trainer_engine", version_base=None)
 def main(config):
+    # [FUNCTION DOC]
+    # Behavior: Hydra entry point; auto-sets device (e.g. NPU) in config then runs run_sft. Inputs: config from Hydra.
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
     run_sft(config)
 
 
 def create_sft_dataset(data_paths, data_config, tokenizer, processor, max_samples=-1):
+    # [FUNCTION DOC]
+    # Behavior: chooses dataset class: data_config.custom_cls.path/name loaded externally if path set, else
+    # MultiTurnSFTDataset; instantiates with parquet_files, tokenizer, config, processor, max_samples.
+    # Inputs: data_paths, data_config, tokenizer, processor, max_samples (-1 = all). Outputs: dataset instance.
     """Create a dataset."""
     # build dataset
     # First check if a custom dataset class is specified

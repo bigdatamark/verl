@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Package for the v1 PPO trainer stack: re-exports the base PPOTrainer with its trainer
+# registry (register_trainer / get_trainer_cls), the sync, colocated-async and
+# separate-async trainer variants, and the TransferQueue-backed agent loop worker/manager.
+
 from .agent_loop_tq import AgentLoopManagerTQ, AgentLoopWorkerTQ
 from .trainer_base import PPOTrainer, get_trainer_cls, register_trainer
 from .trainer_colocate_async import PPOTrainerColocateAsync

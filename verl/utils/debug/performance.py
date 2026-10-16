@@ -14,4 +14,7 @@
 
 # APIs kept for backward compatibility purpose
 # This file is deprecated, for new features please develop in profiler/performance.py
+# [MODULE DOC]
+# Deprecated shim re-exporting reduce_timing and simple_timer from verl.utils.profiler.performance for backward compatibility.
+
 from verl.utils.profiler.performance import reduce_timing, simple_timer  # noqa: F401

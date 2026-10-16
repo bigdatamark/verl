@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# torchrun regression script (CUDA only, >= 2 GPUs) checking that offloading a full-parameter FSDP2 model to CPU
+# yields pinned CPU local shards and that reloading to GPU restores them bitwise.
+
 """Regression test for non-blocking FSDP2 full-parameter model transfers.
 
 PyTorch currently places the CPU tensors produced by a non-blocking CUDA-to-CPU
@@ -41,10 +45,15 @@ from verl.utils.fsdp_utils import (
 
 
 def _local_tensor(tensor):
+    # [FUNCTION DOC]
+    # HELPER: Returns the local shard of a DTensor-like object (its _local_tensor attribute) or the tensor itself otherwise.
     return tensor._local_tensor if hasattr(tensor, "_local_tensor") else tensor
 
 
 def _build_full_parameter_fsdp2_model(device_mesh):
+    # [FUNCTION DOC]
+    # HELPER: Builds a tiny bf16 Qwen2 (2 layers, hidden 128, vocab 512) on CUDA, applies FSDP2 over the mesh with bf16
+    # param / fp32 reduce mixed precision, asserts every parameter requires grad and returns it.
     config = Qwen2Config(
         num_hidden_layers=2,
         hidden_size=128,
@@ -69,6 +78,12 @@ def _build_full_parameter_fsdp2_model(device_mesh):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: returns early with a message on non-CUDA devices; asserts >= 2 GPUs; inits distributed and a "dp" mesh;
+    # snapshots cloned local shards; offloads to CPU (no cache emptying) and asserts each local shard is on CPU and pinned;
+    # reloads to GPU, synchronizes and asserts each local shard is on CUDA and exactly equals the snapshot; barrier,
+    # destroy process group, rank 0 prints success.
+    # Exceptions: AssertionError on any check.
     if get_device_name() != "cuda":
         print("test_fsdp2_pinned_model_transfer skipped: pinned transfer behavior is CUDA-specific")
         return

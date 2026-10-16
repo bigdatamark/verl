@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Timing-based CPU unit tests for AsyncTokenBucket (reward_manager.limited): an asyncio token bucket with refill
+# rate rate_limit tokens/sec and capacity max_tokens (defaults to rate_limit), starting full, with lazily set
+# last_update. Assertions rely on wall-clock timing tolerances and may be flaky on slow machines.
+
 import asyncio
 import time
 
@@ -21,10 +26,14 @@ from verl.experimental.reward_loop.reward_manager.limited import AsyncTokenBucke
 
 
 class TestAsyncTokenBucket:
+    # [CLASS DOC]
+    # Groups the async token bucket tests; each test creates a fresh bucket.
     """Unit tests for AsyncTokenBucket rate limiter."""
 
     @pytest.mark.asyncio
     async def test_basic_acquire(self):
+        # [FUNCTION DOC]
+        # Asserts acquiring 5 of 10 tokens on a full bucket is immediate (<0.1s) and leaves about 5 tokens.
         """Test basic token acquisition."""
         bucket = AsyncTokenBucket(rate_limit=10.0, max_tokens=10.0)
 
@@ -38,6 +47,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_refill_mechanism(self):
+        # [FUNCTION DOC]
+        # Drains the bucket, sleeps 0.5s, and asserts acquiring 4 tokens then completes in under 0.1s.
         """Test that tokens refill over time."""
         bucket = AsyncTokenBucket(rate_limit=10.0, max_tokens=10.0)
 
@@ -57,6 +68,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_waiting_for_tokens(self):
+        # [FUNCTION DOC]
+        # Drains the bucket and asserts acquiring 5 tokens at 10/s blocks between 0.4s and 0.7s.
         """Test that acquire waits when insufficient tokens available."""
         bucket = AsyncTokenBucket(rate_limit=10.0, max_tokens=10.0)
 
@@ -73,6 +86,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_max_tokens_cap(self):
+        # [FUNCTION DOC]
+        # Sleeps 1s on a bucket with capacity 5 and asserts tokens never exceed 5 after an acquire of 1.
         """Test that tokens don't exceed max_tokens capacity."""
         bucket = AsyncTokenBucket(rate_limit=10.0, max_tokens=5.0)
 
@@ -88,6 +103,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_fractional_tokens(self):
+        # [FUNCTION DOC]
+        # Acquires 0.5, 1.5, 2.3 tokens and asserts the remaining balance equals 100 minus their sum (approx).
         """Test acquiring fractional tokens."""
         bucket = AsyncTokenBucket(rate_limit=100.0, max_tokens=100.0)
 
@@ -100,10 +117,14 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_concurrent_acquires(self):
+        # [FUNCTION DOC]
+        # Gathers 5 concurrent acquires of 3 tokens from a 10-token bucket and asserts total time >= 0.4s and all 5 finish.
         """Test multiple concurrent acquire operations."""
         bucket = AsyncTokenBucket(rate_limit=10.0, max_tokens=10.0)
 
         async def acquire_task(num_tokens: float, task_id: int):
+            # [FUNCTION DOC]
+            # HELPER: Acquires num_tokens from the enclosing bucket and returns task_id.
             await bucket.acquire(num_tokens)
             return task_id
 
@@ -121,6 +142,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_high_rate_limit(self):
+        # [FUNCTION DOC]
+        # Performs 100 sequential acquires of 10 tokens at rate/capacity 1000 and asserts it completes in under 1.5s.
         """Test with high rate limit (simulating high-throughput scenarios)."""
         bucket = AsyncTokenBucket(rate_limit=1000.0, max_tokens=1000.0)
 
@@ -135,6 +158,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_zero_initial_state(self):
+        # [FUNCTION DOC]
+        # Asserts a new bucket holds max_tokens and last_update is None, and that last_update is set after an acquire.
         """Test that bucket starts with full tokens."""
         bucket = AsyncTokenBucket(rate_limit=10.0, max_tokens=10.0)
 
@@ -147,6 +172,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_rate_limit_accuracy(self):
+        # [FUNCTION DOC]
+        # Drains a 50/s bucket and asserts acquiring 25 tokens takes 0.5s within a 20% margin.
         """Test rate limit accuracy over time."""
         rate = 50.0  # 50 tokens per second
         bucket = AsyncTokenBucket(rate_limit=rate, max_tokens=rate)
@@ -164,6 +191,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_sequential_acquires(self):
+        # [FUNCTION DOC]
+        # Four acquires of 5 empty a 20-token bucket (approx 0), then asserts acquiring 10 more waits at least 0.4s.
         """Test sequential acquire operations."""
         bucket = AsyncTokenBucket(rate_limit=20.0, max_tokens=20.0)
 
@@ -185,6 +214,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_default_max_tokens(self):
+        # [FUNCTION DOC]
+        # Asserts max_tokens and initial tokens both default to rate_limit (15).
         """Test that max_tokens defaults to rate_limit."""
         bucket = AsyncTokenBucket(rate_limit=15.0)
 
@@ -193,6 +224,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_single_token_acquire(self):
+        # [FUNCTION DOC]
+        # Asserts acquire with no argument consumes 1 token (10 -> about 9).
         """Test default acquire of 1 token."""
         bucket = AsyncTokenBucket(rate_limit=10.0, max_tokens=10.0)
 
@@ -202,6 +235,9 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_large_token_acquire(self):
+        # [FUNCTION DOC]
+        # Asserts acquiring 50 tokens from a full 10-capacity, 10/s bucket (more than capacity) waits between 3.5s and 5s,
+        # i.e. requests above capacity are allowed and wait for the deficit.
         """Test acquiring more tokens than bucket capacity."""
         bucket = AsyncTokenBucket(rate_limit=10.0, max_tokens=10.0)
 
@@ -215,11 +251,15 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_thread_safety_with_lock(self):
+        # [FUNCTION DOC]
+        # Gathers 10 concurrent acquires of 10 tokens from a 100-token bucket; asserts all complete and the balance is ~0.
         """Test that lock prevents race conditions."""
         bucket = AsyncTokenBucket(rate_limit=100.0, max_tokens=100.0)
         results = []
 
         async def acquire_and_record():
+            # [FUNCTION DOC]
+            # HELPER: Acquires 10 tokens from the enclosing bucket then appends 1 to the shared results list.
             await bucket.acquire(10.0)
             results.append(1)
 
@@ -235,6 +275,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_multiple_wait_cycles(self):
+        # [FUNCTION DOC]
+        # Drains a 10/s bucket then asserts acquiring 15 tokens (above capacity) takes between 1.3s and 1.8s.
         """Test multiple wait cycles in the acquire loop."""
         bucket = AsyncTokenBucket(rate_limit=10.0, max_tokens=10.0)
 
@@ -251,6 +293,8 @@ class TestAsyncTokenBucket:
 
     @pytest.mark.asyncio
     async def test_rapid_small_acquires(self):
+        # [FUNCTION DOC]
+        # Asserts 50 acquires of 2 tokens within a 100-token capacity complete in under 0.5s.
         """Test many rapid small acquisitions."""
         bucket = AsyncTokenBucket(rate_limit=100.0, max_tokens=100.0)
 

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CLI tool migrating Megatron checkpoint role directories from the v1 layout
+# (flat dist_ckpt/ and huggingface/) to the v2 split layout (model/, optimizer/,
+# extra/) by mirroring the single legacy dist_ckpt tree into each new subtree and
+# moving the HF tree under model/. Exit codes: 0 success, 1 nothing found, 2 failures.
+
 """Migrate a pre-v2 Megatron checkpoint to the v2 split layout.
 
 Old layout (schema v1, produced by verl <= the previous release)::
@@ -73,14 +79,26 @@ from pathlib import Path
 
 
 def _is_v2_layout(ckpt_dir: Path) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: true if any of model/, optimizer/ or extra/ exists as a directory.
     return any((ckpt_dir / sub).is_dir() for sub in ("model", "optimizer", "extra"))
 
 
 def _is_legacy_layout(ckpt_dir: Path) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: true if dist_ckpt/ or huggingface/ exists as a directory.
     return (ckpt_dir / "dist_ckpt").is_dir() or (ckpt_dir / "huggingface").is_dir()
 
 
 def _link_tree(src: Path, dst: Path, mode: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Ensures dst's parent exists. symlink: create a directory symlink to the
+    # resolved src unless dst already exists (or is a dangling link). copy: full
+    # copytree unless dst exists. Otherwise (hardlink): walk src, recreate directories
+    # under dst and hardlink each file not already present, falling back to a
+    # metadata-preserving file copy on OSError.
+    # Exceptions: OS errors from symlink/copytree/mkdir. Side effects: filesystem writes.
+    # KNOWN ISSUE: docstring says hardlink falls back to symlink on cross-filesystem errors, but the code falls back to copying each file; unknown mode values are silently treated as hardlink.
     """Create ``dst`` as a hardlinked / symlinked / copied mirror of ``src``.
 
     ``mode`` is one of ``"hardlink"``, ``"symlink"``, ``"copy"``.  Hardlink
@@ -117,11 +135,23 @@ def _link_tree(src: Path, dst: Path, mode: str) -> None:
 
 
 def _move(src: Path, dst: Path) -> None:
+    # [FUNCTION DOC]
+    # HELPER: creates dst's parent directories and renames src to dst (same filesystem only).
     dst.parent.mkdir(parents=True, exist_ok=True)
     src.rename(dst)
 
 
 def migrate_one(ckpt_dir: Path, *, dry_run: bool, mode: str) -> str:
+    # [FUNCTION DOC]
+    # Behavior: returns "skipped (already v2)" or "skipped (no recognised layout)" when
+    # applicable. Otherwise plans: mirror legacy dist_ckpt into optimizer/dist_ckpt,
+    # extra/dist_ckpt and model/dist_ckpt using mode; move huggingface/ to
+    # model/huggingface. In dry_run prints "would ..." lines and returns "planned".
+    # Else executes the plan; in copy mode deletes the legacy dist_ckpt afterwards.
+    # Returns "migrated".
+    # Inputs: ckpt_dir - role directory; dry_run - plan only; mode - hardlink/symlink/copy.
+    # Exceptions: filesystem errors propagate. Side effects: filesystem changes, prints.
+    # Note: transformer_config.json / ckpt_contents.json are left in place (already at the v2 location).
     """Return a short status string for reporting."""
     if _is_v2_layout(ckpt_dir):
         return "skipped (already v2)"
@@ -174,6 +204,10 @@ def migrate_one(ckpt_dir: Path, *, dry_run: bool, mode: str) -> str:
 
 
 def iter_checkpoint_dirs(root: Path) -> list[Path]:
+    # [FUNCTION DOC]
+    # Behavior: walks root top-down; every directory matching legacy or v2 layout is
+    # collected and not descended into. Outputs: list of paths (not a generator).
+    # KNOWN ISSUE: docstring says "yield" and that v2 is detected by model/ only, but it returns a list and v2 detection also matches optimizer/ or extra/.
     """Yield every leaf checkpoint directory under ``root``.
 
     A "leaf" is any directory that looks like a Megatron role directory —
@@ -191,6 +225,13 @@ def iter_checkpoint_dirs(root: Path) -> list[Path]:
 
 
 def main() -> int:
+    # [FUNCTION DOC]
+    # Behavior: parses args (exactly one of --checkpoint or --checkpoint-root;
+    # --all-steps required with --checkpoint-root; --dry-run; --mode default hardlink),
+    # builds the target list, returns 1 with a stderr message if empty. For each
+    # target: skips non-directories, prints a header and migrate_one status, counts
+    # exceptions as failures (printed to stderr). Returns 0 if no failures else 2.
+    # Exceptions: argparse exits on invalid usage.
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--checkpoint", type=Path, help="Migrate a single role directory (e.g. .../global_step_N/actor).")

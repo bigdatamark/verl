@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Single-GPU Ray + Megatron(-Bridge) regression test. Constants: Z_LOSS_COEFF (1e-3) router z-loss coefficient;
+# TOKENIZER_REF local tokenizer directory (~/models/Qwen/Qwen2.5-0.5B). Sets NCCL_DEBUG=WARN at import.
+
 """MoE router z-loss must not depend on ``calculate_per_token_loss``.
 
 Under context parallelism the Megatron bridge enables ``calculate_per_token_loss``,
@@ -48,6 +52,11 @@ TOKENIZER_REF = os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B")
 
 
 def _create_tiny_moe_model(path):
+    # [FUNCTION DOC]
+    # HELPER: Builds a random bf16 2-layer Qwen3-MoE (hidden 64, 8 experts, top-2, every layer sparse, untied
+    # embeddings, vocab sized to the borrowed tokenizer) and saves it with the tokenizer to path.
+    # Outputs: vocab size (int).
+    # Side effects: writes checkpoint files; reads the reference tokenizer from disk.
     """Save a tiny Qwen3-MoE checkpoint so the router z-loss path is exercised. The
     engine's forward needs a tokenizer (pad_token_id), so we borrow one and size the
     vocab to match. Returns the vocab size."""
@@ -74,6 +83,11 @@ def _create_tiny_moe_model(path):
 
 
 def _build_data(vocab_size):
+    # [FUNCTION DOC]
+    # HELPER: Seeds torch/numpy with 1 and builds a 4 x 32 random batch with a random left-padded mask, second half as
+    # responses, random old/ref log probs and advantages, temperature 1 and per-sample token counts; converts to a
+    # no-padding TensorDict with global_batch_size set.
+    # Outputs: TensorDict.
     batch_size, seqlen = 4, 32
     response_length = seqlen // 2
     torch.manual_seed(1)
@@ -105,6 +119,14 @@ def _build_data(vocab_size):
 
 
 def _grad_norm(model_path, calculate_per_token_loss, data_td):
+    # [FUNCTION DOC]
+    # HELPER: Configures a Megatron TrainingWorker (mbridge via NVIDIA Megatron-Bridge, TP/PP/CP 1, dynamic bsz, remove
+    # padding, z-loss coefficient and the given calculate_per_token_loss override), starts a fresh Ray session, creates a
+    # one-GPU worker group, sets a PPO loss, runs one train_batch and returns metrics["grad_norm"] as float. Ray is always
+    # shut down.
+    # Inputs: model_path, calculate_per_token_loss flag, data_td.
+    # Outputs: float gradient norm.
+    # Side effects: Ray lifecycle, GPU training.
     """Run one PPO update through a Megatron MoE engine and return the grad norm.
     A fresh Ray session is used per call so the two single-GPU worker groups don't
     contend for the device."""
@@ -143,6 +165,9 @@ def _grad_norm(model_path, calculate_per_token_loss, data_td):
 
 
 def test_moe_zloss_invariant_to_per_token_loss(tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: creates the tiny MoE in tmp_path, builds data, measures grad norm with the per-token-loss flag off and on,
+    # and asserts they are close (rtol 5e-2, atol 1e-3).
     model_path = str(tmp_path / "tiny_moe")
     vocab_size = _create_tiny_moe_model(model_path)
     data_td = _build_data(vocab_size)

@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# GPU/Ray integration test of RewardLoopManager with a standalone discriminative reward model
+# (Skywork-Reward-V2-Llama-3.2-1B served by vLLM/SGLang on its own 8-GPU pool, TP=2). Prints per-sample scores
+# for manual inspection; no assertions. Run from repo root.
+
 import os
 
 import ray
@@ -25,6 +30,18 @@ from verl.utils.tokenizer import normalize_token_ids
 
 
 def create_data_samples(tokenizer) -> DataProto:
+    # [FUNCTION DOC]
+    # HELPER: Builds a 4-sample batch from fixed conversations (two answers to a sigmoid-range question, one right
+    # and one wrong, and two answers about the capital of Australia, one right and one wrong). For each conversation
+    # tokenizes the user turn with the chat template as the prompt and takes the tokens of the full conversation
+    # beyond the prompt length as the response; left-pads prompts to 1024 and right-pads responses to 4096 with the
+    # pad token, builds the matching attention mask, concatenated input_ids, and position ids from the mask.
+    # Non-tensor fields: data_source "gsm8k", reward_model ground_truth "Not Used", raw_prompt (user turn only),
+    # extra_info question (user text).
+    # Inputs: tokenizer - HF tokenizer of the rollout model with a chat template and pad token.
+    # Outputs: tuple (DataProto, list of the raw conversations).
+    # Exceptions: tensor stacking fails if any prompt/response exceeds the fixed lengths.
+    # KNOWN ISSUE: return annotation says DataProto but the function returns a (DataProto, convs) tuple.
     convs = [
         [
             {
@@ -105,6 +122,12 @@ def create_data_samples(tokenizer) -> DataProto:
 
 
 def test_reward_model_manager():
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, composes ppo_trainer config, sets rollout model path (for the tokenizer), one reward worker,
+    # dapo manager, and standalone DisRM settings (backend from ROLLOUT_NAME, default vllm); creates RewardLoopManager,
+    # builds the samples with the rollout tokenizer, calls compute_rm_score, and prints each problem, answer and the
+    # summed rm_scores.
+    # Side effects: Ray lifecycle, GPU servers, prints.
     ray.init(
         runtime_env={
             "env_vars": {

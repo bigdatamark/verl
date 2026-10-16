@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Command-line entry point for the model merger ("python -m verl.model_merger merge|test ...").
+
 """
 This module is used to merge huggingface model and test verl checkpoints from FSDP and Megatron backends.
 
@@ -50,6 +53,11 @@ from .base_model_merger import generate_config_from_args, parse_args
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: parses CLI args, builds a ModelMergerConfig, prints it, instantiates FSDPModelMerger or
+    # MegatronModelMerger (lazy import) by config.backend, then runs merge_and_save and cleanup.
+    # Exceptions: NotImplementedError for an unknown backend; propagates merger errors.
+    # Side effects: prints the config; reads checkpoints and writes/compares models via the merger.
     args = parse_args()
     config = generate_config_from_args(args)
     print(f"config: {config}")

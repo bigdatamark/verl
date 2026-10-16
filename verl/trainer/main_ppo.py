@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Hydra entry point (config "ppo_trainer") for PPO-family training. Validates config, then runs either the V1
+# TransferQueue-based trainer (TaskRunnerV1) or the deprecated legacy TaskRunner from main_ppo_v0 inside Ray.
+# Logger level from VERL_LOGGING_LEVEL (default INFO).
+
 import logging
 import os
 from pprint import pprint
@@ -32,6 +38,17 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 # Define a function to run the PPO-like training process
 def run_ppo(config, task_runner_class) -> None:
+    # [FUNCTION DOC]
+    # Behavior: if rollout full_determinism (or reward-model rollout full_determinism with RM enabled) sets
+    # VERL_FULL_DETERMINISM=1, VLLM_BATCH_INVARIANT=1 and PYTHONHASHSEED to the rollout seed in the environment; sets
+    # VERL_RL_INSIGHT_ENABLE=1 if "rl_insight" is among trainer loggers (string or list). If Ray is not initialized,
+    # merges the default PPO runtime env (adding TRANSFER_QUEUE_ENABLE=1 when transfer_queue.enable) with
+    # ray_kwargs.ray_init.runtime_env (user values win), prints and calls ray.init. Creates the task runner actor, with
+    # nsight runtime options when on CUDA with the nsys profiler and non-empty profiler steps (asserting nvtx is
+    # installed), runs runner.run(config) to completion, and optionally dumps a Ray timeline to
+    # ray_kwargs.timeline_json_file.
+    # Inputs: config; task_runner_class - Ray actor class with a run method. Outputs: None.
+    # Exceptions: AssertionError if nvtx missing; anything raised by the remote run. Side effects: env mutation, Ray init, files.
     """Initialize Ray cluster and run distributed PPO training process.
 
     Args:
@@ -101,14 +118,23 @@ def run_ppo(config, task_runner_class) -> None:
 
 @ray.remote
 class TaskRunnerV1:
+    # [CLASS DOC]
+    # Ray actor that drives the V1 PPO trainer: holds config, trainer and agent loop manager.
     """V1 TaskRunner for PPO training."""
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Initializes config, trainer and agent_loop_manager attributes to None.
         self.config = None
         self.trainer = None
         self.agent_loop_manager = None
 
     def init_agent_loop_manager(self):
+        # [FUNCTION DOC]
+        # Behavior: picks the agent loop manager class from rollout.agent.agent_loop_manager_class (loaded by fully
+        # qualified name) or defaults to the TransferQueue manager; creates it via its create factory with config and the
+        # trainer's LLM client, teacher client and reward loop worker handles; stores it on self.
+        # Exceptions: import/load errors for a bad class name. Requires self.trainer to be set.
         """Initialize the agent loop manager to generate sequences.
 
         NOTE: User can customize their own agent loop manager, the only requirement is:
@@ -131,6 +157,12 @@ class TaskRunnerV1:
         )
 
     def run(self, config: DictConfig):
+        # [FUNCTION DOC]
+        # Behavior: configures verl logging; resolves the trainer class from trainer.v1.trainer_mode; forces
+        # transfer_queue.enable true; prints and resolves config; initializes the transfer queue; constructs and inits the
+        # trainer, creates the agent loop manager and runs fit. Finally, finishes the trainer's tracking logger (if any)
+        # with exit code 0 on success or 1 on failure, and always closes the transfer queue.
+        # Inputs: config DictConfig (mutated). Outputs: None. Exceptions: propagates training errors after cleanup.
         """Run the PPO training process."""
         configure_verl_logging()
 
@@ -165,6 +197,10 @@ class TaskRunnerV1:
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
+    # [FUNCTION DOC]
+    # Behavior: auto-sets the device (e.g. NPU), validates config with flags for reference policy and critic needs, then
+    # runs run_ppo with TaskRunnerV1 if trainer.use_v1, else logs a deprecation warning and uses the legacy TaskRunner.
+    # Inputs: Hydra config. Outputs: None.
     """Main entry point for PPO training with Hydra configuration management.
 
     Args:

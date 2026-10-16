@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# torchrun script (not collected as a pytest test; no test_ functions) comparing a 2-layer Qwen3-1.7B under FSDP2
+# with and without the TiledMLP monkey patch. Needs >=2 GPUs, NCCL, flash-attention and Hub/model access.
+# KNOWN ISSUE: the docstring's run command points to tests/test_tiled_mlp_accuracy.py but the file lives in
+# tests/models/. Results are only printed; the script never fails or sets a non-zero exit code on mismatch.
+
 """
 Test script to verify TiledMLP accuracy by comparing logits and gradients
 between regular MLP and TiledMLP under FSDP2.
@@ -24,6 +30,9 @@ from torch.distributed.fsdp import fully_shard
 
 
 def setup_distributed():
+    # [FUNCTION DOC]
+    # HELPER: Initializes the NCCL process group, sets the CUDA device to the global rank and returns (rank, world_size).
+    # KNOWN ISSUE: uses the global rank as the device index, which breaks on multi-node runs (LOCAL_RANK should be used).
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -32,6 +41,11 @@ def setup_distributed():
 
 
 def create_model(model_name="Qwen/Qwen3-1.7B", num_layers=2):
+    # [FUNCTION DOC]
+    # HELPER: Loads the pretrained model config with trust_remote_code, truncates to num_layers, and loads bf16 weights
+    # with flash_attention_2 (extra layers' weights are ignored).
+    # Inputs: model_name (default Qwen/Qwen3-1.7B), num_layers (default 2).
+    # Outputs: causal LM model.
     """Load a Qwen3-1.7B model with only 2 layers from pretrained weights."""
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -49,6 +63,8 @@ def create_model(model_name="Qwen/Qwen3-1.7B", num_layers=2):
 
 
 def apply_fsdp2(model, device_mesh):
+    # [FUNCTION DOC]
+    # HELPER: Applies fully_shard to each decoder layer and then to the whole model on the given mesh; returns the model.
     """Apply FSDP2 sharding to model."""
     for layer in model.model.layers:
         fully_shard(layer, mesh=device_mesh)
@@ -57,6 +73,10 @@ def apply_fsdp2(model, device_mesh):
 
 
 def run_forward_backward(model, input_ids, labels):
+    # [FUNCTION DOC]
+    # HELPER: Zeroes grads, runs a forward with labels to get logits and loss, backpropagates, and collects clones of
+    # gradients of every parameter whose name contains "mlp".
+    # Outputs: tuple (detached logits, mapping name -> gradient, float loss).
     """Run forward and backward pass, return logits and gradients."""
     model.zero_grad()
 
@@ -76,6 +96,10 @@ def run_forward_backward(model, input_ids, labels):
 
 
 def compare_results(logits1, grads1, logits2, grads2, rank):
+    # [FUNCTION DOC]
+    # HELPER: Computes max/mean absolute logit differences, and for each gradient name present in both runs the max/mean
+    # difference, passing when max diff < 1e-2. Rank 0 prints logits and per-gradient results.
+    # Outputs: True if every compared gradient passed (logit differences are not checked).
     """Compare logits and gradients between two runs."""
     # Compare logits
     logits_diff = (logits1 - logits2).abs()
@@ -117,6 +141,12 @@ def compare_results(logits1, grads1, logits2, grads2, rank):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: sets up distribution and a 1-D CUDA mesh; builds model1 without TiledMLP, shards, moves to GPU, runs
+    # forward/backward on seeded random ids (2 x 256, labels = inputs), frees it; builds model2, applies the TiledMLP patch
+    # for qwen3 with 4 shards before FSDP2 sharding, runs the same inputs; compares and has rank 0 print a summary with loss
+    # difference and pass/fail. Frees memory and destroys the process group.
+    # Side effects: GPU computation, global monkey patching of the Qwen3 MLP class, prints.
     rank, world_size = setup_distributed()
     device_mesh = init_device_mesh("cuda", (world_size,))
 

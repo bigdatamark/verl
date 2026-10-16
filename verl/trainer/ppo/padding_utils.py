@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Note: synthetic padding samples are fixed-length (SYNTHETIC_PADDING_SEQ_LEN=128 tokens:
+# 127 EOS prompt tokens plus 1 EOS response token), fully attended, with zero response/loss
+# masks and zero rewards, and are tagged is_padding so metrics can exclude them.
+# TransferQueue is imported from the external package when available, else from verl's
+# fallback shim.
 """Batch padding utilities for multi-trajectory training with TransferQueue.
 
 When the number of trajectories per prompt varies, the global batch size may
@@ -43,6 +50,13 @@ SYNTHETIC_PADDING_SEQ_LEN = 128
 
 
 def build_padding_position_ids(source_position_ids: Any, attention_mask: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: computes position ids from the 1-D attention mask (cumulative-mask based). If the
+    # source is not a tensor, return these 1-D ids. Otherwise cast to the source device/dtype; for
+    # a source of rank <= 1 return as-is; for higher rank (e.g. multi-axis rope ids with shape
+    # [..., seq]) broadcast the ids over all leading dims of the source and return a copy.
+    # Inputs: source_position_ids - template sample's position ids (any type); attention_mask -
+    # 1-D mask of the padding sequence. Outputs: tensor of position ids. Side effects: none.
     """Build padding position ids with the same rank/prefix shape as the source sample."""
     position_ids = compute_position_id_with_mask(attention_mask.unsqueeze(0)).squeeze(0)
     if not isinstance(source_position_ids, torch.Tensor):
@@ -57,6 +71,11 @@ def build_padding_position_ids(source_position_ids: Any, attention_mask: torch.T
 
 
 def build_padding_routed_experts(source_routed_experts: Any, seq_len: int) -> torch.Tensor | None:
+    # [FUNCTION DOC]
+    # Behavior: returns None if the source is not a tensor; a zero scalar like it if 0-dim;
+    # otherwise a zero tensor of shape [seq_len, *source.shape[1:]] with source dtype/device.
+    # Inputs: source_routed_experts - template value; seq_len - padding sequence length.
+    # Outputs: tensor or None.
     """Build a zero routed-experts tensor matching the source per-token expert shape."""
     if not isinstance(source_routed_experts, torch.Tensor):
         return None
@@ -74,6 +93,17 @@ def construct_minimal_padding_template(
     source_tag: dict,
     eos_token_id: int,
 ) -> tuple[dict, dict]:
+    # [FUNCTION DOC]
+    # Behavior: clones/deep-copies every field of the source sample and deep-copies its tag;
+    # builds the minimal EOS sequence (prompts of length 127, response of length 1), all-ones
+    # attention mask, zero response mask, matching position ids and routed experts. Replaces
+    # teacher_ids (filled with EOS) and teacher_logprobs (zeros) with sequence-length versions
+    # when present. Overwrites prompts/responses/input_ids/attention_mask/position_ids,
+    # num_turns=0, response_mask and loss_mask (zeros), rm_scores and rollout_log_probs (float
+    # zeros). Empties multi_modal_inputs if present; sets or removes routed_experts. Updates the
+    # tag with is_padding=True, prompt_len=127, response_len=1, seq_len=128.
+    # Inputs: source_td - one sample mapping; source_tag - its tag mapping; eos_token_id.
+    # Outputs: (template_sample, template_tag). Side effects: none (inputs not mutated).
     """Construct a text-only padding template.
 
     Args:
@@ -146,6 +176,16 @@ def upsample_batch_to_divisible_size(
     batch_multiple: int,
     eos_token_id: int,
 ) -> KVBatchMeta:
+    # [FUNCTION DOC]
+    # Behavior: no-op if len(batch) is already a multiple. Otherwise fetches the first sample
+    # from TransferQueue, builds the padding template, assigns a fresh shared uid "pad<hex>"
+    # (distinct from real uids so group advantages are unaffected), and creates
+    # (multiple - remainder) deep copies with keys "<uid>_<i>_0" and session_id=i when present.
+    # Puts them into the same TQ partition, logs the upsampling, and returns a new KVBatchMeta
+    # whose keys/tags are extended, reusing partition_id, fields and extra_info.
+    # Inputs: batch - KVBatchMeta; batch_multiple - required divisor; eos_token_id.
+    # Outputs: the original or an enlarged KVBatchMeta.
+    # Side effects: TransferQueue reads and writes; info log.
     """Append synthetic no-op samples so the batch size becomes divisible by *batch_multiple*.
 
     The synthetic samples reuse the first real sample as a metadata template,

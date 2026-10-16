@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Multi-GPU test (spawned processes, file rendezvous) checking that normalize_peft_param_name applied to the state
+# dict of an FSDP1- or FSDP2-wrapped peft LoRA model yields exactly the same keys and tensor shapes as an equally
+# wrapped base model, after both are passed through convert_weight_keys.
+
 import os
 
 import pytest
@@ -35,6 +40,16 @@ from verl.utils.model import convert_weight_keys
 
 
 def _test_normalize_peft_with_fsdp_worker(rank, world_size, rendezvous_file, strategy):
+    # [FUNCTION DOC]
+    # HELPER: Per-rank worker. Initializes the device, NCCL process group and 1-D "dp" mesh; builds a small bf16
+    # flash-attention-2 Qwen3 model and wraps it with LoRA on all linear modules; builds a separate fresh base model.
+    # Wraps both with FSDP1 (full shard, bf16 mixed precision, LoRA-aware wrap policy only for the peft model) or with
+    # FSDP2 via apply_fsdp2. Collects state dicts (FULL_STATE_DICT context for FSDP1, direct call for FSDP2), normalizes
+    # the peft state dict, converts both with convert_weight_keys on the unwrapped module, prints key sets and any
+    # differences, and asserts no missing keys, no extra keys, identical key sets, identical shapes per key, and no keys
+    # containing "lora_" or "adapter_".
+    # Inputs: rank, world_size, rendezvous_file, strategy ("fsdp" or "fsdp2").
+    # Exceptions: AssertionError on mismatch. Side effects: process group lifecycle, GPU memory, prints on every rank.
     """Worker function for testing normalize_peft_param_name with FSDP-wrapped models.
 
     Args:
@@ -198,6 +213,8 @@ def _test_normalize_peft_with_fsdp_worker(rank, world_size, rendezvous_file, str
 @pytest.mark.parametrize("world_size", (2,))
 @pytest.mark.parametrize("strategy", ("fsdp", "fsdp2"))
 def test_normalize_peft_param_name_with_fsdp(world_size, strategy, tmp_path):
+    # [FUNCTION DOC]
+    # Spawns world_size workers for the given strategy using a rendezvous file under tmp_path.
     """Test normalize_peft_param_name with FSDP-wrapped models.
 
     This test verifies that after applying FSDP to both base and PEFT models,

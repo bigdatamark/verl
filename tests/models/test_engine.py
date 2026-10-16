@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Multi-GPU integration tests for the unified model engines (FSDP/FSDP2/Megatron) behind TrainingWorker and the
+# Tinker split-step workers: actor log-prob parity with HF plus PPO updates, critic value parity plus value-loss
+# update, per-tensor parameter export vs a reference state dict, FSDP2 autocast dtype resolution, and separate
+# zero_grad / forward_backward / optimizer_step primitives with gradient accumulation.
+# Sets NCCL_DEBUG=WARN at import; device_name is the detected accelerator name. Local models under ~/models needed.
+
 import os
 
 os.environ["NCCL_DEBUG"] = "WARN"
@@ -71,6 +78,8 @@ device_name = get_device_name()
 
 
 def get_test_language_model(device_count):
+    # [FUNCTION DOC]
+    # HELPER: Returns the expanded path of SmolLM2-135M-Instruct when device_count is 1, else Qwen2.5-0.5B.
     if device_count == 1:
         model = "~/models/HuggingFaceTB/SmolLM2-135M-Instruct"
     else:
@@ -80,6 +89,10 @@ def get_test_language_model(device_count):
 
 
 def test_tinker_workers_expose_split_training_primitives():
+    # [FUNCTION DOC]
+    # Behavior: asserts the Tinker workers subclass TrainingWorker / ActorRolloutRefWorker and that
+    # optimizer_zero_grad, forward_backward and optimizer_step are defined directly on the Tinker classes but not on
+    # the base classes. CPU-only.
     assert issubclass(TinkerTrainingWorker, TrainingWorker)
     assert issubclass(TinkerActorRolloutRefWorker, ActorRolloutRefWorker)
 
@@ -91,6 +104,14 @@ def test_tinker_workers_expose_split_training_primitives():
 
 
 def create_training_config(model_type, strategy, device_count, model):
+    # [FUNCTION DOC]
+    # HELPER: Builds a TrainingWorkerConfig. Parallel sizes are all 1 on one device, else TP=PP=CP=2 and fsdp_size 4.
+    # Shared kwargs: param/optimizer offload, dynamic bsz, remove padding, 500/1000 max tokens per GPU (train/infer).
+    # Megatron uses McoreEngineConfig with mbridge (vanilla per VANILLA_MBRIDGE env) and McoreOptimizerConfig with
+    # lr_decay_steps 10; fsdp/fsdp2 use FSDPEngineConfig with ulysses size = cp and default FSDP optimizer config.
+    # Inputs: model_type ("language_model"/"value_model"), strategy, device_count, model path.
+    # Outputs: TrainingWorkerConfig with no checkpoint config.
+    # Exceptions: NotImplementedError for unknown strategies.
     if device_count == 1:
         tp = pp = cp = fsdp_size = 1
     else:
@@ -140,6 +161,15 @@ def create_training_config(model_type, strategy, device_count, model):
 
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "megatron"])
 def test_actor_engine(strategy):
+    # [FUNCTION DOC]
+    # Behavior: starts Ray and a RayWorkerGroup of TrainingWorker over all local devices, resets (inits) the model,
+    # sets an SFT loss, builds a seeded random batch (8 x 32, random left-padded mask, second half as responses),
+    # converts to no-padding TensorDict, runs infer_batch, re-pads log_probs and asserts their masked mean matches HF
+    # bf16 log-probs within atol 1e-3 / rtol 1e-2. Then adds random advantages/ref log probs, sets a PPO loss and runs
+    # train_batch twice: once with auto offload and once after manually moving to device with auto offload disabled,
+    # printing metrics, then moves back to CPU.
+    # Inputs: strategy - fsdp, fsdp2 or megatron.
+    # Side effects: Ray lifecycle, GPU training, prints.
     ray.init()
     device_count = get_torch_device().device_count()
     config = create_training_config(
@@ -260,6 +290,11 @@ def test_actor_engine(strategy):
 
 
 def create_value_model(language_model_path, output_path):
+    # [FUNCTION DOC]
+    # HELPER: Creates a randomly initialized single-label token-classification (value) model from a language model
+    # config (no dropout, untied embeddings), and saves model, tokenizer and config to output_path.
+    # Outputs: the expanded output path.
+    # Side effects: writes model files.
     config = AutoConfig.from_pretrained(language_model_path)
     config.num_labels = 1
     config.classifier_dropout = 0
@@ -276,6 +311,13 @@ def create_value_model(language_model_path, output_path):
 
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
 def test_critic_engine(strategy):
+    # [FUNCTION DOC]
+    # Behavior: writes a value model to ~/models/test_model, starts Ray and a TrainingWorker group with
+    # model_type value_model, infers values on a seeded random batch and asserts the masked mean matches an HF
+    # flash-attention token-classification forward under bf16 autocast (atol/rtol 1e-2), then adds random returns,
+    # sets a value loss with a CriticConfig and runs one train_batch, printing metrics.
+    # Inputs: strategy - fsdp or fsdp2.
+    # Side effects: writes into the user's ~/models directory, Ray lifecycle, GPU usage.
     device_count = get_torch_device().device_count()
     value_model_path = os.path.expanduser("~/models/test_model")
     language_model_path = get_test_language_model(device_count=device_count)
@@ -379,6 +421,9 @@ def test_critic_engine(strategy):
 
 
 def create_actor_model(tmp_path, config):
+    # [FUNCTION DOC]
+    # HELPER: Saves a randomly initialized causal LM built from config (plus the config) to TMP/test_model.
+    # Outputs: that path.
     model = AutoModelForCausalLM.from_config(config)
     path = os.path.join(tmp_path, "test_model")
     model.save_pretrained(path)
@@ -387,6 +432,15 @@ def create_actor_model(tmp_path, config):
 
 
 def _worker(rank: int, world_size: int, rendezvous_file: str, strategy: str, model_path: str):
+    # [FUNCTION DOC]
+    # HELPER: Spawned per-rank process for test_per_tensor_generator. Initializes a file-rendezvous process group,
+    # builds a meta-device reference model from the saved config, constructs an engine (megatron TP=2 PP=2 or FSDP
+    # size 4 with ulysses 2) via EngineRegistry, initializes it, gets per-tensor params and asserts each key exists in
+    # the reference state dict (after revert_weight_conversion) with equal shape; rank 0 prints keys. Ends with a
+    # barrier and process-group teardown.
+    # Exceptions: NotImplementedError for unknown strategy; AssertionError on mismatch.
+    # KNOWN ISSUE: ref_state_dict is only assigned when revert_weight_conversion is importable; with older
+    # transformers the comparison loop raises NameError.
     get_torch_device().set_device(rank)
     dist.init_process_group(
         backend=get_nccl_backend(),
@@ -459,6 +513,9 @@ def _worker(rank: int, world_size: int, rendezvous_file: str, strategy: str, mod
 @pytest.mark.parametrize("config", [Qwen3Config(num_hidden_layers=2), Qwen3MoeConfig(num_hidden_layers=2)])
 @pytest.mark.parametrize("strategy", ["megatron", "fsdp", "fsdp2"])
 def test_per_tensor_generator(world_size, tmp_path, config, strategy):
+    # [FUNCTION DOC]
+    # Behavior: saves a 2-layer Qwen3 or Qwen3-MoE model to tmp_path and spawns world_size (8) _worker processes.
+    # Inputs: world_size, tmp_path, config, strategy parametrized.
     rendezvous_file = str(tmp_path / "rdzv_mask")
     os.makedirs(os.path.dirname(rendezvous_file), exist_ok=True)
     # create a model
@@ -473,6 +530,11 @@ def test_per_tensor_generator(world_size, tmp_path, config, strategy):
 
 
 def _autocast_dtype_worker(rank: int, world_size: int, rendezvous_file: str, model_path: str):
+    # [FUNCTION DOC]
+    # HELPER: Spawned per-rank process (regression for issue 5932). Builds FSDP2 engines with sdpa attention for
+    # param_dtype bf16, fp32 and fp16 and asserts _autocast_dtype is bfloat16/float32/float16 respectively, with no
+    # grad scaler for bf16/fp32 and a ShardedGradScaler for fp16.
+    # Side effects: process group init/destroy.
     # Regression test for #5932: FSDP engine must resolve autocast dtype from
     # mixed_precision.param_dtype rather than hardcoding bfloat16.
     get_torch_device().set_device(rank)
@@ -492,6 +554,10 @@ def _autocast_dtype_worker(rank: int, world_size: int, rendezvous_file: str, mod
     )
 
     def build_engine(mixed_precision):
+        # [FUNCTION DOC]
+        # HELPER: Creates and initializes an FSDP2 language-model engine with the given mixed_precision mapping,
+        # fsdp_size = world_size, no ulysses, default optimizer and checkpoint configs.
+        # Outputs: initialized engine.
         engine_config = FSDPEngineConfig(
             forward_only=False,
             fsdp_size=world_size,
@@ -532,16 +598,24 @@ def _autocast_dtype_worker(rank: int, world_size: int, rendezvous_file: str, mod
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns the local shard for a DTensor, otherwise the tensor itself.
     if isinstance(tensor, DTensor):
         return tensor.to_local()
     return tensor
 
 
 def _snapshot_trainable_params(module):
+    # [FUNCTION DOC]
+    # HELPER: Returns detached float32 clones of the local shards of all trainable parameters.
     return [_local_tensor(param).detach().float().clone() for param in module.parameters() if param.requires_grad]
 
 
 def _param_delta_norm(module, before) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Sums squared differences between current trainable local shards and the snapshot on the current device,
+    # all-reduces the sum across ranks, and returns its square root.
+    # Exceptions: ValueError if parameter count differs from the snapshot (strict zip).
     device = torch.device(device_name, get_torch_device().current_device())
     total = torch.zeros((), device=device)
     for param, param_before in zip((p for p in module.parameters() if p.requires_grad), before, strict=True):
@@ -552,6 +626,8 @@ def _param_delta_norm(module, before) -> torch.Tensor:
 
 
 def _grad_norm(module) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Global L2 norm of all existing gradients (local shards squared-summed, all-reduced, square root).
     device = torch.device(device_name, get_torch_device().current_device())
     total = torch.zeros((), device=device)
     for param in module.parameters():
@@ -564,6 +640,9 @@ def _grad_norm(module) -> torch.Tensor:
 
 
 def _has_any_grad(module) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if any rank has any parameter with a non-None gradient (all-reduced integer flag).
+    # KNOWN ISSUE: hardcodes the cuda device rather than using the device abstraction used elsewhere.
     any_grad = torch.tensor(
         int(any(param.grad is not None for param in module.parameters())),
         device=torch.device("cuda", torch.cuda.current_device()),
@@ -573,6 +652,12 @@ def _has_any_grad(module) -> bool:
 
 
 def _make_split_step_batch(config: HFModelConfig, engine_config: FSDPEngineConfig, world_size: int) -> TensorDict:
+    # [FUNCTION DOC]
+    # HELPER: Builds a deterministic 2 x 8 batch (arange ids mod vocab, full masks, last 4 tokens as responses, zero
+    # old log probs, unit advantages), converts to no-padding TensorDict and attaches metadata: global batch size
+    # (2 x world_size), remove-padding flag from the model config, and dynamic bsz / token limit / micro batch /
+    # fused kernel settings from the engine config.
+    # Outputs: TensorDict.
     batch_size = 2
     seq_len = 8
     response_length = 4
@@ -612,6 +697,14 @@ def _make_split_step_batch(config: HFModelConfig, engine_config: FSDPEngineConfi
 def _split_training_primitives_fsdp_worker(
     rank: int, world_size: int, rendezvous_file: str, model_path: str, strategy: str
 ):
+    # [FUNCTION DOC]
+    # HELPER: Spawned per-rank process. Builds an FSDP/FSDP2 engine (no dynamic bsz, micro batch 2, lr 1e-3 constant)
+    # with a PPO loss and snapshots parameters. First, in train mode without zeroing on exit, zeroes grads and runs
+    # forward_backward with return_model_output: asserts no grad_norm metric, log_probs present, positive grad norm,
+    # and unchanged parameters. Second forward_backward (no model output) must accumulate (grad norm > 1.5x first),
+    # with parameters still unchanged. Then applies custom optimizer hyperparameters (lr, betas, eps, weight decay) and
+    # steps with zero-grad on exit: asserts positive grad norm, every param group carries the new hyperparameters,
+    # parameters changed, and no gradients remain.
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend="nccl",
@@ -707,6 +800,9 @@ def _split_training_primitives_fsdp_worker(
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least 2 CUDA devices")
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
 def test_fsdp_engine_split_forward_backward_and_optimizer_step(strategy, tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: requires 2 CUDA devices; saves a tiny 2-layer Qwen3 model and spawns 2 split-primitive workers.
+    # Inputs: strategy (fsdp/fsdp2), tmp_path.
     world_size = 2
     rendezvous_file = str(tmp_path / f"rdzv_split_training_primitives_{strategy}")
     os.makedirs(os.path.dirname(rendezvous_file), exist_ok=True)
@@ -732,6 +828,8 @@ def test_fsdp_engine_split_forward_backward_and_optimizer_step(strategy, tmp_pat
 @pytest.mark.parametrize("world_size", [8])
 @pytest.mark.parametrize("config", [Qwen3Config(num_hidden_layers=2)])
 def test_fsdp2_autocast_dtype_honors_mixed_precision(world_size, tmp_path, config):
+    # [FUNCTION DOC]
+    # Behavior: saves a 2-layer Qwen3 model and spawns world_size (8) _autocast_dtype_worker processes.
     rendezvous_file = str(tmp_path / "rdzv_autocast")
     os.makedirs(os.path.dirname(rendezvous_file), exist_ok=True)
     model_path = create_actor_model(tmp_path, config)

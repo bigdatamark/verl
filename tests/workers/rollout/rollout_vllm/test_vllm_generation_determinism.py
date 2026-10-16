@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# GPU tests of vLLM rollout generation determinism with full_determinism enabled: same-instance repeat,
+# cross-instance standalone servers, and cross-instance full AgentLoopManager pipelines must yield identical
+# token ids and log-probs (exact equality and Pearson correlation 1). PYTHONHASHSEED is set via the Ray
+# runtime env so worker interpreters start with fixed hashing. Model path and AgentLoop GPU count are
+# overridable via VLLM_DETERMINISM_DENSE_MODEL_PATH and VLLM_DETERMINISM_N_GPUS. Module constants: SEED 42,
+# three short PROMPTS, RAY_RUNTIME_ENV.
+
 """
 Test vLLM rollout generation determinism.
 
@@ -67,6 +76,8 @@ RAY_RUNTIME_ENV = {
 
 
 def _get_config_dir():
+    # [FUNCTION DOC]
+    # HELPER: returns absolute verl/verl/trainer/config if it exists relative to CWD, else verl/trainer/config.
     config_dir = os.path.abspath("verl/verl/trainer/config")
     if not os.path.exists(config_dir):
         config_dir = os.path.abspath("verl/trainer/config")
@@ -74,12 +85,18 @@ def _get_config_dir():
 
 
 def _pearson_correlation(first, second):
+    # [FUNCTION DOC]
+    # HELPER: Pearson correlation of two numeric sequences computed in float64. Outputs: float.
     f = torch.tensor(first, dtype=torch.float64)
     s = torch.tensor(second, dtype=torch.float64)
     return torch.corrcoef(torch.stack([f, s], dim=0))[0, 1].item()
 
 
 def _make_rollout_config(model_path, seed):
+    # [FUNCTION DOC]
+    # HELPER: composes ppo_trainer for one GPU and sets async vllm rollout with TP 1, prompt 128 / response 256 /
+    # max model len 512, 8 max seqs, 0.4 GPU memory utilization, eager mode, full determinism with the given seed,
+    # priority scheduling and load_format auto (real weights). Inputs: model_path, seed. Outputs: DictConfig.
     with initialize_config_dir(config_dir=_get_config_dir(), version_base=None):
         config = compose(config_name="ppo_trainer")
     config.trainer.n_gpus_per_node = 1
@@ -105,6 +122,12 @@ def _make_rollout_config(model_path, seed):
 
 
 def _make_e2e_config(model_path, seed, n_gpus=2):
+    # [FUNCTION DOC]
+    # Config for a full AgentLoopManager pipeline: composes ppo_trainer with dynamic bsz, FSDP offloads and a DAPO
+    # reward manager (overlong buffer disabled, len 3072, max_resp_len 4096), then applies the same rollout settings as
+    # _make_rollout_config (without load_format) plus rollout log-prob calculation, temperature 0.7, top_p 1, n 1,
+    # one agent worker, tokenizer init and disabled log stats. Inputs: model_path, seed, n_gpus (default 2).
+    # Outputs: DictConfig.
     """Config for full AgentLoopManager pipeline."""
     with initialize_config_dir(config_dir=_get_config_dir(), version_base=None):
         config = compose(
@@ -149,6 +172,10 @@ def _make_e2e_config(model_path, seed, n_gpus=2):
 
 
 def _run_once(server, tokenizer, prompt_texts):
+    # [FUNCTION DOC]
+    # HELPER: tokenizes each prompt with the chat template, submits all generations to the server handle with
+    # request ids "determinism_<i>", priority i, temperature 0.7 and logprobs, waits up to 120 s, and returns a list of
+    # (token ids, log probs) per prompt. Inputs: server replica, tokenizer, prompt texts.
     refs = []
     for i, text in enumerate(prompt_texts):
         prompt_ids = normalize_token_ids(
@@ -172,6 +199,9 @@ def _run_once(server, tokenizer, prompt_texts):
 
 
 def _create_vllm_server(config, replica_rank=0, is_reward_model=False, name_suffix=""):
+    # [FUNCTION DOC]
+    # HELPER: builds a vllm rollout replica (one GPU) with the given rank, reward flag and name suffix and runs
+    # init_standalone synchronously. Outputs: the replica.
     rollout_server_class = get_rollout_replica_class("vllm")
     server = rollout_server_class(
         replica_rank=replica_rank,
@@ -186,6 +216,12 @@ def _create_vllm_server(config, replica_rank=0, is_reward_model=False, name_suff
 
 
 def _compare_logprobs(first, second, label):
+    # [FUNCTION DOC]
+    # HELPER: for each prompt index of the first result list, compares token ids and float32 log-prob tensors for
+    # exact equality, computes max absolute difference and Pearson correlation, prints them and asserts ids match,
+    # log-probs match and correlation is 1 within 1e-12. Exceptions: AssertionError.
+    # KNOWN ISSUE: if the two log-prob sequences differ in length, the max-difference subtraction and correlation
+    # raise a shape error instead of a clear assertion failure.
     for i in range(len(first)):
         ids1, lp1 = first[i]
         ids2, lp2 = second[i]
@@ -208,6 +244,9 @@ def _compare_logprobs(first, second, label):
 
 
 def _make_agent_loop_batch():
+    # [FUNCTION DOC]
+    # HELPER: builds a non-tensor DataProto of the module PROMPTS as single-turn chats with agent_name
+    # single_turn_agent, data_source openai/gsm8k and a rule reward model with ground truth "1.0".
     return DataProto(
         non_tensor_batch={
             "raw_prompt": np.array([[{"role": "user", "content": p}] for p in PROMPTS], dtype=object),
@@ -219,6 +258,9 @@ def _make_agent_loop_batch():
 
 
 def _compare_dataproto_logprobs(first, second, label):
+    # [FUNCTION DOC]
+    # HELPER: asserts response masks are equal, masked response tokens are equal, masked rollout log-probs are exactly
+    # equal and their correlation is 1 within 1e-12; prints a summary. Inputs: two output DataProtos, label.
     """Compare rollout_log_probs and responses at valid positions."""
     lp1 = first.batch["rollout_log_probs"]
     lp2 = second.batch["rollout_log_probs"]
@@ -240,6 +282,8 @@ def _compare_dataproto_logprobs(first, second, label):
 
 
 def test_rollout_determinism_same_instance():
+    # [FUNCTION DOC]
+    # Restarts Ray, creates one server and asserts two consecutive runs over PROMPTS are identical.
     ray.shutdown()
     ray.init(runtime_env=RAY_RUNTIME_ENV, ignore_reinit_error=True)
 
@@ -258,6 +302,8 @@ def test_rollout_determinism_same_instance():
 
 
 def test_rollout_determinism_cross_instance():
+    # [FUNCTION DOC]
+    # Restarts Ray, creates two servers (name suffixes run1/run2) and asserts their outputs are identical.
     ray.shutdown()
     ray.init(runtime_env=RAY_RUNTIME_ENV, ignore_reinit_error=True)
 
@@ -279,6 +325,9 @@ def test_rollout_determinism_cross_instance():
 
 
 def test_agent_loop_determinism_cross_instance():
+    # [FUNCTION DOC]
+    # Builds the e2e config (GPU count from env, default 1) and batch, runs two AgentLoopManager pipelines each in a
+    # fresh Ray session, and asserts identical masked responses and log-probs.
     """Two full AgentLoopManager pipelines produce identical logprobs."""
     n_gpus = int(os.getenv("VLLM_DETERMINISM_N_GPUS", "1"))
 

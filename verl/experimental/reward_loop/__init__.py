@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Reward loop package: asynchronous, per-sample reward computation via Ray workers (rule-based, discriminative
+# reward model served over HTTP, or custom functions), the reward-model server manager, and a helper to migrate
+# legacy reward config. Re-exports RewardModelManager, RewardLoopWorker, RewardLoopManager, migrate_legacy_reward_impl.
+
 from .reward_loop import RewardLoopManager, RewardLoopWorker, migrate_legacy_reward_impl
 from .reward_model import RewardModelManager
 

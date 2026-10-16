@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for verl.utils.tracking._MlflowLoggingAdapter: metric key sanitization (invalid characters and
+# repeated slashes, with warnings) and finish() ending the active MLflow run only when one exists. MLflow calls
+# are mocked.
+
 import unittest
 from unittest.mock import patch
 
@@ -19,7 +24,14 @@ from verl.utils.tracking import _MlflowLoggingAdapter
 
 
 class TestMlflowLoggingAdapter(unittest.TestCase):
+    # [CLASS DOC]
+    # unittest TestCase for the MLflow logging adapter.
     def test_sanitize_key_and_warning(self):
+        # [FUNCTION DOC]
+        # Logs a dict of metrics with valid and invalid keys at step 5 with mlflow.log_metrics and the adapter logger
+        # patched. Asserts "@" becomes "_at_", other invalid characters become "_", spaces and hyphens are kept,
+        # consecutive slashes collapse to one, original invalid keys are absent, and a warning mentioning each original
+        # (and for character fixes, the sanitized) key was logged.
         """Test key sanitization for invalid characters and consecutive slashes with warnings."""
         adapter = _MlflowLoggingAdapter()
         data = {
@@ -60,6 +72,8 @@ class TestMlflowLoggingAdapter(unittest.TestCase):
             self.assertTrue(any("metric////with/many////slashes" in msg for msg in warning_msgs))
 
     def test_finish_ends_active_run(self):
+        # [FUNCTION DOC]
+        # With mlflow.active_run returning an object, finish() calls mlflow.end_run exactly once.
         """Test that finish() calls mlflow.end_run() when a run is active."""
         adapter = _MlflowLoggingAdapter()
         with patch("mlflow.active_run", return_value=object()), patch("mlflow.end_run") as mock_end_run:
@@ -67,6 +81,8 @@ class TestMlflowLoggingAdapter(unittest.TestCase):
         mock_end_run.assert_called_once()
 
     def test_finish_skips_when_no_active_run(self):
+        # [FUNCTION DOC]
+        # With mlflow.active_run returning None, finish() does not call mlflow.end_run.
         """Test that finish() does not call mlflow.end_run() when no run is active."""
         adapter = _MlflowLoggingAdapter()
         with patch("mlflow.active_run", return_value=None), patch("mlflow.end_run") as mock_end_run:

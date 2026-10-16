@@ -12,6 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Central registry mapping HuggingFace architecture names to Megatron-core (mcore) components.
+# Current API: selects forward functions (regular / fused / engine variants) based on whether the
+# architecture is a vision-language model (SupportedVLM). Deprecated section (below the marker): enum
+# SupportedModel plus registries mapping each model to its config converter, model initializer,
+# forward function, fused forward function and mcore->HF weight converter, with lookup helpers.
+# Side effects at import: builds forward closures via model_forward_gen / fused_forward_model_gen.
+
 """
 Registry module for model architecture components.
 """
@@ -27,6 +35,9 @@ from .model_forward_fused import fused_forward_model_gen, fused_forward_model_en
 
 
 class SupportedVLM(Enum):
+    # [CLASS DOC]
+    # Enum of HF architecture names treated as vision-language models; values are matched against
+    # hf_config.architectures[0] to choose VLM forward variants.
     QWEN2_5_VL = "Qwen2_5_VLForConditionalGeneration"
     QWEN3_MOE_VL = "Qwen3VLMoeForConditionalGeneration"
     QWEN3_VL = "Qwen3VLForConditionalGeneration"
@@ -38,6 +49,13 @@ supported_vlm = [member.value for member in SupportedVLM]
 
 
 def get_mcore_forward_fn(hf_config) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: returns the (non-fused) mcore forward function, built with VLM mode on when the single
+    # architecture is in supported_vlm, otherwise language-model mode.
+    # Inputs: hf_config - HF PretrainedConfig with an architectures list.
+    # Outputs: a callable produced by model_forward_gen.
+    # Exceptions: AssertionError if architectures does not contain exactly one entry.
+    # Side effects: none.
     """
     Get the forward function for given model architecture.
     """
@@ -50,6 +68,12 @@ def get_mcore_forward_fn(hf_config) -> Callable:
 
 
 def get_mcore_engine_forward_fn(hf_config) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: returns the shared engine forward function regardless of architecture.
+    # Inputs: hf_config - HF config with an architectures list.
+    # Outputs: gptmodel_forward_model_engine.
+    # Exceptions: AssertionError if architectures has not exactly one entry.
+    # Side effects: none.
     """
     Get the forward function for given model architecture.
     """
@@ -58,6 +82,13 @@ def get_mcore_engine_forward_fn(hf_config) -> Callable:
 
 
 def get_mcore_forward_fused_fn(hf_config) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: same as get_mcore_forward_fn but returns the fused (fused logprob/entropy) forward
+    # variant from fused_forward_model_gen, VLM mode if architecture in supported_vlm.
+    # Inputs: hf_config - HF config.
+    # Outputs: fused forward callable.
+    # Exceptions: AssertionError if architectures has not exactly one entry.
+    # Side effects: none.
     """
     Get the forward function for given model architecture.
     """
@@ -70,6 +101,13 @@ def get_mcore_forward_fused_fn(hf_config) -> Callable:
 
 
 def get_mcore_forward_fused_model_engine_fn(hf_config) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: returns the fused forward for no-padding (engine) inputs from fused_forward_model_engine,
+    # VLM mode when architecture is in supported_vlm.
+    # Inputs: hf_config - HF config.
+    # Outputs: fused engine forward callable.
+    # Exceptions: AssertionError if architectures has not exactly one entry.
+    # Side effects: none.
     """
     Get the fused forward function for no-padding inputs.
     """
@@ -117,6 +155,9 @@ from .weight_converter import (
 
 
 class SupportedModel(Enum):
+    # [CLASS DOC]
+    # Deprecated. Enum of HF architecture names supported by the legacy registries; inline comments note
+    # test status per model. Not every member has an entry in every registry.
     LLAMA = "LlamaForCausalLM"  # tested
     QWEN2 = "Qwen2ForCausalLM"  # tested
     QWEN2_MOE = "Qwen2MoeForCausalLM"  # pending
@@ -224,6 +265,12 @@ MODEL_WEIGHT_CONVERTER_REGISTRY: dict[SupportedModel, type] = {
 
 
 def get_supported_model(model_type: str) -> SupportedModel:
+    # [FUNCTION DOC]
+    # Behavior: converts an architecture string to a SupportedModel member.
+    # Inputs: model_type - HF architecture name.
+    # Outputs: matching SupportedModel.
+    # Exceptions: NotImplementedError (chained from ValueError) listing supported values when unknown.
+    # Side effects: none.
     try:
         return SupportedModel(model_type)
     except ValueError as err:
@@ -236,6 +283,14 @@ def get_supported_model(model_type: str) -> SupportedModel:
 def hf_to_mcore_config(
     hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs
 ) -> TransformerConfig:
+    # [FUNCTION DOC]
+    # Behavior: looks up the config converter for the single architecture and calls it.
+    # Inputs: hf_config - HF config; dtype - parameter dtype; override_transformer_config_kwargs -
+    # forwarded to the converter.
+    # Outputs: mcore TransformerConfig.
+    # Exceptions: AssertionError for not exactly one architecture; NotImplementedError for unsupported
+    # model; KeyError if the model lacks a converter entry (e.g. GLM4_MOE, GPT_OSS, MIMO, QWEN3_VL, QWEN3_MOE_VL).
+    # Side effects: none.
     """Convert huggingface PretrainedConfig to mcore TransformerConfig.
 
     Args:
@@ -261,6 +316,16 @@ def init_mcore_model(
     value: bool = False,
     **extra_kwargs,  # may be used for vlm and moe
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # Behavior: picks the initializer class for the architecture, constructs it with (tfconfig, hf_config)
+    # and returns its initialize(...) result, forwarding all flags and extra kwargs.
+    # Inputs: tfconfig - mcore TransformerConfig; hf_config - HF config; pre_process - build embedding
+    # stage; post_process - build output stage; share_embeddings_and_output_weights - tie weights;
+    # value - build value (critic) head; extra_kwargs - passed through (VLM/MoE options).
+    # Outputs: an nn.Module (mcore model).
+    # Exceptions: AssertionError, NotImplementedError, KeyError as in hf_to_mcore_config.
+    # Side effects: allocates model parameters.
+    # KNOWN ISSUE: docstring calls pre_process/post_process "functions" but they are booleans.
     """
     Initialize a Mcore model.
 
@@ -290,6 +355,13 @@ def init_mcore_model(
 
 
 def get_mcore_weight_converter(hf_config: PretrainedConfig, dtype: torch.dtype) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: builds the TransformerConfig via hf_to_mcore_config and instantiates the registered
+    # mcore-to-HF weight converter class with (hf_config, tfconfig).
+    # Inputs: hf_config - HF config; dtype - model dtype.
+    # Outputs: weight converter instance (annotated as Callable).
+    # Exceptions: AssertionError, NotImplementedError, KeyError for unregistered models.
+    # Side effects: none.
     """
     Get the weight converter for given model architecture.
     """

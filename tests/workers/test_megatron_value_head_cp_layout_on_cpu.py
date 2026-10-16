@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests that MegatronEngineWithValueHead.forward_step requests a contiguous context-parallel layout and value-model mode
+# from the mcore forward function for DeepSeek-V4 hybrid attention models.
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -22,6 +26,10 @@ from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithValu
 
 
 def test_dsv4_value_head_forwards_contiguous_cp_layout():
+    # [FUNCTION DOC]
+    # Builds a value-head engine without __init__ (remove-padding on, no pad_to_length, input prep passing input_ids),
+    # a model whose config's attention variant is "dsv4_hybrid", patches device id and the mcore forward-fn factory with a
+    # kwargs-capturing fake, runs forward_step on a one-batch iterator, and asserts value_model True and cp_layout "contiguous".
     engine = object.__new__(MegatronEngineWithValueHead)
     engine.model_config = SimpleNamespace(
         hf_config=SimpleNamespace(),
@@ -38,6 +46,8 @@ def test_dsv4_value_head_forwards_contiguous_cp_layout():
     captured = {}
 
     def forward_fn(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake forward; records keyword arguments and returns a zero tensor.
         captured.update(kwargs)
         return torch.zeros(1)
 

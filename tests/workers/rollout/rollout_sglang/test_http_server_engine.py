@@ -31,6 +31,12 @@
 # - Improved logging and monitoring capabilities
 # - Additional configuration options and optimizations
 
+# [MODULE DOC]
+# Unit tests for the SGLang HTTP server engine adapters (HttpServerAdapter, AsyncHttpServerAdapter) and
+# launch_server_process. Real SGLang data classes (ServerArgs, UpdateWeightsFromTensorReqInput,
+# MultiprocessingSerializer) are used, while process creation, HTTP calls (requests / aiohttp), process
+# killing and ServerArgs post-init validation are mocked. Requires sglang, aiohttp and requests installed.
+
 """Complete unit tests for HTTP Server Engine Adapters.
 
 This module contains comprehensive unit tests for both HttpServerEngineAdapter
@@ -61,6 +67,8 @@ from verl.workers.rollout.sglang_rollout.http_server_engine import (
 
 @pytest.fixture(scope="session")
 def event_loop():
+    # [FUNCTION DOC]
+    # HELPER: session-scoped fixture creating a fresh asyncio event loop, yielding it, then closing it.
     """Create an event loop for the entire test session."""
     loop = asyncio.new_event_loop()
     yield loop
@@ -69,6 +77,8 @@ def event_loop():
 
 @pytest.fixture
 def basic_adapter_kwargs():
+    # [FUNCTION DOC]
+    # HELPER: fixture returning adapter kwargs for a master node: localhost:8000, node_rank 0, /tmp/test_model.
     """Provide basic kwargs for creating HTTP server adapters."""
     return {
         "host": "localhost",
@@ -80,6 +90,8 @@ def basic_adapter_kwargs():
 
 @pytest.fixture
 def router_adapter_kwargs():
+    # [FUNCTION DOC]
+    # HELPER: same as basic kwargs plus router_ip 192.168.1.1 and router_port 8080.
     """Provide kwargs for creating adapters with router configuration."""
     return {
         "router_ip": "192.168.1.1",
@@ -93,6 +105,8 @@ def router_adapter_kwargs():
 
 @pytest.fixture
 def non_master_adapter_kwargs():
+    # [FUNCTION DOC]
+    # HELPER: basic kwargs but with node_rank 1 (non-master node).
     """Provide kwargs for creating non-master node adapters."""
     return {
         "host": "localhost",
@@ -104,6 +118,9 @@ def non_master_adapter_kwargs():
 
 @pytest.fixture
 def mock_launch_server_process():
+    # [FUNCTION DOC]
+    # HELPER: patches launch_server_process in the module under test to return a mock process that is alive
+    # with pid 12345; yields the patched function mock.
     """Mock the launch_server_process function for testing without actual server startup."""
     from unittest.mock import patch
 
@@ -117,6 +134,9 @@ def mock_launch_server_process():
 
 @pytest.fixture
 def mock_multiprocessing_process():
+    # [FUNCTION DOC]
+    # HELPER: patches multiprocessing.Process in the module to return an alive mock process (pid 12345); yields
+    # the mock process instance.
     """Create mock multiprocessing.Process for testing without actual process creation."""
     from unittest.mock import patch
 
@@ -130,6 +150,9 @@ def mock_multiprocessing_process():
 
 @pytest.fixture
 def mock_requests_session():
+    # [FUNCTION DOC]
+    # HELPER: patches requests.Session so its context manager yields a mock session whose get and post return a
+    # 200 response with JSON {"status": "success"}; yields the mock session.
     """Create mock requests.Session for testing HTTP interactions."""
     from unittest.mock import patch
 
@@ -146,6 +169,8 @@ def mock_requests_session():
 
 @pytest.fixture
 def mock_requests_post():
+    # [FUNCTION DOC]
+    # HELPER: patches requests.post to return a 200 success response; yields the mock.
     """Mock requests.post for testing HTTP POST requests."""
     from unittest.mock import patch
 
@@ -159,6 +184,8 @@ def mock_requests_post():
 
 @pytest.fixture
 def mock_requests_get():
+    # [FUNCTION DOC]
+    # HELPER: patches requests.get to return a 200 success response; yields the mock.
     """Mock requests.get for testing HTTP GET requests."""
     from unittest.mock import patch
 
@@ -172,6 +199,9 @@ def mock_requests_get():
 
 @pytest.fixture
 def mock_aiohttp_session():
+    # [FUNCTION DOC]
+    # HELPER: returns an AsyncMock aiohttp-like session (not closed) whose get/post async context managers yield a
+    # 200 response with async JSON {"status": "success"} and a no-op raise_for_status. Unused by current tests.
     """Create mock aiohttp.ClientSession for testing async HTTP interactions."""
     mock_session = AsyncMock()
     mock_session.closed = False
@@ -191,6 +221,8 @@ def mock_aiohttp_session():
 
 @pytest.fixture
 def mock_kill_process_tree():
+    # [FUNCTION DOC]
+    # HELPER: patches kill_process_tree in the module; yields the mock.
     """Mock kill_process_tree function for testing cleanup without actual process termination."""
     from unittest.mock import patch
 
@@ -201,6 +233,8 @@ def mock_kill_process_tree():
 # Test environment fixtures for real SGLang testing
 @pytest.fixture(scope="session")
 def sglang_test_model_path():
+    # [FUNCTION DOC]
+    # HELPER: session fixture returning SGLANG_TEST_MODEL_PATH env var or "/tmp/test_model".
     """Provide a test model path for SGLang tests.
 
     This can be overridden by environment variable SGLANG_TEST_MODEL_PATH
@@ -213,6 +247,8 @@ def sglang_test_model_path():
 
 @pytest.fixture
 def real_adapter_kwargs(sglang_test_model_path):
+    # [FUNCTION DOC]
+    # HELPER: basic master-node kwargs but with model_path from sglang_test_model_path.
     """Provide kwargs for creating adapters with real SGLang integration."""
     return {
         "host": "localhost",
@@ -224,6 +260,8 @@ def real_adapter_kwargs(sglang_test_model_path):
 
 @pytest.fixture(autouse=True)
 def mock_server_args_post_init():
+    # [FUNCTION DOC]
+    # HELPER: autouse fixture patching ServerArgs.__post_init__ to a no-op so fake model paths are accepted.
     """Mock ServerArgs.__post_init__ to skip model path validation."""
     from unittest.mock import patch
 
@@ -234,11 +272,16 @@ def mock_server_args_post_init():
 
 
 class TestLaunchServerProcess:
+    # [CLASS DOC]
+    # Tests for launch_server_process: startup, non-master shortcut, health-check timeout and early death.
     """Test cases for launch_server_process function."""
 
     def test_launch_server_process_success(
         self, mock_multiprocessing_process, mock_requests_session, real_adapter_kwargs
     ):
+        # [FUNCTION DOC]
+        # Builds real ServerArgs, patches Process and Session, launches as first rank in node and asserts the mock
+        # process is returned, started once, and at least two health GETs (health_generate and flush_cache) were made.
         """Test successful server process launch and health check."""
         # Import real SGLang ServerArgs
         from sglang.srt.server_args import ServerArgs
@@ -262,6 +305,8 @@ class TestLaunchServerProcess:
                 assert mock_requests_session.get.call_count >= 2  # health_generate and flush_cache
 
     def test_launch_server_process_non_master(self, mock_multiprocessing_process, non_master_adapter_kwargs):
+        # [FUNCTION DOC]
+        # With node_rank 1, asserts launch returns the mock process without starting it.
         """Test server launch for non-master nodes (should return immediately)."""
         from sglang.srt.server_args import ServerArgs
 
@@ -277,6 +322,12 @@ class TestLaunchServerProcess:
             mock_multiprocessing_process.start.assert_not_called()
 
     def test_launch_server_process_timeout(self, mock_multiprocessing_process, real_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Patches time so elapsed jumps from 0 to 400 seconds and asserts launch raises TimeoutError and terminates
+        # the process once.
+        # KNOWN ISSUE: the patched requests.Session (raising RequestException) is exited before launch is called, so
+        # health checks hit the real requests module; the timeout path relies on those real calls failing or the
+        # fake clock.
         """Test timeout during server health check."""
         from sglang.srt.server_args import ServerArgs
 
@@ -303,6 +354,8 @@ class TestLaunchServerProcess:
                 mock_multiprocessing_process.terminate.assert_called_once()
 
     def test_launch_server_process_died(self, real_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Mock process reports not alive; asserts RuntimeError "Server process terminated unexpectedly".
         """Test server process dies during startup."""
         from sglang.srt.server_args import ServerArgs
 
@@ -320,9 +373,14 @@ class TestLaunchServerProcess:
 
 
 class TestHttpServerEngineAdapter:
+    # [CLASS DOC]
+    # Tests for the synchronous HttpServerAdapter: router registration, request helper, weight update, generate,
+    # cache flushing, memory management, shutdown and edge cases.
     """Test cases for HttpServerEngineAdapter class."""
 
     def test_init_with_router_registration(self, mock_launch_server_process, mock_requests_post, router_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts router ip/port are stored, process is the launched process, and one router registration POST occurs.
         """Test initialization with router registration."""
         adapter = HttpServerAdapter(**router_adapter_kwargs)
 
@@ -332,6 +390,8 @@ class TestHttpServerEngineAdapter:
         mock_requests_post.assert_called_once()
 
     def test_init_without_router(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts router ip/port are None and process is the launched process.
         """Test initialization without router registration."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -340,6 +400,8 @@ class TestHttpServerEngineAdapter:
         assert adapter.process == mock_launch_server_process.return_value
 
     def test_register_with_router_failure(self, mock_launch_server_process, router_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Registration POST raises RequestException; asserts construction still succeeds (error only logged).
         """Test router registration failure handling."""
         with patch("verl.workers.rollout.sglang_rollout.http_server_engine.requests.post") as mock_post:
             mock_post.side_effect = requests.RequestException("Connection failed")
@@ -351,6 +413,8 @@ class TestHttpServerEngineAdapter:
             mock_post.assert_called_once()
 
     def test_make_request_success(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts _make_request POSTs JSON to http://host:port/endpoint with adapter timeout and returns parsed JSON.
         """Test successful HTTP request."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -370,6 +434,8 @@ class TestHttpServerEngineAdapter:
             )
 
     def test_make_request_get_method(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts method GET issues requests.get to the endpoint URL with timeout and returns parsed JSON.
         """Test HTTP GET request."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -385,6 +451,8 @@ class TestHttpServerEngineAdapter:
             mock_get.assert_called_with("http://localhost:8000/test_endpoint", timeout=adapter.timeout)
 
     def test_make_request_non_master(self, mock_launch_server_process):
+        # [FUNCTION DOC]
+        # Asserts a node_rank 1 adapter returns an empty dict without making a request.
         """Test request from non-master node returns empty dict."""
         kwargs = {"host": "localhost", "port": 8000, "node_rank": 1, "model_path": "/tmp/test_model"}
         adapter = HttpServerAdapter(**kwargs)
@@ -393,6 +461,8 @@ class TestHttpServerEngineAdapter:
         assert result == {}
 
     def test_make_request_retry_logic(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # With max_attempts 3, timeout then connection error then success; asserts success result, 3 POSTs and 2 sleeps.
         """Test retry logic for failed requests."""
         adapter = HttpServerAdapter(max_attempts=3, **basic_adapter_kwargs)
 
@@ -412,6 +482,8 @@ class TestHttpServerEngineAdapter:
                 assert mock_sleep.call_count == 2
 
     def test_make_request_http_error(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Response raise_for_status raises HTTPError; asserts it propagates without being swallowed.
         """Test HTTP error handling."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -424,6 +496,8 @@ class TestHttpServerEngineAdapter:
                 adapter._make_request("test_endpoint")
 
     def test_make_request_max_attempts_exceeded(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # With max_attempts 1 and a timeout, asserts RuntimeError "Failed to complete request" after one POST.
         """Test max retries exceeded."""
         adapter = HttpServerAdapter(max_attempts=1, **basic_adapter_kwargs)
 
@@ -437,6 +511,9 @@ class TestHttpServerEngineAdapter:
                 assert mock_post.call_count == 1  # Initial retry
 
     def test_update_weights_from_tensor_strict(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts update_weights_from_tensor base64-encodes each serialized tensor bytes and forwards them with
+        # load_format and flush_cache to the update_weights_from_tensor endpoint.
         import base64
 
         from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
@@ -471,6 +548,8 @@ class TestHttpServerEngineAdapter:
             )
 
     def test_update_weights_from_tensor_empty(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts an empty tensor list is forwarded as an empty list.
         from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 
         from verl.workers.rollout.sglang_rollout.http_server_engine import HttpServerAdapter
@@ -500,6 +579,8 @@ class TestHttpServerEngineAdapter:
             )
 
     def test_update_weights_from_tensor_none(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts None serialized tensors are converted to an empty list in the payload.
         from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 
         from verl.workers.rollout.sglang_rollout.http_server_engine import HttpServerAdapter
@@ -529,6 +610,9 @@ class TestHttpServerEngineAdapter:
             )
 
     def test_generate(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts generate maps prompt to "text", passes sampling_params and return_logprob to the generate endpoint
+        # with only_master False, returning the response.
         """Test generate method."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -553,6 +637,8 @@ class TestHttpServerEngineAdapter:
             )
 
     def test_flush_cache(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # First GET returns 503, second 200; asserts flush_cache returns the JSON, made 2 GETs and slept once.
         """Test flush_cache method."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -572,6 +658,8 @@ class TestHttpServerEngineAdapter:
                 mock_sleep.assert_called_once()
 
     def test_flush_cache_non_master(self, mock_launch_server_process):
+        # [FUNCTION DOC]
+        # Asserts flush_cache on a non-master node returns an empty dict.
         """Test flush_cache for non-master node."""
         kwargs = {"host": "localhost", "port": 8000, "node_rank": 1, "model_path": "/tmp/test_model"}
         adapter = HttpServerAdapter(**kwargs)
@@ -580,6 +668,8 @@ class TestHttpServerEngineAdapter:
         assert result == {}
 
     def test_memory_management_methods(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts release/resume_memory_occupation send {"tags": ...} to the matching endpoints and return the response.
         """Test memory release and resume methods."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -597,6 +687,9 @@ class TestHttpServerEngineAdapter:
             mock_request.assert_called_with("resume_memory_occupation", {"tags": ["weights"]})
 
     def test_generation_control_methods(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Constructs an adapter and patches _make_request.
+        # KNOWN ISSUE: contains no calls or assertions, so it tests nothing.
         """Test generation control methods."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -604,6 +697,9 @@ class TestHttpServerEngineAdapter:
             mock_request.return_value = {"status": "success"}
 
     def test_shutdown(self, mock_launch_server_process, mock_kill_process_tree, router_adapter_kwargs):
+        # [FUNCTION DOC]
+        # With router configured, asserts shutdown makes a second POST (router unregistration) and kills the process
+        # tree of the launched pid.
         """Test shutdown method."""
         with patch("verl.workers.rollout.sglang_rollout.http_server_engine.requests.post") as mock_post:
             mock_response = Mock()
@@ -620,6 +716,8 @@ class TestHttpServerEngineAdapter:
             mock_kill_process_tree.assert_called_once_with(mock_launch_server_process.return_value.pid)
 
     def test_shutdown_with_errors(self, mock_launch_server_process, mock_kill_process_tree, router_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Unregistration raises and kill_process_tree raises; asserts shutdown swallows both and still attempts each.
         """Test shutdown method with errors."""
         with patch("verl.workers.rollout.sglang_rollout.http_server_engine.requests.post") as mock_post:
             # Mock registration success but unregistration failure
@@ -641,6 +739,11 @@ class TestHttpServerEngineAdapter:
 
     # Edge cases for HttpServerEngineAdapter
     def test_empty_and_none_parameters(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts generate with no arguments, update_weights with all-None request, and release_memory_occupation
+        # return the mocked response.
+        # KNOWN ISSUE: passes the weight-update request object as the tags argument to release_memory_occupation,
+        # which is a nonsensical input that only passes because _make_request is mocked.
         """Test handling of empty and None parameters."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -665,6 +768,8 @@ class TestHttpServerEngineAdapter:
             assert result == {"status": "success"}
 
     def test_large_payload_handling(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts update with 1000 serialized tensors and generate with a 10000-character prompt succeed (mocked).
         """Test handling of large payloads."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -688,6 +793,9 @@ class TestHttpServerEngineAdapter:
             assert result == {"status": "success"}
 
     def test_timeout_edge_cases(self, mock_launch_server_process):
+        # [FUNCTION DOC]
+        # With timeout 0.001 and POST always timing out, asserts RuntimeError "Failed to complete request".
+        # Note: time.sleep is not patched, so retry delays actually elapse.
         """Test various timeout scenarios."""
         # Test with very small timeout
         kwargs = {"host": "localhost", "port": 8000, "node_rank": 0, "model_path": "/tmp/test_model", "timeout": 0.001}
@@ -700,6 +808,8 @@ class TestHttpServerEngineAdapter:
                 adapter._make_request("test_endpoint")
 
     def test_extreme_configuration_values(self, mock_launch_server_process):
+        # [FUNCTION DOC]
+        # Asserts tiny timeout, large max_attempts and tiny retry_delay are stored as given.
         """Test extreme configuration values."""
         # Test with extreme values
         kwargs = {
@@ -719,9 +829,13 @@ class TestHttpServerEngineAdapter:
 
 
 class TestAsyncHttpServerEngineAdapter:
+    # [CLASS DOC]
+    # Tests for AsyncHttpServerAdapter.
     """Test cases for AsyncHttpServerEngineAdapter class."""
 
     def test_init(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts max_connections is stored.
         """Test async adapter initialization."""
         adapter = AsyncHttpServerAdapter(max_connections=50, **basic_adapter_kwargs)
 
@@ -729,6 +843,9 @@ class TestAsyncHttpServerEngineAdapter:
 
     @pytest.mark.asyncio
     async def test_make_async_request_success(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Patches _get_session to yield a mock aiohttp session whose POST context yields a 200 response; asserts the
+        # parsed JSON is returned and POST was called once with URL, JSON payload and timeout.
         """Test successful async HTTP request."""
 
         # Instantiate adapter
@@ -762,6 +879,8 @@ class TestAsyncHttpServerEngineAdapter:
 
     @pytest.mark.asyncio
     async def test_make_async_request_get_method(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Same as the POST test for GET, asserting session.get called with URL and timeout.
         """Test async GET request using aiohttp and proper context mocking."""
 
         # Instantiate the async adapter
@@ -791,6 +910,8 @@ class TestAsyncHttpServerEngineAdapter:
 
     @pytest.mark.asyncio
     async def test_make_async_request_non_master(self, mock_launch_server_process):
+        # [FUNCTION DOC]
+        # Asserts a non-master async adapter returns an empty dict.
         """Test async request from non-master node."""
         kwargs = {"host": "localhost", "port": 8000, "node_rank": 1, "model_path": "/tmp/test_model"}
         adapter = AsyncHttpServerAdapter(**kwargs)
@@ -800,6 +921,8 @@ class TestAsyncHttpServerEngineAdapter:
 
     @pytest.mark.asyncio
     async def test_async_generate(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts async generate returns the mocked response and calls the request helper once.
         """Test async generate method."""
         adapter = AsyncHttpServerAdapter(**basic_adapter_kwargs)
 
@@ -817,6 +940,9 @@ class TestAsyncHttpServerEngineAdapter:
 
     @pytest.mark.asyncio
     async def test_async_memory_management(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts async release/resume send tags to their endpoints and the helper is called exactly twice.
+        # KNOWN ISSUE: the inline comment claims resume also calls release, which contradicts the call count of 2.
         """Test async memory management methods."""
         adapter = AsyncHttpServerAdapter(**basic_adapter_kwargs)
 
@@ -838,9 +964,14 @@ class TestAsyncHttpServerEngineAdapter:
 
 
 class TestErrorRecovery:
+    # [CLASS DOC]
+    # Tests retry/recovery behavior.
     """Test error recovery mechanisms."""
 
     def test_flush_cache_recovery(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # With max_attempts 2, GETs fail with connection error, timeout, 503, then succeed; asserts flush_cache
+        # eventually returns the JSON (flush retries independently of max_attempts).
         """Test flush cache recovery from failures."""
         adapter = HttpServerAdapter(max_attempts=2, **basic_adapter_kwargs)
 
@@ -858,6 +989,8 @@ class TestErrorRecovery:
                 assert result == {"cache_flushed": True}
 
     def test_flush_cache_max_attempts(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # With all GETs failing and max_attempts 1, asserts flush_cache returns an empty dict instead of raising.
         """Test flush cache max retries exceeded."""
         adapter = HttpServerAdapter(max_attempts=1, **basic_adapter_kwargs)
 
@@ -870,6 +1003,8 @@ class TestErrorRecovery:
                 assert result == {}  # Should return empty dict on failure
 
     def test_network_partition_recovery(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Two connection errors then success with max_attempts 3; asserts _make_request returns the success JSON.
         """Test recovery from network partition scenarios."""
         adapter = HttpServerAdapter(max_attempts=3, **basic_adapter_kwargs)
 
@@ -887,11 +1022,15 @@ class TestErrorRecovery:
 
 
 class TestResourceManagement:
+    # [CLASS DOC]
+    # Tests cleanup behavior.
     """Test resource management and cleanup."""
 
     def test_resource_cleanup_on_exception(
         self, mock_launch_server_process, mock_kill_process_tree, basic_adapter_kwargs
     ):
+        # [FUNCTION DOC]
+        # After a failing generate (exception swallowed), asserts shutdown still kills the process tree once.
         """Test resource cleanup when exceptions occur."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -907,6 +1046,8 @@ class TestResourceManagement:
         mock_kill_process_tree.assert_called_once_with(mock_launch_server_process.return_value.pid)
 
     def test_multiple_shutdown_calls(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts calling shutdown three times raises nothing.
         """Test multiple shutdown calls are safe."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -917,9 +1058,13 @@ class TestResourceManagement:
 
 
 class TestDataTypeHandling:
+    # [CLASS DOC]
+    # Tests passthrough of complex payloads.
     """Test handling of various data types."""
 
     def test_complex_data_structures(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts a nested sampling params mapping is passed unchanged in the generate payload.
         """Test handling of complex data structures."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 
@@ -954,9 +1099,13 @@ class TestDataTypeHandling:
 
 
 class TestIntegration:
+    # [CLASS DOC]
+    # Mixed error-scenario checks.
     """Integration tests for both adapters."""
 
     def test_error_scenarios(self, mock_launch_server_process, basic_adapter_kwargs):
+        # [FUNCTION DOC]
+        # Asserts generate with no args and update with an all-None request return the mocked empty dict.
         """Test various error scenarios."""
         adapter = HttpServerAdapter(**basic_adapter_kwargs)
 

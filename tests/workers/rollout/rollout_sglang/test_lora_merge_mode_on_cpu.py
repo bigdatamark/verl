@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU unit tests for lora_served_as_adapter (SGLang rollout utility) which decides whether LoRA is served as
+# a separate adapter (rank > 0 in either the flat lora_rank or nested lora.rank, and lora.merge not true),
+# plus the derived sleep release-tag choice.
+
 """Unit tests for LoRA merge-vs-adapter detection in the SGLang rollout.
 
 ``lora_served_as_adapter`` drives every LoRA branch of ``SGLangHttpServer``:
@@ -34,6 +39,8 @@ from verl.workers.rollout.sglang_rollout.utils import lora_served_as_adapter
 
 @dataclass
 class _StubModelConfig:
+    # [CLASS DOC]
+    # HELPER: dataclass exposing only lora_rank (default 0) and lora mapping (default empty) as read by the helper.
     """Minimal stand-in exposing the HFModelConfig fields the helper reads."""
 
     lora_rank: int = 0
@@ -41,40 +48,67 @@ class _StubModelConfig:
 
 
 class TestLoraServedAsAdapter:
+    # [CLASS DOC]
+    # Truth-table tests of lora_served_as_adapter over megatron-style (lora.rank) and fsdp-style (lora_rank) configs.
     def test_no_lora(self):
+        # [FUNCTION DOC]
+        # Asserts False with no LoRA configured.
         assert lora_served_as_adapter(_StubModelConfig()) is False
 
     def test_megatron_merge(self):
+        # [FUNCTION DOC]
+        # Asserts False for lora.rank 16 with merge true.
         """megatron + merge: keep SGLang LoRA-free even though lora.rank > 0."""
         assert lora_served_as_adapter(_StubModelConfig(lora={"rank": 16, "merge": True})) is False
 
     def test_megatron_adapter(self):
+        # [FUNCTION DOC]
+        # Asserts True for lora.rank 16 without merge.
         assert lora_served_as_adapter(_StubModelConfig(lora={"rank": 16})) is True
 
     def test_fsdp_merge(self):
+        # [FUNCTION DOC]
+        # Asserts False for lora_rank 8 with lora.merge true.
         assert lora_served_as_adapter(_StubModelConfig(lora_rank=8, lora={"merge": True})) is False
 
     def test_fsdp_adapter(self):
+        # [FUNCTION DOC]
+        # Asserts True for lora_rank 8 with empty lora mapping.
         assert lora_served_as_adapter(_StubModelConfig(lora_rank=8)) is True
 
     def test_merge_absent_defaults_to_adapter(self):
+        # [FUNCTION DOC]
+        # Asserts True when merge key is absent (defaults to adapter mode).
         assert lora_served_as_adapter(_StubModelConfig(lora_rank=8, lora={})) is True
 
     def test_merge_without_lora(self):
+        # [FUNCTION DOC]
+        # Asserts False when merge is true but rank is 0.
         """merge=True on a run without LoRA is still 'no adapter'."""
         assert lora_served_as_adapter(_StubModelConfig(lora={"rank": 0, "merge": True})) is False
 
 
 class TestSleepTags:
+    # [CLASS DOC]
+    # Tests the release tags SGLangHttpServer.sleep would choose, using a local reimplementation.
+    # KNOWN ISSUE: the tag selection is reproduced in the test rather than calling the server, so it only checks
+    # lora_served_as_adapter, not the real sleep code.
     """``SGLangHttpServer.sleep`` releases the weights only when they are not the base of
     an adapter that gets hot-swapped in place."""
 
     @staticmethod
     def _sleep_tags(model_config) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: returns only kv_cache when LoRA is served as an adapter, else kv_cache and weights.
+        # Inputs: model config. Outputs: list of tag strings.
         return ["kv_cache"] if lora_served_as_adapter(model_config) else ["kv_cache", "weights"]
 
     def test_merge_mode_releases_weights(self):
+        # [FUNCTION DOC]
+        # Asserts merge mode releases kv_cache and weights.
         assert self._sleep_tags(_StubModelConfig(lora={"rank": 16, "merge": True})) == ["kv_cache", "weights"]
 
     def test_adapter_mode_keeps_weights(self):
+        # [FUNCTION DOC]
+        # Asserts adapter mode releases only kv_cache.
         assert self._sleep_tags(_StubModelConfig(lora={"rank": 16})) == ["kv_cache"]

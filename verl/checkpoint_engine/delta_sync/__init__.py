@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Package delta_sync: wire-format primitives for sparse ("only changed elements") weight sync
+# between trainer and rollout. Re-exports DeltaFlush, DeltaParam and checksum from the encode module.
+# Inputs/outputs: none at import time beyond exposing these names. Side effects: imports torch via encode.
 """Delta weight sync primitives for the checkpoint engine.
 
 This package holds the framework-agnostic wire schema of "send only the

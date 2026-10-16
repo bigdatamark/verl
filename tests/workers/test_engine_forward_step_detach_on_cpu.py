@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Regression test (verl#6698) that FSDPEngineWithLMHead.forward_step returns a model_output detached from the
+# autograd graph, so holding per-micro-batch outputs does not keep checkpoint-saved activations alive.
+# Constants: VOCAB=16, HIDDEN=8, SEQ=6.
+
 """Regression guard for verl#6698.
 
 FSDPEngineWithLMHead.forward_step used to return ``model_output`` tensors
@@ -43,10 +49,15 @@ VOCAB, HIDDEN, SEQ = 16, 8, 6
 
 
 class _TinyCheckpointedLM(torch.nn.Module):
+    # [CLASS DOC]
+    # HELPER: Tiny model with a frozen embedding whose output is forced to require grad, a gradient-checkpointed
+    # bias-free linear block, and a weakref to the checkpoint-saved block input.
     """Frozen embedding + checkpointed trainable block, mimicking a PEFT/LoRA
     base model with gradient checkpointing and enable_input_require_grads."""
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates the frozen embedding, trainable projection and an empty weakref slot.
         super().__init__()
         self.embed = torch.nn.Embedding(VOCAB, HIDDEN)
         self.embed.weight.requires_grad_(False)  # frozen base
@@ -54,6 +65,9 @@ class _TinyCheckpointedLM(torch.nn.Module):
         self.saved_block_input = None  # weakref to the checkpoint-saved input
 
     def forward(self, input_ids=None, use_cache=False):
+        # [FUNCTION DOC]
+        # HELPER: Embeds input_ids, marks it as requiring grad, applies the projection under non-reentrant checkpointing,
+        # stores a weakref to the embedding output, and returns a namespace with attribute hidden. use_cache is ignored.
         x = self.embed(input_ids)
         # PEFT enable_input_require_grads: embedding output requires grad so
         # gradients can flow into trainable params under checkpointing.
@@ -64,6 +78,10 @@ class _TinyCheckpointedLM(torch.nn.Module):
 
 
 def _make_engine_stub():
+    # [FUNCTION DOC]
+    # HELPER: Creates an FSDPEngineWithLMHead without __init__, with float32 autocast dtype, the tiny model as module,
+    # input preparation passing only input_ids (empty output args), output preparation returning log_probs = hidden summed
+    # over the last dim, and no data-parallel group.
     """Bypass __init__; provide only what forward_step touches."""
     eng = object.__new__(FSDPEngineWithLMHead)
     eng._autocast_dtype = torch.float32  # skip autocast
@@ -77,10 +95,16 @@ def _make_engine_stub():
 
 
 def _loss_fn(model_output, data, dp_group=None):
+    # [FUNCTION DOC]
+    # HELPER: Loss callback; returns (sum of log_probs, metrics dict with a dummy metric). data and dp_group are ignored.
     return model_output["log_probs"].sum(), {"dummy_metric": 1.0}
 
 
 def test_forward_step_output_carries_no_grad_fn_and_releases_graph(monkeypatch):
+    # [FUNCTION DOC]
+    # With get_device_id patched to "cpu", forward_step returns a live loss whose backward reaches the projection weight,
+    # a model_output with no grad-attached tensors, and after the loss is deleted and garbage collected the saved
+    # block input is freed while output is still held; output's loss entry is not None.
     monkeypatch.setattr(transformer_impl, "get_device_id", lambda: "cpu")
 
     eng = _make_engine_stub()

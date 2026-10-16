@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Test that FSDPCheckpointManager passes the unwrapped base model (not the PeftModel wrapper) to
+# transformers' custom_object_save when saving a LoRA model whose config has auto_map. Builds a tiny
+# Qwen3 causal LM on CPU.
+
 """For a PEFT model (LoRA here) whose config carries ``auto_map`` (a trust_remote_code model),
 ``FSDPCheckpointManager.save_checkpoint`` bundles the model's own defining source next to the
 checkpoint via transformers' ``custom_object_save`` (which copies the source of
@@ -30,6 +35,10 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 
 
 def _make_peft_model():
+    # [FUNCTION DOC]
+    # HELPER: builds a 2-layer Qwen3 causal LM (hidden 128, intermediate 256, vocab 256, 2 heads / 2 KV heads)
+    # from config with random weights and wraps it with LoRA (r=8, alpha 16, all linear targets, no dropout,
+    # no bias, causal LM task). Outputs: the PeftModel. Side effects: none beyond allocation.
     config = Qwen3Config(
         num_hidden_layers=2,
         num_attention_heads=2,
@@ -46,6 +55,13 @@ def _make_peft_model():
 
 
 def test_custom_object_save_receives_base_model_not_peft_wrapper(monkeypatch, tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: stubs torch.distributed get_rank/get_world_size/barrier; sets an auto_map dict on the model config
+    # to trigger the custom-source-saving path; creates a manager saving only "model" synchronously; replaces
+    # custom_object_save in the manager module with a mock; saves at step 0 to tmp_path; asserts the mock was
+    # called once with the base model (identity check) and not the wrapper.
+    # Inputs: monkeypatch, tmp_path fixtures. Outputs: none. Exceptions: AssertionError.
+    # Side effects: writes checkpoint files under tmp_path.
     """On a LoRA save, the object passed to custom_object_save is the base model, not the PeftModel."""
     # Neutralize the (uninitialized) process group: save_checkpoint queries rank/world_size and
     # calls barrier(). A plain PeftModel has fsdp_version == 0, so the sharded-state-dict block is a

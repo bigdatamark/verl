@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Unit tests (mock-based, no NPU needed) for Ascend NPU helpers in verl.utils.device: check_ipc_version_support
+# (minimum driver software 25.3.rc1 and CANN 8.3.rc1, parsing standard, rc, and "t" suffix versions using only the
+# first 3 parts), get_npu_versions (parses npu-smi output, architecture, CANN toolkit info file, and hardware
+# generation from torch_npu device name), and PlatformNPU.is_ipc_supported (A5 always supported, otherwise
+# delegates to the version check).
 
 import logging
 import sys
@@ -21,6 +27,8 @@ from verl.utils.device import AscendHardwareVersion, check_ipc_version_support, 
 
 
 def _fake_torch_npu(device_name):
+    # [FUNCTION DOC]
+    # HELPER: Returns a MagicMock torch_npu module whose npu.get_device_name returns device_name.
     """Build a fake torch_npu module whose get_device_name returns device_name."""
     fake = MagicMock()
     fake.npu.get_device_name.return_value = device_name
@@ -28,30 +36,43 @@ def _fake_torch_npu(device_name):
 
 
 class TestCheckIPCVersionSupport(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests for check_ipc_version_support; each test passes software and CANN version strings and asserts the
+    # boolean result or the raised error.
     """Test cases for the check_ipc_version_support function."""
 
     def setUp(self):
+        # [FUNCTION DOC]
+        # HELPER: Disables logging at INFO level and below for each test. Side effects: global logging state.
         """Set up test logging to suppress INFO messages."""
         # Suppress INFO log messages during testing
         logging.disable(logging.INFO)
 
     def tearDown(self):
+        # [FUNCTION DOC]
+        # HELPER: Re-enables all logging. Side effects: global logging state.
         """Restore logging."""
         logging.disable(logging.NOTSET)
 
     def test_standard_version_with_support(self):
+        # [FUNCTION DOC]
+        # Behavior: 25.5.0 / 8.3.0 is supported (True). Inputs: self. Outputs: none.
         """Test standard version that meets minimum requirements."""
         # Software 25.5.0 >= 25.3.rc1, CANN 8.3.0 >= 8.3.rc1
         result = check_ipc_version_support("25.5.0", "8.3.0")
         self.assertTrue(result)
 
     def test_standard_version_newer(self):
+        # [FUNCTION DOC]
+        # Behavior: 26.0.0 / 9.0.0 is supported.
         """Test newer standard versions."""
         # Software 26.0.0 >= 25.3.rc1, CANN 9.0.0 >= 8.3.rc1
         result = check_ipc_version_support("26.0.0", "9.0.0")
         self.assertTrue(result)
 
     def test_rc_version_format(self):
+        # [FUNCTION DOC]
+        # Behavior: rc versions with extra parts (25.3.rc1.2 / 8.3.rc1.2) truncate to the minimum and are supported.
         """Test RC version format with additional parts."""
         # Software 25.3.rc1.2 -> 25.3.rc1 >= 25.3.rc1
         # CANN 8.3.rc1.2 -> 8.3.rc1 >= 8.3.rc1
@@ -59,6 +80,8 @@ class TestCheckIPCVersionSupport(unittest.TestCase):
         self.assertTrue(result)
 
     def test_exact_rc_version(self):
+        # [FUNCTION DOC]
+        # Behavior: exactly the minimum rc versions are supported.
         """Test exact RC version."""
         # Software 25.3.rc1 >= 25.3.rc1
         # CANN 8.3.rc1 >= 8.3.rc1
@@ -66,6 +89,8 @@ class TestCheckIPCVersionSupport(unittest.TestCase):
         self.assertTrue(result)
 
     def test_t_suffix_version(self):
+        # [FUNCTION DOC]
+        # Behavior: software with t suffix (25.5.t3.b001, treated as 25.5) with CANN 8.3.rc1 is supported.
         """Test version with lowercase t suffix."""
         # Software 25.5.t3.b001 -> 25.5 >= 25.3.rc1
         # CANN 8.3.rc1 >= 8.3.rc1
@@ -73,6 +98,8 @@ class TestCheckIPCVersionSupport(unittest.TestCase):
         self.assertTrue(result)
 
     def test_t_suffix_version_older(self):
+        # [FUNCTION DOC]
+        # Behavior: t-suffix software but CANN 8.2.rc1 (below minimum) is not supported.
         """Test version with lowercase t suffix that's too old."""
         # Software 25.5.t3.b001 -> 25.5 >= 25.3.rc1 (should pass)
         # CANN 8.2.rc1 < 8.3.rc1 (should fail)
@@ -80,12 +107,16 @@ class TestCheckIPCVersionSupport(unittest.TestCase):
         self.assertFalse(result)
 
     def test_software_version_below_minimum(self):
+        # [FUNCTION DOC]
+        # Behavior: software 25.2.0 below minimum gives False.
         """Test software version below minimum requirement."""
         # Software 25.2.0 < 25.3.rc1
         result = check_ipc_version_support("25.2.0", "8.3.0")
         self.assertFalse(result)
 
     def test_cann_version_below_minimum(self):
+        # [FUNCTION DOC]
+        # Behavior: CANN 8.2.0 below minimum gives False.
         """Test CANN version below minimum requirement."""
         # Software 25.5.0 >= 25.3.rc1
         # CANN 8.2.0 < 8.3.rc1
@@ -93,6 +124,8 @@ class TestCheckIPCVersionSupport(unittest.TestCase):
         self.assertFalse(result)
 
     def test_both_versions_below_minimum(self):
+        # [FUNCTION DOC]
+        # Behavior: both below minimum gives False.
         """Test both versions below minimum requirement."""
         # Software 25.2.0 < 25.3.rc1
         # CANN 8.2.0 < 8.3.rc1
@@ -100,30 +133,40 @@ class TestCheckIPCVersionSupport(unittest.TestCase):
         self.assertFalse(result)
 
     def test_invalid_software_version(self):
+        # [FUNCTION DOC]
+        # Behavior: malformed software version raises RuntimeError containing "Invalid software version format".
         """Test invalid software version format."""
         with self.assertRaises(RuntimeError) as context:
             check_ipc_version_support("invalid.version", "8.3.0")
         self.assertIn("Invalid software version format", str(context.exception))
 
     def test_invalid_cann_version(self):
+        # [FUNCTION DOC]
+        # Behavior: malformed CANN version raises RuntimeError containing "Invalid CANN version format".
         """Test invalid CANN version format."""
         with self.assertRaises(RuntimeError) as context:
             check_ipc_version_support("25.5.0", "invalid.version")
         self.assertIn("Invalid CANN version format", str(context.exception))
 
     def test_rc_with_more_parts(self):
+        # [FUNCTION DOC]
+        # Behavior: rc versions with many extra parts use the first 3 parts and are supported.
         """Test RC version with more than 3 parts."""
         # Should extract only first 3 parts: 25.3.rc1
         result = check_ipc_version_support("25.3.rc1.2.3.4", "8.3.rc1.2.3.4")
         self.assertTrue(result)
 
     def test_standard_with_more_parts(self):
+        # [FUNCTION DOC]
+        # Behavior: standard versions with many extra parts use the first 3 parts and are supported.
         """Test standard version with more than 3 parts."""
         # Should extract only first 3 parts: 25.5.0
         result = check_ipc_version_support("25.5.0.1.2.3", "8.3.0.1.2.3")
         self.assertTrue(result)
 
     def test_rc_edge_case_versions(self):
+        # [FUNCTION DOC]
+        # Behavior: rc1 is accepted at the minimum while 25.3.rc0 is rejected.
         """Test edge case RC versions."""
         # RC1 is the minimum
         result = check_ipc_version_support("25.3.rc1", "8.3.rc1")
@@ -134,6 +177,8 @@ class TestCheckIPCVersionSupport(unittest.TestCase):
         self.assertFalse(result)
 
     def test_major_version_differences(self):
+        # [FUNCTION DOC]
+        # Behavior: much newer majors (30.0.0 / 10.0.0) are supported; older majors (24.0.0 / 7.0.0) are not.
         """Test major version number differences."""
         # Much newer major versions
         result = check_ipc_version_support("30.0.0", "10.0.0")
@@ -145,6 +190,9 @@ class TestCheckIPCVersionSupport(unittest.TestCase):
 
 
 class TestGetNPUVersions(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests for get_npu_versions with subprocess.run (npu-smi), platform.machine, os.path.exists, file open and
+    # optionally the torch_npu module mocked. Mock arguments are injected bottom-up by the patch decorators.
     """Test cases for the get_npu_versions function."""
 
     @patch("subprocess.run")
@@ -152,6 +200,10 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="version=8.3.rc1\n")
     def test_get_npu_versions_success(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: npu-smi reports "Software Version : 25.5.0", x86_64, paths exist and info file contains
+        # version=8.3.rc1; asserts returned software and CANN versions.
+        # Inputs: self, mock_file, mock_exists, mock_machine, mock_run - injected mocks. Outputs: none.
         """Test successful retrieval of versions."""
         # Mock npu-smi output
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\nOther Info\n", check=True)
@@ -169,6 +221,9 @@ class TestGetNPUVersions(unittest.TestCase):
 
     @patch("subprocess.run")
     def test_get_npu_versions_missing_software_version(self, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: npu-smi output lacks the software version line; asserts RuntimeError "Could not find Software Version".
+        # Inputs: self, mock_run. Outputs: none.
         """Test error when Software Version is missing."""
         mock_run.return_value = Mock(stdout="Other Info Without Software Version\n", check=True)
 
@@ -182,6 +237,8 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="version=8.3.rc1\n")
     def test_get_npu_versions_unsupported_architecture(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: architecture armv7l; asserts RuntimeError "Unsupported architecture". Inputs: injected mocks.
         """Test error with unsupported architecture."""
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
 
@@ -198,6 +255,8 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="version=8.3.rc1\n")
     def test_get_npu_versions_cann_path_not_exists(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: CANN toolkit path missing; asserts RuntimeError "CANN toolkit path does not exist". Inputs: mocks.
         """Test error when CANN path doesn't exist."""
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
 
@@ -214,6 +273,9 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open")
     def test_get_npu_versions_info_file_not_exists(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: first existence check (toolkit path) true, second (info file) false; asserts RuntimeError
+        # "CANN toolkit info file does not exist". Inputs: mocks.
         """Test error when CANN info file doesn't exist."""
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
 
@@ -232,6 +294,9 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="other_info=no_version\n")
     def test_get_npu_versions_missing_cann_version(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: info file has no version entry; asserts RuntimeError "Could not find version in CANN toolkit info file".
+        # Inputs: mocks.
         """Test error when CANN version is missing from info file."""
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
 
@@ -249,6 +314,8 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="version=8.3.rc1\n")
     def test_hardware_version_a5_910_95(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: fake torch_npu device name Ascend910_95 maps to hardware version A5. Inputs: mocks.
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
         mock_machine.return_value = "x86_64"
         mock_exists.return_value = True
@@ -261,6 +328,8 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="version=8.3.rc1\n")
     def test_hardware_version_a5_950(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: device name Ascend950 maps to A5. Inputs: mocks.
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
         mock_machine.return_value = "x86_64"
         mock_exists.return_value = True
@@ -273,6 +342,8 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="version=8.3.rc1\n")
     def test_hardware_version_a3(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: device name Ascend910_93 maps to A3. Inputs: mocks.
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
         mock_machine.return_value = "x86_64"
         mock_exists.return_value = True
@@ -285,6 +356,8 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="version=8.3.rc1\n")
     def test_hardware_version_a2_910b(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: device name Ascend910B3 maps to A2. Inputs: mocks.
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
         mock_machine.return_value = "x86_64"
         mock_exists.return_value = True
@@ -297,6 +370,8 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="version=8.3.rc1\n")
     def test_hardware_version_a2_a2g(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: device name A2G maps to A2. Inputs: mocks.
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
         mock_machine.return_value = "x86_64"
         mock_exists.return_value = True
@@ -309,6 +384,8 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="version=8.3.rc1\n")
     def test_hardware_version_max_version(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: unknown name Ascend910_99 maps to MAX_VERSION. Inputs: mocks.
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
         mock_machine.return_value = "x86_64"
         mock_exists.return_value = True
@@ -321,6 +398,8 @@ class TestGetNPUVersions(unittest.TestCase):
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="version=8.3.rc1\n")
     def test_hardware_version_none_when_torch_npu_unavailable(self, mock_file, mock_exists, mock_machine, mock_run):
+        # [FUNCTION DOC]
+        # Behavior: torch_npu set to None in sys.modules (import fails) yields hardware version NONE. Inputs: mocks.
         mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n", check=True)
         mock_machine.return_value = "x86_64"
         mock_exists.return_value = True
@@ -329,11 +408,17 @@ class TestGetNPUVersions(unittest.TestCase):
 
 
 class TestIsIPCSupported(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests for PlatformNPU.is_ipc_supported with get_npu_versions and check_ipc_version_support patched in
+    # verl.utils.device.
     """Test PlatformNPU.is_ipc_supported A5 short-circuit behavior."""
 
     @patch("verl.utils.device.check_ipc_version_support")
     @patch("verl.utils.device.get_npu_versions")
     def test_a5_short_circuit_returns_true(self, mock_get_versions, mock_check):
+        # [FUNCTION DOC]
+        # Behavior: hardware A5 with old versions returns True without calling the version check.
+        # Inputs: self, mock_get_versions, mock_check. Outputs: none.
         mock_get_versions.return_value = (AscendHardwareVersion.A5, "24.0.0", "7.0.0")
         from verl.plugin.platform.platform_npu import PlatformNPU
 
@@ -344,6 +429,9 @@ class TestIsIPCSupported(unittest.TestCase):
     @patch("verl.utils.device.check_ipc_version_support", return_value=True)
     @patch("verl.utils.device.get_npu_versions")
     def test_non_a5_delegates_to_version_check_true(self, mock_get_versions, mock_check):
+        # [FUNCTION DOC]
+        # Behavior: hardware A3 delegates to the version check with (software, CANN) and returns its True result.
+        # Inputs: self, mock_get_versions, mock_check.
         mock_get_versions.return_value = (AscendHardwareVersion.A3, "25.5.0", "8.3.0")
         from verl.plugin.platform.platform_npu import PlatformNPU
 
@@ -354,6 +442,9 @@ class TestIsIPCSupported(unittest.TestCase):
     @patch("verl.utils.device.check_ipc_version_support", return_value=False)
     @patch("verl.utils.device.get_npu_versions")
     def test_non_a5_delegates_to_version_check_false(self, mock_get_versions, mock_check):
+        # [FUNCTION DOC]
+        # Behavior: hardware A3 delegates to the version check and returns its False result.
+        # Inputs: self, mock_get_versions, mock_check.
         mock_get_versions.return_value = (AscendHardwareVersion.A3, "24.0.0", "7.0.0")
         from verl.plugin.platform.platform_npu import PlatformNPU
 

@@ -13,6 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Gathers Megatron-core GPTModel weights sharded across tensor/pipeline(/virtual pipeline)/context
+# parallel ranks into a single HuggingFace-style (Llama/Qwen2 naming) state_dict on global rank 0.
+# Uses collective broadcasts over the model-parallel group, so every rank in the group must call the
+# merge function together. MoE / VL / DeepSeek-V3 / Mixtral variants are stubs that raise.
+
 import time
 
 import torch
@@ -30,6 +36,15 @@ from verl.utils.megatron_utils import unwrap_model
 def _megatron_calc_global_rank(
     tp_rank: int = 0, dp_rank: int = 0, pp_rank: int = 0, cp_rank: int = 0, ep_rank: int = 0
 ):
+    # [FUNCTION DOC]
+    # HELPER: Computes the global rank for given per-dimension parallel ranks, assuming Megatron's
+    # default rank order with tp fastest, then cp, then dp, then pp (formula
+    # ((pp*dp_size + dp)*cp_size + cp)*tp_size + tp).
+    # Inputs: tp_rank, dp_rank, pp_rank, cp_rank, ep_rank - integer ranks (default 0).
+    # Outputs: integer global rank.
+    # Exceptions: AssertionError if tp*dp*pp*cp sizes differ from the world size.
+    # Side effects: none (queries mpu parallel state).
+    # KNOWN ISSUE: ep_rank is accepted but ignored; expert parallelism is not part of the formula.
     """Calculate global rank with support for CP/EP parallelism"""
 
     # Get parallel sizes for each dimension
@@ -51,6 +66,14 @@ def _megatron_calc_global_rank(
 
 
 def _megatron_calc_layer_map(config):
+    # [FUNCTION DOC]
+    # HELPER: Builds a mapping from global decoder layer index to (pp_rank, virtual_pp_rank, local layer
+    # index). Layers are split evenly; layer offset for a chunk is
+    # virtual_rank*(num_layers/vpp_size) + pp_rank*layers_per_model.
+    # Inputs: config - HF config with num_hidden_layers.
+    # Outputs: dict int -> tuple of three ints.
+    # Exceptions: AssertionError if num_hidden_layers is not divisible by pp_size*vpp_size.
+    # Side effects: none.
     """Calculate the mapping of global layer_idx to local layer_idx
     Returns:
         layer_map (Dict: int -> tuple(int, int, int)):
@@ -81,6 +104,23 @@ def _megatron_calc_layer_map(config):
 
 
 def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False):
+    # [FUNCTION DOC]
+    # Behavior: unwraps each virtual-pipeline model chunk (DDP/Float16Module), then on dp_rank 0 and
+    # cp_rank 0 ranks broadcasts every parameter from the owning pp stage (tp rank 0, or each tp rank for
+    # sharded tensors) over the model-parallel group, and rank 0 assembles HF-named tensors: embeddings,
+    # per-layer input layernorm, optional q/k norms, split q/k/v weights (and biases when add_qkv_bias),
+    # o_proj (concat along dim 1), post-attention layernorm, split gate/up, down_proj (dim 1), final norm,
+    # and lm_head (skipped if tie_word_embeddings; replicated broadcast for value models, tp-sharded
+    # otherwise). Finally barriers, empties device cache, and casts rank-0 tensors to dtype.
+    # Inputs: wrapped_models - list/tuple (or iterable) of length vpp_size of wrapped mcore modules;
+    # config - HF config (num_hidden_layers, intermediate_size, heads, optional head_dim); dtype - target
+    # dtype also used for receive buffers; is_value_model - lm_head is a non-sharded value head;
+    # tie_word_embeddings - skip lm_head.
+    # Outputs: dict name -> CPU tensor on global rank 0; empty dict on other ranks.
+    # Exceptions: AssertionError on rank-0 not being mp/pp/dp rank 0, wrong chunk count, uneven layers or
+    # mismatched local layer count.
+    # Side effects: collective communication (all mp-group ranks must participate), device cache clears,
+    # progress logging on rank 0, global barrier.
     """Merge sharded parameters of a Megatron module into a merged checkpoint.
 
     Args:
@@ -98,6 +138,9 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
     start_time = time.time()
 
     def _get_gpt_model(model):
+        # [FUNCTION DOC]
+        # HELPER: Identity accessor returning the model as the GPT model module.
+        # Inputs: model. Outputs: same object. Side effects: none.
         return model
 
     dp_rank = mpu.get_data_parallel_rank()
@@ -132,6 +175,9 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
     state_dict = dict()
 
     def _get_cpu_tensor(tensor: torch.Tensor):
+        # [FUNCTION DOC]
+        # HELPER: Returns a detached CPU copy of a tensor (clones if already on CPU), or None for None.
+        # Inputs: tensor or None. Outputs: CPU tensor or None. Side effects: device-to-host copy.
         if tensor is None:
             return None
         if tensor.device == torch.device("cpu"):
@@ -139,6 +185,14 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
         return tensor.detach().cpu()
 
     def _broadcast_tensor(tensor, name, src_pp_rank) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Broadcasts a replicated (non-tp-sharded) tensor from the tp0/dp0 rank of src_pp_rank (same
+        # cp rank) to the mp group: first broadcasts its shape (None means absent, then logs and returns),
+        # allocates an empty buffer of dtype on non-source ranks, broadcasts data, and rank 0 stores a CPU
+        # copy under name in state_dict.
+        # Inputs: tensor - local tensor on the source rank (ignored elsewhere); name - HF key; src_pp_rank.
+        # Outputs: None.
+        # Side effects: collective ops; mutates enclosing state_dict on rank 0.
         """broadcast tensor across mp_group"""
         nonlocal state_dict
         nonlocal mp_group
@@ -178,6 +232,13 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
             state_dict[name] = _get_cpu_tensor(weight)
 
     def _broadcast_tp_shard_tensor(tensor, name, src_pp_rank, concat_dim=0, mutate_func=None) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Broadcasts a tp-sharded tensor: shares the chunk shape from tp rank 0, then each tp rank of
+        # src_pp_rank broadcasts its shard in turn; rank 0 concatenates shards along concat_dim, optionally
+        # applies mutate_func, and stores the result under name.
+        # Inputs: tensor - local shard; name; src_pp_rank; concat_dim - concat axis (0 column-parallel, 1
+        # row-parallel); mutate_func - optional transform of the full tensor.
+        # Outputs: None. Side effects: collectives; writes state_dict on rank 0; logs and returns if absent.
         """broadcast tensor in tp shards across mp_group"""
         nonlocal state_dict
         nonlocal mp_group
@@ -219,6 +280,12 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
             state_dict[name] = full_tensor
 
     def _broadcast_tp_shard_tensor_gate_up(tensor, gate_name, up_name, src_pp_rank) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Like the tp-shard broadcast for the fused fc1 weight; rank 0 concatenates shards, then for
+        # each tp shard of size 2*intermediate_size/tp takes the first half as gate and second half as up,
+        # and concatenates across shards into gate_name and up_name.
+        # Inputs: tensor - local fused gate/up shard; gate_name; up_name; src_pp_rank.
+        # Outputs: None. Side effects: collectives; writes two state_dict entries on rank 0.
         """broadcast tensor in tp shards across mp_group"""
         nonlocal state_dict
         nonlocal mp_group
@@ -269,6 +336,14 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
             state_dict[up_name] = torch.cat(up_weight_list, dim=0)
 
     def _broadcast_tp_shard_tensor_qkv(tensor, q_name, k_name, v_name, src_pp_rank):
+        # [FUNCTION DOC]
+        # HELPER: Like the tp-shard broadcast for fused linear_qkv weight/bias. Rank 0 concatenates shards,
+        # then per tp shard (size q_tp + 2*kv_tp) splits it into num_query_groups/tp interleaved chunks of
+        # [q | k | v] and collects q, k, v pieces. When num_key_value_heads < tp_size, kv size per shard is
+        # one head and k/v are only kept for shards where i*num_kv_heads is divisible by tp_size (dedupe
+        # replicated KV heads). Head dim is config.head_dim or hidden_size/num_attention_heads.
+        # Inputs: tensor - local qkv shard; q_name, k_name, v_name; src_pp_rank.
+        # Outputs: None. Side effects: collectives; writes three entries on rank 0.
         """broadcast tensor in tp shards across mp_group"""
         nonlocal state_dict
         nonlocal mp_group
@@ -478,20 +553,32 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
 def merge_megatron_ckpt_gptmodel_qwen_moe(
     wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False
 ):
+    # [FUNCTION DOC]
+    # Behavior: placeholder for Qwen MoE merging. Inputs: same as merge_megatron_ckpt_gptmodel.
+    # Outputs: none. Exceptions: always raises NotImplementedError. Side effects: none.
     raise NotImplementedError("merge_megatron_ckpt_gptmodel_qwen_moe is not implemented")
 
 
 def merge_megatron_ckpt_gptmodel_qwen2_5_vl(
     wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False
 ):
+    # [FUNCTION DOC]
+    # Behavior: placeholder for Qwen2.5-VL merging. Inputs: same as merge_megatron_ckpt_gptmodel.
+    # Outputs: none. Exceptions: always raises NotImplementedError. Side effects: none.
     raise NotImplementedError("merge_megatron_ckpt_gptmodel_qwen2_5_vl is not implemented")
 
 
 def merge_megatron_ckpt_gptmodel_dpskv3(wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False):
+    # [FUNCTION DOC]
+    # Behavior: placeholder for DeepSeek-V3 merging. Inputs: same as merge_megatron_ckpt_gptmodel.
+    # Outputs: none. Exceptions: always raises NotImplementedError. Side effects: none.
     raise NotImplementedError("merge_megatron_ckpt_gptmodel_dpskv3 is not implemented")
 
 
 def merge_megatron_ckpt_gptmodel_mixtral(
     wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False
 ):
+    # [FUNCTION DOC]
+    # Behavior: placeholder for Mixtral merging. Inputs: same as merge_megatron_ckpt_gptmodel.
+    # Outputs: none. Exceptions: always raises NotImplementedError. Side effects: none.
     raise NotImplementedError("merge_megatron_ckpt_gptmodel_mixtral is not implemented")

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Core of the reward loop: legacy config migration, the RewardLoopWorker (computes per-sample scores, possibly by
+# querying a reward model router over HTTP), and RewardLoopManager (creates workers across nodes and computes
+# batched reward model scores).
+# Side effects on import: module logger with level from VERL_LOGGING_LEVEL (default WARN).
+
 import asyncio
 import logging
 import os
@@ -37,6 +43,14 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def migrate_legacy_reward_impl(config):
+    # [FUNCTION DOC]
+    # Behavior: copies legacy settings into the new "reward" section, mutating config in place: num_workers; reward
+    # manager name, and source/module path/class name when a legacy source is set; custom_reward_function if any value is
+    # set; reward model enable/enable_resource_pool/n_gpus_per_node/nnodes when set, model path, reward_kwargs (struct
+    # mode relaxed), and every non-none legacy rollout key; sandbox_fusion if any value is set. Finally deletes the
+    # legacy reward_model, custom_reward_function and sandbox_fusion sections.
+    # Inputs: config - OmegaConf config containing both legacy and new sections. Outputs: the same config.
+    # Exceptions: attribute/key errors if expected sections are missing (e.g. when already migrated).
     """
     Migrate the legacy reward model implementation to the new one.
     """
@@ -91,6 +105,9 @@ def migrate_legacy_reward_impl(config):
 
 
 class RewardLoopWorker:
+    # [CLASS DOC]
+    # Worker (wrapped as a Ray actor by the manager) holding input tokenizer, optional reward model tokenizer, the
+    # configured reward manager, and the router address for reward model HTTP requests.
     """
     RewardLoopWork can tackle reward computation:
     (1) rule-based reward computation
@@ -107,6 +124,8 @@ class RewardLoopWorker:
     """
 
     def __init__(self, config: DictConfig, reward_router_address: str = None):
+        # [FUNCTION DOC]
+        # Behavior: stores config and router address, initializes tokenizers and the reward manager, and obtains an event loop.
         """
         Args:
             config: DictConfig, the config for reward loop worker.
@@ -118,6 +137,10 @@ class RewardLoopWorker:
         self.loop = get_event_loop()
 
     def _init_reward_fn(self):
+        # [FUNCTION DOC]
+        # HELPER: Loads the input tokenizer from tokenizer_path (fallback model path) via local copy; if a reward model is
+        # enabled loads its tokenizer from the RM model path; builds the reward manager with tokenizers and router address.
+        # Side effects: file copies/downloads.
         input_tokenizer_path = self.config.actor_rollout_ref.model.tokenizer_path
         if input_tokenizer_path is None:
             input_tokenizer_path = self.config.actor_rollout_ref.model.path
@@ -136,6 +159,9 @@ class RewardLoopWorker:
         )
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
+        # [FUNCTION DOC]
+        # Behavior: creates one concurrent task per single-item slice of data running compute_score, and gathers results in
+        # order. Inputs: data - DataProto. Outputs: list of result mappings.
         tasks = []
         for i in range(len(data)):
             tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
@@ -143,6 +169,10 @@ class RewardLoopWorker:
         return outputs
 
     async def compute_score(self, data: DataProto) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: if a custom reward function path is set, delegates to the reward manager; else if a reward model is
+        # enabled, computes a discriminative RM score on the last item; otherwise delegates to the reward manager (rule-based).
+        # Inputs: single-item DataProto. Outputs: mapping with "reward_score" and optional "reward_extra_info".
         if self.config.reward.custom_reward_function.path is not None:
             # directly use user-customized reward function
             return await self.reward_manager.run_single(data)
@@ -155,6 +185,13 @@ class RewardLoopWorker:
                 return await self.reward_manager.run_single(data)
 
     async def _post_request(self, payload: dict, endpoint: str, max_retries: int = 16):
+        # [FUNCTION DOC]
+        # HELPER: POSTs JSON to http://<router>/<endpoint> with no total timeout, returning the parsed JSON response.
+        # Retries up to max_retries times with exponential backoff (2^attempt seconds, capped at 30) on 5xx, timeouts,
+        # connection errors and any other exception; 4xx errors are logged and re-raised immediately. After exhausting
+        # retries logs and re-raises the last exception.
+        # Inputs: payload; endpoint path; max_retries (default 16). Outputs: decoded JSON.
+        # KNOWN ISSUE: the comment says a timeout is safer than none, yet the timeout is set to none.
         url = f"http://{self.reward_router_address}/{endpoint}"
         last_exception = None
         for attempt in range(max_retries):
@@ -195,6 +232,12 @@ class RewardLoopWorker:
             raise last_exception
 
     async def _preprocess_reward_inputs(self, data: DataProto) -> str:
+        # [FUNCTION DOC]
+        # HELPER: For a single-item batch (asserted), takes the raw prompt chat messages, decodes the valid response tokens
+        # (response length determined by the trailing attention-mask sum) with the input tokenizer, strips EOS text, appends
+        # it as an assistant message, renders the chat with the RM tokenizer's template (no generation prompt, untokenized),
+        # and strips a leading BOS token string if present. Outputs: the RM prompt string.
+        # Exceptions: AssertionError if not exactly one item or no raw_prompt.
         assert len(data) == 1, "RewardLoopWorker only support single data item"
         data_item = data[0]
         assert "raw_prompt" in data_item.non_tensor_batch
@@ -229,6 +272,11 @@ class RewardLoopWorker:
         return rm_prompt
 
     async def compute_score_disrm(self, data: DataProto) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: builds an RM prompt and queries the router according to rollout engine: vllm uses "classify" and takes
+        # the last probability of the last result; sglang uses "v1/embeddings" and takes the last embedding value; trtllm
+        # raises ValueError (the code after it is unreachable); other engines raise NotImplementedError.
+        # Outputs: mapping with "reward_score". Side effects: HTTP requests.
         disrm_prompt = await self._preprocess_reward_inputs(data)
         engine_name = self.config.reward.reward_model.rollout.name
         model_name = self.config.reward.reward_model.model_path
@@ -271,12 +319,21 @@ class RewardLoopWorker:
 
 
 class RewardLoopManager:
+    # [CLASS DOC]
+    # Driver-side manager: optionally launches the reward model servers, creates reward loop Ray workers, and computes
+    # rm_scores for full batches.
     """
     RewardLoopManager run in single controller.
     This class will create reward loop workers and manage them.
     """
 
     def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
+        # [FUNCTION DOC]
+        # Behavior: if a reward model is enabled: when full_determinism is set, no custom reward function is set, and
+        # max_num_seqs is not 1, forces max_num_seqs to 1 with a warning; creates the RewardModelManager and takes its router
+        # address. Otherwise no RM manager/address. Wraps RewardLoopWorker as a Ray remote class, resolves the reward manager
+        # class, and creates workers.
+        # Inputs: config; optional rm_resource_pool. Side effects: config mutation, starts servers and actors.
         self.config = config
         if self.config.reward.reward_model.enable:
             rm_rollout = self.config.reward.reward_model.rollout
@@ -311,6 +368,9 @@ class RewardLoopManager:
 
     @property
     def reward_loop_worker_handles(self) -> list[ActorHandle]:
+        # [FUNCTION DOC]
+        # Behavior: returns the worker list when there is no reward model or the RM has its own resource pool (so rewards can
+        # stream with rollout), else none.
         """Return worker handles for agent loop worker to compute reward score.
 
         Only return worker handles when reward computation can be parallelized with rollout:
@@ -322,6 +382,10 @@ class RewardLoopManager:
         return None
 
     def _init_reward_loop_workers(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates reward.num_workers named actors ("reward_loop_worker_<i>"), assigned round-robin with soft node
+        # affinity across alive nodes that have CPUs, each given config and router address.
+        # Exceptions: division by zero if no eligible nodes.
         self.reward_loop_workers = []
         num_workers = self.config.reward.num_workers
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
@@ -341,6 +405,12 @@ class RewardLoopManager:
             )
 
     def compute_rm_score(self, data: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # Behavior: wakes the RM servers if present; pads data to a multiple of the worker count, splits into one chunk per
+        # worker, blocking-gathers each worker's batched scores, flattens and truncates padding; assembles rm_scores via the
+        # reward manager class; builds non-tensor arrays for every extra-info key found in the first result; sleeps RM servers.
+        # Inputs: data - DataProto. Outputs: DataProto with "rm_scores" tensor, extra info arrays, and reward_extra_keys meta.
+        # Exceptions: key errors if later results lack keys present in the first.
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
 
@@ -376,7 +446,12 @@ class RewardLoopManager:
         )
 
     def _run_all(self, tasks: list[asyncio.Task]):
+        # [FUNCTION DOC]
+        # HELPER: Runs the given awaitables to completion in a fresh event loop and returns their gathered results.
+        # Inputs: tasks - list of awaitables. Outputs: list of results.
         async def run_all():
+            # [FUNCTION DOC]
+            # HELPER: Coroutine awaiting all tasks with gather and returning the results.
             return await asyncio.gather(*tasks)
 
         return asyncio.run(run_all())

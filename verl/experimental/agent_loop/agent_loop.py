@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module agent_loop: core of the agent-loop rollout framework (see module docstring). Defines output schemas,
+# the AgentLoopBase abstract class with Continuous Token tokenization helpers, the name-to-hydra-target registry,
+# AgentLoopWorker (a Ray actor that runs many agent loop coroutines concurrently, then pads and batches their
+# outputs into a DataProto with optional reward and teacher-logprob computation), and AgentLoopManager (creates
+# workers and splits batches across them). DEFAULT_ROUTING_CACHE_SIZE bounds sticky request routing caches.
+# Side effects: module logger keyed by file path, level from VERL_LOGGING_LEVEL.
 """
 Agent framework for multi-turn rollout and agentic reinforcement learning.
 - AgentLoopBase: coroutine based abstract base class for agent loop.
@@ -77,6 +85,8 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
 class AgentLoopMetrics(BaseModel):
+    # [CLASS DOC]
+    # Pydantic model of per-trajectory timing metrics (seconds) and preemption count (-1 means unavailable).
     """Agent loop performance metrics."""
 
     generate_sequences: float = 0.0
@@ -86,6 +96,9 @@ class AgentLoopMetrics(BaseModel):
 
 
 class AgentLoopOutput(BaseModel):
+    # [CLASS DOC]
+    # Pydantic model returned by every agent loop: unpadded prompt/response token ids, response mask, optional
+    # logprobs, routed experts, multimodal data, reward, turn count, metrics, extra fields and multimodal processor data.
     """Agent loop output."""
 
     prompt_ids: list[int]
@@ -115,6 +128,12 @@ class AgentLoopOutput(BaseModel):
     (OPD) path so an SGLang teacher receives the video instead of raw frames. None otherwise."""
 
     def as_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: dumps set fields to a dict, converts prompt/response/mask lists to int64 tensors (renamed prompts,
+        # responses, response_mask), logprobs to float32 rollout_log_probs, routed experts to an int16 tensor zero-padded or
+        # truncated to the total sequence length; places reward_score at the last response position of a zero float tensor
+        # (rm_scores); ensures extra_fields exists (copying the instance's if unset) and moves teacher_ids/teacher_logprobs
+        # out of it to top-level keys. Outputs: dict. Side effects: none on the model (works on dumped copies).
         """Convert agent loop output to a dictionary."""
         output = self.model_dump(exclude_unset=True)
 
@@ -162,6 +181,9 @@ class AgentLoopOutput(BaseModel):
 
 
 class _InternalAgentLoopOutput(AgentLoopOutput):
+    # [CLASS DOC]
+    # Internal variant of the output with padded tensors (prompt, response, input, position, masks, logprobs, teacher
+    # data, routed experts, multimodal inputs) used to build the final batch.
     """Internal agent loop output with padded sequences."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -193,21 +215,32 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
 
 
 class DictConfigWrap:
+    # [CLASS DOC]
+    # Thin holder for a DictConfig so hydra.utils.instantiate does not recursively resolve it.
     """Wrapper for DictConfig to avoid hydra.utils.instantiate recursive resolve."""
 
     def __init__(self, config: DictConfig):
+        # [FUNCTION DOC]
+        # Behavior: stores the config.
         self.config = config
 
 
 class ToolListWrap:
+    # [CLASS DOC]
+    # Thin holder for a tool list so hydra.utils.instantiate leaves the tool objects intact.
     """Wraps a tool list so ``hydra.utils.instantiate`` doesn't recursively
     resolve its elements (which would demote them to ``DictConfig``)."""
 
     def __init__(self, tools: list):
+        # [FUNCTION DOC]
+        # Behavior: stores the tool list.
         self.tools = tools
 
 
 class AgentLoopBase(ABC):
+    # [CLASS DOC]
+    # Abstract base class for agent loops. Subclasses implement run(). Provides multimodal extraction and Continuous
+    # Token helpers that build and extend a single growing token sequence via a model-family-specific builder.
     """An agent loop takes an input message, chat with OpenAI compatible LLM server and interact with various
     environments.
 
@@ -232,6 +265,12 @@ class AgentLoopBase(ABC):
         hf_model_type: str | None = None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores config pieces (full config, rollout sub-config, data config), server manager, tokenizer, processor
+        # and dataset class; reads apply_chat_template_kwargs and mm_processor_kwargs from data config; creates the Continuous
+        # Token builder for the HF model type; captures the event loop.
+        # Inputs: trainer_config, data_config - DictConfigWrap; server_manager; tokenizer; processor (may be None);
+        # dataset_cls; hf_model_type; extra kwargs ignored.
         self.config = trainer_config.config
         self.rollout_config = self.config.actor_rollout_ref.rollout
         self.server_manager = server_manager
@@ -255,6 +294,9 @@ class AgentLoopBase(ABC):
         self.loop = get_event_loop()
 
     def _assert_mm_supported(self, has_multi_modal: bool) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: no-op when no multimodal data; otherwise raises unless the builder supports multimodal and a
+        # processor is set. Exceptions: ValueError with diagnostic text.
         """Fail loudly when multimodal inputs are present but unsupported.
 
         Multimodal rollout requires both a Continuous Token builder that supports
@@ -274,6 +316,9 @@ class AgentLoopBase(ABC):
             )
 
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: copies configured mm processor kwargs; when audio is given and no sampling_rate is set, adds the
+        # processor feature extractor's sampling rate (as int) if available. Outputs: new dict.
         mm_processor_kwargs = dict(self.mm_processor_kwargs or {})
         if audio_data is not None and "sampling_rate" not in mm_processor_kwargs:
             sampling_rate = getattr(getattr(self.processor, "feature_extractor", None), "sampling_rate", None)
@@ -282,10 +327,16 @@ class AgentLoopBase(ABC):
         return mm_processor_kwargs
 
     async def process_vision_info(self, messages: list[dict]) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: backward-compatible alias delegating to process_multi_modal_info.
         """Backward-compatible wrapper for multi-modal extraction."""
         return await self.process_multi_modal_info(messages)
 
     async def process_multi_modal_info(self, messages: list[dict]) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: when a processor exists, determines image patch size (default 14) and calls the dataset class's
+        # process_multi_modal_info (images, videos, audios) or the older process_vision_info (images, videos; no audio);
+        # collects non-None results under "images"/"videos"/"audios". Outputs: dict (empty without processor).
         """Extract images, videos and audios from messages.
 
         Args:
@@ -324,6 +375,10 @@ class AgentLoopBase(ABC):
         audios: list[Any] = None,
         mm_inputs_out: dict[str, Any] = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Behavior: in the executor, builds initial prompt tokens via the builder with tools and media, optionally filling
+        # mm_inputs_out with processor outputs. Multimodal prompts longer than rollout.prompt_length raise; text prompts are
+        # left-truncated to fit. Outputs: list of token ids. Exceptions: ValueError for oversize multimodal prompts.
         """Build the initial prompt token ids with Continuous Token.
 
         Multimodal inputs are forwarded to the builder so that VL builders can
@@ -363,6 +418,10 @@ class AgentLoopBase(ABC):
 
     @staticmethod
     def build_sglang_video_payload(videos, mm_inputs: dict[str, Any]) -> Optional[list[dict[str, Any]]]:
+        # [FUNCTION DOC]
+        # Behavior: returns None when there are no videos or no pixel_values_videos in mm_inputs; otherwise a single-element
+        # list with a dict tagged format "processor_output" carrying pixel_values_videos, video_grid_thw and, if present,
+        # second_per_grid_ts. Exceptions: KeyError if video_grid_thw is missing.
         """Wrap already-computed video features for SGLang's ``video_data``.
 
         SGLang cannot ingest raw frames — its ``video_data`` accepts a path / URL / base64 string or
@@ -395,6 +454,10 @@ class AgentLoopBase(ABC):
         response_logprobs: Optional[list[float]] = None,
         tools: list[dict] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: in the executor, merges newly appended context messages (e.g. tool responses) into the runtime token
+        # sequence using the builder, then aligns response mask/logprobs to the merged result.
+        # Outputs: tuple (merge result with token_ids, aligned mask, aligned logprobs or None).
         """Merge appended context messages into runtime tokens and metadata."""
         merge_result = await self.loop.run_in_executor(
             None,
@@ -418,6 +481,9 @@ class AgentLoopBase(ABC):
         response_logprobs: Optional[list[float]] = None,
         assistant_logprobs: Optional[list[float]] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: in the executor, appends assistant-generated tokens to the runtime sequence via the builder, then aligns
+        # response mask/logprobs (including assistant logprobs). Outputs: (merge result, mask, logprobs).
         """Merge assistant-generated tokens and align response metadata."""
         merge_result = await self.loop.run_in_executor(
             None,
@@ -435,6 +501,9 @@ class AgentLoopBase(ABC):
         return merge_result, aligned_response_mask, aligned_response_logprobs
 
     def _cap_text_prompt_length(self, prompt_ids: list[int]) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: if prompt ids exceed rollout.prompt_length, warns and keeps only the last prompt_length tokens.
+        # Outputs: list of token ids.
         prompt_length = self.rollout_config.prompt_length
         if len(prompt_ids) > prompt_length:
             logger.warning(
@@ -447,6 +516,9 @@ class AgentLoopBase(ABC):
 
     @abstractmethod
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        # [FUNCTION DOC]
+        # Behavior: abstract coroutine that runs one trajectory. Inputs: sampling params and dataset row fields.
+        # Outputs: AgentLoopOutput. Exceptions: NotImplementedError.
         """Run agent loop to interact with LLM server and environment.
 
         Args:
@@ -468,9 +540,14 @@ _agent_loop_registry: dict[str, dict] = {}
 
 
 def register(agent_name: str):
+    # [FUNCTION DOC]
+    # Behavior: returns a class decorator that records the class's fully qualified name as a hydra "_target_" config
+    # under agent_name in the module registry (overwriting duplicates). Side effects: mutates the registry.
     """Register agent loop class."""
 
     def decorator(subclass: type[AgentLoopBase]) -> type[AgentLoopBase]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: registers subclass and returns it unchanged.
         fqdn = f"{subclass.__module__}.{subclass.__qualname__}"
         _agent_loop_registry[agent_name] = {"_target_": fqdn}
         return subclass
@@ -479,6 +556,9 @@ def register(agent_name: str):
 
 
 class AgentLoopWorker:
+    # [CLASS DOC]
+    # Ray actor body (wrapped via ray.remote by the manager) that runs agent loop coroutines for a chunk of the batch,
+    # post-processes each into padded tensors (with optional streaming reward and teacher logprobs) and stacks them.
     """Agent loop worker takes a batch of messages and run each message in an agent loop.
 
     Args:
@@ -495,6 +575,15 @@ class AgentLoopWorker:
         teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores clients; converts rollout/model configs to dataclasses; resolves dataset class, tokenizer,
+        # processor, HF model_type (string only) and mm processor kwargs; if distillation is enabled creates the teacher
+        # server manager and reads teacher_key; loads all tools (config-path and function-tool path, resolved); loads extra
+        # agent loop registrations from agent_loop_config_path into the module registry; applies a custom chat template to
+        # tokenizer/processor if configured; hands the tokenizer to the LLM client when token2text tracing is on; and
+        # initializes the global rollout trace configuration.
+        # Inputs: config - full DictConfig; llm_client; teacher_client - mapping of teacher clients; reward_loop_worker_handles.
+        # Side effects: mutates the global agent loop registry and trace config; may mutate tokenizer chat templates.
         self.config = config
         self.llm_client = llm_client
         self.teacher_client = teacher_client
@@ -556,6 +645,8 @@ class AgentLoopWorker:
         )
 
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Same behavior as AgentLoopBase._get_mm_processor_kwargs using this worker's configured kwargs.
         """Return multimodal processor kwargs with audio sampling-rate defaults."""
         mm_processor_kwargs = dict(self.mm_processor_kwargs or {})
         if audio_data is not None and "sampling_rate" not in mm_processor_kwargs:
@@ -565,6 +656,15 @@ class AgentLoopWorker:
         return mm_processor_kwargs
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # Behavior: builds base sampling params (temperature, top_p, top_k, repetition penalty 1, logprobs flag) with validation
+        # overrides from val_kwargs; defaults every sample's agent_name to config.agent.default_agent_loop if missing; uses the
+        # "index" column (else positional indices); chooses which samples to trace (random subset of unique indices when
+        # max_samples_per_step_per_worker is set, including all rollouts of selected samples); builds trajectory info; launches
+        # one task per sample with that row's non-tensor fields as kwargs (excluding the internal "__do_sample__" override,
+        # which forces greedy params for that sample outside validation); gathers results and stacks them via _postprocess.
+        # Inputs: batch with meta_info (validate, global_steps). Outputs: DataProto (see docstring).
+        # Side effects: mutates batch.non_tensor_batch by adding agent_name; network calls.
         """Generate sequences from agent loop.
 
         Args:
@@ -596,6 +696,8 @@ class AgentLoopWorker:
         )
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Behavior: sets top_p 1.0, top_k -1, temperature 0 on the given dict in place.
             params["top_p"] = 1.0
             params["top_k"] = -1
             params["temperature"] = 0
@@ -667,6 +769,12 @@ class AgentLoopWorker:
         trace: bool = True,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: within a rollout trace context (step, sample index, rollout number, validate), looks up the agent
+        # loop config for agent_name, instantiates it via hydra with worker resources (wrapped configs, client, tokenizer,
+        # processor, model type, dataset class, tools), runs it and post-processes the result.
+        # Inputs: sampling_params; trajectory dict; agent_name (keyword); trace flag; remaining row fields as kwargs.
+        # Outputs: _InternalAgentLoopOutput. Exceptions: AssertionError for an unregistered agent name.
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -702,6 +810,10 @@ class AgentLoopWorker:
         padding_side: str,
         return_attention_mask: bool,
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: empty input -> a 1 x max_length tensor filled with pad id (0 if none) and optional zero attention
+        # mask; otherwise sets tokenizer padding side and pads to max_length via tokenizer.pad returning tensors, adding a batch
+        # dimension if 1-D. Outputs: dict with input_ids and optionally attention_mask. Side effects: sets tokenizer.padding_side.
         """Right/left pad a flat list of token ids to a ``(1, max_length)`` tensor."""
         # tokenizer.pad() with empty input returns dict with list values
         # instead of tensors, which breaks downstream .dim() calls.
@@ -726,6 +838,18 @@ class AgentLoopWorker:
         return padded
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: stores raw_prompt into extra_fields; left-pads prompt ids and right-pads response ids and mask to the
+        # configured lengths; pads logprobs with zeros; response mask is multiplied by the response attention mask; concatenates
+        # attention masks and input ids. Routed experts (numpy, copied if read-only, or tensor; int16) are placed into a zero
+        # tensor of the full padded length starting at the first real prompt position. Computes multimodal inputs and position
+        # ids, computes reward score (streaming) and teacher logprobs, pads teacher outputs to the padded widths, and returns the
+        # internal output.
+        # Inputs: output - AgentLoopOutput; validate flag; kwargs - row fields (must include raw_prompt).
+        # Outputs: _InternalAgentLoopOutput. Exceptions: KeyError without raw_prompt; TypeError for unsupported routed expert
+        # type; ValueError for invalid position range.
+        # KNOWN ISSUE: end_pos is clipped to the total length but the whole experts tensor is still assigned, so an experts
+        # array longer than the remaining padded length would raise a shape mismatch instead of being truncated.
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
@@ -866,6 +990,11 @@ class AgentLoopWorker:
         )
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: without a processor returns empty dict. Otherwise collapses consecutive repeated image/video
+        # placeholder ids in input_ids to one, decodes to text (skipping special tokens), runs the processor on text plus media
+        # with mm processor kwargs, drops input_ids/attention_mask, converts to tensors, and adds images_seqlens (per-image
+        # h*w repeated t times) when image_grid_thw exists. Outputs: dict of tensors.
         """Compute multi-modal inputs with image, video and audio."""
         multi_modal_inputs = {}
         if self.processor is None:
@@ -924,6 +1053,13 @@ class AgentLoopWorker:
         multi_modal_inputs,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: without a processor or get_rope_index, returns 1-D positions from the attention mask. Otherwise
+        # builds kwargs with image/video grid sizes, optional mm_token_type_ids (1 for image, 2 for video tokens) if the inputs
+        # carried them (and removes it from multimodal inputs), merges processor-specific rope kwargs, calls get_rope_index,
+        # and concatenates a text position row (positions over valid tokens, 1 elsewhere) with the 3 vision rows giving shape
+        # (1, 4, seq_len). Inputs: input_ids, attention_mask (1 x L), multimodal inputs dict, mm kwargs (unused here).
+        # Outputs: position id tensor. Side effects: pops mm_token_type_ids from multi_modal_inputs.
         """Compute position ids for multi-modal inputs."""
         # text-only OR non-M-RoPE multimodal (e.g. Gemma4) -> standard 1D positions
         if self.processor is None or not hasattr(self.processor, "get_rope_index"):
@@ -965,6 +1101,12 @@ class AgentLoopWorker:
         return position_ids
 
     async def _compute_score(self, outputs: list[AgentLoopOutput], kwargs: dict) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: only if the final output has no reward and reward workers exist: for each output builds unpadded
+        # prompt/response/input tensors, all-ones attention, multimodal inputs and position ids; pads them into a TensorDict;
+        # builds non-tensor fields (row kwargs repeated, num turns, extra fields, lengths); sends to a randomly chosen reward
+        # worker; stores reward_score and reward_extra_info on the final output and the elapsed time in its metrics.
+        # Inputs: outputs list; kwargs row fields. Outputs: none. Side effects: remote call; mutates the final output.
         """Compute reward score for all outputs in a trajectory; assigns result to outputs[-1]."""
         enable_async_reward = self.reward_loop_worker_handles is not None
 
@@ -1036,6 +1178,10 @@ class AgentLoopWorker:
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: when distillation is enabled and not validating, extracts an optional routing key from the row
+        # (by teacher_key, unwrapping numpy scalars), requests teacher ids/logprobs for prompt+response from the teacher manager
+        # and stores them in output.extra_fields. Side effects: remote call; mutates output.
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
             routing_key = None
@@ -1060,6 +1206,15 @@ class AgentLoopWorker:
         input_non_tensor_batch: dict | None = None,
         validate: bool = False,
     ) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: concatenates per-sample tensors into a TensorDict (prompts, responses, response_mask, input_ids,
+        # attention_mask, position_ids, plus rollout_log_probs, routed_experts, teacher data when the first sample has them).
+        # If every sample has a reward, writes it at the last valid response position into rm_scores. Non-tensor batch gets
+        # __num_turns__, the input non-tensor batch (only when no streaming reward workers), reward_extra_info keys (taken from
+        # the first sample), multi_modal_inputs if any, and object arrays for the union of extra field keys plus default keys.
+        # meta_info carries per-sample metrics, and reward_extra_keys only when rm_scores exists.
+        # Inputs: padded outputs; input non-tensor batch; validate (unused). Outputs: DataProto.
+        # Exceptions: KeyError if later samples lack a reward extra key present in the first.
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
@@ -1149,6 +1304,9 @@ class AgentLoopWorker:
 
 
 async def get_trajectory_info(step, index, validate):
+    # [FUNCTION DOC]
+    # Behavior: assigns each sample a rollout number: consecutive equal indices increment it, otherwise it resets to 0.
+    # Inputs: step, index list, validate. Outputs: list of dicts with step, sample_index, rollout_n, validate.
     """Get trajectory info.
 
     Args:
@@ -1171,6 +1329,8 @@ async def get_trajectory_info(step, index, validate):
 
 
 class AgentLoopManager:
+    # [CLASS DOC]
+    # Driver-side manager that creates AgentLoopWorker Ray actors and splits batches across them.
     """Agent loop manager that manages a group of agent loop workers.
 
     Args:
@@ -1187,6 +1347,9 @@ class AgentLoopManager:
         teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores config pieces, clients and reward handles; sets agent_loop_workers_class to a Ray remote
+        # AgentLoopWorker unless a subclass already defined it.
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
         self.model_config = config.actor_rollout_ref.model
@@ -1200,12 +1363,18 @@ class AgentLoopManager:
     @classmethod
     @auto_await
     async def create(cls, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: (auto-awaited when called synchronously) constructs the instance and creates its workers. Outputs: instance.
         """Create agent loop manager."""
         instance = cls(*args, **kwargs)
         await instance._init_agent_loop_workers()
         return instance
 
     async def _init_agent_loop_workers(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: creates rollout.agent.num_workers actors, uniquely named, round-robin with soft node affinity over
+        # alive nodes having CPUs, each given config, LLM client, teacher client and reward handles.
+        # Exceptions: ZeroDivisionError if no eligible nodes. Side effects: spawns Ray actors.
         self.agent_loop_workers = []
         num_workers = self.rollout_config.agent.num_workers
 
@@ -1230,6 +1399,12 @@ class AgentLoopManager:
     @auto_await
     @SkipManager.annotate(role="rollout")
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # Behavior: (auto-awaited, skippable by SkipManager) adds a global "priority" column (0..N-1) if absent, chunks the batch
+        # evenly across workers, runs them concurrently, concatenates outputs, pops each worker's per-sample metrics to compute
+        # timing stats, and sets meta_info to timing merged with the first output's meta_info.
+        # Inputs: prompts DataProto. Outputs: DataProto. Exceptions: chunking errors if size not divisible by worker count.
+        # Side effects: mutates prompts.non_tensor_batch.
         """Split input batch and dispatch to agent loop workers.
 
         Args:
@@ -1261,6 +1436,11 @@ class AgentLoopManager:
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: flattens per-sample metrics and computes min/max/mean of num_preempted, generate_sequences,
+        # tool_calls and compute_score; identifies the slowest sample (largest sum of the three times) and reports its times,
+        # preemptions and, if available, its prompt and response lengths from the attention mask.
+        # Outputs: dict of metric name to value.
         timing = {}
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
         t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])

@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# GPU/Ray integration test of the reward loop in colocate mode: the generative reward model (GenRM via
+# reward_fn.compute_score_gsm8k) shares the global GPU pool with the hybrid actor/rollout worker group.
+# Requires 8 GPUs, local Qwen2.5 0.5B/1.5B models, and ~/data/gsm8k/train.parquet; run from repo root.
+
 import os
 
 import ray
@@ -33,6 +38,17 @@ from verl.workers.rollout.llm_server import LLMServerManager
 
 
 def test_agent_reward_loop_standalone():
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, composes ppo_trainer config, configures an async rollout (TP=2, 1024/4096 lengths,
+    # tokenizer init skipped) on 8 GPUs and a colocated GenRM (enable_resource_pool False, TP=2, dapo reward manager,
+    # custom gsm8k scorer). Creates a global resource pool and RayWorkerGroup of ActorRolloutRefWorker, inits models,
+    # creates the LLM server manager and AgentLoopManager, a CheckpointEngineManager, sleeps replicas, then builds
+    # a RewardLoopManager on the same pool. Loads one 64-sample batch from GSM8K via RLHFDataset and
+    # StatefulDataLoader, wakes replicas by pushing weights, generates sequences, sleeps replicas again, unions
+    # generations into the batch, computes RM scores, prints the first five outputs' non-tensor data and "done".
+    # Side effects: Ray cluster lifecycle, GPU usage, prints.
+    # KNOWN ISSUE: function is named test_agent_reward_loop_standalone although it tests colocate mode (copy-paste
+    # name shared with the standalone test file).
     ray.init(
         runtime_env={
             "env_vars": {
@@ -141,6 +157,12 @@ def test_agent_reward_loop_standalone():
     batch = DataProto.from_single_dict(batch_dict)
 
     def _get_gen_batch(batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Pops every non-tensor key except reward-related ones (data_source, reward_model, extra_info, uid)
+        # and no tensor keys out of the batch into a generation batch, then copies the remaining reward non-tensor
+        # fields into it too so the agent loop can score.
+        # Inputs: batch - DataProto (mutated: popped keys removed).
+        # Outputs: the generation DataProto.
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation

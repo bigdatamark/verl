@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module nixl_checkpoint_engine: checkpoint engine using NVIDIA NIXL one-sided reads arranged as a chain
+# (trainer rank 0 -> rollout 1 -> ... -> rollout N). Each hop advertises its filled buffer's transfer descriptors
+# plus bucket metadata to the next hop over a ZeroMQ PUSH/PULL channel; the next hop reads the buffer remotely
+# and NIXL notifies the producer with a per-operation key when the read completes. Double-buffered at every hop.
+# cupy is imported with package-metadata discovery patched out. Side effects: module logger level from env.
 import asyncio
 import logging
 import os
@@ -46,6 +53,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @dataclass
 class NixlAgentMetadata:
+    # [CLASS DOC]
+    # Dataclass exchanged between agents: agent name, serialized NIXL agent metadata bytes, and the agent's ZMQ PULL endpoint.
     agent_name: str
     agent_metadata: bytes
     zmq_ip: str
@@ -53,11 +62,18 @@ class NixlAgentMetadata:
 
 
 class NixlAgent:
+    # [CLASS DOC]
+    # Wraps a nixl_agent (named by a random UUID) and adds a ZMQ PULL server for receiving messages, PUSH clients per
+    # remote agent, a per-sender message queue and a per-remote notification queue. Unknown attributes are forwarded
+    # to the underlying nixl agent.
     """This is a wrapper class for nixl_agent, the main purpose is to use ZeroMQ instead of
     `nixl_agent.send_notif` to send bucket tensor metadata.
     """
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Behavior: creates the NIXL agent with a UUID name, initializes queues, starts the asyncio ZMQ PULL server.
+        # Side effects: binds a socket on a free port.
         self.agent_name = str(uuid.uuid4())
         self.agent = nixl_api.nixl_agent(self.agent_name)
         self.notifications: dict[str, deque[bytes]] = defaultdict(deque)
@@ -67,11 +83,16 @@ class NixlAgent:
         self.messages: dict[str, deque[bytes]] = defaultdict(deque)
 
     def __getattr__(self, name):
+        # [FUNCTION DOC]
+        # Behavior: attribute fallback that fetches the named attribute from the wrapped agent; callables are returned
+        # wrapped in a pass-through function, others as-is. Exceptions: AttributeError if the agent lacks it.
         attr = getattr(self.agent, name)
 
         if callable(attr):
 
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Behavior: forwards all arguments to the captured attribute and returns its result.
                 return attr(*args, **kwargs)
 
             return wrapper
@@ -79,6 +100,8 @@ class NixlAgent:
             return attr
 
     def get_agent_metadata(self) -> NixlAgentMetadata:
+        # [FUNCTION DOC]
+        # Behavior: builds NixlAgentMetadata from this agent's name, NIXL metadata, IP and listen port.
         return NixlAgentMetadata(
             agent_name=self.agent_name,
             agent_metadata=self.agent.get_agent_metadata(),
@@ -87,6 +110,9 @@ class NixlAgent:
         )
 
     def start_zmq_server(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: resolves node IP, picks a free port, binds an asyncio ZMQ PULL socket (IPv6-aware).
+        # Side effects: sets ip, listen_port, socket.
         self.ip = ray.util.get_node_ip_address().strip("[]")
         self.listen_port, _ = get_free_port(self.ip)
 
@@ -101,6 +127,9 @@ class NixlAgent:
         self.socket.bind(address)
 
     def add_remote_agent(self, metadata: NixlAgentMetadata) -> str:
+        # [FUNCTION DOC]
+        # Behavior: registers the remote agent with NIXL, checks the returned name matches, opens a blocking ZMQ PUSH
+        # socket to its endpoint and stores it. Outputs: remote agent name. Exceptions: AssertionError on name mismatch.
         agent_name = self.agent.add_remote_agent(metadata.agent_metadata).decode("utf-8")
         assert agent_name == metadata.agent_name, f"Agent name {agent_name} not equal to {metadata.agent_name}"
 
@@ -117,21 +146,34 @@ class NixlAgent:
         return agent_name
 
     def remove_remote_agent(self, agent_name: str):
+        # [FUNCTION DOC]
+        # Behavior: removes the remote agent from NIXL and closes and forgets its PUSH socket. Exceptions: KeyError if unknown.
         self.agent.remove_remote_agent(agent_name)
         socket = self.zmq_clients.pop(agent_name)
         socket.close()
 
     def send_message(self, agent_name, message: dict):
+        # [FUNCTION DOC]
+        # Behavior: sends a pickled tuple (own agent name, message) to the named agent without blocking.
+        # Exceptions: KeyError for unknown agent; zmq.Again if it cannot be queued immediately.
         socket = self.zmq_clients[agent_name]
         socket.send_pyobj((self.agent_name, message), zmq.DONTWAIT)
 
     async def read_message(self, agent_name: str) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: until a message from agent_name is queued, receives pickled (sender, message) tuples from the PULL
+        # socket and queues them by sender; then pops the oldest for agent_name. Outputs: message dict.
         while len(self.messages[agent_name]) == 0:
             recv_agent_name, message = await self.socket.recv_pyobj()
             self.messages[recv_agent_name].append(message)
         return self.messages[agent_name].popleft()
 
     async def get_notification(self, remote_name: str) -> bytes:
+        # [FUNCTION DOC]
+        # Behavior: polls NIXL for new notifications (yielding to the event loop between polls), appending them per remote
+        # agent, until one is queued for remote_name, then pops the oldest. Outputs: notification bytes.
+        # KNOWN ISSUE: the inner loop variable reuses the name remote_name, overwriting the argument; the wait condition and
+        # the returned queue then refer to whichever agent last sent a notification, not the requested one.
         while len(self.notifications[remote_name]) == 0:
             notifs = self.agent.get_new_notifs()
             for remote_name, notif in notifs.items():
@@ -141,6 +183,11 @@ class NixlAgent:
 
 
 class ReadableOperation:
+    # [CLASS DOC]
+    # Producer side of one bucket hand-off: on construction sends the remote agent a message containing a fresh UUID
+    # notify key, this side's transfer descriptors and the given metadata; waiting completes when the remote's read
+    # notification arrives.
+    # KNOWN ISSUE: the docstring lists a bucket_size argument that the constructor does not take.
     """Encapsulates a readable operation to remote agent.
        1. send metadata to remote agent
        2. wait until remote agent read complete.
@@ -160,6 +207,10 @@ class ReadableOperation:
         local_descs: nixl_bindings.nixlXferDList,
         metadata: dict,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores arguments, generates the notify key and sends the message. Inputs: agent, remote_agent name,
+        # local_descs - descriptors of the buffer to be read, metadata - extra fields merged into the message.
+        # Side effects: ZMQ send.
         self.agent = agent
         self.remote_agent = remote_agent
         self.local_descs = local_descs
@@ -168,6 +219,9 @@ class ReadableOperation:
         self.agent.send_message(self.remote_agent, message)
 
     async def wait_for_complete(self):
+        # [FUNCTION DOC]
+        # Behavior: awaits the next notification from the remote agent and checks it equals this operation's key.
+        # Exceptions: AssertionError on key mismatch. Side effects: debug log.
         """Block until remote agent read complete."""
         notification = await self.agent.get_notification(self.remote_agent)
         assert self.notify_key == notification, f"Notify key {self.notify_key} not equal to {notification}"
@@ -175,6 +229,9 @@ class ReadableOperation:
 
 
 class ReadOperation:
+    # [CLASS DOC]
+    # Consumer side of one bucket hand-off: reads the producer's message, issues a NIXL READ into local descriptors
+    # with the notify key, and polls until done.
     """Encapsulates a read operation from remote agent.
     1. read medata from remote agent
     2. start read transfer operation
@@ -188,6 +245,8 @@ class ReadOperation:
     """
 
     def __init__(self, agent: NixlAgent, remote_agent: str, local_descs: nixl_bindings.nixlXferDList, bucket_size: int):
+        # [FUNCTION DOC]
+        # Behavior: stores agent, remote name, local descriptors and bucket_size (for bandwidth logging); other state None.
         self.agent = agent
         self.remote_agent = remote_agent
         self.local_descs = local_descs
@@ -198,6 +257,9 @@ class ReadOperation:
         self.start_time = None
 
     async def read_metadata(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: awaits the next message from the remote agent, extracts and stores remote_descs and notify_key, and
+        # returns the remaining metadata (bucket_meta, is_last).
         """Block until the remote agent sends the metadata.
 
         Returns:
@@ -209,6 +271,9 @@ class ReadOperation:
         return metadata
 
     def begin_read(self):
+        # [FUNCTION DOC]
+        # Behavior: creates a READ transfer from remote descriptors into local descriptors carrying the notify key, starts
+        # it and records the start time. Exceptions: AssertionError if metadata not read yet or the transfer state is "ERR".
         """Start the read operation."""
         assert self.remote_descs is not None and self.notify_key is not None
         self.xfer_handle = self.agent.initialize_xfer(
@@ -219,6 +284,10 @@ class ReadOperation:
         self.start_time = time.time()
 
     async def wait_for_complete(self):
+        # [FUNCTION DOC]
+        # Behavior: polls the transfer state, yielding to the loop, until "DONE"; on "ERR" logs and terminates the process
+        # with exit(-1). Then releases the handle and logs bandwidth based on the full bucket size.
+        # Side effects: may terminate the process.
         """Block until the read operation complete."""
         while True:
             state = self.agent.check_xfer_state(self.xfer_handle)
@@ -237,6 +306,9 @@ class ReadOperation:
 
 @CheckpointEngineRegistry.register("nixl")
 class NIXLCheckpointEngine(CheckpointEngine):
+    # [CLASS DOC]
+    # CheckpointEngine over NIXL in a chain. Holds a NixlAgent, two registered uint8 buffers (send/recv) with their
+    # registration and transfer descriptors, and the names of the previous and next agents.
     """NIXL checkpoint engine with p2p communication, support various backends: ucx, uccl, mooncacke, etc.
 
     For UCX backend, some environment variables need to be set: UCX_TLS, UCX_IB_GID_INDEX, UCX_IB_DEVICES, etc.
@@ -256,6 +328,9 @@ class NIXLCheckpointEngine(CheckpointEngine):
         rollout_dtype: torch.dtype = torch.bfloat16,
         is_master: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores bucket_size, device, rollout_dtype (unused here), is_master, and creates a NixlAgent.
+        # Side effects: binds a ZMQ socket.
         self.bucket_size = bucket_size
         self.device = device
         self.rollout_dtype = rollout_dtype
@@ -263,6 +338,10 @@ class NIXLCheckpointEngine(CheckpointEngine):
         self.is_master = is_master
 
     def prepare(self) -> NixlAgentMetadata:
+        # [FUNCTION DOC]
+        # Behavior: allocates two bucket_size uint8 buffers (cupy-backed CUDA tensors for "cuda", otherwise pinned
+        # tensors on the given device), registers them with NIXL and builds transfer descriptors.
+        # Outputs: this agent's NixlAgentMetadata.
         """Prepare send and recv bucket.
 
         Returns:
@@ -287,6 +366,11 @@ class NIXLCheckpointEngine(CheckpointEngine):
 
     @classmethod
     def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadata: list[dict]):
+        # [FUNCTION DOC]
+        # Behavior: chain topology assuming metadata lists trainer workers followed by rollout workers. Trainer rank 0's
+        # next agent is the first rollout worker; other trainer workers get rank -1 with no neighbors. Rollout i's previous
+        # is trainer 0 (for the first) or rollout i-1, next is rollout i+1 (None for the last). World size N+1.
+        # Outputs: (actor kwargs, rollout kwargs) with method, rank, world_size, prev/next metadata lists.
         actor_wg_kwargs = {
             "method": ["init_process_group"] * actor_wg_world_size,
             "rank": [0] + [-1] * (actor_wg_world_size - 1),
@@ -307,6 +391,10 @@ class NIXLCheckpointEngine(CheckpointEngine):
     def init_process_group(
         self, rank: int, world_size: int, prev_agent_metadata: NixlAgentMetadata, next_agent_metadata: NixlAgentMetadata
     ):
+        # [FUNCTION DOC]
+        # Behavior: validates neighbor presence per position (none for rank<0, only next for rank 0, both for middle,
+        # only prev for last), stores rank/world size, and adds the neighbor agents as remotes. Logs the setup.
+        # Exceptions: AssertionError on inconsistent neighbor metadata. Side effects: NIXL remote registration, ZMQ connects.
         """Setup the communication with the previous and next agent.
 
         Args:
@@ -347,6 +435,8 @@ class NIXLCheckpointEngine(CheckpointEngine):
         )
 
     def finalize(self):
+        # [FUNCTION DOC]
+        # Behavior: removes neighbor agents, deregisters both buffers and clears buffers, descriptors, rank and neighbors.
         """Cleanup communication with the previous and next agent, and deregister the memory."""
         if self.prev_agent:
             self.agent.remove_remote_agent(self.prev_agent)
@@ -373,6 +463,13 @@ class NIXLCheckpointEngine(CheckpointEngine):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: rank -1 drains the generator. Rank 0 packs chunks into the send buffer (non-blocking copy); on overflow
+        # synchronizes, waits for the previous bucket to be read by the next agent, advertises the filled buffer with
+        # metadata (is_last False) and swaps buffers/descriptors. Finally synchronizes, waits for the previous, advertises
+        # the last bucket with is_last True and waits for it to be read.
+        # Inputs: weights generator; global_steps unused.
+        # Exceptions: AssertionError for rank > 0, missing next agent, overflow, or duplicate chunk name.
         """Send the weights of the model.
 
         Args:
@@ -441,6 +538,8 @@ class NIXLCheckpointEngine(CheckpointEngine):
         self,
         global_steps: int | None = None,
     ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        # [FUNCTION DOC]
+        # Behavior: wraps _receive_weight_chunks with merge_weight_chunks and yields reassembled (name, tensor).
         """Receive the weights of the model.
 
         Yields:
@@ -450,6 +549,13 @@ class NIXLCheckpointEngine(CheckpointEngine):
             yield name, weight
 
     async def _receive_weight_chunks(self) -> AsyncGenerator[tuple[TensorMeta, torch.Tensor], None]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: reads the first bucket from the previous agent into the recv buffer and swaps. Then while not
+        # last: advertise the current buffer to the next agent (if any), read the next metadata and start reading into the
+        # other buffer, yield chunk views of the current buffer, wait for the next agent's read and our read, synchronize,
+        # swap. Finally advertise and yield the last bucket and wait for the next agent's read. Logs bandwidth counting
+        # full bucket_size per bucket. Outputs: async generator of (TensorMeta, buffer slice).
+        # Exceptions: AssertionError without a previous agent.
         """Receive the weight chunks of the model.
 
         Yields:

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Multi-GPU tests (spawned via torch.multiprocessing, file-based rendezvous) for LoRA merge helpers in
+# verl.utils.fsdp_utils: merged_lora_context (merge on enter, unmerge/restore on exit, with or without adapter
+# backup) and collect_merged_lora_params (returns HF-format merged base weights on CPU). Each is run under
+# both FSDP1 ("fsdp") and FSDP2 ("fsdp2") wrapping.
+
 import os
 
 import pytest
@@ -37,6 +43,18 @@ from verl.utils.fsdp_utils import (
 def _test_merged_lora_context_worker(
     rank, world_size, rendezvous_file, strategy, model_config, lora_config_dict, backup_adapters
 ):
+    # [FUNCTION DOC]
+    # HELPER: Per-rank worker for merged_lora_context tests.
+    # Behavior: sets the device to rank, initializes the NCCL process group from the rendezvous file, builds a 1-D
+    # "dp" device mesh, creates a bf16 eager-attention causal LM from model_config, applies peft LoRA from
+    # lora_config_dict, initializes every LoRA A weight uniformly in [0.5, 1.5] and B in [1.5, 2.5], then wraps with
+    # FSDP1 (full shard, bf16 params, LoRA wrap policy, use_orig_params) or FSDP2 (apply_fsdp2 with a bf16 mixed
+    # precision policy). Asserts LoRA layers exist and are initially unmerged, snapshots the peft adapter state
+    # dict, enters merged_lora_context three times asserting all layers report merged inside, then asserts all
+    # are unmerged and every adapter weight equals the snapshot (rtol 1e-5, atol 1e-6).
+    # Inputs: see docstring. Outputs: none.
+    # Exceptions: AssertionError on any failed check.
+    # Side effects: initializes/destroys the process group, uses GPU memory, prints a success line on rank 0.
     """Worker function for testing merged_lora_context with FSDP.
 
     Args:
@@ -160,6 +178,10 @@ def _test_merged_lora_context_worker(
 @pytest.mark.parametrize("strategy", ("fsdp", "fsdp2"))
 @pytest.mark.parametrize("backup_adapters", (True, False))
 def test_merged_lora_context_qwen2(world_size, strategy, backup_adapters, tmp_path):
+    # [FUNCTION DOC]
+    # Spawns world_size workers running the merged_lora_context check on a 2-layer, hidden-128 Qwen2 config with
+    # LoRA (r 8, alpha 16) on q_proj and v_proj. Parametrized over strategy and backup_adapters.
+    # Side effects: creates a rendezvous file path under tmp_path, spawns processes.
     """Test merged_lora_context with FSDP on Qwen2 model."""
     rendezvous_file = str(tmp_path / f"rdzv_file_qwen2_{backup_adapters}")
     os.makedirs(os.path.dirname(rendezvous_file), exist_ok=True)
@@ -189,6 +211,9 @@ def test_merged_lora_context_qwen2(world_size, strategy, backup_adapters, tmp_pa
 @pytest.mark.parametrize("strategy", ("fsdp", "fsdp2"))
 @pytest.mark.parametrize("backup_adapters", (True, False))
 def test_merged_lora_context_gptoss(world_size, strategy, backup_adapters, tmp_path):
+    # [FUNCTION DOC]
+    # Same as the Qwen2 variant but on a small GPT-OSS MoE config with LoRA on all linear modules plus the
+    # expert gate_up/down parameter targets, excluding the router.
     """Test merged_lora_context with FSDP on GPT-OSS model."""
     rendezvous_file = str(tmp_path / f"rdzv_file_gptoss_{backup_adapters}")
     os.makedirs(os.path.dirname(rendezvous_file), exist_ok=True)
@@ -223,6 +248,19 @@ def test_merged_lora_context_gptoss(world_size, strategy, backup_adapters, tmp_p
 
 
 def _test_collect_merged_lora_params_worker(rank, world_size, rendezvous_file, strategy, lora_targets):
+    # [FUNCTION DOC]
+    # HELPER: Per-rank worker for collect_merged_lora_params.
+    # Behavior: initializes the distributed environment as above, builds a small Qwen2 bf16 model, records base
+    # state-dict keys, applies LoRA on lora_targets with non-zero random A/B weights, wraps with FSDP1 or FSDP2,
+    # then snapshots adapter weights (unsharded via full_tensor when DTensor). Calls collect_merged_lora_params and
+    # asserts: all tensors are on CPU; no keys contain lora_, _flat_param, _fsdp_wrapped_module or .base_layer;
+    # the key set equals exactly the base model keys; LoRA layers are unmerged afterwards; adapter weights are
+    # unchanged; a second call is identical. Finally builds an unwrapped reference model with the same LoRA
+    # config, loads the full (summoned / unsharded, wrapper prefix stripped) FSDP state dict into it non-strictly,
+    # moves it to GPU, merge_and_unloads it, and compares each base key to the collected value in float32 with
+    # loose bf16 tolerance (rtol 1e-2, atol 0.5).
+    # Inputs: rank, world_size, rendezvous_file, strategy ("fsdp"/"fsdp2"), lora_targets (list or "all-linear").
+    # Exceptions: AssertionError on failures. Side effects: process group lifecycle, GPU use, rank-0 print.
     """Worker function for testing collect_merged_lora_params."""
     get_torch_device().set_device(rank)
     torch.distributed.init_process_group(
@@ -396,6 +434,9 @@ def _test_collect_merged_lora_params_worker(rank, world_size, rendezvous_file, s
 @pytest.mark.parametrize("strategy", ("fsdp", "fsdp2"))
 @pytest.mark.parametrize("lora_targets", (["q_proj", "v_proj"], "all-linear"))
 def test_collect_merged_lora_params(world_size, strategy, lora_targets, tmp_path):
+    # [FUNCTION DOC]
+    # Spawns world_size workers running the collect_merged_lora_params check, parametrized over strategy and
+    # LoRA targets (q/v projections or all-linear); the rendezvous file name encodes both.
     """Test collect_merged_lora_params extracts correct HF-format merged weights."""
     suffix = "alllinear" if lora_targets == "all-linear" else "qv"
     rendezvous_file = str(tmp_path / f"rdzv_file_merged_params_{strategy}_{suffix}")

@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CPU tests that FullyAsyncLLMServerClient's partial-rollout resume loop keeps the cumulative response within
+# response_length across abort/resume attempts, by explicitly passing each attempt the remaining budget instead of
+# relying on the server's prompt-length-based default. The base LLMServerClient.generate is replaced by a fake
+# server mirroring vLLMHttpServer's max_tokens arithmetic. Constants: prompt length 2048, response length 8192,
+# max model length 10241.
+
 """Cumulative response budget across partial rollout resumes.
 
 A resume re-sends ``prompt + everything generated so far`` as ``prompt_ids``. If the request
@@ -48,6 +56,9 @@ MAX_MODEL_LEN = 10241
 
 
 class FakeRolloutServer:
+    # [CLASS DOC]
+    # HELPER: fake rollout server whose model never emits EOS and is aborted every abort_every tokens; records each
+    # attempt's (prompt length, granted max_tokens).
     """Stand-in for the rollout server, reproducing its ``max_tokens`` resolution.
 
     The model never emits EOS, so a request only ends when it exhausts the budget it was granted;
@@ -55,10 +66,18 @@ class FakeRolloutServer:
     """
 
     def __init__(self, abort_every: int):
+        # [FUNCTION DOC]
+        # HELPER: stores abort_every and an empty grants list.
         self.abort_every = abort_every
         self.grants: list[tuple[int, int]] = []
 
     async def generate(self, request_id, *, prompt_ids, sampling_params, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: async; copies sampling params, takes max_tokens from max_tokens or max_new_tokens if present, else the
+        # server default min(response length, prompt length + response length - len(prompt_ids)); clamps to
+        # [1, max model length - len(prompt_ids)], records the grant, and returns min(grant, abort_every) dummy tokens with
+        # stop reason "length" if the grant was exhausted else "aborted".
+        # Exceptions: AssertionError if the prompt leaves no room in the model length.
         # Requests cross a Ray boundary, so the server only ever mutates its own copy.
         params = dict(sampling_params)
 
@@ -84,6 +103,9 @@ class FakeRolloutServer:
 
 @pytest.fixture
 def server(monkeypatch: pytest.MonkeyPatch) -> FakeRolloutServer:
+    # [FUNCTION DOC]
+    # HELPER: fixture creating a FakeRolloutServer (abort every 2000 tokens), patching the base client's generate with
+    # the fake's bound method and replacing asyncio.sleep in llm_server with a zero-delay sleep. Outputs: the fake.
     fake = FakeRolloutServer(abort_every=2000)
     # ``super().generate`` binds to the class, so the base class has to be patched. An already
     # bound method is not a descriptor, so it does not pick up the client as a second ``self``.
@@ -92,6 +114,8 @@ def server(monkeypatch: pytest.MonkeyPatch) -> FakeRolloutServer:
     real_sleep = asyncio.sleep
 
     async def no_wait(_delay, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: async replacement for asyncio.sleep that ignores the delay and yields once via the real sleep(0).
         return await real_sleep(0, *args, **kwargs)
 
     # The resume loop backs off 1s between attempts; collapse it to keep the test fast.
@@ -100,6 +124,9 @@ def server(monkeypatch: pytest.MonkeyPatch) -> FakeRolloutServer:
 
 
 def _config(*, include_async_training: bool = True) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: builds an OmegaConf config with rollout response_length and name vllm, optionally adding
+    # async_training.partial_rollout True. Outputs: config.
     config: dict[str, Any] = {"actor_rollout_ref": {"rollout": {"response_length": RESPONSE_LENGTH, "name": "vllm"}}}
     if include_async_training:
         config["async_training"] = {"partial_rollout": True}
@@ -107,6 +134,9 @@ def _config(*, include_async_training: bool = True) -> Any:
 
 
 async def _generate(config: Any, prompt_len: int, sampling_params: dict[str, Any]) -> TokenOutput:
+    # [FUNCTION DOC]
+    # HELPER: creates a FullyAsyncLLMServerClient without a load balancer and generates request "req-0" for a prompt of
+    # prompt_len sequential ids with the given sampling params. Outputs: TokenOutput.
     client = FullyAsyncLLMServerClient(config=config, load_balancer_handle=None)
     return await client.generate(
         request_id="req-0",
@@ -121,6 +151,10 @@ async def _generate(config: Any, prompt_len: int, sampling_params: dict[str, Any
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prompt_len", [92, 136, PROMPT_LENGTH])
 async def test_resumes_never_exceed_response_length(server, prompt_len):
+    # [FUNCTION DOC]
+    # Parametrized prompt lengths (short and full); asserts the total output equals exactly the response length, the
+    # first grant is the full response length, the per-attempt generated amounts sum to the budget, and the final stop
+    # reason is "length".
     output = await _generate(_config(), prompt_len, {"temperature": 1.0})
 
     assert len(output.token_ids) <= RESPONSE_LENGTH, (
@@ -137,6 +171,8 @@ async def test_resumes_never_exceed_response_length(server, prompt_len):
 
 @pytest.mark.asyncio
 async def test_cap_holds_without_async_training_key(server):
+    # [FUNCTION DOC]
+    # Asserts the cap holds when the config lacks the async_training key (resume loop always enabled).
     """v1 async trainers install this client with a config that has no ``async_training`` key, so
     ``should_retry`` stays True and the resume loop runs with no way to opt out."""
     output = await _generate(_config(include_async_training=False), 136, {"temperature": 1.0})
@@ -146,6 +182,8 @@ async def test_cap_holds_without_async_training_key(server):
 
 @pytest.mark.asyncio
 async def test_caller_sampling_params_not_mutated(server):
+    # [FUNCTION DOC]
+    # Asserts the caller's sampling params mapping is unchanged after generation.
     """The per-attempt budget is written back into ``sampling_params``; the caller reuses that dict
     across turns, so the rewrite must land on a copy."""
     sampling_params = {"temperature": 1.0, "top_p": 0.9}
@@ -158,6 +196,8 @@ async def test_caller_sampling_params_not_mutated(server):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit_key", ["max_tokens", "max_new_tokens"])
 async def test_explicit_caller_budget_wins(server, limit_key):
+    # [FUNCTION DOC]
+    # Parametrized over max_tokens / max_new_tokens = 500; asserts output length does not exceed 500.
     output = await _generate(_config(), 136, {"temperature": 1.0, limit_key: 500})
 
     assert len(output.token_ids) <= 500
@@ -165,6 +205,8 @@ async def test_explicit_caller_budget_wins(server, limit_key):
 
 @pytest.mark.asyncio
 async def test_config_without_rollout_section_is_tolerated(server):
+    # [FUNCTION DOC]
+    # Asserts a config object without a rollout section falls back to the server default and still generates tokens.
     """Lightweight callers and tests pass a config stub; the client must fall back to the server
     default rather than raising."""
     output = await _generate(SimpleNamespace(), 136, {"temperature": 1.0})

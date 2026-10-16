@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Minimal FastAPI/aiohttp reverse proxy that forwards any GET/POST path to the least-loaded reward model worker, with
+# retries and optional deterministic routing (VERL_FULL_DETERMINISM=1). Launched in a separate process.
+# Side effects on import: module logger with level from VERL_LOGGING_LEVEL.
+
 import asyncio
 import binascii
 import logging
@@ -33,6 +38,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 async def _read_async_response(resp: aiohttp.ClientResponse) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Returns an empty mapping for 204 or zero-length responses; otherwise tries to parse JSON regardless of content
+    # type; on failure returns a mapping with content_type and raw text, or empty if even text cannot be read.
+    # Inputs: aiohttp response. Outputs: mapping.
     if resp.status == 204 or (resp.content_length == 0):
         return {}
 
@@ -52,6 +61,10 @@ async def _read_async_response(resp: aiohttp.ClientResponse) -> dict[str, Any]:
 def launch_router_process(
     worker_urls: list[str],
 ):
+    # [FUNCTION DOC]
+    # Behavior: picks node IP (brackets stripped) and a free port, formats the address (bracketed for IPv6), starts a
+    # non-daemonic-safe daemon process running run_router, waits 3 s and asserts it is alive.
+    # Inputs: worker_urls. Outputs: (router address "host:port", process). Exceptions: AssertionError if it died.
     router_ip = ray.util.get_node_ip_address().strip("[]")
     router_port, _ = get_free_port(router_ip)
     router_address = (
@@ -76,11 +89,16 @@ def launch_router_process(
 
 
 def run_router(router_ip: str, router_port: int, worker_urls: list[str]):
+    # [FUNCTION DOC]
+    # Behavior: process entry point; builds a NaiveRouter for the workers and serves its app with uvicorn (blocks).
     router = NaiveRouter(worker_urls=worker_urls, verbose=False)
     uvicorn.run(router.app, host=router_ip, port=router_port, log_level="warning")
 
 
 class NaiveRouter:
+    # [CLASS DOC]
+    # Router state: FastAPI app with a catch-all route, worker URL list, per-worker in-flight counters, determinism flag,
+    # connection/retry settings, and an aiohttp session created at startup.
     def __init__(
         self,
         worker_urls: list[str],
@@ -90,6 +108,11 @@ class NaiveRouter:
         retry_delay: float = 2.0,
         verbose: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: stores settings, initializes per-worker counts to 0, reads VERL_FULL_DETERMINISM, creates the FastAPI app
+        # (created twice; the second replaces the first), registers startup/shutdown hooks and the catch-all GET/POST route.
+        # Inputs: worker_urls; max_connections (1024); timeout (unused); max_attempts (3); retry_delay (2 s); verbose.
+        # KNOWN ISSUE: the timeout argument is stored but never applied (client total timeout is none).
         """A minimal async load-balancing router."""
         self.verbose = verbose
         self.app = FastAPI()
@@ -115,6 +138,9 @@ class NaiveRouter:
         self.client = None
 
     async def _on_startup(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates the aiohttp session with a connector limited to max_connections (a quarter per host), DNS cache,
+        # and no total timeout.
         """Initialize aiohttp client safely inside the event loop"""
         connector = aiohttp.TCPConnector(
             limit=self.max_connections,
@@ -128,6 +154,8 @@ class NaiveRouter:
             logger.info(f"[router] aiohttp client initialized with max_connections={self.max_connections}")
 
     async def _on_shutdown(self):
+        # [FUNCTION DOC]
+        # HELPER: Closes the aiohttp session if open.
         """Gracefully close aiohttp client"""
         if self.client and not self.client.closed:
             await self.client.close()
@@ -135,6 +163,13 @@ class NaiveRouter:
                 logger.info("[router] aiohttp client closed")
 
     async def _make_async_request(self, request: Request, endpoint: str):
+        # [FUNCTION DOC]
+        # HELPER: Returns 503 JSON if there are no workers. Reads body and headers, selects a worker (seeding the tie-break with
+        # the body under determinism), and forwards the request with the same method, body and headers. Up to max_attempts:
+        # returns the parsed response on success; retries after exponential delay (retry_delay times 2^attempt) on timeouts and
+        # connection errors; re-raises HTTP status errors immediately; re-raises other errors on the last attempt. Raises
+        # RuntimeError after exhausting attempts. Always releases the worker's counter.
+        # Inputs: request; endpoint path. Outputs: mapping (serialized as JSON) or error response.
         """Proxy single request to a worker URL."""
         if not self.worker_urls:
             return JSONResponse(status_code=503, content={"error": "No available workers"})
@@ -181,6 +216,9 @@ class NaiveRouter:
             self._release_worker(worker_url)
 
     def _select_worker(self, request_id: bytes | None = None) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Chooses among workers with the minimum in-flight count: the single one, or by crc32 of request_id modulo
+        # candidate count when given, else the first; increments its count. Outputs: worker URL.
         """Select the least-loaded worker.
 
         Under ``full_determinism`` (signalled by a non-None ``request_id`` derived
@@ -201,5 +239,7 @@ class NaiveRouter:
         return url
 
     def _release_worker(self, url: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Decrements the worker's in-flight count, not below 0.
         """Mark worker as free after request completes."""
         self.request_counts[url] = max(0, self.request_counts[url] - 1)

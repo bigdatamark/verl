@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Group-wise tensor helpers for RL advantage computation: canonicalizing arbitrary group labels into contiguous integer ids, and computing per-group mean/std/count in pure PyTorch, with a default device policy (explicit arg, VERL_FORCE_DEVICE env, CPU under pytest, else the platform device).
+
 """
 Group-wise helpers for RL training utilities.
 
@@ -52,6 +55,8 @@ __all__ = ["as_torch_index", "group_mean_std"]
 
 
 def _resolve_device(explicit: Optional[torch.device | str]) -> torch.device:
+    # [FUNCTION DOC]
+    # HELPER: Returns torch.device from the explicit argument, else VERL_FORCE_DEVICE, else CPU if PYTEST_CURRENT_TEST is set, else the platform device name (may be cuda, npu, or cpu, not only cuda as the docstring suggests).
     """
     Resolve device according to policy described in the module docstring.
     Priority:
@@ -75,6 +80,8 @@ def _resolve_device(explicit: Optional[torch.device | str]) -> torch.device:
 
 
 def _to_1d_numpy_object_array(x: Any) -> np.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: Converts x to a numpy array (falling back to an object array of its items, then a single-element object array), flattened to 1-D.
     """Best-effort: convert arbitrary input into a 1-D numpy array; fallback to object dtype."""
     try:
         arr = np.asarray(x)
@@ -89,6 +96,11 @@ def _to_1d_numpy_object_array(x: Any) -> np.ndarray:
 
 
 def as_torch_index(index: Any, device: torch.device | str | None = None) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: tensors: integer/bool dtypes are cast directly to long (values not remapped to 0..G-1); float dtypes that are all within 1e-6 of integers are rounded to long; otherwise elements are stringified and factorized. Non-tensors: converted to 1-D numpy; integer arrays returned as int64; near-integer floats rounded; then attempts integer coercion (e.g. numeric strings, bools); otherwise factorized. Factorization assigns ids by sorted unique value (np.unique inverse), falling back to sorting string representations when values are not comparable.
+    # Inputs: index - labels; device - target device or None.
+    # Outputs: 1-D long tensor on the resolved device.
+    # Note: despite the docstring, integer inputs are passed through unchanged and are not guaranteed contiguous in 0..G-1.
     """
     Convert arbitrary group labels to a contiguous 1-D torch.long tensor (0..G-1).
 
@@ -167,6 +179,12 @@ def group_mean_std(
     eps: float = 1e-6,
     device: torch.device | str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: flattens scores (float32) and gidx (long) onto the target device; G = max id + 1. Uses index_add to compute counts, sums, mean (count clamped to >=1), and sum of squared deviations from the group mean; variance divided by max(count-1, 1), floored at eps, then square root. Groups with count <= 1 (including empty ids) get mean 0, std 1.
+    # Inputs: scores (N,); gidx (N,) group ids; eps - variance floor; device.
+    # Outputs: (mean, std, count) each (G,) float32; three empty tensors if N is 0.
+    # Exceptions: ValueError on length mismatch.
+    # Side effects: none (no_grad).
     """
     Compute per-group mean/std/count in pure PyTorch.
 

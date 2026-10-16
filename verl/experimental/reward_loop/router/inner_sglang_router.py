@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Launches an sglang_router process in front of reward model workers and waits for it to become healthy.
+# Requires the sglang_router package at import time. Currently not used by RewardModelManager.
+# Side effects on import: module logger with level from VERL_LOGGING_LEVEL.
+
 import logging
 import multiprocessing
 import os
@@ -33,6 +38,15 @@ def launch_router_process(
     max_wait_time: int = 300,
     timeout: int = 30,
 ) -> str:
+    # [FUNCTION DOC]
+    # Behavior: picks the current node IP (brackets stripped) and a free port, formats the address (bracketed for IPv6),
+    # starts a daemon process running the sglang router with those workers, zero balance threshold, warn logging and the
+    # request timeout; sleeps 3 s and asserts the process is alive; then polls /health every 2 s (each probe with the
+    # given timeout) until HTTP 200 or max_wait_time elapses, in which case it terminates the process and raises.
+    # Inputs: worker_urls; request_timeout (s); max_wait_time (s); timeout per probe (s).
+    # Outputs: (router address "host:port", process).
+    # Exceptions: AssertionError if the process died; RuntimeError on health check timeout.
+    # KNOWN ISSUE: annotated to return a string but returns a pair.
     router_ip = ray.util.get_node_ip_address().strip("[]")
     router_port, _ = get_free_port(router_ip)
     router_address = (

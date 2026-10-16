@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU Ray tests for the register decorator: synchronous DP_COMPUTE_PROTO, async def methods returning a
+# DataProtoFuture, and nd-compute dispatch over a registered mesh with TensorDict inputs containing jagged nested tensors.
+
 import asyncio
 import time
 
@@ -30,6 +34,8 @@ from verl.utils import tensordict_utils as tu
 # Pytest fixture for Ray setup/teardown
 @pytest.fixture
 def ray_init_shutdown():
+    # [FUNCTION DOC]
+    # HELPER: Pytest fixture that starts Ray with 100 CPUs before a test and shuts it down after.
     ray.init(num_cpus=100)
     yield
     ray.shutdown()
@@ -38,7 +44,11 @@ def ray_init_shutdown():
 # Define a simple worker for testing
 @ray.remote
 class DecoratorTestWorker(Worker):
+    # [CLASS DOC]
+    # HELPER: Ray worker holding an initial value, registering mesh "train" with dp_rank equal to its rank and collecting from every rank.
     def __init__(self, initial_value=0):
+        # [FUNCTION DOC]
+        # HELPER: Calls base init, stores initial_value (default 0), sleeps 0.1s, registers dispatch/collect info for mesh "train".
         super().__init__()
         self.value = initial_value
         # Simulate some setup if needed
@@ -49,6 +59,9 @@ class DecoratorTestWorker(Worker):
     # Test method for synchronous DP compute (default behavior)
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def dp_compute(self, data: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Sync DP_COMPUTE_PROTO; after a 0.1s sleep writes batch "output" = input + value + rank (rank as a tensor
+        # matching the input's device/dtype). Returns the mutated DataProto.
         time.sleep(0.1)  # Simulate work
         rank_value = torch.tensor(self.rank, device=data.batch["input"].device, dtype=data.batch["input"].dtype)
         data.batch["output"] = data.batch["input"] + self.value + rank_value
@@ -58,6 +71,8 @@ class DecoratorTestWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     async def async_dp_compute(self, data: DataProto) -> DataProto:
         # Simulate async work
+        # [FUNCTION DOC]
+        # HELPER: Async, non-blocking DP_COMPUTE_PROTO; awaits 0.1s then writes "output_async" = input*2 + value + rank.
         await asyncio.sleep(0.1)  # Simulate async work
         rank_value = torch.tensor(self.rank, device=data.batch["input"].device, dtype=data.batch["input"].dtype)
         data.batch["output_async"] = data.batch["input"] * 2 + self.value + rank_value
@@ -66,6 +81,11 @@ class DecoratorTestWorker(Worker):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     def dp_compute_td(self, data: TensorDict) -> TensorDict:
         # note that we have to call contiguous so that we can modify data in plac
+        # [FUNCTION DOC]
+        # HELPER: Non-blocking nd-compute over mesh "train" with a TensorDict. Makes the dict contiguous, writes
+        # "output" = input + value + rank, pops the jagged "position_ids", sets its ragged dim to 2, and asserts each row i
+        # equals an arange of length 4 + 2*rank + i broadcast to its shape (verifies correct nested-tensor splitting).
+        # Outputs: the TensorDict without position_ids. Exceptions: AssertionError on mismatch.
         data = tu.contiguous(data)
         rank_value = torch.tensor(self.rank, device=data["input"].device, dtype=data["input"].dtype)
         data["output"] = data["input"] + self.value + rank_value
@@ -80,6 +100,9 @@ class DecoratorTestWorker(Worker):
 
 # Test function for synchronous DP compute
 def test_decorator_dp_compute(ray_init_shutdown):
+    # [FUNCTION DOC]
+    # Behavior: 2 CPU workers with initial_value 10; dispatches a 4-element input and asserts the result is a DataProto
+    # whose "output" equals input + 10 + rank for each half.
     """
     Tests the default behavior of a synchronous decorated method with DP_COMPUTE_PROTO.
     Verifies the result correctness.
@@ -116,6 +139,9 @@ def test_decorator_dp_compute(ray_init_shutdown):
 
 # Test function for async def method with DP compute
 def test_decorator_async_function(ray_init_shutdown):
+    # [FUNCTION DOC]
+    # Behavior: 2 workers with initial_value 5; calls the async method, asserts it returns a DataProtoFuture, gets it and
+    # checks "output_async" equals input*2 + 5 + rank per half.
     """
     Tests the decorator with an `async def` method using DP_COMPUTE_PROTO.
     Verifies that the call returns a future and the result is correct after .get().
@@ -159,6 +185,9 @@ def test_decorator_async_function(ray_init_shutdown):
 
 
 def test_decorator_dp_compute_td(ray_init_shutdown):
+    # [FUNCTION DOC]
+    # Behavior: builds a TensorDict with a 4-element input and jagged position_ids rows of lengths 4..7 (each 4 x L),
+    # calls dp_compute_td, gets the future and checks output is a TensorDict whose "output" equals input + 10 + rank.
     num_workers = 2
     resource_pool = RayResourcePool([num_workers], use_gpu=False, max_colocate_count=1)  # Use CPU for simplicity
     cls_with_args = RayClassWithInitArgs(cls=DecoratorTestWorker, initial_value=10)

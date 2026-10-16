@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Digit-completion toy task package: exposes the task class, the ground-truth response generator and the
+# character-level tokenizer. On import registers CharTokenizer as the AutoTokenizer class for LlamaConfig
+# (overwriting any existing registration).
+# Side effects: global transformers AutoTokenizer registry mutation.
+
 from transformers import AutoTokenizer, LlamaConfig
 
 from .task import DigitCompletion, generate_ground_truth_response

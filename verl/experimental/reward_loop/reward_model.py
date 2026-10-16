@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Manager that launches reward model inference servers (as rollout replicas flagged as reward models) and an HTTP
+# router in front of them, with wake/sleep control.
+# Side effects on import: module logger with level from VERL_LOGGING_LEVEL (default WARN).
+
 import asyncio
 import logging
 import os
@@ -25,6 +30,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class RewardModelManager:
+    # [CLASS DOC]
+    # Owns reward model rollout replicas, their server handles/addresses, the RM tokenizer/processor, and the router
+    # address.
     """Reward model manager."""
 
     def __init__(
@@ -32,6 +40,11 @@ class RewardModelManager:
         config: RewardModelConfig,
         resource_pool: RayResourcePool = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores config and pool, launches servers and the router; asserts skip_tokenizer_init is false; sleeps the
+        # servers if free_cache_engine is set.
+        # Inputs: config - reward model config; optional resource_pool (colocated mode) or none (standalone).
+        # Exceptions: AssertionError on bad config or insufficient GPUs. Side effects: launches servers and router process.
         """
         Initialize the reward model manager.
 
@@ -49,6 +62,12 @@ class RewardModelManager:
             self.sleep()
 
     def _initialize_llm_servers(self):
+        # [FUNCTION DOC]
+        # HELPER: Replica world size is TP times DP times PP; total world size is the pool's world size, or n_gpus_per_node
+        # times nnodes in standalone mode; replica count is their integer ratio (asserted positive). Builds an HF model config
+        # for the RM path and its processor, creates that many replicas of the configured engine class, then initializes them
+        # colocated on equal splits of the pool (count asserted equal) or standalone, and records handles and addresses.
+        # Exceptions: AssertionError when not enough GPUs.
         rollout_config = self.config.rollout
         rollout_world_size = (
             rollout_config.tensor_model_parallel_size
@@ -95,6 +114,8 @@ class RewardModelManager:
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
 
     def _initialize_router(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds http worker URLs from server addresses and launches the naive router process; stores its address.
         worker_urls = [f"http://{server_address}" for server_address in self.server_addresses]
 
         # TODO (dyy): sglang router is not ready yet.
@@ -108,18 +129,29 @@ class RewardModelManager:
         self.router_address, _ = launch_router_process(worker_urls=worker_urls)
 
     def get_router_address(self):
+        # [FUNCTION DOC]
+        # Behavior: returns the router address string.
         return self.router_address
 
     def wake_up(self):
+        # [FUNCTION DOC]
+        # Behavior: wakes up all replicas (blocking until done).
         """Wake up all rollout replica instances."""
         self._run_all([replica.wake_up() for replica in self.rollout_replicas])
 
     def sleep(self):
+        # [FUNCTION DOC]
+        # Behavior: puts all replicas to sleep (blocking until done).
         """Sleep all rollout replica instances."""
         self._run_all([replica.sleep() for replica in self.rollout_replicas])
 
     def _run_all(self, tasks: list[asyncio.Task]):
+        # [FUNCTION DOC]
+        # HELPER: Runs all given awaitables concurrently in a fresh event loop and waits for completion; returns nothing.
+        # Exceptions: fails if called from within a running event loop.
         async def run_all():
+            # [FUNCTION DOC]
+            # HELPER: Coroutine awaiting all tasks with gather.
             await asyncio.gather(*tasks)
 
         asyncio.run(run_all())

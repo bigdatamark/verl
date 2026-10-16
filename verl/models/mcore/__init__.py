@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Megatron-Core (mcore) model support: re-exports registry functions to convert HF configs to mcore TransformerConfig,
+# initialize mcore models, get forward functions (plain, fused, engine) and weight converters.
+# Side effects on import: applies the Megatron 0.12 + torch 2.8/2.9 compatibility patch.
+
 from verl.models.mcore.patch import apply_patch_megatron_v012_with_torch_v28_v29
 
 from .registry import (

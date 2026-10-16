@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Device-agnostic padding/unpadding helpers for variable-length attention. Resolves implementations at call time: NPU
+# helpers on Ascend, flash_attn.bert_padding on CUDA, or pure-torch fallbacks when flash-attn is not installed.
+# Module globals cache the last resolved functions.
+
 from typing import Callable
 
 import torch
@@ -21,12 +26,18 @@ _index_first_axis, _pad_input, _rearrange, _unpad_input = None, None, None, None
 
 
 def _fallback_index_first_axis(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Selects rows of the tensor along the first axis by indices. Inputs: tensor (ndim >= 2), indices.
+    # Outputs: indexed tensor. Exceptions: AssertionError if ndim < 2.
     """Pure-torch equivalent of `flash_attn.bert_padding.index_first_axis`."""
     assert tensor.ndim >= 2
     return tensor[indices]
 
 
 def _fallback_pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch: int, seqlen: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Scatters unpadded rows back into a zero tensor of shape (batch * seqlen, ...) at indices, reshaped to
+    # (batch, seqlen, ...). Inputs: hidden_states (total_tokens, ...), indices, batch, seqlen. Outputs: padded tensor.
     """Pure-torch equivalent of `flash_attn.bert_padding.pad_input`."""
     other_shape = hidden_states.shape[1:]
     output = hidden_states.new_zeros(batch * seqlen, *other_shape)
@@ -35,6 +46,11 @@ def _fallback_pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batc
 
 
 def _fallback_unpad_input(hidden_states: torch.Tensor, attention_mask: torch.Tensor, unused_mask=None):
+    # [FUNCTION DOC]
+    # HELPER: Unpads a (batch, seqlen, ...) tensor. Effective mask is attention_mask plus optional unused_mask; computes
+    # per-row lengths (int32), indices of nonzero flattened mask positions, cumulative lengths with a leading 0.
+    # Outputs: (selected token rows, indices, cu_seqlens, max length in batch as Python int, per-row lengths from
+    # attention_mask only).
     """Pure-torch equivalent of `flash_attn.bert_padding.unpad_input`."""
     all_masks = (attention_mask + unused_mask) if unused_mask is not None else attention_mask
     seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
@@ -51,6 +67,8 @@ def _fallback_unpad_input(hidden_states: torch.Tensor, attention_mask: torch.Ten
 
 
 def _fallback_rearrange(*args, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Lazily imports einops and forwards all arguments to einops.rearrange. Exceptions: ImportError without einops.
     """`einops.rearrange`, imported lazily so the other fallbacks stay einops-free."""
     from einops import rearrange as einops_rearrange
 
@@ -58,6 +76,11 @@ def _fallback_rearrange(*args, **kwargs):
 
 
 def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
+    # [FUNCTION DOC]
+    # HELPER: Imports NPU implementations if an NPU is available (no device check), else flash_attn.bert_padding ones,
+    # falling back to the local pure-torch versions on ImportError; stores them in module globals.
+    # Outputs: (index_first_axis, pad_input, rearrange, unpad_input). Side effects: sets globals.
+    # KNOWN ISSUE: the globals are never consulted as a cache, so resolution (imports and device check) runs on every call.
     """Dynamically import attention functions based on available hardware."""
 
     from verl.utils.device import is_torch_npu_available
@@ -83,6 +106,8 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
 
 
 def index_first_axis(*args, **kwargs):
+    # [FUNCTION DOC]
+    # Behavior: dispatches to the resolved index_first_axis with all arguments. Outputs: its result.
     """
     Unified entry point for `index_first_axis` across CUDA and NPU backends.
 
@@ -100,6 +125,8 @@ def index_first_axis(*args, **kwargs):
 
 
 def pad_input(*args, **kwargs):
+    # [FUNCTION DOC]
+    # Behavior: dispatches to the resolved pad_input with all arguments. Outputs: its result.
     """
     Unified entry point for `pad_input` across CUDA and NPU backends.
 
@@ -117,6 +144,8 @@ def pad_input(*args, **kwargs):
 
 
 def rearrange(*args, **kwargs):
+    # [FUNCTION DOC]
+    # Behavior: dispatches to the resolved rearrange with all arguments. Outputs: its result.
     """
     Unified entry point for `rearrange` across CUDA and NPU backends.
 
@@ -133,6 +162,8 @@ def rearrange(*args, **kwargs):
 
 
 def unpad_input(*args, **kwargs):
+    # [FUNCTION DOC]
+    # Behavior: dispatches to the resolved unpad_input with all arguments. Outputs: its result.
     """
     Unified entry point for `unpad_input` across CUDA and NPU backends.
 

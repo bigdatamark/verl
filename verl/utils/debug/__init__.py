@@ -14,4 +14,7 @@
 
 # APIs kept for backward compatibility purpose
 # For new features please develop in verl/utils/profiler/
+# [PACKAGE DOC]
+# Deprecated debug package kept for backward compatibility; re-exports everything from verl.utils.profiler. New features belong in verl/utils/profiler.
+
 from ..profiler import *  # noqa: F401

@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Imports the real installed megatron.core OptimizerConfig (skipping if unavailable or lacking Muon fields)
+# to verify verl's init_megatron_optim_config forwards Muon fields correctly for "muon" and omits them for "adam".
 
 """Real-Megatron (non-stub) CPU check for the verl -> Megatron-Core Muon wiring.
 
@@ -33,6 +36,9 @@ import pytest
 
 
 def _real_megatron_optimizer_config():
+    # [FUNCTION DOC]
+    # HELPER: Imports megatron.core.optimizer.OptimizerConfig; skips the test if import fails or the dataclass has
+    # no "muon_momentum" field. Outputs: the OptimizerConfig class. Exceptions: pytest Skipped.
     """Return the installed Megatron OptimizerConfig, or skip if it has no Muon fields."""
     try:
         from megatron.core.optimizer import OptimizerConfig
@@ -45,6 +51,13 @@ def _real_megatron_optimizer_config():
 
 
 def test_verl_wiring_builds_real_megatron_muon_config():
+    # [FUNCTION DOC]
+    # Behavior: builds a verl McoreOptimizerConfig for "muon" (lr 0.01, wd 0.01, clip 1.0, momentum 0.9, 6 NS steps,
+    # duplicated TP mode, lion scalar optimizer, layer-wise distributed optimizer on), converts it, and asserts the
+    # result is a real OptimizerConfig with optimizer "muon"; for each of those Muon knobs that the installed
+    # OptimizerConfig declares, asserts the forwarded value matches; finally asserts the optimizer name is not
+    # adam/sgd (so Megatron would choose the emerging path) and that "muon" is in verl's _MUON_ALGORITHMS set.
+    # Inputs: none. Outputs: none. Side effects: none.
     OptimizerConfig = _real_megatron_optimizer_config()
     supported_fields = {f.name for f in dataclasses.fields(OptimizerConfig)}
 
@@ -84,6 +97,11 @@ def test_verl_wiring_builds_real_megatron_muon_config():
 
 
 def test_verl_adam_path_leaves_real_megatron_config_standard():
+    # [FUNCTION DOC]
+    # Behavior: converts an "adam" McoreOptimizerConfig that sets muon_momentum 0.42 and asserts the result is a real
+    # OptimizerConfig with optimizer "adam", that muon_momentum (if declared) equals Megatron's default (i.e. not
+    # forwarded), and that the optimizer is adam or sgd.
+    # Inputs: none. Outputs: none.
     OptimizerConfig = _real_megatron_optimizer_config()
     supported_fields = {f.name for f in dataclasses.fields(OptimizerConfig)}
 

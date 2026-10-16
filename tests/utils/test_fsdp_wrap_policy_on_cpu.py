@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests for get_fsdp_wrap_policy's tolerant resolution of _no_split_modules class names (see module
+# docstring): partial resolution succeeds with a warning, zero resolution raises, explicit config wins.
+
 """CPU-only tests for ``get_fsdp_wrap_policy``.
 
 These tests cover the lenient resolution of ``_no_split_modules``: HF
@@ -28,30 +32,45 @@ from verl.utils.fsdp_utils import get_fsdp_wrap_policy
 
 
 class _RealLayer(nn.Module):
+    # [CLASS DOC]
+    # HELPER: Real layer class (one 4x4 Linear) whose name is resolvable by the wrap policy.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates the Linear submodule.
         super().__init__()
         self.lin = nn.Linear(4, 4)
 
 
 class _PartiallyResolvableModel(nn.Module):
+    # [CLASS DOC]
+    # HELPER: Model whose _no_split_modules lists one resolvable and one nonexistent class name.
     """Mirrors the Qwen3.5 case: one valid layer name + one unknown name."""
 
     _no_split_modules = ["_RealLayer", "_NonExistentLayer"]
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Holds a single _RealLayer child.
         super().__init__()
         self.layer = _RealLayer()
 
 
 class _AllUnresolvableModel(nn.Module):
+    # [CLASS DOC]
+    # HELPER: Model whose _no_split_modules lists only nonexistent class names.
     _no_split_modules = ["_GhostLayerA", "_GhostLayerB"]
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Holds a single _RealLayer child.
         super().__init__()
         self.layer = _RealLayer()
 
 
 def test_wrap_policy_skips_missing_layer_class_names(caplog):
+    # [FUNCTION DOC]
+    # Captures WARNING logs from verl.utils.fsdp_utils, builds a policy for the partially resolvable model, and
+    # asserts the policy is not None and a warning mentioning _NonExistentLayer was logged.
     """A single missing name in ``_no_split_modules`` must not break wrapping."""
     import logging
 
@@ -67,12 +86,17 @@ def test_wrap_policy_skips_missing_layer_class_names(caplog):
 
 
 def test_wrap_policy_raises_when_no_layer_classes_resolve():
+    # [FUNCTION DOC]
+    # Asserts get_fsdp_wrap_policy raises an exception matching "Could not find any of the transformer layer
+    # classes" when no names resolve.
     """If no name resolves, raise -- otherwise FSDP would silently no-op."""
     with pytest.raises(Exception, match="Could not find any of the transformer layer classes"):
         get_fsdp_wrap_policy(_AllUnresolvableModel())
 
 
 def test_wrap_policy_explicit_config_overrides_no_split_modules():
+    # [FUNCTION DOC]
+    # Asserts a non-None policy is built when config sets transformer_layer_cls_to_wrap explicitly.
     """Explicit ``transformer_layer_cls_to_wrap`` config takes precedence."""
     model = _PartiallyResolvableModel()
     config = {"transformer_layer_cls_to_wrap": ["_RealLayer"]}

@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Script comparing SFT engine runs: loads the golden JSONL log at ~/verl/test/log/golden.jsonl and every .jsonl file in
+# ~/verl/test/log/verl_sft_test, and asserts the first record's train/loss and train/grad_norm of each run are close to
+# the golden ones. Prints progress; raises on mismatch.
+
 import json
 import os
 
@@ -19,6 +24,9 @@ import torch
 
 
 def get_result(file):
+    # [FUNCTION DOC]
+    # HELPER: Expands "~" in the path, reads the file and returns a list of parsed JSON objects, one per line.
+    # Exceptions: OSError, JSON decode errors (including on blank lines).
     file = os.path.expanduser(file)
     result = []
     with open(file) as f:
@@ -29,6 +37,9 @@ def get_result(file):
 
 
 def compare_results(golden_results, other_result):
+    # [FUNCTION DOC]
+    # HELPER: Compares the first record's data["train/loss"] (atol/rtol 1e-2) and data["train/grad_norm"] (atol 1e-4,
+    # rtol 3e-2) between golden and other results. Exceptions: AssertionError on mismatch; KeyError/IndexError on bad input.
     golden_loss = golden_results[0]["data"]["train/loss"]
     golden_grad_norm = golden_results[0]["data"]["train/grad_norm"]
 

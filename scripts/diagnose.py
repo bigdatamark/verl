@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Environment diagnostics CLI: prints Python, pip and key package versions, verl install info,
+# OS/hardware details, selected environment variables, CUDA versions, CPU/GPU memory, and
+# optionally tests network connectivity to PyPI (plus regional mirrors). Which sections run is
+# controlled by integer flags parsed in parse_args; output goes to stdout.
 """Diagnose script for checking OS/hardware/python/pip/verl/network.
 The output of this script can be a very good hint to issue/problem.
 """
@@ -48,6 +53,10 @@ REGIONAL_URLS = {
 
 
 def test_connection(name, url, timeout=10):
+    # [FUNCTION DOC]
+    # Times DNS resolution of the URL's host and then opening the URL, printing timings or an error
+    # message (and returning early) for whichever step fails. Inputs: name label; url; timeout seconds
+    # for the open. Outputs: None. Side effects: network I/O, prints.
     """Simple connection test"""
     urlinfo = urlparse(url)
     start = time.time()
@@ -68,6 +77,8 @@ def test_connection(name, url, timeout=10):
 
 
 def check_python():
+    # [FUNCTION DOC]
+    # Prints Python version, compiler, build and architecture info.
     print("----------Python Info----------")
     print("Version      :", platform.python_version())
     print("Compiler     :", platform.python_compiler())
@@ -76,6 +87,8 @@ def check_python():
 
 
 def check_pip():
+    # [FUNCTION DOC]
+    # Prints pip version and install directory, or a message if pip cannot be imported.
     print("------------Pip Info-----------")
     try:
         import pip
@@ -87,6 +100,10 @@ def check_pip():
 
 
 def _get_current_git_commit():
+    # [FUNCTION DOC]
+    # HELPER: Runs "git rev-parse HEAD" in the current working directory and returns the stripped
+    # hash; on command failure or missing git, prints a message and returns None.
+    # KNOWN ISSUE: uses the current working directory rather than the verl install directory.
     try:
         result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
         return result.stdout.strip()
@@ -99,6 +116,10 @@ def _get_current_git_commit():
 
 
 def check_verl():
+    # [FUNCTION DOC]
+    # Prepends the cwd to sys.path, imports verl and prints its version, directory and current git
+    # commit. ImportError prints "No verl installed"; other errors print a traceback (with an extra
+    # explanation unless it is an IOError). Side effects: mutates sys.path, prints.
     print("----------verl Info-----------")
     try:
         sys.path.insert(0, os.getcwd())
@@ -124,6 +145,8 @@ def check_verl():
 
 
 def check_os():
+    # [FUNCTION DOC]
+    # Prints platform string, system, node name, release and version.
     print("----------Platform Info----------")
     print("Platform     :", platform.platform())
     print("system       :", platform.system())
@@ -133,6 +156,9 @@ def check_os():
 
 
 def check_hardware():
+    # [FUNCTION DOC]
+    # Prints machine and processor, then platform-specific CPU details: on macOS filters "sysctl -a"
+    # lines with brand_string/features, on Linux runs lscpu, on Windows runs wmic. Side effects: subprocesses.
     print("----------Hardware Info----------")
     print("machine      :", platform.machine())
     print("processor    :", platform.processor())
@@ -149,6 +175,11 @@ def check_hardware():
 
 
 def check_network(args):
+    # [FUNCTION DOC]
+    # Optionally sets a global socket default timeout, merges URLs for each requested comma-separated
+    # region into the global URLS mapping (warning for unknown regions), then runs test_connection for
+    # each URL. Inputs: args with timeout and region. Side effects: mutates URLS, global socket timeout, network.
+    # KNOWN ISSUE: prints args.timeout but sets the socket default timeout to a hardcoded 10.
     print("----------Network Test----------")
     if args.timeout > 0:
         print("Setting timeout: {}".format(args.timeout))
@@ -168,6 +199,8 @@ def check_network(args):
 
 
 def check_environment():
+    # [FUNCTION DOC]
+    # Prints environment variables starting with VERL_, OMP_ or KMP_, plus CC and CXX.
     print("----------Environment----------")
     for k, v in os.environ.items():
         if k.startswith("VERL_") or k.startswith("OMP_") or k.startswith("KMP_") or k == "CC" or k == "CXX":
@@ -175,6 +208,8 @@ def check_environment():
 
 
 def check_pip_package_versions():
+    # [FUNCTION DOC]
+    # Prints installed versions of vllm, sglang, ray and torch (or "not found") via package metadata.
     packages = ["vllm", "sglang", "ray", "torch"]
     for package in packages:
         try:
@@ -185,6 +220,10 @@ def check_pip_package_versions():
 
 
 def check_cuda_versions():
+    # [FUNCTION DOC]
+    # If CUDA is available, prints torch's CUDA runtime version and the "release" line from
+    # nvcc --version; reports a missing nvcc or any other error as a message. Otherwise prints that
+    # CUDA is unavailable.
     if torch.cuda.is_available():
         try:
             cuda_runtime_version = torch.version.cuda
@@ -206,6 +245,8 @@ def check_cuda_versions():
 
 
 def _get_cpu_memory():
+    # [FUNCTION DOC]
+    # HELPER: Returns total system RAM in GiB (float) via psutil.
     """
     Get the total CPU memory capacity in GB.
     """
@@ -214,6 +255,10 @@ def _get_cpu_memory():
 
 
 def _get_gpu_info():
+    # [FUNCTION DOC]
+    # HELPER: Queries nvidia-smi for GPU name and total memory (MiB, CSV). Returns (count, list of
+    # {type, memory in GiB}). On nvidia-smi failure or absence prints a message and returns (0, []).
+    # KNOWN ISSUE: if nvidia-smi succeeds with empty output the count is 1 and parsing raises ValueError.
     """
     Get GPU type, GPU memory, and GPU count using nvidia-smi command.
     """
@@ -242,6 +287,8 @@ def _get_gpu_info():
 
 
 def _get_system_info():
+    # [FUNCTION DOC]
+    # HELPER: Combines CPU memory and GPU info into a dict with cpu_memory, gpu_count, gpu_info.
     """
     Get CPU memory capacity, GPU type, GPU memory, and GPU count.
     """
@@ -251,6 +298,8 @@ def _get_system_info():
 
 
 def check_system_info():
+    # [FUNCTION DOC]
+    # Prints CPU memory, GPU count and each GPU's type and memory from _get_system_info.
     print("----------System Info----------")
     system_info = _get_system_info()
     print(f"CPU Memory\t: {system_info['cpu_memory']:.2f} GB")
@@ -261,6 +310,10 @@ def check_system_info():
 
 
 def parse_args():
+    # [FUNCTION DOC]
+    # Builds the argument parser: integer toggles --python, --pip, --verl, --system, --os,
+    # --environment (default 1), --network and --hardware (default 0), --region (comma-separated,
+    # default empty) and --timeout (default 10). Outputs: parsed namespace.
     """Parse arguments."""
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

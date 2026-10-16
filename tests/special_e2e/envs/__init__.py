@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Toy RL environments for e2e tests; re-exports DigitCompletion from the digit_completion subpackage.
+
 from .digit_completion import DigitCompletion
 
 __all__ = ["DigitCompletion"]

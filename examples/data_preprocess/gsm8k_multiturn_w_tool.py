@@ -13,6 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script converting openai/gsm8k into the multi-turn tool-calling RL format: the prompt has
+# a system message telling the model to call calc_gsm8k_reward and format the answer as
+# "#### <answer>", then the user question. extra_info adds need_tools_kwargs and
+# tools_kwargs.calc_gsm8k_reward.create_kwargs.ground_truth. Default save dir ~/data/gsm8k.
+# KNOWN ISSUE: the save dir is not tilde-expanded or created before writing.
 """
 Preprocess the GSM8k dataset to parquet format
 """
@@ -27,6 +33,8 @@ from verl.utils.hdfs_io import copy, makedirs
 
 
 def extract_solution(solution_str):
+    # [FUNCTION DOC]
+    # HELPER: GSM8K "####" final-answer extractor (asserts marker exists, strips commas).
     solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
     assert solution is not None
     final_solution = solution.group(0)
@@ -60,7 +68,13 @@ if __name__ == "__main__":
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
+        # [FUNCTION DOC]
+        # Returns a process_fn closure bound to the split name.
         def process_fn(example, idx):
+            # [FUNCTION DOC]
+            # Pops question and answer, extracts the ground truth, and returns the RL record with
+            # system+user prompt, rule reward, and extra_info containing split, index, raw answer,
+            # question and the tool kwargs.
             question_raw = example.pop("question")
 
             question = question_raw + " " + instruction_following

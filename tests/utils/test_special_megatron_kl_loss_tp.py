@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Standalone torchrun script (requires WORLD_SIZE > 1, CUDA, Megatron-core)
+# checking that the Megatron vocab-parallel top-k forward-KL distillation loss
+# matches the FSDP full-vocab reference: per-token losses, overlap metrics
+# (overlap_token_advantage, overlap_count) and student-logit gradients, for both
+# "thd" (packed) and "bshd" (padded) data formats. Tensor-parallel size equals the
+# world size; the vocab is split evenly into per-rank shards. MAX_TEST_CASES env
+# var (default 4, parsed as int) selects how many shape cases run.
 
 
 import gc
@@ -30,7 +38,15 @@ MAX_TEST_CASES = int(os.environ.get("MAX_TEST_CASES", 4))
 
 
 class TestVocabParallelKLDivergence:
+    # [CLASS DOC]
+    # Driver class (plain class, not pytest-collected) holding distributed/TP state,
+    # per-case hyperparameters and the correctness check.
     def __init__(self):
+        # [FUNCTION DOC]
+        # Behavior: initializes the global process group and Megatron model parallel with
+        # TP size equal to world size; stores local rank, world size, CUDA device and the
+        # TP process group; prints rank info.
+        # Side effects: global distributed and Megatron parallel-state initialization.
         local_rank, rank, world_size = initialize_global_process_group()
         mpu.initialize_model_parallel(tensor_model_parallel_size=world_size)
 
@@ -41,18 +57,30 @@ class TestVocabParallelKLDivergence:
         print(f"[INFO]: Local rank: {self.local_rank}, World size: {self.world_size}")
 
     def initialize(self, test_case_idx: int):
+        # [FUNCTION DOC]
+        # HELPER: Records the current test case index.
         self.test_case_idx = test_case_idx
 
     def shutdown(self):
+        # [FUNCTION DOC]
+        # HELPER: Tears down the global process group.
         destroy_global_process_group()
 
     def cleanup(self):
+        # [FUNCTION DOC]
+        # HELPER: Empties CUDA cache, resets peak memory stats, collects garbage, syncs.
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         gc.collect()
         torch.cuda.synchronize()
 
     def generate_hyper(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets batch size, sequence length, vocab size, top-k and the student
+        # log-prob min clamp (None in case 3) for cases 0..3, then the per-rank shard size
+        # as vocab divided by world size.
+        # Exceptions: ValueError for an unknown case; AssertionError if vocab is not
+        # divisible by world size.
         if self.test_case_idx == 0:
             self.batch_size = 2
             self.seq_len = 4
@@ -84,6 +112,19 @@ class TestVocabParallelKLDivergence:
         self.shard_size = self.vocab_size // self.world_size
 
     def generate_forward_inputs(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds random full-vocab student logits [B, S, V] (scaled 0.7) and
+        # teacher top-k log-probs/ids from a random teacher log-softmax (scaled 0.9), then
+        # injects edge cases: the first top-k id is forced to global index shard_size
+        # (local index 0 on rank 1, colliding with the out-of-shard placeholder index) and
+        # that student logit set to 3.0; the last two top-k ids are forced to 1 and 2 (in
+        # rank 0's shard, out-of-shard for rank 1); the student logit at the second top-k
+        # id is set to -50 so it hits the clamp. Teacher log-probs are kept consistent
+        # with the forced ids.
+        # Outputs: (student_logits, teacher_topk_logps, teacher_topk_ids).
+        # KNOWN ISSUE: forcing ids can create duplicate ids within a token's top-k (and
+        # the top-k log-probs are no longer sorted); the edge-case comments assume
+        # exactly 2 ranks.
         B, S, V = self.batch_size, self.seq_len, self.vocab_size
         topk = self.topk
         shard_size = self.shard_size
@@ -118,9 +159,17 @@ class TestVocabParallelKLDivergence:
         return full_student_logits, teacher_topk_logps, teacher_topk_ids
 
     def to_nested(self, tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Converts a dense [B, ...] tensor into a jagged nested tensor with one
+        # component per batch row.
         return torch.nested.as_nested_tensor([tensor[i] for i in range(tensor.shape[0])], layout=torch.jagged)
 
     def pad_for_bshd_preprocess(self, tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Right-pads the sequence dim (dim 1) with zeros up to a multiple of the
+        # TP world size, mirroring the BSHD preprocessing with context parallel size 1.
+        # Inputs: tensor [B, S, ...]. Outputs: padded tensor or the input if aligned.
+        # Exceptions: AssertionError if context parallel size is not 1.
         """Mirror preprocess_bshd_engine's CP=1 sequence padding for student logits."""
         assert mpu.get_context_parallel_world_size() == 1, "This TP KL test does not initialize context parallelism"
         align_size = mpu.get_tensor_model_parallel_world_size()
@@ -139,6 +188,20 @@ class TestVocabParallelKLDivergence:
         return padded
 
     def verify_correctness(self, iterations: int = 5):
+        # [FUNCTION DOC]
+        # Behavior: builds a DistillationConfig with the case's clamp, computes this
+        # rank's vocab slice, and for each iteration: seeds on rank 0 (seed from case and
+        # iteration), generates inputs and broadcasts them from rank 0, converts teacher
+        # tensors to nested; runs the VP loss on the local slice of the THD-flattened
+        # student logits and backprops the summed loss; runs the reference on full logits
+        # and takes this rank's slice of its grad; asserts losses, overlap advantage
+        # (1e-4 tolerance), overlap count, and gradients match. Then repeats the VP loss
+        # on padded BSHD logits, backprops only the unpadded positions, and asserts the
+        # unpadded loss, metrics and grads (reshaped to THD) match the reference.
+        # Inputs: iterations - default 5. Side effects: collectives, prints PASS on rank 0.
+        # Exceptions: AssertionError on mismatch.
+        # KNOWN ISSUE: shard offset uses the local rank rather than the TP rank, which is
+        # only correct for single-node runs.
         self.cleanup()
         self.generate_hyper()
 

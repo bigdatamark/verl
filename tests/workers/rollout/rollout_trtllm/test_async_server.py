@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests for the TensorRT-LLM async server: CPU-level placement-group / bundle index selection of
+# TRTLLMReplica for different resource pools and GPU integration tests of TRTLLMHttpServer (generate and
+# sleep memory release) on a local Ray cluster with Qwen2.5-0.5B-Instruct.
+
 import os
 import subprocess
 import time
@@ -28,7 +33,12 @@ from verl.workers.rollout.trtllm_rollout.trtllm_async_server import TRTLLMHttpSe
 
 
 class TestTRTLLMReplica:
+    # [CLASS DOC]
+    # Tests of TRTLLMReplica.get_pgs_and_bundle_indices with Ray patched out and mocked placement groups.
     def test_placement_group_with_sub_ray_resource_pool(self):
+        # [FUNCTION DOC]
+        # SubRayResourcePool with start_bundle_index 4 and world size 4 for replica 1 on one 8-bundle PG; asserts a
+        # single PG with bundles 4..7.
         """
         Scenario: SubRayResourcePool, 1 node, 8 GPUs, TP=4, replica_rank=1
         SubRayResourcePool pre-assigns start_bundle_index=4 for replica 1.
@@ -67,6 +77,8 @@ class TestTRTLLMReplica:
             assert bundle_indices[0] == [4, 5, 6, 7]
 
     def test_placement_group_with_ray_resource_pool(self):
+        # [FUNCTION DOC]
+        # RayResourcePool on one 8-GPU node, TP 2, replica 1; asserts bundles 2 and 3 (world size times replica rank).
         """
         Scenario: RayResourcePool, 1 node, 8 GPUs, TP=2, replica_rank=1
         RayResourcePool calculates: local_bundle_index = world_size * replica_rank = 2 * 1 = 2
@@ -107,6 +119,8 @@ class TestTRTLLMReplica:
             assert bundle_indices[0] == [2, 3]
 
     def test_placement_group_multi_node_ray_resource_pool(self):
+        # [FUNCTION DOC]
+        # Two 8-GPU nodes, TP 16, replica 0; asserts both PGs are returned with all 8 bundles each.
         """
         Scenario: RayResourcePool, 2 nodes, 8 GPUs each, TP=16, replica_rank=0
         Single replica spans 2 placement groups (one per node).
@@ -151,6 +165,8 @@ class TestTRTLLMReplica:
             assert bundle_indices[1] == list(range(8))
 
     def test_placement_group_multi_node_multi_replica(self):
+        # [FUNCTION DOC]
+        # Two nodes, TP 8, replicas 0 and 1; asserts each replica gets its own node's PG with all 8 bundles.
         """
         Scenario: RayResourcePool, 2 nodes, 8 GPUs each, TP=8, 2 replicas.
         Each replica occupies one full node (one PG each).
@@ -194,8 +210,15 @@ class TestTRTLLMReplica:
 
 
 class TestTRTLLMHttpServer:
+    # [CLASS DOC]
+    # GPU integration tests for the TRTLLMHttpServer Ray actor.
     @staticmethod
     def _build_rollout_config(*, response_length: int | None = None, free_cache_engine: bool = False):
+        # [FUNCTION DOC]
+        # HELPER: composes ppo_trainer (config dir verl/verl/trainer/config or verl/trainer/config relative to CWD),
+        # sets 1 GPU / 1 node, Qwen2.5-0.5B-Instruct under TRTLLM_TEST_MODEL_PATH_ROOT (default ~/models), trtllm async
+        # rollout with TP 1, optionally overriding response_length and enabling free_cache_engine.
+        # Outputs: (rollout config, model config). Side effects: Hydra global init.
         from hydra import compose, initialize_config_dir
 
         config_dir = os.path.abspath("verl/verl/trainer/config")
@@ -221,6 +244,10 @@ class TestTRTLLMHttpServer:
 
     @staticmethod
     def _create_server(rollout_config, model_config, *, name: str):
+        # [FUNCTION DOC]
+        # HELPER: creates a one-GPU RayResourcePool, finds the node of bundle 0 of its first PG, and launches a named
+        # TRTLLMHttpServer actor pinned (hard affinity) to that node with RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1,
+        # in COLOCATED mode, non-reward, no workers, replica 0, bundle indices [[0]]. Outputs: actor handle.
         resource_pool = RayResourcePool(
             process_on_nodes=[1],
             use_gpu=True,
@@ -253,6 +280,10 @@ class TestTRTLLMHttpServer:
         )
 
     def test_async_generate(self):
+        # [FUNCTION DOC]
+        # Starts local Ray, launches the server with response_length 16, generates for a 5-token prompt with
+        # temperature 1, top_k 0 and logprobs 1, and asserts the output has a non-empty token_ids list and log_probs of
+        # equal length. Prints results. Side effects: Ray shutdown and "ray stop" in finally.
         """Test TRT-LLM generate method with real model."""
         try:
             os.environ.setdefault("TLLM_RAY_FORCE_LOCAL_CLUSTER", "1")
@@ -299,6 +330,10 @@ class TestTRTLLMHttpServer:
             subprocess.run(["ray", "stop"], capture_output=True)
 
     def test_async_memory_management(self):
+        # [FUNCTION DOC]
+        # Launches the server with free_cache_engine, measures used GPU memory on the server's device before and
+        # 2 s after sleep(), and asserts at least 60% of baseline used memory was freed.
+        # Side effects: GPU memory queries, prints, Ray shutdown and "ray stop".
         """Test TRT-LLM async memory management (sleep) reduces memory usage."""
         try:
             os.environ.setdefault("TLLM_RAY_FORCE_LOCAL_CLUSTER", "1")
@@ -317,6 +352,11 @@ class TestTRTLLMHttpServer:
             print(f"TRTLLM device UUIDs: {device_ids}")
 
             def _uuid_to_device_index(device_uuid: str) -> int | None:
+                # [FUNCTION DOC]
+                # HELPER: maps a device UUID string to a local torch CUDA index by comparing device property UUIDs (decoded
+                # if bytes; exact or substring match). Outputs: matching index, else 0.
+                # KNOWN ISSUE: returns 0 as soon as any device lacks a uuid property, and falls back to 0 when no match is
+                # found, so memory could be measured on the wrong GPU.
                 for idx in range(torch.cuda.device_count()):
                     props = torch.cuda.get_device_properties(idx)
                     uuid = getattr(props, "uuid", None)
@@ -333,6 +373,9 @@ class TestTRTLLMHttpServer:
                 return 0
 
             def get_gpu_memory_mb_for_device(device_uuid: str) -> float:
+                # [FUNCTION DOC]
+                # HELPER: temporarily switches the current CUDA device to the mapped index, reads free/total memory, restores
+                # the previous device and returns used memory in MiB.
                 device_index = _uuid_to_device_index(device_uuid)
                 prev_device = torch.cuda.current_device()
                 torch.cuda.set_device(device_index)

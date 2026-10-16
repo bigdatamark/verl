@@ -1,5 +1,10 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 
+# [MODULE DOC]
+# Debug script: composes the Hydra ppo_trainer config from verl/trainer/config,
+# prints it, then converts critic.profiler into its dataclass and prints that.
+# Exits with ImportError (instructing to install hydra-core) if hydra is missing.
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -19,6 +24,13 @@ except ImportError as e:
 
 @hydra.main(config_path="../verl/trainer/config", config_name="ppo_trainer", version_base=None)
 def main(config):
+    # [FUNCTION DOC]
+    # Behavior: Hydra entry point; prints the full composed config, then the
+    # critic profiler section converted via omega_conf_to_dataclass.
+    # Inputs: config - OmegaConf DictConfig injected by Hydra (CLI overrides apply).
+    # Outputs: none. Exceptions: conversion errors if the profiler section is invalid.
+    # Side effects: prints to stdout.
+    # KNOWN ISSUE: docstring names the argument "config_dict" but the parameter is "config"; also it only prints config rather than running PPO training as the docstring implies.
     """Main entry point for PPO training with Hydra configuration management.
 
     Args:

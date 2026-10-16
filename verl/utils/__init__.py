@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE]
+# Top-level verl utilities package. Re-exports config helpers (omega_conf_to_dataclass, validate_config),
+# tokenizer/processor helpers, and groupwise statistics helpers (as_torch_index, group_mean_std); __all__ combines
+# the tokenizer and config submodule exports with these names.
+
 from . import config, tokenizer
 from .config import omega_conf_to_dataclass, validate_config
 from .groupwise import as_torch_index, group_mean_std

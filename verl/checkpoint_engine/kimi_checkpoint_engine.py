@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module kimi_checkpoint_engine: checkpoint engine built on Moonshot's checkpoint_engine package
+# (ParameterServer). Trainer ranks offload their share of weights to CPU and register them as a named
+# checkpoint; rollout ranks pull them via RDMA/P2P into a device H2D buffer and broadcast bucket by bucket
+# inside a rollout-only process group. Provides a replacement receive_tensor coroutine that is bound onto the
+# ParameterServer instance. Side effects: module logger level from VERL_LOGGING_LEVEL.
 import asyncio
 import concurrent.futures
 import logging
@@ -41,6 +48,13 @@ def ckpt_get_named_tensor_buckets(
     rank_id: int,
     rollout_dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: generator that round-robin assigns tensors to ranks by enumeration index modulo world_size;
+    # every tensor is cast to rollout_dtype, and those owned by rank_id are packed into dict buckets whose total
+    # bytes do not exceed bucket_bytes (a single oversize tensor forms its own bucket). Yields each non-empty bucket.
+    # Inputs: iterable of (name, tensor); bucket_bytes; world_size; rank_id; rollout_dtype.
+    # Outputs: yields mappings name to tensor. Exceptions: ValueError if bucket_bytes <= 0 (raised on first iteration).
+    # KNOWN ISSUE: annotated as returning a dict but is a generator; also casts every tensor, including those not owned by this rank.
     if bucket_bytes <= 0:
         raise ValueError(f"bucket_bytes must be greater than 0, got {bucket_bytes}")
 
@@ -71,6 +85,21 @@ async def receive_tensor(
     bucket_size: int = 2 << 30,
     disable_h2d_buffer: bool = False,
 ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+    # [FUNCTION DOC]
+    # Behavior: replacement for ParameterServer.receive_tensor, bound as a method (self is the ParameterServer).
+    # Barriers on ranks_group, plans H2D buckets from the global parameter metas across the given ranks, optionally
+    # allocates and registers an H2D staging buffer in the P2P store, and allocates a 2x bucket_size double buffer.
+    # For each bucket round i: copies this rank's i-th owned bucket into the H2D buffer; then for each receiver rank
+    # with an i-th bucket, the owning receiver copies data into the alternating half of the double buffer and a
+    # broadcast from that rank is started on a worker thread. After the first broadcast, each later step yields the
+    # previous bucket's tensors (views into the double buffer at the previous half's offset, by name, dtype, shape)
+    # before waiting for the current broadcast and synchronizing. After the loop, yields the last bucket.
+    # In a finally block: barrier, unregister the H2D buffer, empty the device cache.
+    # Inputs: checkpoint_name; ranks_group - process group; ranks - participating ranks; bucket_size - bytes;
+    # disable_h2d_buffer - copy directly into the broadcast buffer instead of staging.
+    # Outputs: async generator of (name, tensor view). Yielded tensors alias the reusable buffer.
+    # Exceptions: AssertionError if metas empty, dist not initialized, P2P store missing, or ranks empty.
+    # Side effects: collectives, RDMA reads, device allocations, P2P registration.
     assert len(self._current_global_parameter_metas) != 0, "parameter metas is empty"
     assert dist.is_initialized(), "process group is not initialized"
     assert self._p2p_store is not None, "p2p store is not initialized"
@@ -174,6 +203,8 @@ async def receive_tensor(
 
 @dataclass
 class MasterMetadata:
+    # [CLASS DOC]
+    # Dataclass of master endpoints; only dist_ip/dist_port are used here (zmq fields are None).
     zmq_ip: str
     zmq_port: int
     dist_ip: str
@@ -181,6 +212,8 @@ class MasterMetadata:
 
 
 class BroadcastOperation:
+    # [CLASS DOC]
+    # Wraps one broadcast that runs on the default thread-pool executor of the running asyncio loop.
     """Async broadcast operation in separate thread.
 
     Args:
@@ -197,6 +230,10 @@ class BroadcastOperation:
         bucket: torch.Tensor,
         metadata: list[ParameterMeta],
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: stores arguments and schedules the broadcast in an executor. Inputs: rank - source rank;
+        # ranks_group - process group; bucket - tensor; metadata - list of ParameterMeta to hand back.
+        # Exceptions: RuntimeError if no running event loop. Side effects: starts a background broadcast.
         self.rank = rank
         self.ranks_group = ranks_group
         self.bucket = bucket
@@ -206,10 +243,14 @@ class BroadcastOperation:
         self._task = loop.run_in_executor(None, self._run)
 
     def _run(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: broadcasts the bucket from self.rank within ranks_group. Side effects: collective communication.
         # broadcast tensor
         dist.broadcast(self.bucket, src=self.rank, group=self.ranks_group)
 
     async def wait_for_complete(self) -> list[ParameterMeta]:
+        # [FUNCTION DOC]
+        # Behavior: awaits the executor task. Outputs: the stored metadata list. Exceptions: propagates broadcast errors.
         """Wait for the broadcast operation to complete.
 
         Returns:
@@ -221,6 +262,9 @@ class BroadcastOperation:
 
 @CheckpointEngineRegistry.register("kimi_ckpt_engine")
 class KIMICheckpointEngine(CheckpointEngine):
+    # [CLASS DOC]
+    # CheckpointEngine using the kimi ParameterServer. All trainer ranks (0..A-1) and rollout ranks (A..A+R-1)
+    # join one global group; a sub-group of rollout ranks is used for broadcasts.
     """kimi checkpoint engine with collective communication.
 
     Args:
@@ -238,6 +282,9 @@ class KIMICheckpointEngine(CheckpointEngine):
         is_master: bool = False,
         rollout_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: stores configuration; marks not initialized; fixed checkpoint name "kimi_checkpoint_engine".
+        # Inputs: bucket_size, rebuild_group, is_master, rollout_dtype. Side effects: none.
         self.bucket_size = bucket_size
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
@@ -246,6 +293,8 @@ class KIMICheckpointEngine(CheckpointEngine):
         self.checkpoint_name = "kimi_checkpoint_engine"
 
     def prepare(self) -> MasterMetadata:
+        # [FUNCTION DOC]
+        # Behavior: on master, resolves node IP and a free port. Outputs: MasterMetadata (dist fields only) on master, else None.
         if self.is_master:
             self.ip = ray.util.get_node_ip_address().strip("[]")
             self.listen_port, _ = get_free_port(self.ip)
@@ -257,6 +306,8 @@ class KIMICheckpointEngine(CheckpointEngine):
         )
 
     def finalize(self):
+        # [FUNCTION DOC]
+        # Behavior: if rebuild_group, destroys the default process group and resets rank, world size and initialized flag.
         """Destroy the ckpt engine process group if rebuild_group is True."""
         if self.rebuild_group:
             dist.destroy_process_group()
@@ -266,6 +317,10 @@ class KIMICheckpointEngine(CheckpointEngine):
 
     @classmethod
     def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadata: list[dict]):
+        # [FUNCTION DOC]
+        # Behavior: builds init kwargs: trainer ranks 0..A-1, rollout ranks A..A+R-1; every entry gets method name
+        # "init_process_group", both world sizes and master metadata (metadata[0]).
+        # Outputs: tuple of (actor kwargs, rollout kwargs), each a dict of per-worker lists.
         actor_wg_kwargs = {
             "method": ["init_process_group"] * actor_wg_world_size,
             "rank": list(range(0, actor_wg_world_size)),
@@ -289,6 +344,11 @@ class KIMICheckpointEngine(CheckpointEngine):
         rollout_world_size: int,
         master_metadata: MasterMetadata,
     ):
+        # [FUNCTION DOC]
+        # Behavior: records rank and sizes; on first call creates a ParameterServer (manual process group, master
+        # address from metadata), binds the custom receive_tensor onto it, selects the vllm NCCL-family backend,
+        # initializes the process group, and creates the rollout sub-group. Subsequent calls only update attributes.
+        # Inputs: rank, actor_wg_world_size, rollout_world_size, master_metadata. Side effects: distributed init.
         """Initialize the ckpt engine process group.
 
         Args:
@@ -323,6 +383,11 @@ class KIMICheckpointEngine(CheckpointEngine):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: for each bucket of this rank's tensors (round-robin by index), copies tensors to CPU non-blocking
+        # with a 32-thread pool and collects them; synchronizes, registers the checkpoint with the parameter server,
+        # empties device cache, gathers metas, barriers globally (waiting for receivers to finish) and unregisters.
+        # Inputs: weights generator; global_steps unused. Side effects: CPU memory, collectives, logging.
         """Send the weights of the model.
 
         Args:
@@ -330,6 +395,8 @@ class KIMICheckpointEngine(CheckpointEngine):
         """
 
         def offload_cpu(name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor]:
+            # [FUNCTION DOC]
+            # HELPER: Behavior: returns the name and a non-blocking CPU copy of tensor.
             return name, tensor.to("cpu", non_blocking=True)
 
         start_time = time.time()
@@ -367,6 +434,10 @@ class KIMICheckpointEngine(CheckpointEngine):
         self,
         global_steps: int | None = None,
     ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        # [FUNCTION DOC]
+        # Behavior: gathers metas, then iterates the bound receive_tensor over the rollout group, counting bytes and
+        # params, yielding (name, tensor); then barriers globally and logs time and bandwidth.
+        # Inputs: global_steps unused. Outputs: async generator of (name, tensor). Side effects: collectives, logging.
         """Receive the weights of the model.
 
         Yields:

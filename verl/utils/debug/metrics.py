@@ -11,6 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Debug metrics comparing rollout-engine log probabilities against actor (training engine) log probabilities to detect numerical mismatch between inference and training.
+
 import logging
 
 import torch
@@ -22,6 +25,11 @@ logger = logging.getLogger(__file__)
 
 def calculate_token_list_diff(tensor1: torch.Tensor, tensor2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     # verify inputs
+    # [FUNCTION DOC]
+    # Behavior: counts, per row, the positions where two token tensors differ and the mask equals 1. Empty inputs yield zeros per row; shape mismatch prints a warning and returns a tensor of ones shaped like tensor1. Moves tensor2 and mask onto tensor1's device.
+    # Inputs: tensor1, tensor2 - (batch, seq) tensors; mask - same shape, 1 for valid positions.
+    # Outputs: long tensor of shape (batch,) with diff counts (or ones_like(tensor1) on shape mismatch).
+    # KNOWN ISSUE: on shape mismatch the return is shaped like tensor1 (2-D), not per-row counts.
     if tensor1.numel() == 0 or tensor2.numel() == 0:
         return torch.zeros(tensor1.shape[0], dtype=torch.long, device=tensor1.device)
     if tensor1.shape != tensor2.shape or mask.shape != tensor1.shape or mask.shape != tensor2.shape:
@@ -47,6 +55,10 @@ def calculate_token_list_diff(tensor1: torch.Tensor, tensor2: torch.Tensor, mask
 
 def pearson_correlation_coefficient(tensor1: torch.Tensor, tensor2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     # implemention of https://arxiv.org/pdf/2506.13585
+    # [FUNCTION DOC]
+    # Behavior: selects masked elements from both tensors and computes their Pearson correlation via corrcoef.
+    # Inputs: tensor1, tensor2 - same-shape tensors; mask - boolean mask of same shape.
+    # Outputs: Python float correlation; integer 0 if shapes mismatch (annotated as Tensor, actually returns a scalar).
     if tensor1.shape != tensor2.shape or mask.shape != tensor1.shape or mask.shape != tensor2.shape:
         return 0
     mt1 = torch.masked_select(tensor1, mask)
@@ -56,11 +68,22 @@ def pearson_correlation_coefficient(tensor1: torch.Tensor, tensor2: torch.Tensor
 
 
 def calculate_log_prob_diff(log_probs1: torch.Tensor, log_probs2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: returns absolute elementwise difference of the inputs, restricted to masked positions (flattened).
+    # Inputs: log_probs1, log_probs2 - same shape; mask - boolean mask.
+    # Outputs: 1-D tensor of absolute differences.
     full_diff = torch.abs(log_probs1 - log_probs2)
     return torch.masked_select(full_diff, mask)
 
 
 def calculate_debug_metrics(data: DataProto) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: reads rollout_log_probs and old_log_probs from the batch, chooses a mask (response_mask, else attention_mask, else all ones), slices mask to the last response_length columns, exponentiates log probs to probabilities, and computes max/mean/std of the absolute probability difference plus the Pearson correlation over valid tokens. If no valid token exists, returns valid=0 and NaN metrics.
+    # Note: despite metric names saying "probs_diff", the differences are computed on probabilities (exp of log probs), not log probs.
+    # Inputs: data - DataProto with batch keys rollout_log_probs, old_log_probs, responses and optional masks.
+    # Outputs: dict of training/rollout_probs_diff_{valid,max,mean,std} and training/rollout_actor_probs_pearson_corr.
+    # Exceptions: KeyError if required batch keys are missing.
+    # Side effects: logging.
     """
     calculate rollout vs actor logprobs diff, for debugging purpose
 

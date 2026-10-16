@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Multi-GPU (CUDA or NPU) test that activation offloading (enable_activation_offloading) does not change numerics
+# for FSDP1 and FSDP2: logits after a training step with offloading must exactly equal those without it, starting
+# from the same checkpoint.
 import os
 import shutil
 import tempfile
@@ -31,6 +35,12 @@ from verl.utils.fsdp_utils import MixedPrecisionPolicy, apply_fsdp2, get_fsdp_wr
 
 
 def create_random_input_ids(batch_size, seq_len, vocab_size):
+    # [FUNCTION DOC]
+    # HELPER: Generates random token ids of shape (batch_size, seq_len) on the current device, a random left-padded
+    # attention mask (up to 10% left padding, 50-70% valid tokens) and position ids from it, then removes padding
+    # (flash-attn unpad on CUDA, verl's unpad on NPU) and returns both as packed tensors of shape (1, total_valid).
+    # Inputs: batch_size, seq_len, vocab_size - ints. Outputs: (input_ids, position_ids).
+    # KNOWN ISSUE: on a device that is neither cuda nor npu, unpad_input is never imported and a NameError results.
     if get_device_name() == "cuda":
         from flash_attn.bert_padding import unpad_input
     elif get_device_name() == "npu":
@@ -50,6 +60,19 @@ def create_random_input_ids(batch_size, seq_len, vocab_size):
 
 
 def _fsdp_activation_offloading_test(rank, world_size, rendezvous_file, strategy="fsdp"):
+    # [FUNCTION DOC]
+    # HELPER: Per-rank worker spawned by the test. Sets the device, initializes the process group through a file
+    # rendezvous, builds a 1-D "dp" device mesh, creates a 4-layer Qwen2 model from config (bf16, flash attention 2)
+    # on device, and wraps it with FSDP1 (full shard, bf16 params, fp32 reduce/buffers, verl wrap policy) when
+    # strategy is "fsdp", otherwise applies FSDP2 with a bf16/fp32 mixed precision policy. Creates AdamW (lr 1e-4),
+    # StepLR (gamma 0.9) and an FSDPCheckpointManager using the Qwen2.5-0.5B tokenizer from ~/models.
+    # Procedure: step 1 on random batch 1 (loss = mean of logits) then save checkpoint to a fresh temp dir; step 2 on
+    # batch 2 and record no-grad logits on batch 2 as the reference; enable activation offloading, reload the
+    # checkpoint (model, optimizer, scheduler), repeat step 2 on batch 2 and record logits again; assert exact
+    # equality (zero tolerance), print a success message, remove the temp dir, barrier and destroy the process group.
+    # Inputs: rank, world_size - ints; rendezvous_file - path; strategy - "fsdp" or "fsdp2".
+    # Outputs: none. Exceptions: AssertionError on logit mismatch.
+    # Side effects: distributed init/teardown, GPU memory, temp checkpoint files, stdout print.
     get_torch_device().set_device(rank)
     torch.distributed.init_process_group(
         backend=get_nccl_backend(),
@@ -164,6 +187,10 @@ def _fsdp_activation_offloading_test(rank, world_size, rendezvous_file, strategy
 @pytest.mark.parametrize("world_size", (2, 4))
 @pytest.mark.parametrize("strategy", ("fsdp", "fsdp2"))
 def test_activation_offloading(world_size, strategy, tmp_path):
+    # [FUNCTION DOC]
+    # Behavior: parametrized over world size 2 and 4 and strategy fsdp/fsdp2; spawns world_size processes running
+    # the worker with a rendezvous file under tmp_path and waits for them.
+    # Inputs: world_size, strategy, tmp_path. Outputs: none. Side effects: process spawning.
     rendezvous_file = str(tmp_path / "rdzv_file")
     os.makedirs(os.path.dirname(rendezvous_file), exist_ok=True)
 

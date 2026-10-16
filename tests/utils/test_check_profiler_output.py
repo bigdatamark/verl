@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Command-line checker script (not a pytest test despite its name) that verifies profiler output exists for a set
+# of training stages under a profiler directory, for GPU (torch profiler JSON traces) or NPU (Ascend profiling
+# directories). Exits 0 on success and 1 on failure. Configures root logging at INFO on import.
 
 import argparse
 import glob
@@ -27,6 +31,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 
 @dataclass
 class DeviceCheckConfig:
+    # [CLASS DOC]
+    # Holds per-device validation callbacks: search_patterns maps a stage to glob patterns (relative to the profiler
+    # dir); path_filter keeps matched paths of the right kind; count_validator decides whether the number of matches
+    # for a stage is acceptable; prof_validator checks each matched path's content.
     """Device check configuration: encapsulates device-specific validation rules"""
 
     search_patterns: Callable[[str], list[str]]
@@ -36,11 +44,20 @@ class DeviceCheckConfig:
 
 
 class ProfilerChecker:
+    # [CLASS DOC]
+    # Validates profiler deliverables for each configured stage pattern. Default stages are "actor_update",
+    # "*rollout*" and "ref_*".
     """Unified Profiler checker supporting GPU/NPU devices"""
 
     TARGET_STAGES = ["actor_update", "*rollout*", "ref_*"]
 
     def __init__(self, device_type: str, profiler_dir: str, stages: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Behavior: lowercases and stores device_type, stores profiler_dir, uses the given stages or the default list,
+        # then builds the device config.
+        # Inputs: device_type - "gpu" or "npu" (case-insensitive); profiler_dir - root path; stages - optional list of
+        # glob stage patterns. Outputs: none.
+        # Exceptions: ValueError for unsupported device type or an empty stages list.
         self.device_type = device_type.lower()
         self.profiler_dir = profiler_dir
 
@@ -55,6 +72,12 @@ class ProfilerChecker:
         self._init_device_config()
 
     def _init_device_config(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets self.config. GPU: patterns match any *.json* file recursively under a directory containing the
+        # stage name, or a top-level file containing the stage name; keep only files ending .json or .json.gz; require at
+        # least one; each must have non-zero size. NPU: pattern matches "*_ascend_*" directories directly under a stage
+        # directory; keep only directories; require at least one; each must contain at least one "PROF_*" entry and the
+        # first such entry must be a directory.
         """Initialize validation rules for different devices (core: device differences as config)"""
         if self.device_type == "gpu":
             self.config = DeviceCheckConfig(
@@ -78,6 +101,10 @@ class ProfilerChecker:
             )
 
     def _validate_stage(self, stage: str) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Expands the stage's patterns under profiler_dir, globs recursively, filters, de-duplicates and sorts the
+        # paths, logs the count and each path; returns False (logging an error) if the count check fails or any path fails
+        # content validation, else True. Inputs: stage - pattern string. Outputs: bool. Side effects: logging.
         """Match, log and validate the stage's profiler output."""
         patterns = [os.path.join(self.profiler_dir, p) for p in self.config.search_patterns(stage)]
         paths = sorted(
@@ -104,6 +131,10 @@ class ProfilerChecker:
         return True
 
     def check(self) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: logs start; returns False (with error log) if profiler_dir does not exist; validates each stage in
+        # order, returning False at the first failure; logs success and returns True.
+        # Outputs: bool. Side effects: logging.
         """Unified check entry point"""
         logger.info(f"Starting profiler deliverables check for {self.device_type.upper()}...")
 
@@ -122,6 +153,10 @@ class ProfilerChecker:
 
 
 def parse_args():
+    # [FUNCTION DOC]
+    # Behavior: parses --device (required, gpu or npu), --profiler_dir (default ./profiler_data) and --stage (one or
+    # more patterns, default None meaning the built-in stages) from the command line.
+    # Outputs: argparse namespace. Exceptions: exits on invalid arguments.
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Check Profiler deliverables (support GPU/NPU)")
     parser.add_argument(
@@ -147,6 +182,9 @@ def parse_args():
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: parses arguments, runs the checker and exits with status 0 on success or 1 on failure; any exception
+    # is logged with traceback and exits 1. Outputs: none (process exit). Side effects: logging, sys.exit.
     args = parse_args()
 
     try:

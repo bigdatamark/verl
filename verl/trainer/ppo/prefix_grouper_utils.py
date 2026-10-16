@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Helpers for running actor forward passes with the PrefixGrouper library, which packs
+# responses that share the same prompt (same uid) behind a single copy of the prefix so the
+# shared prompt is computed once. Provides position-id construction, grouping a micro batch
+# into a PrefixGrouper, the grouped forward, and a full micro-batch forward that returns
+# per-token log-probs/entropy aligned to the response layout.
+
 from __future__ import annotations
 
 import torch
@@ -21,6 +28,12 @@ from verl.utils.torch_functional import logprobs_from_logits
 
 
 def build_position_ids_for_prefix_grouper(prefix_grouper: PrefixGrouper) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: for each packed row (one group), positions 0..prefix_len-1 for the prefix, then
+    # each non-empty suffix gets positions starting again at prefix_len (prefix_len ..
+    # prefix_len+suffix_len-1), laid out consecutively. Remaining (padding) positions are 0.
+    # Inputs: prefix_grouper - object exposing group_info (prefix_len, suffix_lens) and
+    # padding_mask [groups, max_len]. Outputs: long tensor [groups, max_len].
     """Build position_ids for PrefixGrouper where each response restarts from prefix_len."""
     num_samples = len(prefix_grouper.group_info)
     max_len = prefix_grouper.padding_mask.size(1)
@@ -48,6 +61,18 @@ def build_pg_from_micro_batch(
     pad_token_id: int,
     padding_mode: str = "right",
 ):
+    # [FUNCTION DOC]
+    # Behavior: derives group sizes by run-length counting consecutive equal uids (assumes
+    # same-uid samples are contiguous), takes the first sample's prompt of each group as the
+    # prefix, prefix mask = tokens not equal to pad_token_id, builds the PrefixGrouper from the
+    # prefix mask, response mask and group sizes, concatenates inputs, and builds the attention
+    # mask (grouper padding mask) and position ids.
+    # Inputs: micro_batch - mapping with prompts, responses, response_mask, uid; pad_token_id;
+    # padding_mode - padding layout passed to PrefixGrouper (default right).
+    # Outputs: tuple (prefix_grouper, concat_input_ids, attention_mask, position_ids, responses,
+    # response_mask).
+    # KNOWN ISSUE: non-contiguous samples sharing a uid are treated as separate groups; prefix
+    # mask treats any pad_token_id occurrence as padding even inside the prompt.
     """Build PrefixGrouper from micro_batch dict containing prompts, responses, response_mask, uid."""
     prompts = micro_batch["prompts"]
     responses = micro_batch["responses"]
@@ -115,6 +140,15 @@ def pg_forward(
     calculate_entropy=False,
     entropy_fn=None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: runs the model on the packed inputs (no KV cache, passing prefix_grouper), splits
+    # logits into prefix/suffix parts (including the last prefix logit), converts completion ids
+    # to the grouper's padding layout, shifts so logits at t predict token t+1 (drop last logit,
+    # drop first mask entry), casts to float and divides by temperature in place, and computes
+    # token log-probs; entropy optionally via entropy_fn.
+    # Inputs: model; prefix_grouper; packed input ids, attention mask, position ids; completion
+    # ids/mask; temperature; padding_mode; include_prefix_last; calculate_entropy; entropy_fn.
+    # Outputs: (log_probs, entropy or None, suffix_mask).
     logits = model(
         input_ids=concat_input_ids,
         attention_mask=attention_mask,
@@ -156,6 +190,12 @@ def forward_micro_batch_with_prefix_grouper(
     param_dtype,
     use_chunking_entropy: bool = False,
 ):
+    # [FUNCTION DOC]
+    # Behavior: selects the entropy function (chunked or plain) if requested, reads pad_token_id
+    # from the micro batch (default 0), builds the grouper, runs pg_forward under autocast,
+    # zeroes log-probs/entropy at padded suffix positions, and right-pads them with zeros to the
+    # response length when shorter.
+    # Inputs: see docstring. Outputs: (entropy or None, log_probs), shapes [bs, response_len].
     """
     Forward pass using PrefixGrouper for shared-prefix optimization.
 

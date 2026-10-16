@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Trainer config package. Star-re-exports the public names of the algorithm and config submodules and
+# sets __all__ to the concatenation of both submodules' __all__ lists.
+
 from . import algorithm, config
 from .algorithm import *  # noqa: F401
 from .config import *  # noqa: F401

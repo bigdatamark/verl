@@ -12,6 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Pydantic models describing OpenAI-format tool schemas, parsed tool calls and tool responses.
+
 import json
 from typing import Any, Literal
 
@@ -19,6 +23,8 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class OpenAIFunctionPropertySchema(BaseModel):
+    # [CLASS DOC]
+    # Schema of a single function parameter: type (string or list of strings for unions), optional description, optional enum values.
     """The schema of a parameter in OpenAI format."""
 
     # Union's type is list[str], e.g. ["integer", "number"] for int | float unions.
@@ -30,6 +36,8 @@ class OpenAIFunctionPropertySchema(BaseModel):
 
 
 class OpenAIFunctionParametersSchema(BaseModel):
+    # [CLASS DOC]
+    # Parameters object of a function schema: type (normally "object"), properties mapping name to property schema, required names (default empty).
     """The schema of parameters in OpenAI format."""
 
     type: str
@@ -39,6 +47,8 @@ class OpenAIFunctionParametersSchema(BaseModel):
 
 
 class OpenAIFunctionSchema(BaseModel):
+    # [CLASS DOC]
+    # Function schema: name, description, parameters (default: empty object schema), strict flag (default false).
     """The schema of a function in OpenAI format."""
 
     name: str
@@ -50,6 +60,8 @@ class OpenAIFunctionSchema(BaseModel):
 
 
 class OpenAIFunctionToolSchema(BaseModel):
+    # [CLASS DOC]
+    # Top-level tool schema: type (e.g. "function") plus function schema.
     """The schema of a tool in OpenAI format."""
 
     type: str
@@ -57,6 +69,8 @@ class OpenAIFunctionToolSchema(BaseModel):
 
 
 class OpenAIFunctionParsedSchema(BaseModel):
+    # [CLASS DOC]
+    # Raw tool call as parsed from model output: name and arguments as a JSON string.
     """The parsed schema of a tool in OpenAI format."""
 
     name: str
@@ -64,6 +78,8 @@ class OpenAIFunctionParsedSchema(BaseModel):
 
 
 class OpenAIFunctionCallSchema(BaseModel):
+    # [CLASS DOC]
+    # Decoded tool call: name and arguments as a mapping.
     """The parsed schema of a tool in OpenAI format."""
 
     name: str
@@ -73,6 +89,10 @@ class OpenAIFunctionCallSchema(BaseModel):
     def from_openai_function_parsed_schema(
         parsed_schema: OpenAIFunctionParsedSchema,
     ) -> tuple["OpenAIFunctionCallSchema", bool]:
+        # [FUNCTION DOC]
+        # Behavior: JSON-decodes parsed_schema.arguments; on decode failure or a non-mapping result, uses an empty mapping
+        # and flags an error. Inputs: parsed_schema - OpenAIFunctionParsedSchema. Outputs: (OpenAIFunctionCallSchema,
+        # bool has_decode_error). Exceptions: none raised for bad JSON.
         has_decode_error = False
         try:
             arguments = json.loads(parsed_schema.arguments)
@@ -88,6 +108,8 @@ class OpenAIFunctionCallSchema(BaseModel):
 
 
 class OpenAIFunctionToolCall(BaseModel):
+    # [CLASS DOC]
+    # OpenAI tool call record: id, type fixed to "function", decoded function call.
     """The tool call in OpenAI format."""
 
     id: str
@@ -96,6 +118,8 @@ class OpenAIFunctionToolCall(BaseModel):
 
 
 class ToolResponse(BaseModel):
+    # [CLASS DOC]
+    # Multimodal tool output: optional text, optional list of images, optional list of videos.
     """The response from a tool execution."""
 
     text: str | None = None
@@ -105,6 +129,10 @@ class ToolResponse(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def initialize_request(cls, values):
+        # [FUNCTION DOC]
+        # Behavior: pre-validation hook; ensures image and video, when present in the raw input mapping, are lists.
+        # Inputs: values - raw input mapping. Outputs: values unchanged. Exceptions: ValueError with guidance if not a list.
+        # Note: a present-but-None image/video also fails the list check, so explicitly passing None raises.
         if "image" in values and not isinstance(values["image"], list):
             raise ValueError(
                 f"Image must be a list, but got {type(values['image'])}. Please check the tool.execute(). "
@@ -121,7 +149,12 @@ class ToolResponse(BaseModel):
         return values
 
     def is_empty(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns True when text, image and video are all falsy.
         return not self.text and not self.image and not self.video
 
     def is_text_only(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns truthy when text is non-empty and there are no images or videos.
+        # KNOWN ISSUE: annotated as bool but returns the text string itself (or a falsy value) rather than a strict bool.
         return self.text and not self.image and not self.video

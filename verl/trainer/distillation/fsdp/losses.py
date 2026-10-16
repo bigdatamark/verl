@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Top-k forward-KL distillation loss for FSDP/FSDP2/VeOmni actors with optional Ulysses sequence parallelism.
+# Student logits hold the full vocab on each rank; teacher top-k inputs arrive as nested (jagged) tensors.
+
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +32,13 @@ def _chunked_topk_log_probs(
     topk_ids: torch.Tensor,
     chunk_size: int = 4096,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: computes student log-softmax values at the given indices without materializing the full
+    # (B, T, V) log-softmax. Flattens to (N, V) and (N, K), iterates over row chunks of chunk_size, and for each chunk
+    # computes, in fp32, the gathered logits minus the row log-sum-exp; casts back to the logits dtype. Returns an
+    # empty (B, T, K) tensor when N is 0.
+    # Inputs: logits (B, T, V); topk_ids (B, T, K) integer indices; chunk_size rows per chunk. Outputs: (B, T, K) tensor.
+    # Side effects: none. Note: gradients flow through the chunked ops normally.
     """Compute log_softmax(logits).gather(topk_ids) without materializing [B, T, V].
 
     Uses the identity:
@@ -64,6 +75,10 @@ def _chunked_topk_log_probs(
 
 
 def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: casts inputs to fp32 and returns per-position sum over the last dim of p times (log p minus log q),
+    # where p is exp of log_p. Inputs: log_q - student log-probs; log_p - teacher log-probs (same shape).
+    # Outputs: tensor with last dim reduced. No normalization (top-k subsets need not sum to 1).
     """Compute KL divergence between two distributions given their log probabilities."""
     log_p = log_p.float()
     log_q = log_q.float()
@@ -79,6 +94,21 @@ def compute_forward_kl_topk(
     config: DistillationConfig,
     data_format: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: asserts teacher inputs are nested; flattens them to packed (1, total_nnz, topk). If Ulysses SP world
+    # size > 1, slices them along the sequence dim to this rank's shard. Asserts first two dims match student logits.
+    # Student top-k log-probs at the TEACHER's ids are computed either via the chunked helper (when loss config has
+    # use_chunked_topk; chunk size from chunked_topk_chunk_size, default 4096) or via full log-softmax plus gather; the
+    # student's own top-k ids (topk over logits) are also taken for overlap diagnostics. Computes student mass and
+    # teacher mass (sum of exp over top-k) before clamping; optionally clamps both log-prob sets at
+    # log_prob_min_clamp; loss is the forward KL of teacher vs student over the top-k. Overlap diagnostics: per token,
+    # count of teacher ids also in the student top-k, and mean of negative per-entry KL over overlapping entries
+    # (0 when none).
+    # Inputs: student_logits (1, nnz/sp, V); nested teacher log-probs and ids; distillation config; data_format (unused).
+    # Outputs: mapping with distillation_losses, student_mass, teacher_mass, overlap_count, overlap_token_advantage,
+    # each shaped like the first two dims of student_logits.
+    # Exceptions: AssertionError for non-nested inputs or shape mismatch.
+    # KNOWN ISSUE: annotated to return a 3-tuple but returns a mapping of five tensors; data_format is ignored.
     """Compute forward KL distillation loss using top-k log probabilities.
 
     Args:

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Backend-agnostic core of the single controller: exports Worker, WorkerGroup, ClassWithInitArgs and ResourcePool.
 from .worker import Worker
 from .worker_group import ClassWithInitArgs, ResourcePool, WorkerGroup
 

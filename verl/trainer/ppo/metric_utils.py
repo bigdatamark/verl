@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Metric computation for PPO training and validation: batch data statistics (scores, rewards,
+# advantages, returns, values, lengths, turns), timing and throughput, gradient-variance
+# proxies, rollout MoE expert load-balance metrics (with an interval accumulator and
+# TransferQueue fetch helper), and validation metrics with bootstrap best/worst/majority
+# estimates. Metric dicts map slash-separated names to scalar values.
 """
 Metrics related to the PPO trainer.
 """
@@ -38,6 +45,10 @@ _NUM_LOCAL_EXPERTS_MODEL_TYPES = {"gpt_oss", "mixtral"}
 
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Behavior: deprecated alias; forwards to verl.utils.metric.reduce_metrics (mean of each list).
+    # Inputs: metrics - name to list of values. Outputs: name to mean.
+    # Side effects: deprecation warning from the decorator.
     """
     Reduces a dictionary of metric lists by computing the mean of each list.
 
@@ -58,6 +69,13 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
 
 
 def _compute_response_info(batch: DataProto) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: if the batch already has prompt_length and response_length tensors,
+    # return them directly. Otherwise split attention_mask at the response width (last
+    # responses.shape[-1] columns) and sum each part per row as floats.
+    # Inputs: batch with responses and attention_mask (or precomputed lengths).
+    # Outputs: dict with prompt_length and response_length tensors of shape [batch].
+    # KNOWN ISSUE: docstring says a response_mask entry is returned, but only the two lengths are.
     """
     Computes information about prompts and responses from a batch.
 
@@ -93,12 +111,19 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
 
 
 def _get_nested_attr(obj: Any, name: str) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Reads attribute/key name from a mapping-like object (anything with get) or via
+    # getattr with None default. Outputs: value or None.
     if hasattr(obj, "get"):
         return obj.get(name)
     return getattr(obj, name, None)
 
 
 def get_hf_config_override_kwargs(override_config: Any) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Behavior: converts an OmegaConf DictConfig to a resolved plain container; returns empty dict
+    # for falsy input; if a "model_config" key exists, returns that sub-mapping, else the whole
+    # mapping. Inputs: override_config. Outputs: dict of HF config override kwargs.
     if isinstance(override_config, DictConfig):
         override_config = OmegaConf.to_container(override_config, resolve=True)
     if not override_config:
@@ -109,12 +134,21 @@ def get_hf_config_override_kwargs(override_config: Any) -> dict[str, Any]:
 
 
 def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Like _get_nested_attr but with an explicit default value.
     if hasattr(config, "get"):
         return config.get(key, default)
     return getattr(config, key, default)
 
 
 def infer_moe_num_experts(model_config: Any) -> int | None:
+    # [FUNCTION DOC]
+    # Behavior: builds a candidate list: the config itself, its hf_config and hf_config.text_config,
+    # its text_config, its override_config plus override_config.model_config and
+    # override_config.text_config (in that order). For each candidate, returns the first of
+    # num_experts / n_routed_experts found (as int); for model types gpt_oss / mixtral also
+    # accepts num_local_experts. Returns None if nothing found.
+    # Inputs: model_config - config-like object. Outputs: int or None. Side effects: none.
     """Infer the global number of routed experts from an in-memory config-like object."""
     candidates = [model_config]
     hf_config = _get_nested_attr(model_config, "hf_config")
@@ -149,6 +183,14 @@ def infer_moe_num_experts(model_config: Any) -> int | None:
 
 
 def infer_rollout_moe_num_experts(model_config: Any) -> int | None:
+    # [FUNCTION DOC]
+    # Behavior: tries the in-memory inference first; otherwise resolves an HF config path
+    # (local_hf_config_path, then hf_config_path, then path), copies it locally (optionally to
+    # shared memory per use_shm), loads AutoConfig (trust_remote_code from config), applies
+    # override kwargs, and infers from the loaded config.
+    # Inputs: model_config. Outputs: int or None.
+    # Exceptions: propagates file copy / AutoConfig load errors.
+    # Side effects: filesystem copy, possible remote download.
     """Infer rollout MoE num_experts, loading the HF config only when needed."""
     num_experts = infer_moe_num_experts(model_config)
     if num_experts is not None:
@@ -177,6 +219,13 @@ def _compute_rollout_moe_load_balance_metrics_from_counts(
     load_counts: torch.Tensor | None,
     prefix: str = "rollout/moe",
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: returns empty dict for None/empty counts. Normalizes counts per layer to
+    # fractions (row sum clamped to at least 1), computes deviation = fraction*num_experts - 1
+    # (0 means perfectly balanced), and per layer the max, min and mean-absolute deviation.
+    # Emits per-layer metrics "<prefix>/{max,min,avg}_vio/layer_<i>" plus across-layer max and
+    # average of each.
+    # Inputs: load_counts [layers, experts]; prefix. Outputs: dict of floats.
     if load_counts is None or load_counts.numel() == 0:
         return {}
 
@@ -207,6 +256,16 @@ def _compute_rollout_moe_load_counts(
     response_mask: torch.Tensor | None,
     num_experts: int | None,
 ) -> torch.Tensor | None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: returns None when any input is missing, num_experts <= 0, routed_experts
+    # is not 4-D [bsz, seq, layers, topk], the mask is not 2-D with matching batch, the response
+    # length is 0, or routed_experts is shorter than the response (warnings logged for shape
+    # problems). Takes the trailing response_len positions, removes each row's last valid response
+    # token from the mask, gathers selected tokens' expert ids to CPU long, returns None if empty
+    # or ids are out of [0, num_experts) (warning). Otherwise bincounts expert ids per layer over
+    # all tokens and top-k slots.
+    # Inputs: routed_experts; response_mask [bsz, response_len]; num_experts.
+    # Outputs: long tensor [layers, num_experts] or None. Side effects: warning logs.
     """Count routed experts in response tokens as [num_layers, num_experts].
 
     Each sequence's last valid response position is excluded: that token is
@@ -277,6 +336,9 @@ def compute_rollout_moe_load_balance_metrics(
     num_experts: int | None,
     prefix: str = "rollout/moe",
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Behavior: computes load counts from the routed experts and converts them to load-balance
+    # metrics. Inputs: as in the helpers above. Outputs: metrics dict (empty if no counts).
     """Compute rollout MoE load-balance metrics from returned routed expert ids."""
     load_counts = _compute_rollout_moe_load_counts(
         routed_experts=routed_experts,
@@ -295,6 +357,14 @@ def get_metric_data_with_optional_routed_experts(
     accumulator: "RolloutMoELoadBalanceMetricsAccumulator",
     kv_batch_get: Callable[..., Any],
 ):
+    # [FUNCTION DOC]
+    # Behavior: if the interval is disabled (<= 0) or the accumulator is in a retry back-off,
+    # fetches only the requested fields. Otherwise fetches fields plus "routed_experts"; if that
+    # raises a ValueError mentioning routed_experts, defers further requests by one interval,
+    # warns once, and refetches without it.
+    # Inputs: keys, partition_id, fields - TransferQueue fetch arguments; moe_lb_metrics_interval;
+    # global_steps; accumulator; kv_batch_get - fetch callable.
+    # Outputs: fetched data. Exceptions: re-raises unrelated ValueErrors and other errors.
     if moe_lb_metrics_interval <= 0 or not accumulator.should_request_routed_experts(global_steps):
         return kv_batch_get(keys=keys, partition_id=partition_id, select_fields=fields)
 
@@ -315,6 +385,13 @@ def compute_moe_lb_metrics(
     global_steps: int,
     accumulator: "RolloutMoELoadBalanceMetricsAccumulator",
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Behavior: returns empty dict when disabled. Feeds the batch's routed_experts and
+    # response_mask (may be missing) into the accumulator. Only on steps divisible by the interval,
+    # pops accumulated metrics and adds rollout/moe/routed_experts_found (1.0/0.0) and
+    # rollout/moe/routed_expert_assignments; warns once if nothing was counted.
+    # Inputs: metrics_batch; interval; global_steps; accumulator. Outputs: metrics dict.
+    # Side effects: mutates/reset accumulator state.
     if moe_lb_metrics_interval <= 0:
         return {}
 
@@ -338,9 +415,16 @@ def compute_moe_lb_metrics(
 
 
 class RolloutMoELoadBalanceMetricsAccumulator:
+    # [CLASS DOC]
+    # Stateful accumulator of per-layer expert assignment counts over a logging interval. Holds the
+    # model config for lazy num_experts inference (computed once), a retry step for
+    # routed-expert fetching, and a set of warning keys already emitted.
     """Accumulate rollout MoE routed expert counts across a logging interval."""
 
     def __init__(self, model_config: Any | None = None):
+        # [FUNCTION DOC]
+        # Behavior: stores model_config and initializes empty counts, unknown num_experts, retry step 0,
+        # and an empty warned-keys set. Inputs: model_config - optional config-like object.
         self.model_config = model_config
         self.load_counts: torch.Tensor | None = None
         self.num_experts: int | None = None
@@ -349,12 +433,20 @@ class RolloutMoELoadBalanceMetricsAccumulator:
         self.warned_skip_keys: set[str] = set()
 
     def should_request_routed_experts(self, global_steps: int) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: true when global_steps has reached the retry step. Outputs: bool.
         return global_steps >= self.routed_experts_retry_after_step
 
     def defer_routed_experts_retry(self, global_steps: int, interval: int) -> None:
+        # [FUNCTION DOC]
+        # Behavior: sets the retry step to global_steps + max(interval, 1). Side effects: mutates state.
         self.routed_experts_retry_after_step = global_steps + max(interval, 1)
 
     def _infer_num_experts(self) -> int | None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: on first call, attempts infer_rollout_moe_num_experts on the stored config
+        # (exceptions are caught and warned once), marks initialized, warns once if still unknown.
+        # Later calls return the cached value. Outputs: int or None.
         if self.num_experts_initialized:
             return self.num_experts
 
@@ -376,6 +468,8 @@ class RolloutMoELoadBalanceMetricsAccumulator:
         return self.num_experts
 
     def warn_skip_once(self, key: str, message: str) -> None:
+        # [FUNCTION DOC]
+        # Behavior: logs the warning only the first time for a given key. Side effects: logging, adds key.
         if key in self.warned_skip_keys:
             return
         logger.warning(message)
@@ -387,6 +481,12 @@ class RolloutMoELoadBalanceMetricsAccumulator:
         response_mask: torch.Tensor | None,
         num_experts: int | None = None,
     ) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: uses given num_experts or the inferred one, computes counts; returns False if none.
+        # Adds counts to the accumulated tensor when shapes match; initializes if empty; on shape
+        # mismatch logs a warning and replaces the accumulated counts. Returns True.
+        # Inputs: routed_experts; response_mask; num_experts - optional override.
+        # Outputs: bool whether counts were added.
         if num_experts is None:
             num_experts = self._infer_num_experts()
         load_counts = _compute_rollout_moe_load_counts(
@@ -410,23 +510,43 @@ class RolloutMoELoadBalanceMetricsAccumulator:
         return True
 
     def compute(self, prefix: str = "rollout/moe") -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: converts accumulated counts into metrics (empty if none). Outputs: metrics dict.
         return _compute_rollout_moe_load_balance_metrics_from_counts(self.load_counts, prefix=prefix)
 
     def total_assignments(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: total number of counted assignments (0 if none). Outputs: int.
         if self.load_counts is None:
             return 0
         return int(self.load_counts.sum().item())
 
     def reset(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: clears accumulated counts (keeps num_experts and warnings).
         self.load_counts = None
 
     def pop_metrics(self, prefix: str = "rollout/moe") -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: compute metrics then reset. Outputs: metrics dict.
         metrics = self.compute(prefix=prefix)
         self.reset()
         return metrics
 
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Behavior: sequence score/reward = sums of token_level_scores/rewards; samples with response
+    # length 0 are "aborted" and excluded from score/reward stats. Advantages/returns stats are
+    # over response_mask tokens. Values stats and explained variance
+    # (1 - var(returns-values)/(var(returns)+1e-5)) when use_critic. Response/prompt length
+    # mean/max/min and clip ratio (fraction equal to the max padded length); non-aborted response
+    # length stats; aborted ratio. NaN with a warning whenever a selection is empty. Adds
+    # num_turns/* from non-tensor "__num_turns__" and tool_call_counts/* when present.
+    # Inputs: batch with token_level_scores, token_level_rewards, advantages, returns, prompts,
+    # responses, response_mask, attention_mask (or length tensors), and values if use_critic.
+    # Outputs: metrics dict. Exceptions: KeyError for missing required fields.
+    # Side effects: warning logs.
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -609,6 +729,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 
 
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Behavior: emits timing_s/<name> for every entry of timing_raw, and timing_per_token_ms/<name>
+    # for gen (normalized by response tokens) and ref/values/adv/update_critic/update_actor
+    # (normalized by prompt+response tokens) when present in timing_raw; 0.0 if the token count is 0.
+    # Inputs: batch; timing_raw - stage name to seconds. Outputs: metrics dict.
     """
     Computes timing metrics for different processing stages in PPO training.
 
@@ -653,6 +778,12 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
 
 
 def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n_gpus: int) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Behavior: total tokens = sum of meta_info global_token_num; reports it, the "step" time, and
+    # throughput = tokens / (time * n_gpus).
+    # Inputs: batch; timing_raw (must contain step); n_gpus.
+    # Outputs: metrics dict. Exceptions: KeyError if step or global_token_num missing;
+    # ZeroDivisionError if time or n_gpus is 0.
     """
     Computes throughput metrics for PPO training.
 
@@ -689,6 +820,17 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
 
 
 def compute_variance_proxy_metrics(batch: DataProto, gradient_norm: float = None) -> dict[str, float]:
+    # [FUNCTION DOC]
+    # Behavior: returns empty dict unless sum_pi_squared, old_log_probs and advantages exist.
+    # Per-token W = 1 - 2*exp(old_log_prob) + sum_pi_squared; if rollout_is_weights exist, W is
+    # scaled by the squared (detached) IS weights. Scalar advantage per sequence = masked mean;
+    # W per sequence = masked sum. Proxy1 = gradient_norm squared (if given). Proxy2: with IS
+    # weights, mean of (masked-mean IS weight)^2 * A^2 * unscaled W (recovered by dividing by
+    # clamped squared weights, clamped >= 0); without, mean of A^2 * W clamped >= 0. Proxy3 =
+    # (Proxy2 - Proxy1)/(N-1) clamped at 0 when Proxy1 given and N > 1. Also reports mean A^2 and
+    # mean W (IS-scaled when weights present). Missing proxies reported as 0.0.
+    # Inputs: batch with response_mask; gradient_norm - optional float.
+    # Outputs: dict of floats under variance_proxy/*.
     """
     Compute variance proxy metrics using the simplified expected squared norm approach.
 
@@ -809,6 +951,13 @@ def bootstrap_metric(
     n_bootstrap: int = 1000,
     seed: int = 42,
 ) -> list[tuple[float, float]]:
+    # [FUNCTION DOC]
+    # Behavior: seeds the global numpy RNG, draws an n_bootstrap x subset_size matrix of indices
+    # with replacement, applies each reduce function to each resample, and returns the mean and
+    # std of the results per function.
+    # Inputs: data; subset_size; reduce_fns; n_bootstrap; seed.
+    # Outputs: list of (mean, std) floats, one per reduce function.
+    # Side effects: resets global numpy random state.
     """
     Performs bootstrap resampling to estimate statistics of metrics.
 
@@ -858,6 +1007,11 @@ def bootstrap_metric(
 
 
 def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> float:
+    # [FUNCTION DOC]
+    # Behavior: groups val_key values by vote_key, finds the vote with most occurrences (ties go
+    # to the first-seen vote), and returns the first value recorded for it.
+    # Inputs: data - list of mappings; vote_key; val_key. Outputs: that value.
+    # Exceptions: KeyError if keys missing; ValueError on empty data.
     """
     Calculate a value based on majority voting.
 
@@ -900,6 +1054,17 @@ def process_validation_metrics(
     seed: int = 42,
     expected_acc_counts: dict[tuple[str, str], int] | None = None,
 ) -> dict[str, dict[str, dict[str, float]]]:
+    # [FUNCTION DOC]
+    # Behavior: groups each variable's values by data source then uid. If expected_acc_counts is
+    # given, for data sources that have any non-None acc value: per (source, uid) store observed
+    # acc as acc_success_only and pad acc with 0.0 up to the expected count. For each uid and
+    # variable (None values dropped; empty or string-valued variables skipped): mean@N, and for
+    # N > 1 std@N plus, for n in powers of two from 2 below N and N itself, bootstrap best@n /
+    # worst@n mean/std and, when a fully non-None "pred" list of equal length exists, maj@n
+    # mean/std via majority vote. Finally averages each metric across uids per source/variable.
+    # Inputs: data_sources, sample_uids - per-sample lists; infos_dict - variable to per-sample
+    # values; seed; expected_acc_counts - optional mapping (source, uid) to expected count.
+    # Outputs: nested mapping source -> variable -> metric name -> mean value.
     """
     Process validation metrics into a structured format with statistical analysis.
 
@@ -977,6 +1142,9 @@ def process_validation_metrics(
 
     # 2. cache ns list
     def gen_ns(n_resps: int) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Returns sample sizes to evaluate: empty for n_resps <= 1, otherwise 2, 4, 8, ...
+        # while below n_resps, followed by n_resps.
         if n_resps <= 1:
             return []
         ns = []

@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Version gate for the optional vLLM rollout backend.
+# Behavior at import: looks up the installed "vllm" distribution version. If absent and SGLang is also absent,
+# raises ValueError. On NPU, imports LLM and parallel_state with sleep level 1. If version >= 0.18.0, records
+# vllm_version, sets VLLM_SLEEP_LEVEL to 2 and imports LLM and parallel_state. An older vLLM raises ValueError
+# unless SGLang is available.
+# Exports: package_name, package_version, vllm_version (None unless the >=0.18 branch ran), VLLM_SLEEP_LEVEL,
+# and re-exports LLM / parallel_state from vllm.
+# Side effects: imports vllm (heavy) when present.
+# KNOWN ISSUE: when vLLM is missing/too old but SGLang is present, LLM and parallel_state are never imported yet
+# remain listed in __all__, so a star-import would fail with AttributeError.
+
 from importlib.metadata import PackageNotFoundError, version
 
 from packaging import version as vs
@@ -21,6 +33,9 @@ from verl.utils.import_utils import is_sglang_available
 
 
 def get_version(pkg):
+    # [FUNCTION DOC]
+    # HELPER: Returns the installed version string of distribution pkg, or None if it is not installed.
+    # Inputs: pkg - distribution name. Outputs: version string or None. Exceptions: none (PackageNotFoundError swallowed).
     try:
         return version(pkg)
     except PackageNotFoundError:

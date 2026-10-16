@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CPU Ray tests for environment variables injected into worker processes: RAY_LOCAL_WORLD_SIZE, custom worker_env
+# entries, and rejection of overriding system-managed variables such as WORLD_SIZE.
+
 """
 e2e test verl.single_controller.ray
 """
@@ -25,15 +30,23 @@ from verl.single_controller.ray.base import RayClassWithInitArgs, RayResourcePoo
 
 @ray.remote
 class TestActor(Worker):
+    # [CLASS DOC]
+    # HELPER: Worker exposing a getenv method.
     def __init__(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls base Worker init only.
         super().__init__()
 
     def getenv(self, key):
+        # [FUNCTION DOC]
+        # HELPER: Returns the env var value for key, or the string "<key> not set" if absent.
         val = os.getenv(key, f"{key} not set")
         return val
 
 
 def test_basics():
+    # [FUNCTION DOC]
+    # Behavior: 4-worker CPU group; asserts every worker sees RAY_LOCAL_WORLD_SIZE == "4". Side effects: starts/stops Ray.
     ray.init(num_cpus=100)
 
     # create 4 workers, each hold a GPU
@@ -51,6 +64,10 @@ def test_basics():
 
 
 def test_customized_worker_env():
+    # [FUNCTION DOC]
+    # Behavior: creates a group with worker_env {"test_key": "test_value"} and asserts all workers see it; then asserts
+    # creating a group whose worker_env sets WORLD_SIZE raises ValueError mentioning WORLD_SIZE (raises ValueError
+    # "test failed" if no error). Side effects: starts/stops Ray.
     ray.init(num_cpus=100)
 
     # create 4 workers, each hold a GPU

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Async tests of RateLimitedRewardManager (three limiting layers: concurrency semaphore, requests-per-minute and
+# tokens-per-minute token buckets, plus per-call timeout and error handling) using mock reward functions.
+# Despite the _on_cpu name, the tokenizer fixture loads ~/models/Qwen/Qwen2.5-0.5B-Instruct from disk.
+# A module-level MockAPICounter instance api_counter is shared by mocks and tests; several tests are timing based.
+
 import asyncio
 import os.path
 import time
@@ -28,23 +34,34 @@ from verl.experimental.reward_loop.reward_manager.limited import RateLimitedRewa
 
 # Mock API reward functions for testing
 class MockAPICounter:
+    # [CLASS DOC]
+    # HELPER: Records the count and timestamps of mock API calls, guarded by an asyncio lock.
     """Shared counter to track API calls across tests."""
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes call_count 0, empty call_times list, and an asyncio.Lock.
         self.call_count = 0
         self.call_times = []
         self.lock = asyncio.Lock()
 
     async def record_call(self):
+        # [FUNCTION DOC]
+        # HELPER: Under the lock, increments call_count and appends the current time.
         async with self.lock:
             self.call_count += 1
             self.call_times.append(time.time())
 
     def reset(self):
+        # [FUNCTION DOC]
+        # HELPER: Zeroes call_count and clears call_times (not under the lock).
         self.call_count = 0
         self.call_times.clear()
 
     def get_rate_per_second(self, window_start: float = None):
+        # [FUNCTION DOC]
+        # HELPER: Returns number of calls at or after window_start divided by (last call time - window_start); window_start
+        # defaults to the first call. Returns 0.0 if no calls or non-positive duration. Unused by the tests.
         """Calculate API call rate over a time window."""
         if window_start is None:
             if not self.call_times:
@@ -71,6 +88,9 @@ api_counter = MockAPICounter()
 def mock_sync_reward_function(
     data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **kwargs
 ) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Blocking mock scorer; sleeps 10ms and returns 1.0 if stripped solution equals stripped ground truth else
+    # 0.0. Does not record a call.
     """Synchronous mock reward function that simulates API call."""
     # Simulate API processing time
     time.sleep(0.01)
@@ -83,6 +103,8 @@ def mock_sync_reward_function(
 async def mock_async_reward_function(
     data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **kwargs
 ) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Records a call, awaits 10ms, returns 1.0 on stripped exact match else 0.0.
     """Asynchronous mock reward function that simulates API call."""
     # Record API call for rate tracking
     await api_counter.record_call()
@@ -98,6 +120,8 @@ async def mock_async_reward_function(
 async def mock_slow_api_function(
     data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **kwargs
 ) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Awaits 2 seconds then returns 0.5; used to trigger timeouts.
     """Slow mock API function for timeout testing."""
     await asyncio.sleep(2.0)  # Simulate slow API
     return 0.5
@@ -106,6 +130,8 @@ async def mock_slow_api_function(
 async def mock_failing_api_function(
     data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **kwargs
 ) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Records a call then raises ValueError("Simulated API error").
     """Mock API function that raises an exception."""
     await api_counter.record_call()
     raise ValueError("Simulated API error")
@@ -114,6 +140,8 @@ async def mock_failing_api_function(
 async def mock_dict_result_function(
     data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **kwargs
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Records a call, awaits 10ms, returns a dict with score (1.0/0.0), correct bool and a fixed reasoning string.
     """Mock API function that returns dict result."""
     await api_counter.record_call()
     await asyncio.sleep(0.01)
@@ -123,6 +151,12 @@ async def mock_dict_result_function(
 
 
 def create_test_data_proto(tokenizer, response_text: str, ground_truth: str, data_source: str = "test"):
+    # [FUNCTION DOC]
+    # HELPER: Tokenizes response_text without special tokens into a 1-row responses tensor with all-ones attention
+    # mask, wraps it in a DataProto, and sets non-tensor data_source and reward_model {"ground_truth": ...} as
+    # length-1 object arrays.
+    # Inputs: tokenizer, response_text, ground_truth, data_source (default "test").
+    # Outputs: DataProto with batch size 1.
     """Helper to create DataProto for testing."""
     response_ids = tokenizer.encode(response_text, add_special_tokens=False)
     response_tensor = torch.tensor([response_ids], dtype=torch.long)
@@ -145,10 +179,17 @@ def create_test_data_proto(tokenizer, response_text: str, ground_truth: str, dat
 
 
 class TestRateLimitedRewardManager:
+    # [CLASS DOC]
+    # Test class; every test calls init_class with a DictConfig under "reward" then constructs a manager with a mock
+    # compute_score and awaits run_single, which returns a dict containing reward_score and reward_extra_info.
     """Integration tests for RateLimitedRewardManager with mock API functions."""
 
     @pytest.fixture(autouse=True)
     def setup_and_teardown(self):
+        # [FUNCTION DOC]
+        # HELPER: Autouse fixture; resets api_counter and the manager's class-level state (_class_initialized False,
+        # _semaphore / _rpm_limiter / _tpm_limiter None) before each test, yields, then resets the counter again.
+        # Side effects: mutates class attributes of RateLimitedRewardManager.
         """Reset global state before each test."""
         api_counter.reset()
         # Reset class state
@@ -162,11 +203,15 @@ class TestRateLimitedRewardManager:
 
     @pytest.fixture
     def tokenizer(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture loading the Qwen2.5-0.5B-Instruct tokenizer from the local models directory.
         """Load a simple tokenizer for testing."""
         return AutoTokenizer.from_pretrained(os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B-Instruct"))
 
     @pytest.mark.asyncio
     async def test_basic_reward_computation(self, tokenizer):
+        # [FUNCTION DOC]
+        # Asserts a correct answer yields reward_score 1.0 and exactly one API call with no rate limits configured.
         """Test basic reward computation without rate limiting."""
         config = DictConfig({"reward": {"max_concurrent": 10, "timeout": 10.0}})
 
@@ -185,6 +230,8 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_rpm_rate_limiting(self, tokenizer):
+        # [FUNCTION DOC]
+        # With max_rpm 60, three sequential requests must take at least 1.8s, all score 1.0, and make 3 calls.
         """Test request per minute (RPM) rate limiting."""
         # Set RPM limit to 60 (1 request per second)
         config = DictConfig(
@@ -220,6 +267,9 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_tpm_rate_limiting(self, tokenizer):
+        # [FUNCTION DOC]
+        # With max_tpm 6000 and 2000 estimated tokens per request, two sequential requests must take at least 18s
+        # (the second waits for refill); both score 1.0. Slow test (~20s).
         """Test tokens per minute (TPM) rate limiting."""
         # Set TPM limit to 6000 (100 tokens per second)
         # With 2000 tokens per request, that's 0.05 req/sec or 20 seconds per request
@@ -256,6 +306,8 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_concurrency_limiting(self, tokenizer):
+        # [FUNCTION DOC]
+        # With max_concurrent 2, gathers 5 requests; asserts all succeed with 1.0 and elapsed >= 0.02s.
         """Test concurrent request limiting."""
         config = DictConfig(
             {
@@ -289,6 +341,8 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_timeout_handling(self, tokenizer):
+        # [FUNCTION DOC]
+        # With timeout 0.5s and the 2s mock, asserts reward_score 0.0 and extra info timeout True and acc 0.0.
         """Test timeout handling for slow API."""
         config = DictConfig(
             {
@@ -313,6 +367,8 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_error_handling(self, tokenizer):
+        # [FUNCTION DOC]
+        # With the failing mock, asserts score 0.0, extra info "error" containing the message, acc 0.0, and one call.
         """Test error handling for failing API."""
         config = DictConfig({"reward": {"max_concurrent": 10, "timeout": 10.0}})
 
@@ -332,6 +388,8 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_dict_result_format(self, tokenizer):
+        # [FUNCTION DOC]
+        # With the dict-returning mock, asserts reward_score comes from "score" and all dict fields appear in extra info.
         """Test handling of dict return format from reward function."""
         config = DictConfig({"reward": {"max_concurrent": 10, "timeout": 10.0}})
 
@@ -349,6 +407,8 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_sync_reward_function(self, tokenizer):
+        # [FUNCTION DOC]
+        # Asserts a synchronous scorer works (score 1.0) and the manager flags is_async_reward_score False.
         """Test that synchronous reward functions work correctly."""
         config = DictConfig({"reward": {"max_concurrent": 10, "timeout": 10.0}})
 
@@ -364,6 +424,9 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_combined_rate_limits(self, tokenizer):
+        # [FUNCTION DOC]
+        # With concurrency 2, 120 RPM, 12000 TPM and 100 tokens/request, gathers 6 requests; asserts >= 1.8s elapsed,
+        # all score 1.0, and 6 calls (RPM bucket burst of 2 is the bottleneck).
         """Test all three rate limiting layers together."""
         config = DictConfig(
             {
@@ -400,6 +463,8 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_correct_vs_incorrect_answers(self, tokenizer):
+        # [FUNCTION DOC]
+        # Asserts matching answer scores 1.0 and mismatching scores 0.0.
         """Test scoring of correct vs incorrect answers."""
         config = DictConfig({"reward": {"max_concurrent": 10, "timeout": 10.0}})
 
@@ -419,6 +484,9 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_high_throughput(self, tokenizer):
+        # [FUNCTION DOC]
+        # With concurrency 20 and 6000 RPM, gathers 200 requests; asserts all score 1.0, elapsed >= 0.9s (burst 100 then
+        # refill), and the average rate is at most 200 req/s.
         """Test high throughput with many concurrent requests."""
         config = DictConfig(
             {
@@ -461,6 +529,8 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_class_initialization_once(self, tokenizer):
+        # [FUNCTION DOC]
+        # Calls init_class twice and asserts the class semaphore object is unchanged (idempotent initialization).
         """Test that class initialization only happens once."""
         config = DictConfig({"reward": {"max_concurrent": 5, "timeout": 10.0}})
 
@@ -476,12 +546,16 @@ class TestRateLimitedRewardManager:
 
     @pytest.mark.asyncio
     async def test_extra_info_handling(self, tokenizer):
+        # [FUNCTION DOC]
+        # Adds non-tensor extra_info {"custom_field": "test_value"} and asserts the scorer received it.
         """Test that extra_info is properly passed to reward function."""
         received_extra_info = {}
 
         async def mock_reward_with_extra_info(
             data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **kwargs
         ):
+            # [FUNCTION DOC]
+            # HELPER: Async scorer that copies extra_info into the enclosing received_extra_info dict and returns 1.0.
             received_extra_info.update(extra_info)
             return 1.0
 

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# GPU Ray tests for split_resource_pool: splitting a pool by a fixed size, by a list of sizes (within and across
+# simulated nodes) and splitting a split pool again, then checking world sizes and DP outputs per sub-pool.
+
 import os
 
 import ray
@@ -30,12 +34,21 @@ from verl.utils.device import get_device_name, get_nccl_backend
 
 
 def get_local_gpus_num(division=1):
+    # [FUNCTION DOC]
+    # HELPER: Returns the local CUDA device count integer-divided by division, at least 1.
     return max(1, torch.cuda.device_count() // division)
 
 
 @ray.remote
 class Actor(Worker):
+    # [CLASS DOC]
+    # HELPER: Worker holding a worker_id offset; allocates a 4096x4096 random tensor on device (to occupy memory) and
+    # initializes torch.distributed if needed.
     def __init__(self, worker_id) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls base init, stores worker_id, allocates the device tensor and, if not initialized, inits the process
+        # group with the device collective backend using RANK (default 0) and WORLD_SIZE (default 1).
+        # Side effects: global distributed init, device memory.
         super().__init__()
         self.worker_id = worker_id
         self.temp_tensor = torch.rand(4096, 4096).to(get_device_name())
@@ -47,11 +60,18 @@ class Actor(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def add(self, data: DataProto):
+        # [FUNCTION DOC]
+        # HELPER: DP_COMPUTE_PROTO; adds rank + worker_id to batch "a" in place and returns it.
         data.batch["a"] += self.rank + self.worker_id
         return data
 
 
 def test_split_resource_pool_with_split_size():
+    # [FUNCTION DOC]
+    # Behavior: builds a pool of two simulated nodes of half GPUs, creates placement groups, splits by half into two pools
+    # with worker_id 0 and 100, asserts each world size is half and that adding to an ngpus-length zero tensor gives each
+    # rank's value repeated twice (plus 100 for the second).
+    # KNOWN ISSUE: the "repeated twice" expectation assumes ngpus equals 2 x half (i.e. an even GPU count >= 2).
     ray.init()
     ngpus = torch.cuda.device_count()
     half = get_local_gpus_num(2)
@@ -83,6 +103,9 @@ def test_split_resource_pool_with_split_size():
 
 
 def test_split_resource_pool_with_split_size_list():
+    # [FUNCTION DOC]
+    # Behavior: four simulated nodes of quarter GPUs, split into [quarter, 3*quarter]; asserts world sizes and outputs
+    # 0..quarter-1 and 100..100+3*quarter-1.
     ray.init()
     quarter = get_local_gpus_num(4)
     # simulate 4 nodes of quarter GPUs each
@@ -117,6 +140,8 @@ def test_split_resource_pool_with_split_size_list():
 
 
 def test_split_resource_pool_with_split_size_list_cross_nodes():
+    # [FUNCTION DOC]
+    # Behavior: same as the list test but the pool is two nodes of half GPUs, so the second split spans nodes.
     ray.init()
     half = get_local_gpus_num(2)
     quarter = get_local_gpus_num(4)
@@ -153,6 +178,10 @@ def test_split_resource_pool_with_split_size_list_cross_nodes():
 
 
 def test_split_resource_pool_with_split_twice():
+    # [FUNCTION DOC]
+    # Behavior: pool of ngpus/2 nodes with 2 GPUs each, split into [quarter, mid, quarter] with mid = ngpus - 2*quarter,
+    # then the middle pool split into size-1 pools; for each final pool (worker_id = index*100) dispatches 4 zeros and
+    # asserts world size and that each rank's value (rank + index*100) repeats 4 / world_size times.
     ray.init()
     ngpus = torch.cuda.device_count()
     quarter = get_local_gpus_num(4)

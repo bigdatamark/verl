@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests FSDPEngine._gradient_sync_context, which defers gradient all-reduce during gradient accumulation (FSDP1 via
+# no_sync, FSDP2 via set_requires_gradient_sync) on all but the last micro-batch, plus forward_backward_batch's use of
+# it, and a 2-process gloo/CPU equivalence check that deferred sync yields the same parameters as per-micro-batch sync.
+
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
@@ -29,11 +34,17 @@ from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
 
 class _FSDP1Module:
+    # [CLASS DOC]
+    # HELPER: Fake FSDP1 module recording "enter"/"exit" events of its no_sync context.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes an empty event list.
         self.events = []
 
     @contextmanager
     def no_sync(self):
+        # [FUNCTION DOC]
+        # HELPER: Context manager appending "enter" on entry and "exit" on exit (also on error).
         self.events.append("enter")
         try:
             yield
@@ -42,14 +53,23 @@ class _FSDP1Module:
 
 
 class _FSDP2Module:
+    # [CLASS DOC]
+    # HELPER: Fake FSDP2 module recording each set_requires_gradient_sync argument.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes an empty event list.
         self.events = []
 
     def set_requires_gradient_sync(self, enabled):
+        # [FUNCTION DOC]
+        # HELPER: Appends the boolean enabled to events.
         self.events.append(enabled)
 
 
 def _make_engine(module, *, use_no_sync_for_gradient_accumulation=True):
+    # [FUNCTION DOC]
+    # HELPER: Creates an FSDPEngine without __init__ wrapping module, with an engine config carrying only
+    # use_no_sync_for_gradient_accumulation (default True). Outputs: the engine.
     engine = object.__new__(FSDPEngine)
     engine.module = module
     engine.engine_config = SimpleNamespace(
@@ -60,6 +80,8 @@ def _make_engine(module, *, use_no_sync_for_gradient_accumulation=True):
 
 @pytest.mark.parametrize("version,module_cls", [(1, _FSDP1Module), (2, _FSDP2Module)])
 def test_gradient_sync_context_skips_non_final_micro_batch(monkeypatch, version, module_cls):
+    # [FUNCTION DOC]
+    # For a non-final micro-batch, FSDP1 wraps the body in no_sync and FSDP2 disables then re-enables gradient sync.
     module = module_cls()
     engine = _make_engine(module)
     monkeypatch.setattr(transformer_impl, "fsdp_version", lambda _: version)
@@ -72,6 +94,8 @@ def test_gradient_sync_context_skips_non_final_micro_batch(monkeypatch, version,
 
 
 def test_gradient_sync_context_restores_fsdp2_after_error(monkeypatch):
+    # [FUNCTION DOC]
+    # On an exception inside the context FSDP2 sync is re-enabled and the exception propagates.
     module = _FSDP2Module()
     engine = _make_engine(module)
     monkeypatch.setattr(transformer_impl, "fsdp_version", lambda _: 2)
@@ -84,6 +108,8 @@ def test_gradient_sync_context_restores_fsdp2_after_error(monkeypatch):
 
 
 def test_gradient_sync_context_keeps_sync_for_final_micro_batch(monkeypatch):
+    # [FUNCTION DOC]
+    # For the final micro-batch nothing is toggled.
     module = _FSDP2Module()
     engine = _make_engine(module)
     monkeypatch.setattr(transformer_impl, "fsdp_version", lambda _: 2)
@@ -96,6 +122,8 @@ def test_gradient_sync_context_keeps_sync_for_final_micro_batch(monkeypatch):
 
 @pytest.mark.parametrize("version,module_cls", [(1, _FSDP1Module), (2, _FSDP2Module)])
 def test_gradient_sync_context_keeps_sync_when_disabled(monkeypatch, version, module_cls):
+    # [FUNCTION DOC]
+    # With the config option False nothing is toggled for either FSDP version.
     module = module_cls()
     engine = _make_engine(module, use_no_sync_for_gradient_accumulation=False)
     monkeypatch.setattr(transformer_impl, "fsdp_version", lambda _: version)
@@ -112,6 +140,8 @@ def test_gradient_sync_context_defaults_to_deferred_sync_for_legacy_config(
     version,
     module_cls,
 ):
+    # [FUNCTION DOC]
+    # A config lacking the option behaves as if it were True (deferred sync).
     module = module_cls()
     engine = _make_engine(module)
     engine.engine_config = SimpleNamespace()
@@ -125,6 +155,9 @@ def test_gradient_sync_context_defaults_to_deferred_sync_for_legacy_config(
 
 
 def test_forward_backward_batch_syncs_only_final_micro_batch(monkeypatch):
+    # [FUNCTION DOC]
+    # With three patched micro-batches, forward_backward_batch enters the sync context with is_last_micro_batch
+    # False, False, True, returns three outputs, and gradients reach every micro-batch's loss tensor.
     engine = _make_engine(_FSDP2Module())
     engine.ulysses_sequence_parallel_size = 1
     engine.scaler = None
@@ -134,6 +167,8 @@ def test_forward_backward_batch_syncs_only_final_micro_batch(monkeypatch):
 
     @contextmanager
     def record_sync(*, is_last_micro_batch):
+        # [FUNCTION DOC]
+        # HELPER: Context manager recording the is_last_micro_batch flag.
         sync_states.append(is_last_micro_batch)
         yield
 
@@ -168,6 +203,9 @@ def test_forward_backward_batch_syncs_only_final_micro_batch(monkeypatch):
 
 
 def _build_distributed_model(strategy, mesh):
+    # [FUNCTION DOC]
+    # HELPER: Builds a seeded 4->8->2 MLP (GELU) and wraps it with FSDP1 FULL_SHARD on CPU when strategy is "fsdp",
+    # otherwise applies FSDP2 fully_shard on mesh in place. Outputs: the wrapped model.
     torch.manual_seed(2026)
     model = torch.nn.Sequential(
         torch.nn.Linear(4, 8),
@@ -185,6 +223,10 @@ def _build_distributed_model(strategy, mesh):
 
 
 def _run_distributed_step(model, inputs, targets, strategy, defer_sync):
+    # [FUNCTION DOC]
+    # HELPER: Runs one SGD step (lr 0.05) accumulating summed-MSE gradients over the micro-batches, using the engine's
+    # gradient sync context when defer_sync is true (deferring all but the last) or none otherwise. Outputs: list of cloned
+    # full parameter tensors (summoned full params for FSDP1, full_tensor for FSDP2). Side effects: updates the model.
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     optimizer.zero_grad(set_to_none=True)
     engine = _make_engine(model)
@@ -207,6 +249,10 @@ def _run_distributed_step(model, inputs, targets, strategy, defer_sync):
 
 
 def _distributed_equivalence_worker(rank, world_size, rendezvous_file):
+    # [FUNCTION DOC]
+    # HELPER: Per-process entry: initializes a gloo process group via a file rendezvous, builds rank-dependent inputs split
+    # into two micro-batches, and for both FSDP1 and FSDP2 compares parameters after a baseline step and a deferred-sync
+    # step (rtol/atol 1e-6). Always destroys the process group. Exceptions: assertion errors on mismatch.
     dist.init_process_group(
         backend="gloo",
         init_method=f"file://{rendezvous_file}",
@@ -245,6 +291,8 @@ def _distributed_equivalence_worker(rank, world_size, rendezvous_file):
 
 
 def test_distributed_accumulation_matches_per_micro_batch_sync(tmp_path):
+    # [FUNCTION DOC]
+    # Spawns two worker processes running the equivalence check and waits for them; a failure in either fails the test.
     world_size = 2
     rendezvous_file = str(tmp_path / "fsdp_rdzv")
     mp.spawn(

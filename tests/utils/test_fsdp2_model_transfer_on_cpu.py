@@ -12,12 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CPU tests asserting FSDP2 model offload/load helpers in verl.utils.fsdp_utils move the model with
+# non-blocking copies, using Mock models.
+
 from unittest.mock import Mock
 
 from verl.utils import fsdp_utils
 
 
 def test_offload_fsdp2_model_to_cpu_uses_non_blocking_copy():
+    # [FUNCTION DOC]
+    # Calls offload_fsdp2_model_to_cpu on a Mock with empty_cache disabled and asserts model.to was called once
+    # with "cpu" and non_blocking=True.
     model = Mock()
 
     fsdp_utils.offload_fsdp2_model_to_cpu(model, empty_cache=False)
@@ -26,6 +33,9 @@ def test_offload_fsdp2_model_to_cpu_uses_non_blocking_copy():
 
 
 def test_load_fsdp2_model_to_gpu_uses_non_blocking_copy(monkeypatch):
+    # [FUNCTION DOC]
+    # Patches get_device_id to return a sentinel device, calls load_fsdp2_model_to_gpu, and asserts model.to was
+    # called once with that device and non_blocking=True.
     model = Mock()
     device = object()
     monkeypatch.setattr(fsdp_utils, "get_device_id", lambda: device)

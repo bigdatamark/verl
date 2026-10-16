@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Module tool_agent_loop: multi-turn agent loop with tool calling, registered as "tool_agent". Runs a state
+# machine (PENDING -> GENERATING <-> PROCESSING_TOOLS -> TERMINATED) that alternates model generations with tool
+# executions, keeping a single growing token sequence where response_mask marks model-generated tokens (1) versus
+# injected tool/context tokens (0). SPEC_DECODE_EXTRA_KEYS lists speculative-decoding counters summed across turns.
+# Side effects: module logger keyed by file path, level from VERL_LOGGING_LEVEL.
 import asyncio
 import json
 import logging
@@ -46,6 +53,8 @@ SPEC_DECODE_EXTRA_KEYS = (
 
 
 class AgentState(Enum):
+    # [CLASS DOC]
+    # Enum of agent loop states: PENDING, GENERATING, PROCESSING_TOOLS, TERMINATED.
     PENDING = "pending"
     GENERATING = "generating"
     PROCESSING_TOOLS = "processing_tools"
@@ -53,6 +62,11 @@ class AgentState(Enum):
 
 
 class AgentData:
+    # [CLASS DOC]
+    # Mutable per-trajectory state container passed through the loop and into tools: chat messages, multimodal data,
+    # metrics, request id, tool kwargs, accumulated token ids (prompt_ids holds the full sequence), response mask,
+    # logprobs, turn scores, tool rewards, turn counters, pending tool calls, routed experts and free-form extra_fields.
+    # The loop also attaches _active_tools and _active_tool_schemas dynamically.
     """Encapsulates all state variables for the agent loop. AgentData is passed to tool calling in case that
     tool may need to access full history state. User can store any tool session data in `extra_fields`."""
 
@@ -67,6 +81,10 @@ class AgentData:
         request_id: str,
         tools_kwargs: dict[str, Any],
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores constructor arguments (mm_processor_kwargs defaults to empty dict) and initializes all state
+        # fields empty/zero/None. Inputs: messages, image_data, video_data, audio_data, mm_processor_kwargs, metrics,
+        # request_id, tools_kwargs. Side effects: none.
         self.messages = messages
         self.image_data = image_data
         self.video_data = video_data
@@ -100,7 +118,14 @@ class AgentData:
 
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
+    # [CLASS DOC]
+    # Agent loop implementing tool-calling rollouts. Configured from rollout_config.multi_turn: max user/assistant
+    # turns, max parallel calls, tool response max length and truncation side, and tool parser format.
     def __init__(self, *args, tools: Optional[ToolListWrap] = None, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: initializes the base loop, reads multi-turn limits, indexes tools by name, dumps their schemas
+        # (excluding unset/None fields), creates the tool parser for the configured format, and caches prompt/response lengths.
+        # Inputs: base args; tools - optional ToolListWrap. Exceptions: errors from unknown parser names.
         """Initialize the tool agent loop.
 
         Args:
@@ -125,10 +150,24 @@ class ToolAgentLoop(AgentLoopBase):
 
     @staticmethod
     def _make_request_id(priority: int, full_determinism: bool) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Outputs: "det-<priority>" when full_determinism is set, otherwise a random hex UUID.
         return f"det-{priority}" if full_determinism else uuid4().hex
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
+        # [FUNCTION DOC]
+        # Behavior: (traced) copies raw_prompt messages, extracts multimodal data and mm kwargs, creates a request id and
+        # AgentData; selects active tools from extra_info.tool_selection (intersection with known tools) or all tools; runs
+        # the state machine until TERMINATED (unknown states log an error and terminate). Then splits the final sequence into
+        # prompt ids and response ids by the response mask length, gathers non-None multimodal data, and builds the
+        # AgentLoopOutput truncating response ids/mask/logprobs to response_length and routed experts to prompt length plus
+        # response_length; num_turns = user + assistant turns + 1; extra_fields gain turn_scores and tool_rewards.
+        # Inputs: sampling_params; priority; kwargs with raw_prompt and optional tools_kwargs, extra_info.
+        # Outputs: AgentLoopOutput. Exceptions: KeyError without raw_prompt; propagates handler errors.
+        # KNOWN ISSUE: if the response mask is empty, slicing the last zero elements yields the whole sequence, so
+        # response_ids would equal the entire prompt (single_turn_agent_loop guards this case). Also priority is used only for
+        # the request id and is not forwarded to the generate call, unlike the single-turn loop.
         messages = list(kwargs["raw_prompt"])
 
         # extract multimodal inputs from messages
@@ -213,6 +252,10 @@ class ToolAgentLoop(AgentLoopBase):
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: asserts multimodal support if any media is present, builds initial prompt tokens with the active
+        # tool schemas and media via the continuous-token builder, stores them and the SGLang video payload.
+        # Inputs: agent_data; sampling_params unused. Outputs: AgentState.GENERATING. Side effects: mutates agent_data.
         """Handle the pending state: prepare the prompt and start generation."""
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         # Continuous Token is the only tokenization path; multimodal prompts require a
@@ -234,6 +277,16 @@ class ToolAgentLoop(AgentLoopBase):
     async def _handle_generating_state(
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
     ) -> AgentState:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: adds the tool parser's stop token ids (deduplicated) to a copy of sampling_params; generates from the
+        # current sequence (timed); sets num_preempted on first turn (-1 if unknown) or adds to it later; on first turn copies
+        # the output extra_fields, later updates only max_global_steps (if truthy) and sums spec-decode counters present in both.
+        # Increments assistant_turns, stores raw output tokens, merges them into the sequence (updating mask and logprobs when
+        # any logprobs exist), stores routed experts. Terminates if mask length reaches response_length (unless
+        # ignore_termination), or assistant/user turn limits are reached. Otherwise parses tool calls from the output using the
+        # active tools' schemas, appends the assistant message, and returns PROCESSING_TOOLS if any calls else TERMINATED.
+        # Inputs: agent_data, sampling_params, ignore_termination. Outputs: next AgentState.
+        # Side effects: network request; mutates agent_data heavily.
         """Handle the generating state: generate model response and check for tool calls."""
         # Inject tool parser stop tokens so generation halts after each tool call
         if self.tool_parser.stop_token_ids:
@@ -308,6 +361,18 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: runs up to max_parallel_calls tool calls concurrently (timed). For each result builds a tool message:
+        # structured content (image entries, a video placeholder, text) when media is present (requires a processor with an
+        # image processor), else plain text; adds tool_call_id when available; collects non-None images; raises on any video;
+        # records non-None rewards. Asserts multimodal support if new images arrived, appends the messages, merges the new
+        # context into the token sequence via ct_merge_context_msg (mask zeros for context). If the mask reaches
+        # response_length returns TERMINATED (without committing the merged tokens); otherwise commits tokens, mask and
+        # logprobs (only if logprobs were being tracked), appends new images to image_data (normalizing to a list),
+        # increments user_turns and returns GENERATING.
+        # Inputs: agent_data. Outputs: AgentState.
+        # Exceptions: ValueError when media is returned without a VLM processor; NotImplementedError for video.
+        # Side effects: tool execution, mutation of agent_data.
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
         add_messages: list[dict[str, Any]] = []
         new_images_this_turn: list[Any] = []  # Local variable instead of agent_data attribute
@@ -411,6 +476,11 @@ class ToolAgentLoop(AgentLoopBase):
         return AgentState.GENERATING
 
     def _build_assistant_message(self, content: str, agent_data: AgentData) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: builds an assistant chat message with the given content (empty string if None); when tool calls
+        # exist, adds up to max_parallel_calls OpenAI-style tool_calls entries, using the decoded arguments schema when valid or
+        # the raw argument string (with a warning) when decoding fails, and including ids when present.
+        # Inputs: content text; agent_data. Outputs: message dict. Side effects: warning logs.
         message: dict[str, Any] = {"role": "assistant", "content": content or ""}
         if not agent_data.tool_calls:
             return message
@@ -443,6 +513,16 @@ class ToolAgentLoop(AgentLoopBase):
     async def _call_tool(
         self, tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: AgentData
     ) -> tuple[ToolResponse, float, dict]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: looks up the tool among active tools (unknown -> error text response with reward 0); parses JSON
+        # arguments (failure -> error text response); executes it: FunctionTool instances are called directly and their return
+        # normalized; other tools are created with create_kwargs from tools_kwargs for that tool name, then executed with
+        # agent_data; any exception yields an error text response; created BaseTool instances are always released. Truncates
+        # response text over max_tool_response_length: "left" keeps the tail with a prefix marker, "right" keeps the head with
+        # a suffix marker, otherwise keeps half from each end with a middle marker. Copies non-None image/video attributes.
+        # Inputs: tool_call, tools_kwargs mapping tool name to kwargs, agent_data.
+        # Outputs: tuple (ToolResponse, reward, extra result dict). Exceptions: none propagated from tool execution.
+        # Side effects: tool execution, warning logs.
         """Call tool and return tool response.
 
         Dispatches between two contracts:

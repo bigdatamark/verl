@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests for compute_spec_decode_metrics (speculative-decoding rollout metrics) from the PPO ray trainer.
+# Skipped entirely if ray is not installed. Verifies accept rate / accept length computation from
+# per-sample draft, accept and verify counts, including padding-mask handling.
+
 import numpy as np
 import pytest
 
@@ -21,6 +26,11 @@ from verl.trainer.ppo.ray_trainer import compute_spec_decode_metrics
 
 
 def test_spec_decode_metrics_detect_drafts_with_zero_acceptance():
+    # [FUNCTION DOC]
+    # Behavior: 3 samples with drafts but zero accepted tokens; expects accept rate 0.0 and accept length 1.0
+    # (only the verified token counts).
+    # Inputs: none. Outputs: none; asserts on the returned metrics mapping.
+    # Exceptions: AssertionError on mismatch. Side effects: none.
     metrics = compute_spec_decode_metrics(
         spec_drafts=np.array([3, 3, 3]),
         spec_accepts=np.array([0, 0, 0]),
@@ -32,6 +42,9 @@ def test_spec_decode_metrics_detect_drafts_with_zero_acceptance():
 
 
 def test_spec_decode_metrics_report_nonzero_acceptance_after_recovery():
+    # [FUNCTION DOC]
+    # Behavior: accepts of 3,2,1 out of 3 drafts each; expects accept rate > 0 and accept length > 1.
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on mismatch. Side effects: none.
     metrics = compute_spec_decode_metrics(
         spec_drafts=np.array([3, 3, 3]),
         spec_accepts=np.array([3, 2, 1]),
@@ -43,6 +56,10 @@ def test_spec_decode_metrics_report_nonzero_acceptance_after_recovery():
 
 
 def test_spec_decode_metrics_drop_padded_placeholders():
+    # [FUNCTION DOC]
+    # Behavior: only the first sample is non-padding (mask True,False,False) with 3/3 accepted; expects padded
+    # entries excluded so accept rate is 1.0 and accept length is 4.0 (3 accepted + 1 verify).
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on mismatch. Side effects: none.
     metrics = compute_spec_decode_metrics(
         spec_drafts=np.array([3, 3, 3]),
         spec_accepts=np.array([3, 0, 0]),

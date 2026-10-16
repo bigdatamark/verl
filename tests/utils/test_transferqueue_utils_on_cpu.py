@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for the transferqueue async bridge: running a coroutine function
+# synchronously via _run_async_in_temp_loop must not leak file descriptors over
+# repeated calls, and must reuse a single background event-loop thread
+# (module globals _ASYNC_BRIDGE_THREAD and _ASYNC_BRIDGE_LOOP) until
+# _shutdown_async_bridge_runtime is called.
 
 import gc
 import os
@@ -21,16 +27,27 @@ from verl.utils import transferqueue_utils as tqu
 
 
 async def _noop():
+    # [FUNCTION DOC]
+    # HELPER: Coroutine that does nothing and returns None.
     return None
 
 
 def _open_fd_count() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Counts open file descriptors of the current process via /proc/self/fd.
+    # Outputs: int. Side effects: skips the test when /proc/self/fd is missing
+    # (non-Linux).
     if not os.path.isdir("/proc/self/fd"):
         pytest.skip("requires Linux /proc file descriptor accounting")
     return len(os.listdir("/proc/self/fd"))
 
 
 def test_temp_event_loop_releases_file_descriptors():
+    # [FUNCTION DOC]
+    # Behavior: with garbage collection disabled (to avoid GC hiding leaks) and a fresh
+    # bridge runtime, runs the noop once to warm up, records the fd count, runs it 32
+    # more times, and asserts the fd count did not grow. Always shuts down the bridge
+    # and restores the GC state.
     gc.collect()
     gc_was_enabled = gc.isenabled()
     gc.disable()
@@ -51,6 +68,10 @@ def test_temp_event_loop_releases_file_descriptors():
 
 
 def test_async_bridge_loop_reused_between_calls():
+    # [FUNCTION DOC]
+    # Behavior: after a shutdown, the first call creates a live bridge thread and an
+    # open loop; a second call reuses the identical thread and loop objects. Shuts the
+    # bridge down afterwards.
     tqu._shutdown_async_bridge_runtime()
     try:
         tqu._run_async_in_temp_loop(_noop)

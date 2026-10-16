@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Example custom reward function module, plugged in via custom_reward_function, shared by the
+# dapo-math training and AIME validation reward managers (see the module docstring for rationale).
 """Reward dispatcher used for BOTH training (dapo-math-17k) and validation (AIME).
 
 verl applies a single ``custom_reward_function`` to the train AND val reward
@@ -25,6 +28,14 @@ from verl.utils.reward_score import default_compute_score
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
+    # [FUNCTION DOC]
+    # Normalizes the data_source tag and delegates scoring to verl's default_compute_score.
+    # Behavior: converts data_source to a string (None becomes empty); if it contains "aime"
+    # case-insensitively it is replaced by exactly "aime" so the default router uses the math_dapo
+    # verifier; all other tags pass through unchanged.
+    # Inputs: data_source; solution_str model output; ground_truth; optional extra_info; extra kwargs
+    # forwarded verbatim. Outputs: whatever default_compute_score returns (a float or a result dict).
+    # Exceptions: propagates errors from the default router (e.g. unsupported data_source).
     ds = str(data_source or "")
     # AIME val parquets may carry a tag the default router does not match
     # (it only routes ``data_source.startswith("aime")``). Normalize those so

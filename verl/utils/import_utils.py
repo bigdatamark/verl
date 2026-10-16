@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Package-availability checks (cached for the process lifetime) and dynamic loading helpers: importing extra libraries, resolving config paths, loading modules from "pkg://" or file paths, loading objects/classes by name, and a deprecation decorator. Constants PKG_PATH_PREFIX ("pkg://") and FILE_PATH_PREFIX ("file://").
+
 """
 Utilities to check if packages are available.
 We assume package availability won't change during runtime.
@@ -26,6 +29,8 @@ from typing import Optional
 
 @cache
 def is_megatron_core_available():
+    # [FUNCTION DOC]
+    # Cached; True if importlib can find the megatron.core spec (missing parent package counts as unavailable).
     try:
         mcore_spec = importlib.util.find_spec("megatron.core")
     except ModuleNotFoundError:
@@ -35,6 +40,8 @@ def is_megatron_core_available():
 
 @cache
 def is_vllm_available():
+    # [FUNCTION DOC]
+    # Cached; True if the vllm spec is findable.
     try:
         vllm_spec = importlib.util.find_spec("vllm")
     except ModuleNotFoundError:
@@ -44,6 +51,8 @@ def is_vllm_available():
 
 @cache
 def is_sglang_available():
+    # [FUNCTION DOC]
+    # Cached; True if the sglang spec is findable.
     try:
         sglang_spec = importlib.util.find_spec("sglang")
     except ModuleNotFoundError:
@@ -53,6 +62,8 @@ def is_sglang_available():
 
 @cache
 def is_nvtx_available():
+    # [FUNCTION DOC]
+    # Cached; True if the nvtx spec is findable.
     try:
         nvtx_spec = importlib.util.find_spec("nvtx")
     except ModuleNotFoundError:
@@ -62,6 +73,8 @@ def is_nvtx_available():
 
 @cache
 def is_trl_available():
+    # [FUNCTION DOC]
+    # Cached; True if the trl spec is findable.
     try:
         trl_spec = importlib.util.find_spec("trl")
     except ModuleNotFoundError:
@@ -71,6 +84,8 @@ def is_trl_available():
 
 @cache
 def is_msprobe_available():
+    # [FUNCTION DOC]
+    # Cached; True if the msprobe spec is findable.
     try:
         msprobe_spec = importlib.util.find_spec("msprobe")
     except ModuleNotFoundError:
@@ -79,6 +94,9 @@ def is_msprobe_available():
 
 
 def import_external_libs(external_libs=None):
+    # [FUNCTION DOC]
+    # Imports each named module (single name or list) for its side effects (e.g. registering custom models); no-op for None.
+    # Exceptions: ImportError propagates.
     if external_libs is None:
         return
     if not isinstance(external_libs, list):
@@ -89,6 +107,10 @@ def import_external_libs(external_libs=None):
 
 
 def resolve_config_path(config_path: str) -> str:
+    # [FUNCTION DOC]
+    # Behavior: absolute paths returned unchanged. Otherwise tries, in order, cwd/config_path, <parent of verl package>/config_path, and <verl package dir>/config_path; each candidate must stay inside its base directory (no escaping via "..") and exist.
+    # Outputs: absolute path.
+    # Exceptions: FileNotFoundError if none match.
     """Resolve agent loop configuration file path.
 
     In multi-node Ray training, relative paths may not resolve correctly
@@ -149,6 +171,11 @@ FILE_PATH_PREFIX = "file://"
 
 
 def load_module(module_path: str, module_name: Optional[str] = None) -> object:
+    # [FUNCTION DOC]
+    # Behavior: returns None for empty path. "pkg://" paths are converted (slashes to dots) and imported normally (module_name argument ignored). Otherwise strips "file://", requires the file to exist, builds a spec named module_name or "custom_module_<hash of abs path>", executes it, and if module_name was given registers it in sys.modules.
+    # Inputs: module_path; module_name - optional sys.modules key.
+    # Outputs: module object.
+    # Exceptions: FileNotFoundError; ImportError if no spec/loader; RuntimeError (chained) if execution fails or module_name already maps to a different module.
     """Load a module from a path.
 
     Args:
@@ -204,6 +231,8 @@ def load_module(module_path: str, module_name: Optional[str] = None) -> object:
 
 
 def _get_qualified_name(func):
+    # [FUNCTION DOC]
+    # HELPER: Returns "<module>.<qualname>" of a function or class.
     """Get full qualified name including module and class (if any)."""
     module = func.__module__
     qualname = func.__qualname__
@@ -211,9 +240,15 @@ def _get_qualified_name(func):
 
 
 def deprecated(replacement: str = ""):
+    # [FUNCTION DOC]
+    # Behavior: decorator factory. For classes, wraps __init__ to emit a FutureWarning naming the class (and replacement if given) on every instantiation, returning the same class. For functions, returns a wrapper emitting the warning on each call.
+    # Inputs: replacement - suggested replacement text.
+    # Outputs: decorator.
     """Decorator to mark functions or classes as deprecated."""
 
     def decorator(obj):
+        # [FUNCTION DOC]
+        # HELPER: Applies the deprecation wrapping to obj as described above.
         qualified_name = _get_qualified_name(obj)
 
         if isinstance(obj, type):
@@ -221,6 +256,8 @@ def deprecated(replacement: str = ""):
 
             @wraps(original_init)
             def wrapped_init(self, *args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Warns then calls the original __init__.
                 msg = f"Warning: Class '{qualified_name}' is deprecated."
                 if replacement:
                     msg += f" Please use '{replacement}' instead."
@@ -234,6 +271,8 @@ def deprecated(replacement: str = ""):
 
             @wraps(obj)
             def wrapped(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Warns then calls the original function.
                 msg = f"Warning: Function '{qualified_name}' is deprecated."
                 if replacement:
                     msg += f" Please use '{replacement}' instead."
@@ -246,6 +285,9 @@ def deprecated(replacement: str = ""):
 
 
 def load_extern_object(module_path: str, object_name: str) -> object:
+    # [FUNCTION DOC]
+    # Loads the module via load_module and returns the named attribute.
+    # Exceptions: AttributeError if missing (also if load_module returned None).
     """Load an object from a module path.
 
     Args:
@@ -262,6 +304,9 @@ def load_extern_object(module_path: str, object_name: str) -> object:
 
 
 def load_class_from_fqn(fqn: str, description: str = "class") -> type:
+    # [FUNCTION DOC]
+    # Behavior: splits fqn at the last dot, imports the module, returns the attribute.
+    # Exceptions: ValueError if no dot; ImportError / AttributeError re-raised with descriptive messages.
     """Load a class from its fully qualified name.
 
     Args:
@@ -296,5 +341,7 @@ def load_class_from_fqn(fqn: str, description: str = "class") -> type:
 
 @deprecated(replacement="load_module(file_path); getattr(module, type_name)")
 def load_extern_type(file_path: str, type_name: str) -> type:
+    # [FUNCTION DOC]
+    # Deprecated alias for load_extern_object (warns on each call).
     """DEPRECATED. Directly use `load_extern_object` instead."""
     return load_extern_object(file_path, type_name)

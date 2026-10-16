@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Package dynamic_schedule: policies and controller for dynamically activating/deactivating hybrid (trainer-colocated)
+# rollout replicas during fully async training. Re-exports the context dataclass, policy base class, registry helpers
+# (build_policy, register_policy), the default and static policies, and DynamicResourceController.
+# Side effects: importing registers the built-in policies in the policy registry.
+
 from .base import DynamicScheduleContext, DynamicSchedulePolicyBase, build_policy, register_policy
 from .default_policy import DefaultDynamicSchedulePolicy
 from .dynamic_resource_controller import DynamicResourceController

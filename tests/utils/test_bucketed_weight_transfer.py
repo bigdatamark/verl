@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for vLLM rollout BucketedWeightSender / BucketedWeightReceiver, which stream named weight tensors over a
+# ZMQ socket in fixed-size byte buckets via shared memory or CUDA IPC. Includes a single-process unit test of the
+# sender with non-contiguous tensors, and spawn-based sender/receiver process pairs that compare received
+# name/dtype/shape/sum checksums with deterministically regenerated weights. Device type flags are derived from
+# the device name string to avoid initializing CUDA in the pytest process.
 """Tests for BucketedWeightSender and BucketedWeightReceiver.
 
 Sender and receiver run in separate processes to match real-world usage
@@ -35,10 +41,16 @@ HAS_CUDA = "cuda" in get_device_name()
 
 
 def _unique_zmq_handle():
+    # [FUNCTION DOC]
+    # HELPER: Returns a unique ZMQ IPC endpoint string under /tmp using a random UUID hex.
     return f"ipc:///tmp/test-bwt-{uuid.uuid4().hex}.sock"
 
 
 def _generate_weights(weight_specs, seed):
+    # [FUNCTION DOC]
+    # HELPER: Seeds the device RNG with seed, then for each (name, shape, dtype) spec draws a float32 normal tensor on
+    # device index 0 of the current device type and casts it to dtype. Outputs: list of (name, tensor) pairs.
+    # Side effects: reseeds the device RNG.
     """Deterministically generate weights on the best available device from specs.
 
     Args:
@@ -59,22 +71,42 @@ def _generate_weights(weight_specs, seed):
 
 
 class _FakeSocket:
+    # [CLASS DOC]
+    # HELPER: Fake ZMQ socket recording sent Python objects.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes an empty messages list.
         self.messages = []
 
     def send_pyobj(self, message):
+        # [FUNCTION DOC]
+        # HELPER: Appends message to messages.
         self.messages.append(message)
 
     def recv(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns empty bytes (simulated acknowledgement).
         return b""
 
 
 class _FakeTorchDevice:
+    # [CLASS DOC]
+    # HELPER: Fake device module whose synchronize does nothing.
     def synchronize(self):
+        # [FUNCTION DOC]
+        # HELPER: No-op.
         pass
 
 
 def test_sender_accepts_strided_tensor(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: builds a non-contiguous (strided) slice of a 2x3x4 float tensor, and a uint8 CPU buffer of exactly its
+    # byte size; asserts the slice is non-contiguous and cannot be byte-viewed directly. Creates a sender (1 MB
+    # bucket, shm mode) and monkeypatches socket init, buffer init, cleanup and get_torch_device with fakes; sends the
+    # single weight. Asserts exactly one message was sent containing bucket metadata for "strided" (name, shape,
+    # dtype, offset 0, handle None) with is_last True, the buffer is still uint8 of the same size, and reinterpreting
+    # the buffer as the weight dtype/shape reproduces the weight exactly (sender copied the strided data correctly).
+    # Inputs: monkeypatch. Outputs: none.
     from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
 
     base = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
@@ -123,6 +155,9 @@ def test_sender_accepts_strided_tensor(monkeypatch):
 # Process entry points (must be module-level for pickling with spawn)
 # ---------------------------------------------------------------------------
 def _sender_fn(zmq_handle, weight_specs, seed, bucket_size_mb, use_shm):
+    # [FUNCTION DOC]
+    # HELPER: Child-process sender: generates weights from specs and seed, creates a BucketedWeightSender with the
+    # given handle, bucket size and shm flag, and runs its async send of all weights to completion.
     """Sender process: generate weights, move to device, send."""
     from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
 
@@ -136,6 +171,10 @@ def _sender_fn(zmq_handle, weight_specs, seed, bucket_size_mb, use_shm):
 
 
 def _receiver_fn(zmq_handle, use_shm, result_queue):
+    # [FUNCTION DOC]
+    # HELPER: Child-process receiver: creates a BucketedWeightReceiver on device index 0, receives all buckets while
+    # cloning each (name, tensor) into a list, then puts a list of (name, dtype, shape tuple, float sum) summaries on
+    # result_queue. Inputs: zmq_handle; use_shm - bool; result_queue - multiprocessing queue.
     """Receiver process: receive weights, send back (name, dtype, shape, checksum)."""
     from verl.utils.device import get_device_name
     from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
@@ -159,6 +198,14 @@ def _receiver_fn(zmq_handle, use_shm, result_queue):
 # Test helper
 # ---------------------------------------------------------------------------
 def _transfer_and_validate(weight_specs, bucket_size_mb, use_shm):
+    # [FUNCTION DOC]
+    # HELPER: Starts sender then receiver as spawn-context processes using a fresh handle and seed 42, joins both
+    # with PROCESS_TIMEOUT, asserts both exit codes are 0, reads summaries from the queue (5 s timeout), regenerates
+    # expected weights with the same seed, and asserts equal counts and, per weight in order, equal name, shape,
+    # dtype and exact float sum.
+    # Inputs: weight_specs - list of (name, shape, dtype); bucket_size_mb - int; use_shm - bool.
+    # Outputs: none. Exceptions: AssertionError on mismatch; queue Empty on timeout.
+    # Side effects: spawns processes, IPC socket files under /tmp, device memory.
     """Spawn sender + receiver processes, then validate received tensors."""
     zmq_handle = _unique_zmq_handle()
     seed = 42
@@ -210,13 +257,21 @@ def _transfer_and_validate(weight_specs, bucket_size_mb, use_shm):
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(not (HAS_ACCELERATOR and not HAS_CUDA), reason="Requires (shm only tested)")
 class TestBucketedWeightTransferSHM:
+    # [CLASS DOC]
+    # Shared-memory transfer tests.
+    # KNOWN ISSUE: the skip condition runs these only on non-CUDA accelerators (e.g. NPU); the skip reason text
+    # "Requires (shm only tested)" is incomplete/unclear.
     """Test BucketedWeightSender/Receiver via shared memory path."""
 
     def test_single_small_weight(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers one 32x16 float32 weight via shm and validates. Inputs: self. Outputs: none.
         specs = [("layer.weight", (32, 16), torch.float32)]
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=True)
 
     def test_multiple_weights_single_bucket(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers three small weights (fp32 weight/bias, bf16 weight) in one bucket via shm.
         specs = [
             ("layer0.weight", (16, 16), torch.float32),
             ("layer0.bias", (16,), torch.float32),
@@ -225,11 +280,15 @@ class TestBucketedWeightTransferSHM:
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=True)
 
     def test_multiple_buckets(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers twenty 128x128 float32 weights (about 1.25 MB) with 1 MB buckets, spanning 2 buckets.
         # ~64 KB each x 20 = ~1.25 MB, bucket = 1 MB => spans 2 buckets
         specs = [(f"layer{i}.weight", (128, 128), torch.float32) for i in range(20)]
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=True)
 
     def test_mixed_dtypes(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers fp32, bf16 and fp16 weights via shm.
         specs = [
             ("fp32_param", (64, 64), torch.float32),
             ("bf16_param", (64, 64), torch.bfloat16),
@@ -238,6 +297,8 @@ class TestBucketedWeightTransferSHM:
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=True)
 
     def test_empty_weights(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers an empty weight list via shm and asserts nothing is received.
         _transfer_and_validate([], bucket_size_mb=1, use_shm=True)
 
 
@@ -246,13 +307,19 @@ class TestBucketedWeightTransferSHM:
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(not is_support_ipc(), reason="Requires IPC support")
 class TestBucketedWeightTransferIPC:
+    # [CLASS DOC]
+    # CUDA IPC transfer tests; skipped unless the platform supports IPC.
     """Test BucketedWeightSender/Receiver via CUDA IPC path."""
 
     def test_single_small_weight(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers one 32x16 float32 weight via IPC.
         specs = [("layer.weight", (32, 16), torch.float32)]
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=False)
 
     def test_multiple_weights_single_bucket(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers three small mixed weights in one bucket via IPC.
         specs = [
             ("layer0.weight", (16, 16), torch.float32),
             ("layer0.bias", (16,), torch.float32),
@@ -261,10 +328,15 @@ class TestBucketedWeightTransferIPC:
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=False)
 
     def test_multiple_buckets(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers twenty 128x128 float32 weights over multiple 1 MB buckets via IPC.
         specs = [(f"layer{i}.weight", (128, 128), torch.float32) for i in range(20)]
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=False)
 
     def test_mixed_dtypes(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers small uint8 and bf16 metadata-like tensors (delta spec, positions, values) plus fp32/bf16/fp16
+        # params via IPC, checking odd-sized/mixed-alignment tensors.
         specs = [
             ("__delta_spec__", (5,), torch.uint8),
             ("__positions__", (8,), torch.uint8),
@@ -276,15 +348,22 @@ class TestBucketedWeightTransferIPC:
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=False)
 
     def test_empty_weights(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers an empty weight list via IPC.
         _transfer_and_validate([], bucket_size_mb=1, use_shm=False)
 
     def test_exact_bucket_boundary(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers one float32 tensor of exactly 1 MB (262144 elements) to exercise the exact bucket boundary.
         # 1 MB bucket = 1048576 bytes; float32 = 4 bytes => 262144 elements
         numel = (1 << 20) // 4
         specs = [("exact_fit", (numel,), torch.float32)]
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=False)
 
     def test_large_weight(self):
+        # [FUNCTION DOC]
+        # Behavior: transfers three 4 MB float32 tensors (each larger than the 1 MB bucket) interleaved with small bf16
+        # tensors via IPC. Note several small tensors reuse the same names (layer0..4 appear twice); validation is by order.
         specs = [("embedding", (1024, 1024), torch.float32)]  # 4MB
         specs.extend([(f"layer{i}.weight", (128,), torch.bfloat16) for i in range(5)])
         specs.append(("gate_up_proj", (1024, 1024), torch.float32))  # 4MB

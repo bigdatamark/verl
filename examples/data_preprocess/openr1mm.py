@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script converting lmms-lab/multimodal-open-r1-8k-verified into verl multimodal RL parquet.
+# Images are kept as undecoded bytes (column cast with decode disabled). The single train split
+# is split 90/10 with seed 42 into train/test. Each record: user prompt "<image>\n{problem}\n\n
+# {think/answer instruction}", images list with the one image, ability "math", rule reward with
+# the solution as ground truth, extra_info {split, index, question, answer}; only these columns are kept.
+# Args: --local_save_dir (default ~/data/openr1mm, expanded and created), --hdfs_dir.
 """
 Preprocess the lmms-lab/multimodal-open-r1-8k-verified dataset to parquet format.
 
@@ -43,7 +50,12 @@ if __name__ == "__main__":
     )
 
     def make_map_fn(split):
+        # [FUNCTION DOC]
+        # Returns a process_fn closure bound to the split name.
         def process_fn(example, idx):
+            # [FUNCTION DOC]
+            # Pops problem, solution, image; normalizes the image to a dict containing "bytes" (wrapping raw
+            # bytes, passing dicts or other values unchanged), and returns the record described in the module doc.
             problem = example.pop("problem")
             solution = example.pop("solution")
             img = example.pop("image")

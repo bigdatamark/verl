@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Qwen3-VL patches and PPO forward variants for verl: an FSDP2-safe vision position-embedding interpolation, 3D (t,h,w)
+# MRoPE position-id computation for a single unbatched sample, input-embedding construction that merges vision features
+# (including deepstack features) into text embeddings, base / normal / fused-kernel forwards returning a PPO output
+# dataclass, and a monkey patch fixing a router-weights bug in the transformers Qwen3-VL-MoE sparse MoE block.
+# Logger level from VERL_LOGGING_LEVEL (default WARN).
+
 import functools
 import logging
 import os
@@ -32,6 +39,17 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def fast_pos_embed_interpolate(self, grid_thw):
+    # [FUNCTION DOC]
+    # Behavior: replacement for the vision model's position-embedding interpolation (bound as a method of the vision
+    # module). For each (t, h, w) grid: create h and w evenly spaced fractional coordinates over the learned grid
+    # (num_grid_per_side), take floor and ceil (clipped) indices, and compute four bilinear corner indices and weights
+    # flattened over the h x w grid. Gathers all corners in one embedding lookup, weights and sums them to get per-patch
+    # embeddings, splits per image, repeats each over t frames, and reorders into spatial-merge-window order (t, h/merge,
+    # w/merge, merge, merge) before concatenating.
+    # Inputs: self - vision module with pos_embed, num_grid_per_side, config.spatial_merge_size; grid_thw - (N, 3) tensor.
+    # Outputs: tensor (sum of t*h*w over images, hidden) of positional embeddings.
+    # Side effects: none. The modification versus upstream is creating index/weight tensors on grid_thw's device so it works
+    # when FSDP2 CPU offload leaves pos_embed on CPU.
     grid_thw_list = grid_thw.tolist()
     grid_ts = [row[0] for row in grid_thw_list]
     grid_hs = [row[1] for row in grid_thw_list]
@@ -104,6 +122,20 @@ def get_rope_index(
     attention_mask: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: computes 3-row MRoPE position ids for one sample. Videos are first expanded so each frame is its own grid
+    # entry with t=1 (timestamps separate frames). If vision grids exist: keep only attended tokens, count images/videos by
+    # the token following each vision-start token, then repeatedly find the next image or video token from the current
+    # cursor, emit text positions (same value on all 3 rows) for the preceding text continuing from the previous max + 1,
+    # then emit grid positions (t, h/merge, w/merge indices) offset by text length and start index, advancing the cursor
+    # past the vision tokens. Trailing text gets sequential positions. Results are written into a 3 x seq tensor of ones at
+    # attended positions. Without vision: positions are attention-mask cumulative sum minus one (masked set to 1) broadcast to
+    # 3 rows, or a plain arange if no mask.
+    # Inputs: processor - HF processor (merge size and special token ids); input_ids - 1D token ids; image_grid_thw,
+    # video_grid_thw - optional (N,3) grids; attention_mask - optional 1D mask; kwargs ignored.
+    # Outputs: long tensor of shape (3, seq_len).
+    # Side effects: mutates a repeated copy of video_grid_thw only.
+    # KNOWN ISSUE: the no-vision, no-mask branch uses input_ids.shape[1], which fails for the documented 1D input.
     """
     Gets the position ids for Qwen3-VL, it should be generated before sharding the sequence.
     The batch dim has been removed and the input_ids should be a 1D tensor representing a single example.
@@ -211,6 +243,17 @@ def _get_input_embeds(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Behavior: embed input_ids; if pixel_values given, run the vision tower (casting to its dtype), verify image
+    # token count equals feature rows, and scatter image embeddings into positions of the image token; same for videos.
+    # Builds visual_pos_masks (token-level mask of vision positions) and deepstack_visual_embeds: when both images and
+    # videos exist, combines per-layer deepstack features into joint tensors ordered by the union mask; otherwise uses
+    # whichever exists. If no visual input, runs the vision tower on a dummy 16-patch 1x4x4 image and adds zero times its
+    # mean (and deepstack means) so vision parameters participate in the graph (avoids FSDP/grad hangs).
+    # Inputs: model - Qwen3-VL conditional-generation model; input_ids; attention_mask; pixel tensors and grids (optional).
+    # Outputs: mapping with inputs_embeds, attention_mask (moved to embed device), visual_pos_masks,
+    # deepstack_visual_embeds.
+    # Exceptions: ValueError when token and feature counts mismatch.
     inputs_embeds = model.get_input_embeddings()(input_ids)
     image_mask, video_mask = None, None
     if pixel_values is not None:
@@ -300,6 +343,8 @@ def _get_input_embeds(
 
 @dataclass
 class Qwen3VLCausalLMOutputForPPO(Qwen3VLCausalLMOutputWithPast):
+    # [CLASS DOC]
+    # Dataclass extending the HF Qwen3-VL output with optional log_probs and entropy tensors for PPO.
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
 
@@ -314,6 +359,11 @@ def qwen3_vl_base_forward(
     video_grid_thw: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Behavior: replacement for the inner model forward: build embeddings via _get_input_embeds, merge them into kwargs, and
+    # call the language model with input_ids None.
+    # Inputs: self - inner Qwen3-VL model; input ids, mask, visual inputs; kwargs forwarded (e.g. position_ids).
+    # Outputs: language model output.
     input_kwargs = _get_input_embeds(
         self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
     )  # avoid lora module having multiple keyword arguments
@@ -331,6 +381,9 @@ def forward_with_normal_backend(
     temperature: float = 1.0,
     **kwargs,
 ) -> "Qwen3VLCausalLMOutputForPPO":
+    # [FUNCTION DOC]
+    # Behavior: run self.model, apply lm_head to the last hidden states, return PPO output with logits and hidden states.
+    # labels and temperature are accepted but unused.
     outputs = self.model(input_ids, **kwargs)
     hidden_states = outputs[0]
     logits = self.lm_head(hidden_states)
@@ -349,6 +402,12 @@ def forward_with_torch_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> "Qwen3VLCausalLMOutputForPPO":
+    # [FUNCTION DOC]
+    # Behavior: run self.model; choose target ids as shift_labels if given, else labels rolled left by one, else input_ids
+    # rolled left by one. Materialize lm_head weight to a full local tensor if it is a DTensor. Compute log_probs and entropy
+    # with FusedLinearForPPO using the backend stored on the model (default torch) and temperature.
+    # Outputs: PPO output with log_probs, entropy, hidden_states.
+    # Exceptions: RuntimeError if no labels/input_ids.
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
     outputs = self.model(input_ids, **kwargs)
@@ -392,6 +451,10 @@ def forward_with_triton_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> "Qwen3VLCausalLMOutputForPPO":
+    # [FUNCTION DOC]
+    # Behavior: same target selection as the torch backend, then computes log_probs and entropy via the Triton
+    # linear_cross_entropy kernel with reduction none on the raw lm_head weight.
+    # Outputs: PPO output with log_probs, entropy, hidden_states. Exceptions: RuntimeError if no labels/input_ids.
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
     outputs = self.model(input_ids, **kwargs)
@@ -423,6 +486,10 @@ def forward_with_triton_backend(
 
 
 def patch_qwen3_vl_moe_sparse_moe_block_forward():
+    # [FUNCTION DOC]
+    # Behavior: if the Qwen3-VL-MoE module is importable, replaces Qwen3VLMoeTextSparseMoeBlock.forward with a fixed version;
+    # returns silently otherwise.
+    # Side effects: global class patch; info log.
     """
     Monkey patch to fix a bug in transformers 4.57.3 where Qwen3VLMoeTextSparseMoeBlock.forward
     incorrectly uses torch.zeros_like(hidden_states) instead of torch.zeros_like(router_logits)
@@ -442,6 +509,11 @@ def patch_qwen3_vl_moe_sparse_moe_block_forward():
 
     @functools.wraps(original_forward)
     def patched_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: flatten tokens, compute router logits, softmax in float32, top-k, renormalize, cast to router logits dtype,
+        # scatter into a dense zero tensor shaped like router_logits (the fix), reshape hidden states back to
+        # (batch, -1, hidden) and call experts with dense weights and indices.
+        # Inputs: hidden_states (batch, seq, hidden). Outputs: expert output tensor.
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         router_logits = self.gate(hidden_states)

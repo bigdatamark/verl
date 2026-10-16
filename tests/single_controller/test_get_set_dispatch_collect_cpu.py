@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# CPU unit test for Worker get_dispatch_collect / set_dispatch_collect: copying mesh dispatch info between workers
+# and rejecting a duplicate mesh name.
+
 import os
 
 import pytest
@@ -19,6 +24,11 @@ from verl.single_controller.base import Worker
 
 
 def test_get_set_dispatch_collect_cpu():
+    # [FUNCTION DOC]
+    # Behavior: sets RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT env vars, creates two Workers registering mesh
+    # "actor" (dp 0 collect, dp 1 no collect), copies their info into a third Worker under names "ref" and "actor",
+    # checks queried dispatch rank and collect flags, and asserts setting "actor" again raises AssertionError.
+    # Side effects: mutates process environment variables permanently.
     os.environ["RANK"] = "0"
     os.environ["LOCAL_RANK"] = "0"
     os.environ["WORLD_SIZE"] = "2"

@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Tests for _chunked_topk_log_probs (distillation FSDP losses), which computes top-k log-probabilities as gathered
+# logits minus logsumexp in row chunks to avoid materializing full log_softmax. Checks forward equivalence against
+# log_softmax+gather, chunk-size invariance, gradient equivalence, edge cases and autograd tracking. Sets
+# KMP_DUPLICATE_LIB_OK=TRUE (if unset) at import to avoid OpenMP duplicate-library aborts.
+
 """Numerical equivalence and gradient correctness tests for the chunked
 gather-logsumexp helper added to verl/trainer/distillation/fsdp/losses.py.
 
@@ -41,6 +48,9 @@ from verl.trainer.distillation.fsdp.losses import _chunked_topk_log_probs
 
 
 def _reference_topk_log_probs(logits: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Reference result: full log_softmax over the last dim, then gather at topk_ids.
+    # Inputs: logits [B, T, V]; topk_ids [B, T, K] integer indices. Outputs: [B, T, K] tensor.
     """Reference: standard log_softmax + gather (the pre-patch code path)."""
     log_probs = F.log_softmax(logits, dim=-1)
     return torch.gather(log_probs, dim=-1, index=topk_ids)
@@ -58,6 +68,9 @@ def _reference_topk_log_probs(logits: torch.Tensor, topk_ids: torch.Tensor) -> t
     ],
 )
 def test_numerical_equivalence(B, T, V, K, dtype, atol):
+    # [FUNCTION DOC]
+    # Parametrized fp32 cases (small vocab and Qwen-size vocab, K 4/8/64): chunked output (chunk 4096) matches the reference
+    # within atol, seeded for determinism.
     """chunked output matches torch.log_softmax(...).gather(...) within tolerance.
 
     Tests fp32 only on CPU. bf16/fp16 are tested separately on GPU
@@ -91,6 +104,8 @@ def test_numerical_equivalence(B, T, V, K, dtype, atol):
     ],
 )
 def test_numerical_equivalence_low_precision_on_gpu(dtype, atol):
+    # [FUNCTION DOC]
+    # GPU-only: bf16 and fp16 chunked outputs match the reference within dtype-specific tolerances.
     """Verify bf16/fp16 equivalence on GPU (where fused log_softmax upcasts)."""
     torch.manual_seed(42)
     B, T, V, K = 2, 64, 152064, 64
@@ -108,6 +123,8 @@ def test_numerical_equivalence_low_precision_on_gpu(dtype, atol):
 
 @pytest.mark.parametrize("chunk_size", [1, 64, 256, 1024, 4096, 16384, 99999999])
 def test_chunk_size_invariance(chunk_size):
+    # [FUNCTION DOC]
+    # For chunk sizes from 1 up to larger than the row count, output matches a single-chunk run within 5e-6.
     """Result is independent of chunk_size (only changes memory/speed, not numerics)."""
     torch.manual_seed(123)
     B, T, V, K = 2, 64, 152064, 32
@@ -123,6 +140,8 @@ def test_chunk_size_invariance(chunk_size):
 
 
 def test_gradient_correctness():
+    # [FUNCTION DOC]
+    # On two identical leaf copies, forward outputs match and gradients of the summed outputs agree within 1e-5.
     """Backward gradients match the reference implementation."""
     torch.manual_seed(7)
     B, T, V, K = 2, 16, 1024, 8
@@ -147,6 +166,8 @@ def test_gradient_correctness():
 
 
 def test_handles_small_chunk_size():
+    # [FUNCTION DOC]
+    # A single-row input with chunk_size 1 matches the reference.
     """Edge case: chunk_size smaller than N still produces correct output."""
     torch.manual_seed(0)
     B, T, V, K = 1, 1, 100, 5
@@ -160,6 +181,8 @@ def test_handles_small_chunk_size():
 
 
 def test_empty_input():
+    # [FUNCTION DOC]
+    # Zero-size batch/time dims return an empty [0, 0, K] float32 tensor without error.
     """Edge case: N=0 (fully-padded micro-batch) returns empty tensor without error."""
     logits = torch.empty((0, 0, 1024), dtype=torch.float32)
     topk_ids = torch.empty((0, 0, 8), dtype=torch.long)
@@ -169,6 +192,8 @@ def test_empty_input():
 
 
 def test_gradient_flows_through_slice_assignment():
+    # [FUNCTION DOC]
+    # Output is a non-leaf requiring grad, and backward yields finite, not-all-zero gradients on logits.
     """Verify that PyTorch tracks `out[s:e] = ...` via aten.index_put_ / CopySlices.
 
     This is a regression guard for confusion that `torch.empty(...)` plus

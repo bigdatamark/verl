@@ -14,6 +14,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Like geo3k.py, but produces the multi-turn tool-calling variant: the prompt starts with a
+# system message instructing the model to use the calc_geo3k_reward tool, and extra_info adds
+# need_tools_kwargs=true plus tools_kwargs.calc_geo3k_reward.create_kwargs.ground_truth.
+# Default save dir ~/data/geo3k_multiturn_w_tool.
+# KNOWN ISSUE: the save dir is not tilde-expanded or created before writing.
 
 """
 Preprocess the Geometry3k dataset to parquet format
@@ -58,7 +64,13 @@ if __name__ == "__main__":
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
+        # [FUNCTION DOC]
+        # Returns a process_fn closure bound to the split name.
         def process_fn(example, idx):
+            # [FUNCTION DOC]
+            # Pops problem, answer, images; returns the record with system + user prompt, images,
+            # ability "math", rule reward on answer, and extra_info including the tool kwargs.
+            # Exceptions: KeyError if fields missing.
             problem = example.pop("problem")
             prompt = problem + " " + instruction_following
             answer = example.pop("answer")

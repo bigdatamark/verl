@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# GPU integration test (also runnable as a script) for vLLM rollout abort_all_requests: starts 8 long
+# generations on a standalone vLLM replica, aborts shortly after and checks every request resolves quickly.
+# Uses ~/models/Qwen/Qwen2.5-1.5B-Instruct on 2 GPUs with TP 1. Prints progress and decoded outputs.
+
 """
 Test vLLM abort functionality.
 
@@ -27,6 +33,14 @@ from uuid import uuid4
 
 
 def test_vllm_abort():
+    # [FUNCTION DOC]
+    # Initializes Ray with tokenizer/NCCL/vLLM env vars, composes ppo_trainer (verl/verl/trainer/config or
+    # verl/trainer/config relative to CWD) for async vllm rollout with 512 prompt/response lengths and load_format auto,
+    # creates replica 0 via get_rollout_replica_class and runs init_standalone. Tokenizes 8 chat prompts, submits
+    # them concurrently with temperature 1 sampling, sleeps 0.5 s, calls abort_all_requests on the server handle
+    # (timed), and collects each output with a 10 s timeout, classifying as timeout, aborted (stop_reason "aborted")
+    # or completed. Asserts no timeouts, all 8 resolved, the abort result contains aborted_count, and abort took < 1 s.
+    # Side effects: GPU server launch, prints; Ray shutdown in finally.
     # ==================== Configuration ====================
     MODEL_PATH = os.path.expanduser("~/models/Qwen/Qwen2.5-1.5B-Instruct")  # /root/models/Qwen/Qwen2.5-1.5B-Instruct
     GPUS_PER_NODE = 2

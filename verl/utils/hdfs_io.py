@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Minimal HDFS-aware filesystem helpers (exists, makedirs, copy) that dispatch to the hdfs CLI ("<hdfs binary> dfs ...", located via PATH at import) for paths starting with "hdfs://" and to os/shutil for local paths. Logging level from VERL_SFT_LOGGING_LEVEL.
+
 import logging
 import os
 import shutil
@@ -25,6 +28,9 @@ _HDFS_BIN_PATH = shutil.which("hdfs")
 
 
 def exists(path: str, **kwargs) -> bool:
+    # [FUNCTION DOC]
+    # Returns hdfs "-test -e" result for HDFS paths, else os.path.exists.
+    # KNOWN ISSUE: extra kwargs are forwarded to _exists, which accepts none, so passing any kwargs for an HDFS path raises TypeError.
     r"""Works like os.path.exists() but supports hdfs.
 
     Test whether a path exists. Returns False for broken symbolic links.
@@ -41,6 +47,8 @@ def exists(path: str, **kwargs) -> bool:
 
 
 def _exists(file_path: str):
+    # [FUNCTION DOC]
+    # HELPER: Runs "dfs -test -e" for paths starting with "hdfs" and returns True on exit code 0; otherwise os.path.exists.
     """hdfs capable to check whether a file_path is exists"""
     if file_path.startswith("hdfs"):
         return _run_cmd(_hdfs_cmd(f"-test -e {file_path}")) == 0
@@ -48,6 +56,10 @@ def _exists(file_path: str):
 
 
 def makedirs(name, mode=0o777, exist_ok=False, **kwargs) -> None:
+    # [FUNCTION DOC]
+    # Behavior: HDFS paths run "dfs -mkdir -p" (mode and exist_ok ignored); local paths use os.makedirs with mode/exist_ok.
+    # Exceptions: OSError locally when the dir exists and exist_ok is False.
+    # KNOWN ISSUE: kwargs forwarded to _mkdir, which accepts none (TypeError if any given).
     r"""Works like os.makedirs() but supports hdfs.
 
     Super-mkdir; create a leaf directory and all intermediate ones.  Works like
@@ -73,6 +85,8 @@ def makedirs(name, mode=0o777, exist_ok=False, **kwargs) -> None:
 
 
 def _mkdir(file_path: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: "dfs -mkdir -p" for hdfs paths (exit code ignored), else os.makedirs(exist_ok=True). Always returns True.
     """hdfs mkdir"""
     if file_path.startswith("hdfs"):
         _run_cmd(_hdfs_cmd(f"-mkdir -p {file_path}"))
@@ -82,6 +96,9 @@ def _mkdir(file_path: str) -> bool:
 
 
 def copy(src: str, dst: str, **kwargs) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: if either side is HDFS, delegates to _copy and returns a bool success; otherwise uses shutil.copytree for directories or shutil.copy for files (returning the destination path) with kwargs forwarded.
+    # Exceptions: local shutil errors propagate.
     r"""Works like shutil.copy() for file, and shutil.copytree for dir, and supports hdfs.
 
     Copy data and mode bits ("cp src dst"). Return the file's destination.
@@ -111,6 +128,9 @@ def copy(src: str, dst: str, **kwargs) -> bool:
 
 
 def _copy(from_path: str, to_path: str, timeout: int = None) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: to HDFS: "dfs -cp -f" from HDFS or "dfs -put -f" from local; from HDFS to local: "dfs -get"; local to local: shutil.copy, treating SameFileError as success and logging other errors as failure.
+    # Outputs: True iff the return code is 0.
     if to_path.startswith("hdfs"):
         if from_path.startswith("hdfs"):
             returncode = _run_cmd(_hdfs_cmd(f"-cp -f {from_path} {to_path}"), timeout=timeout)
@@ -138,12 +158,18 @@ def _copy(from_path: str, to_path: str, timeout: int = None) -> bool:
 
 
 def _run_cmd(cmd: str, timeout=None):
+    # [FUNCTION DOC]
+    # HELPER: Runs the command string through the shell via os.system and returns its status; timeout is ignored.
     return os.system(cmd)
 
 
 def _hdfs_cmd(cmd: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Prefixes a dfs subcommand with the hdfs binary path.
     return f"{_HDFS_BIN_PATH} dfs {cmd}"
 
 
 def _is_non_local(path: str):
+    # [FUNCTION DOC]
+    # HELPER: True if path starts with "hdfs://".
     return path.startswith(_HDFS_PREFIX)

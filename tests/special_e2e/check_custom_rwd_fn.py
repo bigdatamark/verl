@@ -12,10 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# CLI checker used by e2e scripts: verifies a training log file contains the message printed by the custom reward
+# function test fixture. Usage: --output_file <path> (required).
+
 import argparse
 
 
 def check_congratulations_in_file(output_file):
+    # [FUNCTION DOC]
+    # HELPER: Reads the whole file and asserts it contains "Congratulations!!! You have called my_reward_function
+    # successfully!!!"; prints "Check passes" on success.
+    # Inputs: output_file - path. Exceptions: AssertionError if missing; OSError if the file cannot be read.
     with open(output_file) as f:
         output = f.read()
 

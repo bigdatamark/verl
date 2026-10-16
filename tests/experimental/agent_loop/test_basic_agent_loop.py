@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Agent loop tests. GPU integration tests (Qwen3-0.6B, env ROLLOUT_NAME) for the
+# single-turn agent with DAPO reward scoring, the tool agent with native weather
+# tools, and the tool agent with function tools loaded from
+# function_tool_examples.py; a pure test of get_trajectory_info; and lightweight
+# CPU Ray-actor tests for GlobalRequestLoadBalancer (least-loaded routing,
+# sticky sessions per request id, dynamic add/remove of servers, status).
+
 import json
 import os
 from typing import Any
@@ -32,6 +41,12 @@ from verl.workers.rollout.router import GlobalRequestLoadBalancer
 
 @pytest.fixture
 def init_config() -> DictConfig:
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture composing Hydra ppo_trainer (cwd-relative) with dynamic
+    # bsz, FSDP param/optimizer offload, DAPO reward manager (overlong buffer off,
+    # len 3072, max_resp_len 4096); then sets model path, rollout name from env
+    # ROLLOUT_NAME, async mode, eager, prompt/response length 4096, n=4, 2 agent
+    # workers, skip_tokenizer_init. Exceptions: KeyError if ROLLOUT_NAME unset.
     from hydra import compose, initialize_config_dir
 
     with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
@@ -64,6 +79,13 @@ def init_config() -> DictConfig:
 
 
 def test_single_turn(init_config):
+    # [FUNCTION DOC]
+    # Behavior: inits Ray, builds the agent loop manager, generates for 2 role-play
+    # prompts repeated n times with the single-turn agent; asserts output count,
+    # input_ids/attention_mask/position_ids width equals prompt+response width,
+    # rollout_log_probs width when enabled, rm_scores shaped like responses,
+    # reward extra info contains per-sample "acc", and all samples have 2 turns.
+    # Side effects: Ray lifecycle, GPU use, prints.
     ray.init(
         runtime_env={
             "env_vars": {
@@ -126,7 +148,11 @@ def test_single_turn(init_config):
 
 
 class WeatherTool(BaseTool):
+    # [CLASS DOC]
+    # HELPER: native tool returning a fixed current temperature; schema derived from get_current_temperature.
     def get_current_temperature(self, location: str, unit: str = "celsius"):
+        # [FUNCTION DOC]
+        # HELPER: prints a debug line and returns a mapping with temperature 26.1, the location and unit.
         """Get current temperature at a location.
 
         Args:
@@ -144,10 +170,15 @@ class WeatherTool(BaseTool):
         }
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
+        # [FUNCTION DOC]
+        # HELPER: builds the OpenAI function schema from get_current_temperature via get_json_schema.
         schema = get_json_schema(self.get_current_temperature)
         return OpenAIFunctionToolSchema(**schema)
 
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
+        # [FUNCTION DOC]
+        # HELPER: async; calls the function with parameters and returns (JSON text
+        # response, reward 0, empty metrics); exceptions become an error-text response.
         try:
             result = self.get_current_temperature(**parameters)
             return ToolResponse(text=json.dumps(result)), 0, {}
@@ -156,11 +187,17 @@ class WeatherTool(BaseTool):
 
 
 class WeatherToolWithData(BaseTool):
+    # [CLASS DOC]
+    # HELPER: native tool returning a fixed temperature for a location and date.
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
+        # [FUNCTION DOC]
+        # HELPER: builds the OpenAI function schema from get_temperature_date.
         schema = get_json_schema(self.get_temperature_date)
         return OpenAIFunctionToolSchema(**schema)
 
     def get_temperature_date(self, location: str, date: str, unit: str = "celsius"):
+        # [FUNCTION DOC]
+        # HELPER: prints a debug line and returns a mapping with temperature 25.9, location, date and unit.
         """Get temperature at a location and date.
 
         Args:
@@ -180,6 +217,8 @@ class WeatherToolWithData(BaseTool):
         }
 
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
+        # [FUNCTION DOC]
+        # HELPER: async; same contract as WeatherTool.execute but calls get_temperature_date.
         try:
             result = self.get_temperature_date(**parameters)
             return ToolResponse(text=json.dumps(result)), 0, {}
@@ -188,6 +227,15 @@ class WeatherToolWithData(BaseTool):
 
 
 def test_tool_agent(init_config):
+    # [FUNCTION DOC]
+    # Behavior: restarts Ray, writes a tool config with both weather tools to
+    # /tmp/tool_config.json, sets n=2, 2 parallel calls, logprob computation, and
+    # optionally merges a YAML/JSON rollout override from env
+    # AGENT_LOOP_TOOL_AGENT_ROLLOUT_CONFIG; generates for 4 prompts with the tool
+    # agent. Asserts the greeting prompt has 2 turns and others 4 turns, rm_scores,
+    # response_mask and rollout_log_probs widths match responses, and response_mask
+    # excludes tool_response tags. Prints responses.
+    # Side effects: Ray lifecycle, writes /tmp file, GPU use.
     ray.shutdown()
     ray.init(
         runtime_env={
@@ -305,6 +353,13 @@ def test_tool_agent(init_config):
 
 
 def test_function_tool_agent(init_config):
+    # [FUNCTION DOC]
+    # Behavior: restarts Ray, points multi_turn.function_tool_path at
+    # function_tool_examples.py, n=2; generates for a greeting and a Tokyo-weather
+    # prompt. Asserts greeting samples have 2 turns, at least one weather sample has
+    # 4 turns, some tool-calling weather response (with observations) contains the
+    # stub value "17.3", and no masked response contains tool_response tags.
+    # KNOWN ISSUE: comment refers to test_tool_agent for why Ray is shut down first, but no explanation exists there.
     """End-to-end coverage for ``rollout.multi_turn.function_tool_path``."""
     # See ``test_tool_agent`` for why we shut Ray down first.
     ray.shutdown()
@@ -394,6 +449,9 @@ def test_function_tool_agent(init_config):
 
 @pytest.mark.asyncio
 async def test_get_trajectory_info():
+    # [FUNCTION DOC]
+    # Behavior: get_trajectory_info(10, [1,1,3,3], validate=False) must number
+    # rollouts per repeated sample index (0,1 for each) with step and validate flag.
     """Tests the get_trajectory_info method."""
     # Initialize the class to set up class-level attributes
     step = 10
@@ -417,20 +475,32 @@ async def test_get_trajectory_info():
 
 @pytest.fixture(scope="module")
 def ray_for_lb():
+    # [FUNCTION DOC]
+    # HELPER: module-scoped fixture starting Ray (reinit tolerated) for load
+    # balancer tests and shutting it down afterwards.
     ray.init(ignore_reinit_error=True)
     yield
     ray.shutdown()
 
 
 class TestLoadBalancerRouting:
+    # [CLASS DOC]
+    # Tests for least-loaded server selection; each test creates a fresh balancer
+    # actor whose servers mapping ids to None handles. acquire_server returns a
+    # tuple whose first element is the server id.
     """Least-loaded selection."""
 
     def test_distributes_across_servers(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: three distinct new requests over three idle servers land on all three.
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None, "s2": None})
         servers = [ray.get(lb.acquire_server.remote(request_id=f"r{i}"))[0] for i in range(3)]
         assert sorted(servers) == ["s0", "s1", "s2"]
 
     def test_new_requests_route_to_least_loaded(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: after 3 sticky acquires for request "a" and one for "b" (on a
+        # different server), a new request goes to the remaining idle server.
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None, "s2": None})
         # Load one server with 3 inflight requests (sticky). The first acquire
         # may land on any replica because equally-least-loaded ties are random.
@@ -446,6 +516,8 @@ class TestLoadBalancerRouting:
         assert s_new == idle
 
     def test_release_rebalances(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: two requests go to different servers; after releasing both, two new requests again split across servers.
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         s0 = ray.get(lb.acquire_server.remote(request_id="r0"))[0]
         s1 = ray.get(lb.acquire_server.remote(request_id="r1"))[0]
@@ -457,12 +529,16 @@ class TestLoadBalancerRouting:
         assert s2 != s3
 
     def test_release_invalid_server_silently_ignored(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: releasing an unknown server id does not raise.
         """Releasing a nonexistent server is silently ignored (hybrid-safe)."""
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         # Should not raise
         ray.get(lb.release_server.remote(server_id="nonexistent"))
 
     def test_release_without_inflight_silently_ignored(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: releasing a server with zero inflight requests does not raise.
         """Releasing a server with no inflight requests is silently ignored (hybrid-safe)."""
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         # Should not raise even though s1 has 0 inflight
@@ -470,9 +546,13 @@ class TestLoadBalancerRouting:
 
 
 class TestLoadBalancerStickySession:
+    # [CLASS DOC]
+    # Tests that a request id keeps mapping to the same server.
     """Request-level sticky session."""
 
     def test_same_request_id_same_server(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: acquiring, releasing and re-acquiring the same request id returns the same server.
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None, "s2": None, "s3": None})
         s0 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))[0]
         ray.get(lb.release_server.remote(server_id=s0))
@@ -481,9 +561,13 @@ class TestLoadBalancerStickySession:
 
 
 class TestLoadBalancerHybrid:
+    # [CLASS DOC]
+    # Tests for dynamic server addition/removal and status reporting.
     """Dynamic server add/remove for hybrid scaling."""
 
     def test_add_server(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: add_servers registers a new server with 0 inflight in status.
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         ray.get(lb.add_servers.remote(servers={"s2": None}))
         status = ray.get(lb.get_status.remote())
@@ -491,6 +575,9 @@ class TestLoadBalancerHybrid:
         assert status["servers"]["s2"] == 0
 
     def test_remove_server_purges_handle(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: remove_servers drops the id from both status "servers" and
+        # "registered_handles", and new requests route only to the remaining server.
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         ray.get(lb.remove_servers.remote(server_ids=["s1"]))
         # remove_server now purges from both _inflight_requests and _servers
@@ -502,6 +589,8 @@ class TestLoadBalancerHybrid:
         assert s == "s0"
 
     def test_removed_server_invalidates_sticky_session(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: a sticky request whose server was removed is rerouted to the remaining server.
         """When a sticky session points to a removed server, cache is invalidated."""
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         # Occupy one replica so the sticky request is assigned to the other.
@@ -517,6 +606,8 @@ class TestLoadBalancerHybrid:
         assert s_new == occupied
 
     def test_remove_server_also_purges_registry(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: removal purges the server from both the load table and handle registry.
         """remove_servers atomically purges from both LB pool and handle registry."""
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         ray.get(lb.remove_servers.remote(server_ids=["s1"]))
@@ -526,6 +617,8 @@ class TestLoadBalancerHybrid:
         assert "s1" not in status["registered_handles"]
 
     def test_get_all_servers_excludes_removed(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: get_all_servers excludes removed ids.
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None, "s2": None})
         ray.get(lb.remove_servers.remote(server_ids=["s1"]))
         all_servers = ray.get(lb.get_all_servers.remote())
@@ -534,12 +627,16 @@ class TestLoadBalancerHybrid:
         assert "s1" not in all_servers
 
     def test_no_available_servers_raises(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: acquiring after removing all servers raises a RayTaskError mentioning "No available servers".
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         ray.get(lb.remove_servers.remote(server_ids=["s0", "s1"]))
         with pytest.raises(ray.exceptions.RayTaskError, match="No available servers"):
             ray.get(lb.acquire_server.remote(request_id="r1"))
 
     def test_add_server_readds_previously_removed(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: a removed server can be re-added and becomes routable again.
         """Re-adding a previously removed server makes it routable again."""
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         ray.get(lb.remove_servers.remote(server_ids=["s1"]))
@@ -552,6 +649,8 @@ class TestLoadBalancerHybrid:
         assert s in ("s0", "s1")
 
     def test_get_inflight_count(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: get_inflight_count is 1 for the server assigned a request and 0 for the other.
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None})
         assert ray.get(lb.get_inflight_count.remote(server_id="s0")) == 0
         assigned = ray.get(lb.acquire_server.remote(request_id="r1"))[0]
@@ -560,6 +659,8 @@ class TestLoadBalancerHybrid:
         assert ray.get(lb.get_inflight_count.remote(server_id=other)) == 0
 
     def test_get_status_reports_active_correctly(self, ray_for_lb):
+        # [FUNCTION DOC]
+        # Behavior: after removing one of three servers, status reports 2 active servers and 0 total inflight.
         lb = ray.remote(GlobalRequestLoadBalancer).remote(servers={"s0": None, "s1": None, "s2": None})
         ray.get(lb.remove_servers.remote(server_ids=["s1"]))
         status = ray.get(lb.get_status.remote())

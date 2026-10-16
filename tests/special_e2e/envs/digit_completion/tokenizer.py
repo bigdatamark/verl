@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Character-level Hugging Face tokenizer (adapted from an external project, see docstring) used by the digit-completion
+# toy task. Special tokens are single characters: "S" (sep), "E" (eos), "P" (pad), "U" (unk).
+
 """Copied from https://github.com/dariush-bahrami/character-tokenizer/blob/master/charactertokenizer/core.py
 
 CharacterTokenzier for Hugging Face Transformers.
@@ -27,7 +32,16 @@ from transformers.tokenization_utils import AddedToken, PreTrainedTokenizer
 
 
 class CharTokenizer(PreTrainedTokenizer):
+    # [CLASS DOC]
+    # Tokenizer mapping each character to an id: S=0, E=1, P=2, U=3, then the given characters from 4 in order. Config is
+    # persisted as a JSON tokenizer_config.json with character code points, max length and chat template.
+    # KNOWN ISSUE: the constructor docstring lists different special tokens and ids ([CLS]=0 ... [UNK]=6, characters from 7) than the implementation.
     def __init__(self, characters: Sequence[str], model_max_length: int, chat_template, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: builds the forward and reverse vocab mappings (must happen before the base initializer, which queries the
+        # vocab), stores characters and model_max_length, initializes the base tokenizer with the four special tokens (no
+        # prefix space) plus extra kwargs, then sets chat_template.
+        # Inputs: characters - sequence of single-character strings; model_max_length; chat_template; kwargs forwarded.
         """Character tokenizer for Hugging Face transformers.
 
         Args:
@@ -81,26 +95,41 @@ class CharTokenizer(PreTrainedTokenizer):
 
     @property
     def vocab_size(self) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Property returning the number of vocab entries (4 + number of characters, assuming no duplicates).
         return len(self._vocab_str_to_int)
 
     def get_vocab(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns the internal character-to-id mapping (not a copy).
         return self._vocab_str_to_int
 
     def _tokenize(self, text: str) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Splits text into a list of single characters.
         return list(text)
 
     def _convert_token_to_id(self, token: str) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Returns the token's id or the id of "U" for unknown tokens.
         return self._vocab_str_to_int.get(token, self._vocab_str_to_int["U"])
 
     def _convert_id_to_token(self, index: int) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the character for an id. Exceptions: KeyError for unknown ids.
         return self._vocab_int_to_str[index]
 
     def convert_tokens_to_string(self, tokens):
+        # [FUNCTION DOC]
+        # HELPER: Concatenates tokens without separators.
         return "".join(tokens)
 
     def build_inputs_with_special_tokens(
         self, token_ids_0: list[int], token_ids_1: Optional[list[int]] = None
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Returns cls + ids0 + sep, plus ids1 + sep when a second sequence is given.
+        # KNOWN ISSUE: no cls token is defined, so cls_token_id is None and the result starts with None.
         sep = [self.sep_token_id]
         cls = [self.cls_token_id]
         result = cls + token_ids_0 + sep
@@ -114,6 +143,9 @@ class CharTokenizer(PreTrainedTokenizer):
         token_ids_1: Optional[list[int]] = None,
         already_has_special_tokens: bool = False,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: If the ids already contain special tokens, defers to the base implementation; otherwise returns 1 for the
+        # leading cls and each trailing sep and 0 for every regular id, matching build_inputs_with_special_tokens.
         if already_has_special_tokens:
             return super().get_special_tokens_mask(
                 token_ids_0=token_ids_0,
@@ -127,6 +159,8 @@ class CharTokenizer(PreTrainedTokenizer):
         return result
 
     def get_config(self) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Returns a serializable mapping with "char_ords" (code points), "model_max_length" and "chat_template".
         return {
             "char_ords": [ord(ch) for ch in self.characters],
             "model_max_length": self.model_max_length,
@@ -135,6 +169,8 @@ class CharTokenizer(PreTrainedTokenizer):
 
     @classmethod
     def from_config(cls, config: dict):
+        # [FUNCTION DOC]
+        # HELPER: Class method rebuilding a tokenizer from a get_config mapping. Exceptions: KeyError if keys missing.
         cfg = {}
         cfg["characters"] = [chr(i) for i in config["char_ords"]]
         cfg["model_max_length"] = config["model_max_length"]
@@ -142,6 +178,9 @@ class CharTokenizer(PreTrainedTokenizer):
         return cls(**cfg)
 
     def save_pretrained(self, save_directory: str | os.PathLike, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Writes get_config as indented JSON to <save_directory>/tokenizer_config.json; extra kwargs ignored; returns
+        # None (unlike the base API which returns saved file paths). Side effects: writes a file (directory must exist).
         cfg_file = Path(save_directory) / "tokenizer_config.json"
         cfg = self.get_config()
         with open(cfg_file, "w") as f:
@@ -149,6 +188,9 @@ class CharTokenizer(PreTrainedTokenizer):
 
     @classmethod
     def from_pretrained(cls, save_directory: str | os.PathLike, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Class method reading <save_directory>/tokenizer_config.json and building via from_config; extra kwargs ignored.
+        # Exceptions: OSError / JSON errors on missing or invalid file.
         cfg_file = Path(save_directory) / "tokenizer_config.json"
         with open(cfg_file) as f:
             cfg = json.load(f)

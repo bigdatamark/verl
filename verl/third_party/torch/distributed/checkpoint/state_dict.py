@@ -88,6 +88,17 @@
 
 # ruff: noqa: B028, UP038, UP007, E721
 # mypy: allow-untyped-defs
+
+# [MODULE DOC]
+# Vendored copy of torch 2.7.0's torch.distributed.checkpoint.state_dict (used because torch 2.6.0's
+# set_model_state_dict could OOM). Provides distributed-aware get/set of model and optimizer state dicts keyed by
+# canonical fully-qualified names (FQNs), handling FSDP (v1 flat params and sharded/full state dict types), DDP and
+# torch.compile wrapper prefixes, DTensor/ShardedTensor, full-state gathering, CPU offload, rank-0 broadcast, and
+# optional flattened optimizer state. Uses the sibling vendored _state_dict_utils helpers for gather/offload/
+# broadcast/distribute/flatten.
+# Globals: key constants for flat params, param groups, params and state; type aliases; a set of patched
+# state_dict/load_state_dict callables (so internal calls bypass the patches).
+
 import contextlib
 import functools
 import gc
@@ -169,6 +180,9 @@ _patched_state_dict: set[Callable] = set()
 
 @contextlib.contextmanager
 def _gc_context():
+    # [FUNCTION DOC]
+    # HELPER: Context manager that disables Python garbage collection for its duration and re-enables it afterwards
+    # only if it was enabled on entry. Side effects: toggles global gc state.
     is_enabled = gc.isenabled()
     gc.disable()
     try:
@@ -180,6 +194,10 @@ def _gc_context():
 
 @dataclass
 class StateDictOptions:
+    # [CLASS DOC]
+    # User-facing options controlling get/set behavior (see docstring): full_state_dict, cpu_offload,
+    # ignore_frozen_params, keep_submodule_prefixes, strict, broadcast_from_rank0, flatten_optimizer_state_dict, and
+    # dsd_fqn_modifiers (name of a module method returning a mapping of child names that are hidden in state dict keys).
     """
     This dataclass specifies how get_state_dict/set_state_dict will work.
 
@@ -228,6 +246,10 @@ class StateDictOptions:
 
 @dataclass
 class _StateDictInfo(StateDictOptions):
+    # [CLASS DOC]
+    # HELPER: Internal options plus derived info: mapping from parameter tensor to its FQN set and from each FQN to its
+    # tensor; the same restricted to shared (tied) params; submodule prefixes; whether to handle model/optimizer; an
+    # FSDP state-dict-type context factory; and the list of FSDP modules.
     fqn_param_mapping: dict[
         str | torch.Tensor,
         FQNS_T | torch.Tensor,
@@ -251,6 +273,16 @@ def _get_fqns(
     skip_ddp_prefix: bool = True,
     skip_compiler_prefix: bool = True,
 ) -> FQNS_T:
+    # [FUNCTION DOC]
+    # HELPER: Behavior (memoized per arguments): converts a module-tree name to canonical FQN(s). Strips activation
+    # checkpoint prefixes; a name with no dot is returned as-is. Walks the dotted path from the root: through DDP
+    # (asserting "module" and optionally keeping it), FSDP (if the next token is the flat param, expands to all original
+    # FQNs of that flat param under the current prefix; otherwise descends into the wrapped module, dropping the
+    # wrapper token), compiled modules (asserting "_orig_mod" and optionally keeping it), and normal modules (applying
+    # the fqn-modifier mapping to skip hidden children; the extra-state suffix must be the last token).
+    # Inputs: model; name; dsd_fqn_modifiers; skip_ddp_prefix; skip_compiler_prefix. Outputs: set of FQN strings.
+    # Exceptions: AssertionError on unexpected wrapper tokens; RuntimeError if extra-state is not last.
+    # Note: cached result is shared, callers must copy before mutating.
     """
     This API is used to convert the name of a parameter to the FQNs. For FSDP
     without `use_orig_params`, the name of FlatParameter can be mapped to
@@ -314,13 +346,24 @@ def _get_fqns(
 
 
 class _EXTRA_STATE:
+    # [CLASS DOC]
+    # HELPER: Sentinel type marking a module's extra-state entry during model state iteration.
     pass
 
 
 def _iterate_valid_model_state(model, dsd_fqn_modifiers="_fqn_modifiers"):
+    # [FUNCTION DOC]
+    # HELPER: Generator over (fqn, tensor-or-extra-state-sentinel) for every persistent buffer and parameter of the
+    # model, visiting each module once (shared submodules skipped) and applying fqn modifiers to skip hidden children
+    # in names; also yields an extra-state sentinel for modules overriding get_extra_state.
+    # Inputs: model; dsd_fqn_modifiers method name. Outputs: generator.
     visited_modules: set[nn.Module] = set()
 
     def recurse(module: nn.Module, curr_fqn: str) -> Generator:
+        # [FUNCTION DOC]
+        # HELPER: Recursive step: marks module visited, recurses into unvisited children (prefix built from current fqn,
+        # with modifier-hidden children not adding a name segment), then yields the module's own non-persistent-excluded
+        # buffers and parameters, then the extra-state sentinel if applicable.
         visited_modules.add(module)
 
         curr_fqn = f"{curr_fqn}." if curr_fqn else ""
@@ -357,6 +400,15 @@ def _verify_options(
     submodules: Optional[set[nn.Module]] = None,
     options: Optional[StateDictOptions] = None,
 ) -> _StateDictInfo:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: validates inputs and builds a _StateDictInfo. Warns (FutureWarning) if submodules given;
+    # raises RuntimeError if optim_only without optimizers. Defaults options. Builds bidirectional param/FQN mappings,
+    # merging FQN sets for tied params and recording them as shared. Computes submodule prefixes (asserting one FQN per
+    # submodule). Raises ValueError if broadcast_from_rank0 without full_state_dict. If FSDP modules exist, builds an
+    # FSDP state_dict_type context (full: offload/rank0_only from cpu_offload, optim rank0_only also when broadcasting;
+    # else sharded configs) wrapped to suppress the FSDP deprecation warning; otherwise a null context.
+    # Outputs: _StateDictInfo with handle_model = not optim_only and handle_optim = any optimizers.
+    # Note: the mapping pass uses the default fqn-modifiers name rather than options.dsd_fqn_modifiers (upstream behavior).
     """
     Verify the model and options passed by the user and generates _StateDictInfo.
     """
@@ -435,6 +487,9 @@ def _verify_options(
             state_dict_config,
             optim_state_dict_config,
         ):
+            # [FUNCTION DOC]
+            # HELPER: Context manager entering FSDP.state_dict_type with the given configs on module while ignoring the
+            # "FSDP.state_dict_type" FutureWarning.
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="FSDP.state_dict_type", category=FutureWarning)
                 with FSDP.state_dict_type(
@@ -472,6 +527,11 @@ def _verify_state_dict(
     optim_state_dict: OptimizerStateType,
     info: _StateDictInfo,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: asserts each FSDP module has an FSDP state; raises RuntimeError when the model state dict is
+    # required (handle_model, no submodules, not ignoring frozen params, not cpu-offloaded full, strict, not broadcast)
+    # but empty; when handling optimizers raises RuntimeError if the optim state dict is empty (unless cpu-offloaded full
+    # or broadcast); raises RuntimeError if any model key contains the flat-param name (model not root).
     for module in info.fsdp_modules:
         fsdp_state = _get_module_fsdp_state_if_fully_sharded_module(module)
         assert fsdp_state is not None, "Expected a fsdp_state with a fsdp module."
@@ -506,6 +566,9 @@ def _verify_state_dict(
 
 
 def _state_dict_fn(obj: nn.Module | torch.optim.Optimizer, api: str) -> Callable:
+    # [FUNCTION DOC]
+    # HELPER: Returns obj's bound state_dict/load_state_dict-style method named api; if that attribute is one of the
+    # patched callables, returns the class's original method bound to obj instead (avoids recursion).
     call = getattr(obj, api)
     if call in _patched_state_dict:
         call = functools.partial(getattr(obj.__class__, api), self=obj)
@@ -513,6 +576,9 @@ def _state_dict_fn(obj: nn.Module | torch.optim.Optimizer, api: str) -> Callable
 
 
 def _maybe_full_or_cpu_state_dict(state_dict: dict[str, Any], info: _StateDictInfo) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Post-processes a state dict: with full_state_dict gathers sharded tensors (to rank 0 only when cpu offload
+    # and distributed are active), else with cpu_offload moves tensors to CPU, else returns it unchanged.
     if info.full_state_dict:
         ranks_only = () if (not info.cpu_offload or not torch.distributed.is_initialized()) else (0,)
         return _gather_state_dict(state_dict, cpu_offload=info.cpu_offload, ranks_only=ranks_only)
@@ -524,6 +590,12 @@ def _maybe_full_or_cpu_state_dict(state_dict: dict[str, Any], info: _StateDictIn
 
 @torch.no_grad()
 def _get_model_state_dict(model: nn.Module, info: _StateDictInfo) -> dict[str, ValueType]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior (no grad): returns empty if model handling is off. Calls the model's original state_dict inside the
+    # FSDP context, then renames each key to its single canonical FQN, verifying the key differs only by "module"/
+    # "_orig_mod" wrapper segments. Filters by submodule prefixes (optionally stripping them), drops frozen params when
+    # requested, drops meta tensors, then applies full/CPU post-processing.
+    # Exceptions: AssertionError if a key maps to several FQNs; RuntimeError for unexpected keys.
     if not info.handle_model:
         return {}
 
@@ -539,6 +611,9 @@ def _get_model_state_dict(model: nn.Module, info: _StateDictInfo) -> dict[str, V
             # wrapper-based DDP and compiler. Verify if the assumption
             # is correct.
             def verify(key, fqn) -> bool:
+                # [FUNCTION DOC]
+                # HELPER: Returns True when fqn is a strictly shorter subsequence of key obtainable by skipping only "module" and
+                # "_orig_mod" segments and ending at key's last segment; False otherwise.
                 if len(fqn) >= len(key):
                     return False
                 fqn_split = fqn.split(".")
@@ -594,6 +669,16 @@ def _load_model_state_dict(
     state_dict: dict[str, ValueType],
     info: _StateDictInfo,
 ) -> _IncompatibleKeys:
+    # [FUNCTION DOC]
+    # HELPER: Behavior (no grad): no-op returning empty incompatible keys when model handling is off or the state dict is
+    # empty without broadcast. For each model tensor, renames incoming entries from canonical FQN to the wrapper-prefixed
+    # name when they differ (only on rank 0 if broadcasting; strict mode raises on missing keys) and collects the local
+    # tensors keyed by prefixed names. For broadcast/full modes, determines the single non-meta device of local tensors
+    # (meta present sets assign=True; none falls back to the process group default device), then either broadcasts from
+    # rank 0 or distributes the full dict into local shards and replaces the state dict entries with the local tensors.
+    # Finally loads via the model's original load_state_dict inside the FSDP context with strict and assign flags.
+    # Outputs: incompatible-keys result. Exceptions: RuntimeError missing key; ValueError multiple devices.
+    # Side effects: mutates the passed state_dict; collectives.
     if not info.handle_model or (not state_dict and not info.broadcast_from_rank0):
         return _IncompatibleKeys({}, {})
 
@@ -655,6 +740,11 @@ def _load_model_state_dict(
 
 
 def _init_optim_state(optim: torch.optim.Optimizer) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: lazily initializes optimizer state. Returns if state exists or any param already has a grad.
+    # Otherwise sets zero grads on trainable params, temporarily sets every group's lr to zero (tensor-typed if it was a
+    # tensor), steps the optimizer, restores lrs and clears grads to None.
+    # Side effects: mutates params' grads, optimizer state, and may alter params for optimizers that update with zero grad.
     """
     Initialize optim states by calling the step() with zero grads.
     """
@@ -693,6 +783,11 @@ def _init_optim_state(optim: torch.optim.Optimizer) -> None:
 
 
 def _flatten_optim_state_dict(state_dict: OptimizerStateType) -> dict[str, ValueType]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: flattens an FQN-keyed optimizer state dict to single-level keys "state.<fqn>.<name>" and
+    # "param_groups.<fqn>.<hyperparam>" (each group's hyperparams repeated per param). Container values are kept as-is.
+    # Exceptions: NotImplementedError if a state value is not tensor/int/float.
+    # Side effects: removes the params list from each input param group (mutates input).
     """
     This API flattens the optimizer state_dict to support optimizer resharding for
     MPMD, e.g., pipeline parallelism.
@@ -735,6 +830,8 @@ def _flatten_optim_state_dict(state_dict: OptimizerStateType) -> dict[str, Value
     """
 
     def _raise_if_type_not_supported(v):
+        # [FUNCTION DOC]
+        # HELPER: Raises NotImplementedError unless v is a tensor, int or float.
         if not isinstance(v, (torch.Tensor, int, float)):
             raise NotImplementedError(
                 f"Flattening optimizer state_dict only supports tensor, int, float states now. Type is {type(v)}."
@@ -759,6 +856,15 @@ def _unflatten_optim_state_dict(
     state_dict: dict[str, ValueType],
     info: _StateDictInfo,
 ) -> OptimizerStateType:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: inverse of flattening for a given optimizer: for each param group and each param FQN (shared params
+    # included only if their flattened group key is present), appends the FQN to the group's params and, for trainable
+    # params, collects every state entry the optimizer has for that param from the flattened keys; then fills group
+    # hyperparameters from the first param's flattened values, requiring consistency.
+    # Outputs: nested optimizer state dict. Exceptions: KeyError for missing flattened keys; RuntimeError on inconsistent
+    # group values; IndexError if a group ends up with no params.
+    # KNOWN ISSUE: the shared-param presence check breaks after inspecting only the first non-params hyperparameter key
+    # (upstream behavior), so presence is decided by a single key.
     """
     This API unflattens the state_dict generated by _flatten_optim_state_dict().
     See the docstring of _flatten_optim_state_dict() for more detail.
@@ -821,6 +927,12 @@ def _get_optim_state_dict(
     optimizers: tuple[torch.optim.Optimizer, ...],
     info: _StateDictInfo,
 ) -> OptimizerStateType:
+    # [FUNCTION DOC]
+    # HELPER: Behavior (no grad): returns empty if not handling optimizers. For each optimizer: lazily inits state, takes
+    # its original state dict; with FSDP converts via FSDP.optim_state_dict inside the context (skipping empty results)
+    # and strips "_orig_mod." from keys/params; without FSDP maps integer param ids to canonical FQNs using model named
+    # parameters. Merges all optimizers' state and groups, optionally flattens, then applies full/CPU post-processing.
+    # Exceptions: AssertionError for multi-FQN params; KeyError for params not in the model.
     if not info.handle_optim:
         return {}
 
@@ -883,6 +995,15 @@ def _split_optim_state_dict(
     optim_state_dict: OptimizerStateType,
     info: _StateDictInfo,
 ) -> OptimizerStateType:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: returns the input unchanged if its state keys are all integers (already per-optimizer). Otherwise
+    # builds the subset for optim: for each group and param FQN (shared params only when listed in a loaded group) adds
+    # the FQN, copies state for trainable params, and records which loaded group maps to this output group. Handles
+    # param groups with zero params by requiring exactly one empty loaded group and a single optimizer. Copies
+    # hyperparameters from mapped loaded groups.
+    # Exceptions: ValueError for unsupported empty-group situations; KeyError for missing state.
+    # KNOWN ISSUE: in the empty-group branch the mapping uses the loop variable left from the scan (the last loaded group)
+    # instead of the single empty group found (upstream behavior).
     """
     Extract the corresponding optim state_dict from ``optim_state_dict`` for
     ``optim`` and return the result optim state_dict.
@@ -971,6 +1092,16 @@ def _load_optim_state_dict(
     state_dict: OptimizerStateType,
     info: _StateDictInfo,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior (no grad): returns if not handling optimizers. For each optimizer: lazily inits state; derives its
+    # optim state dict by splitting a nested input or unflattening a flattened one (empty if no input). With FSDP, rewrites
+    # FQNs to compiler-prefixed names where they differ, then converts via FSDP.optim_state_dict_to_load in the context.
+    # Else with full_state_dict: obtains the local (sharded) optim state by temporarily disabling full mode, determines the
+    # single device of non-scalar tensors, flattens both dicts, broadcasts from rank 0 or distributes into local shards,
+    # fills keys absent locally from the full dict, unflattens, and ensures each group has a params list. Finally loads into
+    # the optimizer via its original load_state_dict.
+    # Exceptions: ValueError device mismatch; AssertionError when no device found. Side effects: collectives; temporarily
+    # mutates info.full_state_dict.
     if not info.handle_optim:
         return
 
@@ -1013,6 +1144,9 @@ def _load_optim_state_dict(
             device = None
 
             def _device(t):
+                # [FUNCTION DOC]
+                # HELPER: Records the device of t (dimension > 0 only) in the enclosing device variable, raising ValueError if two
+                # differ; returns t unchanged.
                 if t.dim() > 0:
                     nonlocal device
                     if device is None:
@@ -1055,6 +1189,9 @@ def get_model_state_dict(
     submodules: Optional[set[nn.Module]] = None,
     options: Optional[StateDictOptions] = None,
 ) -> dict[str, ValueType]:
+    # [FUNCTION DOC]
+    # Behavior: with gc disabled, builds info (model only), collects and verifies the model state dict and returns it.
+    # Inputs: model; deprecated submodules; options. Outputs: FQN-keyed state dict. Exceptions: from verification.
     """
     Return the model state_dict of ``model``.
 
@@ -1093,6 +1230,9 @@ def get_optimizer_state_dict(
     submodules: Optional[set[nn.Module]] = None,
     options: Optional[StateDictOptions] = None,
 ) -> OptimizerStateType:
+    # [FUNCTION DOC]
+    # Behavior: with gc disabled, normalizes optimizers to a tuple, builds info (optim only), collects and verifies the
+    # combined optimizer state dict and returns it. Exceptions: from verification.
     """
     Return the combined state_dict for optimizers.
 
@@ -1134,6 +1274,9 @@ def get_state_dict(
     submodules: Optional[set[nn.Module]] = None,
     options: Optional[StateDictOptions] = None,
 ) -> tuple[dict[str, ValueType], OptimizerStateType]:
+    # [FUNCTION DOC]
+    # Behavior: with gc disabled, normalizes optimizers, builds info for both, collects model and optimizer state dicts,
+    # verifies, returns (model_state_dict, optim_state_dict).
     """
     Return the model state_dict and optimizers state_dict.
 
@@ -1218,6 +1361,10 @@ def _unflatten_model_state_dict(
     model: nn.Module,
     state_dict: dict[nn.Module, dict[str, ValueType]] | dict[str, ValueType],
 ) -> dict[str, ValueType]:
+    # [FUNCTION DOC]
+    # HELPER: Returns {} for empty input. If keys are modules (deprecated form, FutureWarning), prefixes each submodule's
+    # entries with its single FQN and merges them; otherwise returns the input unchanged.
+    # Exceptions: AssertionError if a submodule has multiple FQNs.
     if not state_dict:
         return {}
 
@@ -1251,6 +1398,9 @@ def set_model_state_dict(
     *,
     options: Optional[StateDictOptions] = None,
 ) -> _IncompatibleKeys:
+    # [FUNCTION DOC]
+    # Behavior: normalizes the deprecated module-keyed form, then with gc disabled builds info (model only), verifies and
+    # loads the model state dict. Outputs: incompatible-keys result (missing/unexpected keys).
     """Load the model state_dict.
 
     The counterpart of ``get_model_state_dict`` to set the state_dict to the
@@ -1289,6 +1439,9 @@ def set_optimizer_state_dict(
     *,
     options: Optional[StateDictOptions] = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: with gc disabled, normalizes optimizers, builds info (optim only), verifies and loads the optimizer state
+    # dict into each optimizer. Outputs: None.
     """Load the optimizers state_dict.
 
     The counterpart of ``get_optimizer_state_dict`` to set the state_dict to the
@@ -1329,6 +1482,9 @@ def set_state_dict(
     optim_state_dict: OptimizerStateType,
     options: Optional[StateDictOptions] = None,
 ) -> _IncompatibleKeys:
+    # [FUNCTION DOC]
+    # Behavior: normalizes the model state dict, then with gc disabled builds info (optim_only when the model dict is
+    # empty), verifies, loads optimizer state first and then model state. Outputs: incompatible-keys result of the model load.
     """Load the model state_dict and optimizers state_dict.
 
     The counterpart of ``get_state_dict`` to set the state_dict to the model and
@@ -1385,6 +1541,10 @@ def _patch_model_state_dict(
     *,
     options: Optional[StateDictOptions] = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Replaces model.state_dict and model.load_state_dict with closures calling get_model_state_dict /
+    # set_model_state_dict with the given options, and registers the closures as patched. Side effects: mutates model
+    # attributes and the global patched set.
     """Patch the ``state_dict`` and ``load_state_dict`` attributes of ``model``.
 
     Patch the ``state_dict`` and ``load_state_dict`` attributes of ``model`` to
@@ -1413,6 +1573,8 @@ def _patch_model_state_dict(
     )
 
     def state_dict_call():
+        # [FUNCTION DOC]
+        # HELPER: Returns the model state dict via the bound partial getter.
         return _state_dict_call()
 
     model.state_dict = state_dict_call
@@ -1424,6 +1586,8 @@ def _patch_model_state_dict(
     )
 
     def load_state_dict_call(state_dict: dict[str, Any]):
+        # [FUNCTION DOC]
+        # HELPER: Loads state_dict into the model via the bound partial setter; returns None.
         _load_state_dict_call(model_state_dict=state_dict)
 
     model.load_state_dict = load_state_dict_call
@@ -1441,6 +1605,10 @@ def _patch_optimizer_state_dict(
     optimizers: tuple[torch.optim.Optimizer, ...],
     options: Optional[StateDictOptions] = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Replaces state_dict and load_state_dict on each optimizer with closures calling get_optimizer_state_dict /
+    # set_optimizer_state_dict over all optimizers with the given options; registers closures as patched.
+    # Side effects: mutates optimizer attributes and the global patched set.
     """Patch the ``state_dict`` and ``load_state_dict`` attributes of ``optimizers``.
 
     Patch the ``state_dict`` and ``load_state_dict`` attributes of ``optimizers`` to
@@ -1473,6 +1641,8 @@ def _patch_optimizer_state_dict(
     )
 
     def state_dict_call():
+        # [FUNCTION DOC]
+        # HELPER: Returns the combined optimizer state dict via the bound partial getter.
         return _state_dict_call()
 
     _load_state_dict_call = functools.partial(
@@ -1483,6 +1653,8 @@ def _patch_optimizer_state_dict(
     )
 
     def load_state_dict_call(state_dict: dict[str, Any]):
+        # [FUNCTION DOC]
+        # HELPER: Loads state_dict into the optimizers via the bound partial setter; returns None.
         _load_state_dict_call(optim_state_dict=state_dict)
 
     _patched_state_dict.add(state_dict_call)

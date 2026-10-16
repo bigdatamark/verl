@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: shared test utility that stands up a full agent-loop stack on Ray
+# (hybrid actor/rollout workers, optional reward model pool, reward loop, LLM
+# server manager, agent loop manager, checkpoint engine) for integration tests.
+
 import ray
 from omegaconf import DictConfig
 
@@ -28,6 +33,22 @@ from verl.workers.rollout.llm_server import LLMServerManager
 
 
 def init_agent_loop_manager(config: DictConfig) -> AgentLoopManager | RayWorkerGroup:
+    # [FUNCTION DOC]
+    # HELPER: builds and returns an AgentLoopManager ready to generate.
+    # Behavior: maps Role.ActorRollout to a "global_pool" sized
+    # n_gpus_per_node x nnodes. If the reward model is enabled, either assigns it a
+    # separate "reward_pool" (validating its gpus/nodes are > 0) or colocates it in
+    # the global pool, overwriting its nnodes/n_gpus_per_node with the trainer's.
+    # Creates resource pools, spawns colocated ActorRolloutRefWorker groups per pool,
+    # calls init_model on the actor_rollout group. Requires async rollout mode. Then
+    # creates RewardLoopManager (with the reward pool if enabled), LLMServerManager,
+    # AgentLoopManager (using the server client and reward loop worker handles), and
+    # a CheckpointEngineManager which puts replicas to sleep and syncs weights.
+    # Inputs: config - full PPO-style DictConfig (trainer, reward, actor_rollout_ref).
+    # Outputs: the AgentLoopManager.
+    # Exceptions: ValueError for non-positive reward pool sizes or rollout.mode "sync".
+    # Side effects: allocates Ray actors/GPUs; mutates config.reward.reward_model when colocated.
+    # KNOWN ISSUE: the sync-mode check happens only after workers are created and models initialized, wasting resources; the return annotation includes RayWorkerGroup but only the manager is returned.
     # =========================== 1. Create hybrid ActorRollout workers ===========================
     # The unified model-engine ActorRolloutRefWorker supports both sync and async rollout modes.
     actor_rollout_cls = ActorRolloutRefWorker

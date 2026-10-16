@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# GPU integration tests for TensorRT-LLM rollout through a standalone TRTLLMReplica: unimodal generation
+# (Qwen2.5-0.5B-Instruct), multimodal generation with synthetic images (Qwen2.5-VL-3B-Instruct) and a
+# sleep/wake lifecycle. Models are resolved under TRTLLM_TEST_MODEL_PATH_ROOT (default ~/models). Module
+# constants fix max model length 2048, response length 32, 16 max sequences, 0.8 GPU memory utilization, TP 1.
+# All test classes are skipped when CUDA is unavailable. Outputs are printed for inspection.
+
 import asyncio
 import os
 import uuid
@@ -35,6 +43,9 @@ TENSOR_PARALLEL_SIZE = 1
 
 
 def create_test_image(width: int = 224, height: int = 224) -> Image.Image:
+    # [FUNCTION DOC]
+    # HELPER: builds an RGB uint8 image whose red channel ramps with row, green with column and blue with
+    # row+column (diagonal gradient). Inputs: width, height (default 224). Outputs: PIL Image.
     img_array = np.zeros((height, width, 3), dtype=np.uint8)
     for i in range(height):
         for j in range(width):
@@ -47,6 +58,10 @@ def create_test_image(width: int = 224, height: int = 224) -> Image.Image:
 
 
 def create_rollout_config_dict():
+    # [FUNCTION DOC]
+    # HELPER: returns an OmegaConf RolloutConfig spec (target verl.workers.config.RolloutConfig) for async trtllm
+    # with sampling temperature 0.7, top_k 50, top_p 0.9, n 1, prompt length 512, bfloat16, eager mode, no cache
+    # freeing, single DP/PP, module-level TP/length/seq limits, auto load format, chunked prefill and prefix caching.
     config_dict = {
         "_target_": "verl.workers.config.RolloutConfig",
         "name": "trtllm",
@@ -77,6 +92,8 @@ def create_rollout_config_dict():
 
 
 def create_model_config_dict(model_path: str):
+    # [FUNCTION DOC]
+    # HELPER: returns an OmegaConf HFModelConfig spec for the given path with trust_remote_code and tokenizer loading.
     config_dict = {
         "_target_": "verl.workers.config.HFModelConfig",
         "path": model_path,
@@ -87,10 +104,14 @@ def create_model_config_dict(model_path: str):
 
 
 def get_tokenizer(model_path: str):
+    # [FUNCTION DOC]
+    # HELPER: loads an AutoTokenizer for the path with trust_remote_code.
     return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
 
 def get_processor(model_path: str):
+    # [FUNCTION DOC]
+    # HELPER: loads an AutoProcessor for the path with trust_remote_code.
     from transformers import AutoProcessor
 
     return AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
@@ -101,8 +122,12 @@ def get_processor(model_path: str):
     reason="CUDA not available",
 )
 class TestUnimodalTRTLLMRollout:
+    # [CLASS DOC]
+    # Text-only generation tests sharing one replica per class.
     @pytest.fixture(scope="class")
     def ray_context(self):
+        # [FUNCTION DOC]
+        # HELPER: class fixture that shuts down any existing Ray, initializes Ray, yields, then shuts it down.
         if ray.is_initialized():
             ray.shutdown()
         ray.init(ignore_reinit_error=True)
@@ -111,6 +136,9 @@ class TestUnimodalTRTLLMRollout:
 
     @pytest.fixture(scope="class")
     def trtllm_replica(self, ray_context):
+        # [FUNCTION DOC]
+        # HELPER: class fixture building a TRTLLMReplica (rank 0, all visible GPUs, non-reward) for the unimodal model,
+        # running init_standalone on a new event loop set as current; yields the replica and closes the loop afterwards.
         from verl.workers.rollout.trtllm_rollout.trtllm_async_server import TRTLLMReplica
 
         rollout_config = create_rollout_config_dict()
@@ -134,6 +162,8 @@ class TestUnimodalTRTLLMRollout:
 
     @pytest.fixture(scope="class")
     def tokenizer(self):
+        # [FUNCTION DOC]
+        # HELPER: class fixture returning the unimodal model tokenizer.
         return get_tokenizer(UNIMODAL_MODEL_PATH)
 
     @pytest.mark.parametrize(
@@ -145,6 +175,9 @@ class TestUnimodalTRTLLMRollout:
         ],
     )
     def test_unimodal_generate(self, trtllm_replica, tokenizer, prompt):
+        # [FUNCTION DOC]
+        # Parametrized over math prompts; applies the chat template with a system prompt, encodes, generates via the
+        # server handle with logprobs, and asserts non-empty token_ids; prints the decoded text.
         replica = trtllm_replica
 
         messages = [
@@ -185,6 +218,8 @@ class TestUnimodalTRTLLMRollout:
         print(f"Generated ({len(output.token_ids)} tokens): {generated_text[:300]}...")
 
     def test_unimodal_batch_generate(self, trtllm_replica, tokenizer):
+        # [FUNCTION DOC]
+        # Sequentially generates for three arithmetic prompts and asserts each result has tokens.
         replica = trtllm_replica
 
         prompts = [
@@ -230,8 +265,12 @@ class TestUnimodalTRTLLMRollout:
     reason="CUDA not available",
 )
 class TestMultimodalTRTLLMRollout:
+    # [CLASS DOC]
+    # Vision-language generation tests sharing one VLM replica per class.
     @pytest.fixture(scope="class")
     def ray_context(self):
+        # [FUNCTION DOC]
+        # HELPER: same Ray lifecycle fixture as in the unimodal class.
         if ray.is_initialized():
             ray.shutdown()
         ray.init(ignore_reinit_error=True)
@@ -240,6 +279,8 @@ class TestMultimodalTRTLLMRollout:
 
     @pytest.fixture(scope="class")
     def trtllm_vlm_replica(self, ray_context):
+        # [FUNCTION DOC]
+        # HELPER: same as the unimodal replica fixture but for the multimodal model.
         from verl.workers.rollout.trtllm_rollout.trtllm_async_server import TRTLLMReplica
 
         rollout_config = create_rollout_config_dict()
@@ -263,10 +304,14 @@ class TestMultimodalTRTLLMRollout:
 
     @pytest.fixture(scope="class")
     def tokenizer(self):
+        # [FUNCTION DOC]
+        # HELPER: class fixture returning the multimodal model tokenizer.
         return get_tokenizer(MULTIMODAL_MODEL_PATH)
 
     @pytest.fixture(scope="class")
     def processor(self):
+        # [FUNCTION DOC]
+        # HELPER: class fixture returning the multimodal model processor.
         return get_processor(MULTIMODAL_MODEL_PATH)
 
     @pytest.mark.parametrize(
@@ -278,6 +323,9 @@ class TestMultimodalTRTLLMRollout:
         ],
     )
     def test_multimodal_generate_with_image(self, trtllm_vlm_replica, processor, tokenizer, prompt):
+        # [FUNCTION DOC]
+        # Parametrized prompts; builds an image+text chat message, renders it with the processor chat template,
+        # tokenizes, generates with a 224x224 synthetic image passed as image_data and asserts non-empty tokens.
         replica = trtllm_vlm_replica
 
         test_image = create_test_image(224, 224)
@@ -336,6 +384,8 @@ class TestMultimodalTRTLLMRollout:
         [(224, 224), (384, 384), (512, 512)],
     )
     def test_multimodal_different_image_sizes(self, trtllm_vlm_replica, processor, tokenizer, image_size):
+        # [FUNCTION DOC]
+        # Parametrized image sizes (224, 384, 512 square); same flow, asserting non-empty output.
         replica = trtllm_vlm_replica
 
         width, height = image_size
@@ -376,6 +426,8 @@ class TestMultimodalTRTLLMRollout:
         print(f"\n[Image Size {image_size}] Generated {len(output.token_ids)} tokens")
 
     def test_multimodal_text_only_fallback(self, trtllm_vlm_replica, tokenizer):
+        # [FUNCTION DOC]
+        # Generates on the VLM with a text-only prompt (no image data) and asserts non-empty output.
         replica = trtllm_vlm_replica
 
         prompt = "What is the capital of China?"
@@ -413,8 +465,12 @@ class TestMultimodalTRTLLMRollout:
     reason="CUDA not available",
 )
 class TestTRTLLMServerLifecycle:
+    # [CLASS DOC]
+    # Sleep/wake lifecycle test on a unimodal replica.
     @pytest.fixture(scope="class")
     def ray_context(self):
+        # [FUNCTION DOC]
+        # HELPER: same Ray lifecycle fixture as above.
         if ray.is_initialized():
             ray.shutdown()
         ray.init(ignore_reinit_error=True)
@@ -423,6 +479,8 @@ class TestTRTLLMServerLifecycle:
 
     @pytest.fixture(scope="class")
     def trtllm_replica_lifecycle(self, ray_context):
+        # [FUNCTION DOC]
+        # HELPER: like the unimodal replica fixture but yields (replica, event loop) so tests can run replica coroutines.
         from verl.workers.rollout.trtllm_rollout.trtllm_async_server import TRTLLMReplica
 
         rollout_config = create_rollout_config_dict()
@@ -446,9 +504,14 @@ class TestTRTLLMServerLifecycle:
 
     @pytest.fixture(scope="class")
     def tokenizer(self):
+        # [FUNCTION DOC]
+        # HELPER: class fixture returning the unimodal tokenizer.
         return get_tokenizer(UNIMODAL_MODEL_PATH)
 
     def test_wake_sleep_cycle(self, trtllm_replica_lifecycle, tokenizer):
+        # [FUNCTION DOC]
+        # Generates once, runs replica.sleep then wake_up on the fixture loop, generates again, and asserts both
+        # generations return tokens.
         replica, loop = trtllm_replica_lifecycle
 
         prompt = "Hello, world!"

@@ -12,6 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Standalone GPU smoke script (not pytest-collected), run under torchrun on one GPU, verifying that verl's
+# Megatron optimizer wiring builds a real Megatron-Core Muon (TensorParallelMuon) optimizer and that one step
+# updates parameters. Prints MUON_GPU_SMOKE_OK on success.
 
 """GPU smoke: verl wiring -> Megatron-Core TensorParallelMuon, real build + one step.
 
@@ -35,6 +39,20 @@ import torch.nn as nn
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: asserts CUDA is available; reads RANK and WORLD_SIZE env vars (default 0/1), sets the CUDA device
+    # to rank modulo device count, initializes an NCCL process group if not yet initialized, and initializes Megatron
+    # model parallel state with TP size 1. Imports Megatron DDP, TensorParallelMuon (import check only), and verl's
+    # optimizer helpers. Builds a two-layer MLP (80->48->16 with ReLU) in bf16 on GPU with seed 0, wraps it in
+    # Megatron DDP (non-distributed optimizer, minimal TransformerConfig). Builds a verl McoreOptimizerConfig for
+    # "muon" (lr 0.01, weight decay 0.01, clip 1.0, momentum 0.95, nesterov, 5 Newton-Schulz steps, spectral scale,
+    # duplicated TP mode), converts it with init_megatron_optim_config and asserts optimizer is "muon"; builds the
+    # optimizer, collects the class names of the inner optimizers (each chained optimizer's wrapped optimizer, or
+    # the optimizer itself if not chained) and asserts one contains "Muon". Runs a forward/backward on random
+    # 16x80 input with sum loss, snapshots parameters, steps, and asserts at least one parameter tensor changed.
+    # Inputs: none (env vars RANK, WORLD_SIZE). Outputs: none.
+    # Exceptions: AssertionError on any failed check; import errors if Megatron/emerging optimizers are missing.
+    # Side effects: initializes distributed and Megatron parallel state; GPU allocation; prints progress lines.
     assert torch.cuda.is_available(), "this smoke requires a GPU"
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -54,12 +72,18 @@ def main():
     from verl.workers.config.optimizer import McoreOptimizerConfig
 
     class Net(nn.Module):
+        # [CLASS DOC]
+        # HELPER: Tiny two-layer MLP used as the model under test.
         def __init__(self):
+            # [FUNCTION DOC]
+            # HELPER: Creates fc1 (80->48) and fc2 (48->16) linear layers with bias.
             super().__init__()
             self.fc1 = nn.Linear(80, 48)
             self.fc2 = nn.Linear(48, 16)
 
         def forward(self, x):
+            # [FUNCTION DOC]
+            # HELPER: Returns fc2 applied to ReLU of fc1(x).
             return self.fc2(torch.relu(self.fc1(x)))
 
     torch.manual_seed(0)
