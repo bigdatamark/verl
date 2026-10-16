@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Package for the TorchTitan training engine backend.
+# Re-exports TorchTitanEngine and TorchTitanEngineWithLMHead.
 from .transformer_impl import TorchTitanEngine, TorchTitanEngineWithLMHead
 
 __all__ = ["TorchTitanEngine", "TorchTitanEngineWithLMHead"]

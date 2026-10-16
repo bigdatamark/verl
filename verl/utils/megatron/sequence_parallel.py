@@ -13,20 +13,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Sequence-parallel helpers for Megatron: tagging parameters as sequence-parallel and padding
+# flattened token tensors to a multiple of the tensor-parallel world size.
+
 import torch
 import torch.nn.functional as F
 from megatron.core import parallel_state as mpu
 
 
 def mark_parameter_as_sequence_parallel(parameter):
+    # [FUNCTION DOC]
+    # Behavior: sets attribute sequence_parallel=True on the parameter. Side effects: mutates it.
     parameter.sequence_parallel = True
 
 
 def is_sequence_parallel_param(param):
+    # [FUNCTION DOC]
+    # Behavior: returns whether the param has a truthy sequence_parallel attribute. Outputs: bool-ish.
     return hasattr(param, "sequence_parallel") and param.sequence_parallel
 
 
 def pad_to_sequence_parallel(unpad_tokens: torch.Tensor):
+    # [FUNCTION DOC]
+    # Behavior: computes pad so the first dim is a multiple of the TP world size and right-pads with
+    # zeros along dim 0 (supports 1-D and 2-D tensors).
+    # Inputs: unpad_tokens - (total_nnz,) or (total_nnz, d). Outputs: padded tensor (or the input
+    # unchanged when no padding is needed).
+    # Exceptions: NotImplementedError for ndim > 2 (only when padding is needed).
+    # KNOWN ISSUE: the error message calls unpad_tokens.ndim() but ndim is an int, so a TypeError is
+    # raised instead of the intended NotImplementedError.
     """pad the tokens such that the total length is a multiple of sp world size
 
     Args:

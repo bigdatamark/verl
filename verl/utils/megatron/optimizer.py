@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Builds Megatron-Core OptimizerConfig objects, optimizers and LR/WD schedulers from verl
+# optimizer configs (OmegaConf-like objects supporting attribute access and .get), including
+# pass-through support for the Muon "emerging optimizer" knobs.
+
 import dataclasses
 import math
 
@@ -30,6 +35,12 @@ _MUON_ALGORITHMS = ("muon",)
 
 
 def is_muon_layer_wise_config(optim_config) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: reads the optimizer name (attribute, falling back to .get) lower-cased; returns False
+    # if not a Muon algorithm, else whether use_layer_wise_distributed_optimizer is truthy (attribute
+    # or .get).
+    # Inputs: optim_config - config object supporting .get. Outputs: bool.
+    # Exceptions: AttributeError if the config lacks .get (it is evaluated eagerly as the default).
     """True when verl will build Megatron's LayerWiseDistributedOptimizer path."""
     algo = str(getattr(optim_config, "optimizer", optim_config.get("optimizer", ""))).lower()
     if algo not in _MUON_ALGORITHMS:
@@ -60,6 +71,13 @@ _MUON_PASSTHROUGH_FIELDS = (
 
 
 def _add_muon_args(optim_args: dict, optim_config: dict) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Copies Muon fields into the OptimizerConfig kwargs.
+    # Behavior: for each name in the Muon passthrough list that OptimizerConfig declares and whose
+    # config value is not None, sets optim_args[name] to the value. Raises if OptimizerConfig declares
+    # none of the Muon fields. Logs forwarded names on rank 0.
+    # Inputs: optim_args - kwargs dict being built (must contain "optimizer"); optim_config - config.
+    # Outputs: none. Exceptions: ValueError as described. Side effects: mutates optim_args; prints.
     """Forward the Muon hyperparameters onto the Megatron ``OptimizerConfig`` kwargs.
 
     Only fields declared by the installed ``OptimizerConfig`` are forwarded so this stays compatible
@@ -89,6 +107,10 @@ def _add_muon_args(optim_args: dict, optim_config: dict) -> None:
 
 
 def adamw_rms_match_scale_factor(beta1: float) -> float:
+    # [FUNCTION DOC]
+    # Behavior: returns sqrt((1 - beta1) / (1 + beta1)).
+    # Inputs: beta1 - float in [0, 1). Outputs: float.
+    # Exceptions: ValueError if beta1 is outside [0, 1).
     """Extra Muon scale factor that matches AdamW's update RMS norm.
 
     ``emerging_optimizers`` 0.3.0 documents the closed form in
@@ -123,6 +145,20 @@ def init_megatron_optim_config(
     fp16: bool = False,
     bf16: bool = True,
 ) -> OptimizerConfig:
+    # [FUNCTION DOC]
+    # Behavior: builds OptimizerConfig kwargs from optimizer/lr/min_lr/clip_grad/weight_decay plus
+    # use_distributed_optimizer. For Muon: forwards Muon args; if muon_match_adamw_update_rms is set,
+    # errors when muon_extra_scale_factor was also set to a non-1.0 value, otherwise derives it from
+    # betas[0] (default 0.9); and defaults use_layer_wise_param_layout to True when supported, the
+    # layer-wise config is on, and the attribute is unset (None). Precision: fp16 -> fp16 params,
+    # initial loss scale 32768, min scale 1, precision-aware optimizer on, no param remainders;
+    # elif bf16 -> bf16 params, and if use_precision_aware_optimizer is set, enables it with
+    # main_grads/exp_avg/exp_avg_sq dtypes from config (default fp32); else fp32 params. Finally
+    # applies every key of override_optimizer_config verbatim, logs, and constructs OptimizerConfig.
+    # Inputs: optim_config; use_distributed_optimizer; fp16; bf16 (fp16 wins if both).
+    # Outputs: megatron OptimizerConfig.
+    # Exceptions: ValueError from Muon checks / beta1 validation; TypeError from OptimizerConfig on
+    # unknown override keys. Side effects: rank-0 prints.
     optim_args = {
         "optimizer": optim_config.optimizer,
         "lr": optim_config.lr,
@@ -222,6 +258,9 @@ def get_megatron_optimizer(
     model,
     config: OptimizerConfig,
 ):
+    # [FUNCTION DOC]
+    # Behavior: delegates to Megatron-Core get_megatron_optimizer with the config and model chunks.
+    # Inputs: model - list of model chunks; config - OptimizerConfig. Outputs: Megatron optimizer.
     # Base optimizer.
     return get_megatron_optimizer_native(
         config=config,
@@ -233,6 +272,16 @@ def get_megatron_optimizer_param_scheduler(
     optimizer,
     config,
 ):
+    # [FUNCTION DOC]
+    # Behavior: decay steps = config.lr_decay_steps, or total_training_steps if unset; WSD decay steps
+    # from lr_wsd_decay_steps if set; warmup steps = lr_warmup_steps, but if lr_warmup_steps_ratio is
+    # set and lr_warmup_steps is unset or <= 0, warmup = int(ratio * decay steps). Constructs an
+    # OptimizerParamScheduler with init_lr=lr_warmup_init, max/min lr, decay style, constant weight
+    # decay (start=end=weight_decay) over total_training_steps with weight_decay_incr_style, the
+    # checkpoint-scheduler flags (override is the negation of use_checkpoint_opt_param_scheduler),
+    # and WSD settings.
+    # Inputs: optimizer - Megatron optimizer; config - verl optim config.
+    # Outputs: OptimizerParamScheduler. Exceptions: missing config attributes raise.
     """
     Get the optimizer parameter scheduler for Megatron.
     """
@@ -270,6 +319,9 @@ def get_megatron_optimizer_param_scheduler(
 
 
 def get_megatron_last_lr(optimizer):
+    # [FUNCTION DOC]
+    # Behavior: returns the "lr" of the optimizer's first param group.
+    # Inputs: optimizer. Outputs: float.
     """
     Get the last learning rate from the optimizer parameter scheduler.
     """

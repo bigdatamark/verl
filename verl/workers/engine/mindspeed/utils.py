@@ -12,8 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Utilities for the MindSpeed engine backend, related to FP8 quantized weight reuse on NPU.
+
 
 def reset_fp8_reuse_quantized_weight(engine, device: str, model: bool, optimizer: bool, grad: bool):
+    # [FUNCTION DOC]
+    # Resets MindSpeed's FP8 quantized-weight reuse cache when that feature is enabled.
+    # Behavior: reads engine.engine_config.override_transformer_config; if it has fp8_reuse_quantized_weight truthy, clears the quantization reuse cache (releasing storage) and enables high-precision weight release only when the engine's mode attribute equals "train" (disabled otherwise, e.g. for ref models that must keep weights for offload).
+    # Inputs: engine - engine with engine_config and optional mode; device, model, optimizer, grad - accepted for call-site compatibility but unused.
+    # Outputs: none.
+    # Side effects: mutates MindSpeed global FP8 reuse state; lazy imports mindspeed.
     override_config = getattr(engine.engine_config, "override_transformer_config", None)
     if override_config and override_config.get("fp8_reuse_quantized_weight", False):
         from mindspeed.te.pytorch.fp8.reuse import (

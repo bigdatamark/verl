@@ -785,6 +785,11 @@ def compute_opo_outcome_advantage(
 def compute_reinforce_plus_plus_outcome_advantage(
     token_level_rewards: torch.Tensor, response_mask: torch.Tensor, config: Optional[AlgoConfig] = None, **kwargs
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "reinforce_plus_plus". Behavior (no grad): computes discounted reward-to-go backwards with
+    # config.gamma; returns at mask-0 positions are 0 and the running return is carried unchanged across them (so
+    # rewards propagate past observation tokens). Advantages = returns whitened over the mask, times mask.
+    # Inputs: rewards, mask (bs, T); config required. Outputs: (advantages, returns). Exceptions: AssertionError if no config.
     """
     Compute advantage for REINFORCE++.
     This implementation is based on the paper: https://arxiv.org/abs/2501.03262
@@ -830,6 +835,10 @@ def compute_remax_outcome_advantage(
     config: Optional[AlgoConfig] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "remax". Behavior (no grad): returns = reverse cumulative sum of masked rewards; advantages = returns
+    # minus the per-sample baseline reward broadcast over masked tokens. Inputs: rewards (bs, T), reward_baselines (bs,),
+    # mask. Outputs: (advantages, returns).
     """
     Compute advantage for ReMax, operating only on Outcome reward
     This implementation is based on the paper: https://arxiv.org/abs/2310.10505
@@ -869,6 +878,11 @@ def compute_gpg_outcome_advantage(
     config=None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Registered as "gpg". Behavior (no grad): alpha is recomputed as batch size / max(1, number of non-zero scores);
+    # each score becomes alpha * (score - group mean) / f_norm (group mean 0 for singletons); broadcast times mask.
+    # Outputs: (advantages, advantages).
+    # Note: the alpha argument is always overwritten; epsilon and the computed group std are unused.
     """
     Compute advantage for GPG, operating only on Outcome reward
     (with only one scalar reward for each response).
@@ -930,6 +944,11 @@ def compute_rloo_vectorized_outcome_advantage(
     config: Optional[AlgoConfig] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "rloo_vectorized". Behavior (no grad): maps index to dense group ids, counts group sizes c and group
+    # sums; advantage = (c * score - group sum) / max(c - 1, 1) for groups of size > 1, else 0; broadcast times mask.
+    # Outputs: (advantages, advantages).
+    # Note: singleton groups get advantage 0 here, whereas the loop version keeps the raw score.
     """
     Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
 
@@ -971,6 +990,15 @@ def compute_optimal_token_baseline_advantage(
     epsilon: float = 1e-8,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "optimal_token_baseline". Behavior (no grad): returns = reverse cumulative masked rewards. Per-token
+    # weight w = 1 - 2 * exp(old_log_prob) + sum_pi_squared, optionally multiplied by squared rollout IS weights;
+    # W = cumulative sum over time of masked w. For each prompt group of size > 1, per-timestep baseline =
+    # sum over trajectories of (return * W * mask) / (sum of W * mask + epsilon), assigned to all group members; with
+    # handle_zero_tail, when a unique longest trajectory exceeds the second longest, its baseline beyond the second
+    # longest length is zeroed. Singleton groups get baseline 0. Advantages = (returns - baselines) * mask.
+    # Inputs: rewards, mask, index, old_log_probs, sum_pi_squared (bs, T), optional rollout_is_weights, flags.
+    # Outputs: (advantages, returns).
     """
     Compute advantages using Optimal Token Baseline (OTB).
 
@@ -1090,6 +1118,14 @@ def compute_multi_turn_optimal_token_baseline_advantage(
     epsilon: float = 1e-8,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Registered as "tir_optimal_token_baseline". Same weighting as the OTB estimator, but first compacts each
+    # trajectory's valid (mask=1) positions to the left (so multi-turn responses with interleaved observation tokens
+    # are aligned by valid-token index), computes per-index baselines over the group on the compacted tensors (summing
+    # over all group members without masking, padded entries are zero), applies optional zero-tail handling, then
+    # scatters the compacted advantages back to the original valid positions. Empty trajectories are skipped and get 0.
+    # Outputs: (advantages, reward-to-go returns in original layout).
+    # KNOWN ISSUE: the docstring says handle_zero_tail defaults to False, but the signature default is True.
     """
     Compute advantages using Optimal Token Baseline (OTB).
 
@@ -1213,6 +1249,8 @@ def compute_multi_turn_optimal_token_baseline_advantage(
 
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
+    # [FUNCTION DOC]
+    # Returns token_level_scores - kl_ratio * (old_log_prob - ref_log_prob) (k1 KL penalty in reward). Pure tensor op.
     """Compute token-level rewards with KL penalty.
 
     Args:
@@ -1237,6 +1275,15 @@ def agg_loss(
     global_batch_size: Optional[int] = None,
     loss_scale_factor: Optional[int] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: reduces a (bs, T) loss matrix to a scalar normalized by global batch quantities so the result is
+    # invariant to data-parallel sharding (each rank's value is multiplied by dp_size, assuming later averaging):
+    # token-mean: masked sum / batch_num_tokens (local mask sum if not given; required when dp_size > 1) * dp_size;
+    # token-sum: masked sum * dp_size; seq-mean-token-sum: per-sequence token sums, summed over sequences with at least
+    # one valid token, / global_batch_size (local count of non-empty sequences if not given; required when dp_size > 1)
+    # * dp_size; seq-mean-token-sum-norm: same then divided by loss_scale_factor (default the mask's last-dim length);
+    # seq-mean-token-mean: per-sequence token means (epsilon-guarded), then the same seq-mean.
+    # Exceptions: ValueError for missing global sizes when dp_size > 1 or unknown mode.
     """
     Aggregate the loss across global batch to ensure the loss is invariant to fsdp/megatron parallelism.
 
@@ -1309,6 +1356,12 @@ def compute_policy_loss(
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
 ):
+    # [FUNCTION DOC]
+    # Deprecated (points to the vanilla loss). Behavior: dual-clip PPO: ratio = exp(clamped log-ratio within
+    # plus/minus 20); loss per token = max(-A * ratio, -A * clipped ratio within [1 - low, 1 + high]); for negative
+    # advantages additionally capped by -A * clip_ratio_c. Aggregates with local agg_loss (no global batch info).
+    # Outputs: (loss, clip fraction, approx KL = masked mean of old minus new log-prob, lower clip fraction).
+    # Exceptions: AssertionError if clip_ratio_c <= 1.
     """
     Compute the clipped policy objective and related metrics for PPO.
 
@@ -1383,6 +1436,14 @@ def compute_policy_loss_vanilla(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "vanilla". Behavior: same dual-clip PPO math as the deprecated function, with clip ranges from config
+    # (clip_ratio, optional clip_ratio_low/high, clip_ratio_c default 3.0); optionally multiplies per-token losses by
+    # rollout IS weights; aggregates with agg_loss using config.global_batch_info.
+    # Outputs: (loss, metrics actor/pg_clipfrac, actor/ppo_kl, actor/pg_clipfrac_lower as Python floats).
+    # Exceptions: AssertionError if config missing, is an AlgoConfig, or clip_ratio_c <= 1.
+    # KNOWN ISSUE: the docstring documents a rollout_log_probs argument, but the parameter is rollout_is_weights (same
+    # mismatch in several sibling losses).
     """
     Compute the clipped policy objective and related metrics for PPO.
 
@@ -1477,6 +1538,13 @@ def compute_policy_loss_dppo_tv(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "dppo_tv". Behavior: ratio as in PPO; truncated ratio = min(ratio, clip_ratio_c default 20), detached.
+    # Trust region in probability space: tokens are valid when (for A > 0) new prob - old prob <= high bound, or (for
+    # A <= 0) new prob - old prob >= -low bound. Loss per token = -A * truncated ratio * log_prob * valid mask
+    # (detached mask), optionally times IS weights, aggregated with global batch info.
+    # Metrics: pg_clipfrac = fraction invalid; pg_clipfrac_lower = fraction valid with ratio above clip_ratio_c; ppo_kl.
+    # Exceptions: AssertionError for missing/Algo config.
     """
     Compute the clipped policy objective and related metrics for DPPO-Binary-TV.
 
@@ -1558,6 +1626,11 @@ def compute_policy_loss_dppo_kl(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "dppo_kl". Same as dppo_tv but the trust region uses the binary KL between old and new token
+    # probabilities (Bernoulli of the sampled token, epsilon-guarded): for A > 0 valid if binary KL <= high bound or
+    # the new prob did not increase; for A <= 0 valid if binary KL <= low bound or the prob did not decrease.
+    # Outputs and metrics as dppo_tv.
     """
     Compute the clipped policy objective and related metrics for DPPO-Binary-KL.
 
@@ -1643,6 +1716,12 @@ def compute_policy_loss_gspo(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "gspo". Behavior: sequence-level importance ratio: per-sequence mean log-ratio (mask-weighted, length
+    # at least 1) combined with a token-level straight-through term (log_prob minus its detached value) so gradients flow
+    # per token; log ratio clamped at max 10 and exponentiated. Loss = max(-A * s, -A * clip(s, 1 - low, 1 + high)),
+    # optionally times IS weights, aggregated (default seq-mean-token-mean) with global batch info.
+    # Metrics: pg_clipfrac, ppo_kl (token masked mean), pg_clipfrac_lower fixed 0. Exceptions: AssertionError unless ActorConfig.
     """
     Compute the clipped policy objective and related metrics for GSPO.
 
@@ -1720,6 +1799,11 @@ def compute_policy_loss_sapo(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "sapo". Behavior: ratio as in PPO; per-token temperature tau_pos where A > 0 else tau_neg (from
+    # config); soft gate = sigmoid(tau * (ratio - 1)) * 4 / tau; loss = -gate * A, optionally times IS weights.
+    # Metrics: pg_clipfrac and pg_clipfrac_lower fixed 0, ppo_kl. Exceptions: AssertionError unless ActorConfig.
+    # KNOWN ISSUE: the loss_agg_mode argument is ignored; aggregation is hard-coded to seq-mean-token-mean.
     """
     Compute the smoothed policy objective and related metrics for SAPO.
 
@@ -1746,6 +1830,8 @@ def compute_policy_loss_sapo(
     tau_neg = torch.as_tensor(config.tau_neg, dtype=advantages.dtype, device=advantages.device)
 
     def gate_function(x, tau):
+        # [FUNCTION DOC]
+        # HELPER: Returns sigmoid(tau * (x - 1)) * (4 / tau), elementwise.
         """The gating function used in SAPO"""
         return torch.sigmoid(tau * (x - 1.0)) * (4.0 / tau)
 
@@ -1805,6 +1891,9 @@ def compute_policy_loss_gpg(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "gpg". Loss per token = -log_prob * A (optionally times IS weights), aggregated with global batch
+    # info. Outputs: (loss, empty metrics). Exceptions: AssertionError if config missing.
     """Adapted from
     https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
     Args:
@@ -1841,6 +1930,14 @@ def compute_policy_loss_clip_cov(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "clip_cov". Behavior: standard PPO clipped losses (no log-ratio clamping, no dual clip); computes
+    # per-token covariance between centered advantages and centered log-probs; excludes masked and already-clipped
+    # tokens; candidates are tokens whose covariance lies strictly between clip_cov_lb (default 1) and clip_cov_ub
+    # (default 5); randomly selects up to max(1, clip_cov_ratio (default 0.0002) * valid token count) of them and zeroes
+    # their loss (detaching their gradient). Optionally multiplies IS weights; aggregates with global batch info.
+    # Metrics: pg_clipfrac = fraction of zeroed tokens, ppo_kl. Exceptions: AssertionError for missing configs or
+    # non-positive ratio. Side effects: uses the global torch RNG.
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
 
@@ -1946,6 +2043,12 @@ def compute_policy_loss_kl_cov(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "kl_cov". Behavior: base loss -A * ratio; on CPU computes covariance of advantages and log-probs over
+    # valid tokens, picks the top max(1, kl_cov_ratio * count) covariance tokens and replaces their loss with
+    # -A * ratio + ppo_kl_coef * abs(log-ratio). Optionally IS weights; aggregates with global batch info.
+    # Metrics: actor/ppo_kl = masked mean absolute log-ratio. Exceptions: AssertionError; topk error if no valid tokens.
+    # Note: the guard compares a ratio with a count, so it only skips when there are no valid tokens.
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
 
@@ -2026,6 +2129,14 @@ def compute_policy_loss_geo_mean(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "geo_mean" (GMPO). Behavior: per token, log-ratio clipped to [-low, high] in the direction that is
+    # pessimistic for the advantage sign; sequence ratio = exp of the masked mean of these clipped log-ratios; sequence
+    # advantage = masked mean advantage; loss per sequence = -adv * ratio, optionally times the geometric mean of IS
+    # weights over the sequence; final loss = plain mean over sequences.
+    # Metrics: pg_clipfrac (clipped tokens with A > 0), pg_clipfrac_lower (clipped with A < 0), ppo_kl.
+    # KNOWN ISSUE: loss_agg_mode and config.global_batch_info are ignored (simple local mean), so the loss is not
+    # normalized consistently across data-parallel ranks like the other losses.
     """
     Compute the clipped policy objective and related metrics for GMPO.
 
@@ -2112,6 +2223,10 @@ def compute_policy_loss_dro(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "dro". Behavior: loss per token = -(log_prob * A - 0.5 * beta * (log-ratio)^2) with beta from
+    # policy_loss.dro_beta; optionally IS weights; aggregated with global batch info. Metrics: actor/ppo_kl.
+    # Exceptions: AssertionError if config/policy_loss missing; ValueError if beta missing or not positive.
     """Compute Direct Reward Optimization with a quadratic log-ratio penalty."""
     assert config is not None
     assert config.policy_loss is not None
@@ -2145,6 +2260,11 @@ def compute_policy_loss_cispo(
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "cispo". Behavior: ratio as in PPO; clipped ratio within [1 - low, 1 + high] detached as a weight;
+    # loss per token = -weight * A * log_prob, optionally IS weights; aggregated with global batch info.
+    # Metrics: pg_clipfrac (ratio changed by clipping), ppo_kl, pg_clipfrac_lower fixed 0.
+    # Exceptions: AssertionError unless ActorConfig.
     """
     Compute the clipped policy objective and related metrics for CISPO.
 
@@ -2197,6 +2317,9 @@ def compute_policy_loss_cispo(
 
 
 def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):
+    # [FUNCTION DOC]
+    # Computes per-token entropy from logits (bs, T, V) and aggregates it with agg_loss (local, no global info).
+    # Outputs: scalar tensor.
     """Compute categorical entropy loss (For backward compatibility)
 
     Args:
@@ -2225,6 +2348,10 @@ def compute_value_loss(
     global_batch_size: Optional[int] = None,
     loss_scale_factor: Optional[int] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: clipped value loss: predicted values clipped to within plus/minus cliprange_value of old values;
+    # per-token loss = max of squared errors (unclipped, clipped) to returns; scalar = 0.5 * agg_loss with the given
+    # global batch info. Outputs: (loss, clip fraction = masked mean of clipped error > unclipped error).
     """
     Compute the clipped value-function loss for PPO.
 
@@ -2277,6 +2404,14 @@ def compute_value_loss(
 
 
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
+    # [FUNCTION DOC]
+    # Behavior: computes the forward KL estimate for the estimator name with any trailing "+" removed. Without "+" returns
+    # it directly. With "+" (e.g. "k3+") uses a straight-through trick: value of the forward estimate but gradient of the
+    # k2 estimator 0.5 * (log-ratio)^2.
+    # Inputs: logprob, ref_logprob tensors; estimator name. Outputs: per-token tensor.
+    # Exceptions: NotImplementedError for unknown names or "full".
+    # Note: the early-return check compares the full name (including "+") against mse/k2, so "k2+" goes through the
+    # straight-through path, which is numerically equivalent.
     """Compute KL divergence given logprob and ref_logprob. Optionally using straight through to bind k2 on other
     kl penalty compute method for unbiased KL gradient estimation.
     See more description in http://joschu.net/blog/kl-approx.html
@@ -2305,6 +2440,10 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
 
 
 def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
+    # [FUNCTION DOC]
+    # Behavior: per-token KL estimates of logprob vs ref: kl/k1 = difference; abs = absolute difference; mse/k2 =
+    # 0.5 * squared difference; low_var_kl/k3 = exp(r) - r - 1 with r = ref - logprob clamped to [-20, 20], result
+    # clamped to [-10, 10]. Exceptions: NotImplementedError for "full" or unknown names.
     """Compute KL divergence given logprob and ref_logprob.
     Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1104
     See more description in http://joschu.net/blog/kl-approx.html
@@ -2347,6 +2486,14 @@ def compute_pf_ppo_reweight_data(
     reweight_method: str = "pow",
     weight_pow: float = 2.0,
 ):
+    # [FUNCTION DOC]
+    # Behavior: preference-feedback PPO resampling: per-sample score = sum of token_level_scores; weights from the helper,
+    # clamped to at least 1e-8 (after adding 1e-8); draws batch-size indices with replacement by multinomial sampling;
+    # builds a resampled copy of the DataProto (deep copy) with tensors, non-tensor arrays/lists, and meta_info lists of
+    # batch length reindexed; other meta_info values kept; batch size preserved.
+    # Inputs: data (DataProto); reweight_method; weight_pow. Outputs: new DataProto.
+    # Exceptions: ValueError for unknown method. Side effects: uses global RNG; deep copy of data.
+    # KNOWN ISSUE: converts sampled indices with a direct numpy conversion, which fails if the scores live on GPU.
     """Reweight the data based on the token_level_scores.
 
     Args:
@@ -2360,6 +2507,9 @@ def compute_pf_ppo_reweight_data(
 
     @torch.no_grad()
     def compute_weights(scores: torch.Tensor, reweight_method: str, weight_pow: float) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: (no grad) pow: abs(score) to weight_pow; max_min: 1 for samples equal to the batch max or min, else 0;
+        # max_random: 0.4 for samples equal to the max, else 0.1. Exceptions: ValueError for other methods.
         """Compute importance weights for resampling based on scores.
 
         Args:
@@ -2430,6 +2580,10 @@ def compute_policy_loss_reinforce(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Behavior: REINFORCE loss per token = -A * log_prob, optionally times IS weights; aggregated with global batch info
+    # (default seq-mean-token-sum). Metric actor/ppo_kl = masked mean of rollout log-prob minus current log-prob.
+    # Exceptions: AssertionError if config missing. Not registered in the policy loss registry (used by bypass mode).
     """Compute REINFORCE-style policy gradient loss with optional IS correction.
 
     This function implements policy gradient (REINFORCE) with optional importance
@@ -2511,6 +2665,14 @@ def compute_policy_loss_bypass_mode(
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Registered as "bypass_mode". Behavior: requires config.policy_loss.rollout_correction (ValueError otherwise); reads
+    # loss_type (default ppo_clip), IS level/threshold/batch-normalize and RS modes/thresholds. Treats old_log_prob as
+    # the rollout log-prob; under no grad computes IS weights, rejection-modified mask and metrics via the rollout
+    # correction helper (current policy vs rollout). For "reinforce" calls the REINFORCE loss with computed IS weights and
+    # the modified mask; for "ppo_clip" calls the vanilla PPO loss with the modified mask and no IS weights. Merges
+    # rollout correction metrics into the loss metrics.
+    # Exceptions: ValueError for missing config or invalid loss_type. Note: the passed rollout_is_weights is ignored.
     """Bypass mode policy loss supporting both REINFORCE and PPO-clip.
 
     This function is the entry point for bypass mode, where old_log_prob = rollout_log_prob.

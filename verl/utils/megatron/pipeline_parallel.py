@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Helpers for Megatron pipeline parallelism: precomputing per-micro-batch activation shapes for
+# remove-padding inputs and building (virtual-)pipeline batch iterators.
+
 import torch
 from megatron.core import parallel_state as mpu
 
@@ -20,6 +24,14 @@ from .sequence_parallel import pad_to_sequence_parallel
 
 
 def compute_transformers_input_shapes(batches, meta_info):
+    # [FUNCTION DOC]
+    # Behavior: for each micro-batch, unpads input_ids by attention_mask with flash_attn unpad_input
+    # to get total non-pad tokens; if sequence parallel, pads that count to a multiple of the TP size
+    # and records shape (padded_tokens / TP size, 1, hidden_size), else (tokens, 1, hidden_size).
+    # Inputs: batches - iterable of mappings with "input_ids" and "attention_mask" (batch, seq);
+    # meta_info - mapping with "sequence_parallel" (bool) and "hidden_size".
+    # Outputs: list of torch.Size, one per micro-batch.
+    # Exceptions: ImportError if flash_attn missing. Side effects: none (computes on device tensors).
     from flash_attn.bert_padding import unpad_input  # flash 2 is a must for Megatron
 
     # pre-compute input shapes for each micro-batch at each pp stage
@@ -47,6 +59,10 @@ def compute_transformers_input_shapes(batches, meta_info):
 
 
 def make_batch_generator(batches, vpp_size):
+    # [FUNCTION DOC]
+    # Behavior: if vpp_size > 1 returns a list of vpp_size independent iterators over the same batches
+    # sequence; otherwise a single iterator.
+    # Inputs: batches - re-iterable sequence; vpp_size - int. Outputs: iterator or list of iterators.
     """
     Creates a batch generator suitable for Megatron pipeline parallelism,
     handling virtual pipeline parallelism (VPP).

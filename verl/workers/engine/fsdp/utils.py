@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Helper utilities for the FSDP engine: NPU patching, device mesh creation, sharding-strategy selection and MoE weight unfusing for rollout weight sync.
 import logging
 import os
 
@@ -23,6 +26,12 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def apply_npu_fsdp_patches(model_config=None):
+    # [FUNCTION DOC]
+    # HELPER: Applies NPU-specific model patches for the FSDP backend.
+    # Behavior: no-op unless an NPU is available; also returns early when model_config is given and has use_liger truthy; otherwise imports and calls apply_npu_patches.
+    # Inputs: model_config - optional mapping-like config supporting get.
+    # Outputs: none.
+    # Side effects: monkey-patches transformers model code globally.
     """Apply NPU patches for FSDP backend if NPU is available."""
     if is_npu_available:
         if model_config is not None and model_config.get("use_liger", False):
@@ -33,6 +42,12 @@ def apply_npu_fsdp_patches(model_config=None):
 
 
 def create_device_mesh(world_size, fsdp_size):
+    # [FUNCTION DOC]
+    # HELPER: Builds the device mesh for FSDP/HSDP.
+    # Behavior: if fsdp_size is negative or at least world_size, creates a 1D mesh of size world_size named "fsdp"; otherwise a 2D mesh of shape (world_size // fsdp_size, fsdp_size) named ("ddp", "fsdp").
+    # Inputs: world_size - total processes; fsdp_size - shard group size.
+    # Outputs: the DeviceMesh on the current device type.
+    # Side effects: initializes process-group mesh state.
     """
     Create a device mesh for distributed training based on the world size and FSDP size.
 
@@ -54,6 +69,13 @@ def create_device_mesh(world_size, fsdp_size):
 
 
 def get_sharding_strategy(device_mesh, zero3_enable=True):
+    # [FUNCTION DOC]
+    # HELPER: Maps a device mesh to an FSDP1 ShardingStrategy.
+    # Behavior: with zero3_enable chooses FULL_SHARD (1D) / HYBRID_SHARD (2D); without it SHARD_GRAD_OP (1D) / _HYBRID_SHARD_ZERO2 (2D).
+    # Inputs: device_mesh - mesh whose ndim is inspected; zero3_enable - bool, default True (undocumented in docstring).
+    # Outputs: the selected ShardingStrategy.
+    # Exceptions: NotImplementedError when mesh ndim is not 1 or 2.
+    # Side effects: none.
     """
     Determine the appropriate sharding strategy based on the number of dimensions of the device mesh.
 
@@ -88,6 +110,12 @@ def get_sharding_strategy(device_mesh, zero3_enable=True):
 
 
 def unfuse_moe_params(weights, model_type: str | None = None):
+    # [FUNCTION DOC]
+    # HELPER: Generator converting packed 3D MoE expert parameters into per-expert 2D checkpoint keys.
+    # Behavior: for each (name, tensor) pair: if model_type is "gpt_oss" and the name contains ".mlp.experts." with a 3D tensor, yield unchanged; if the name ends with ".mlp.experts.gate_up_proj" and is 3D, split along dim 1 into gate and up halves and yield "<base>.<i>.gate_proj.weight" and "<base>.<i>.up_proj.weight" per expert i (contiguous slices); if it ends with ".mlp.experts.down_proj" and is 3D, yield "<base>.<i>.down_proj.weight" per expert; otherwise yield the pair unchanged.
+    # Inputs: weights - iterable of (name, tensor); model_type - optional HF model type string.
+    # Outputs: lazily yields (name, tensor) pairs.
+    # Side effects: none (allocates contiguous copies of slices).
     """Expand Transformers 5 packed MoE expert tensors to vLLM checkpoint keys.
 
     Transformers 5 stores Qwen-style MoE experts as packed 3D parameters:

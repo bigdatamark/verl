@@ -11,3 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Package for the TensorRT-LLM rollout backend: async TRT-LLM server actors, the
+# TRT-LLM ServerAdapter rollout, and the worker extension used for in-place weight
+# updates. The package init itself is empty and exports nothing.

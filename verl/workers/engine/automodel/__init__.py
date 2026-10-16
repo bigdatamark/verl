@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Package for the NVIDIA NeMo Automodel training engine backend.
+# Re-exports AutomodelEngine (base engine) and AutomodelEngineWithLMHead (causal-LM variant) from the transformer_impl module.
+# Side effects: importing the package imports transformer_impl (and its heavy dependencies).
+
 from .transformer_impl import AutomodelEngine, AutomodelEngineWithLMHead
 
 __all__ = [

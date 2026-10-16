@@ -281,9 +281,6 @@ def qwen3_5_gated_delta_net_forward(
     # Side effects: cache mutation; SP communication; host sync.
     # KNOWN ISSUE: in the chunked path output_final_state is always false, so with cache_params set (non
     # packed prefill) the stored recurrent state is None.
-    # KNOWN ISSUE: in the fallback CP path model_cu_seqlens is shifted in place after the add creates a
-    # new tensor, which is fine, but cu_seqlens_cpu from the CP context is similarly copied; behavior
-    # depends on the fallback conv seeing the prefix as part of the first sequence.
     if cu_seqlens is not None and cache_params is not None:
         raise NotImplementedError("Packed Qwen3.5 linear attention does not support cached forward.")
 

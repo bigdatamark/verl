@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU unit tests for the VeOmniRouterReplay controller state machine (actions
+# DISABLED, RECORD, REPLAY). The controller assigns each router module a layer
+# position keyed by object identity on first fire within a micro-batch; in RECORD
+# it snapshots the native top-k expert indices once per layer (recompute does not
+# overwrite), in REPLAY it returns the per-layer target indices (falling back to
+# native for rows with duplicate top-k entries). Also covers take_recorded
+# stacking, micro-batch mode validation, clear, and install/uninstall against a
+# stubbed VeOmni global hook module. Toy shapes: 16 tokens, top-2 of 8 experts.
 
 """Unit tests for ``verl.utils.veomni.router_replay.VeOmniRouterReplay``.
 
@@ -52,6 +61,8 @@ from verl.utils.veomni.router_replay import RouterReplayAction, VeOmniRouterRepl
 
 @pytest.fixture
 def ctrl():
+    # [FUNCTION DOC]
+    # HELPER: Fixture returning a fresh, not-installed controller.
     """Fresh controller per test. Does NOT call ``install()`` — that
     would need a stubbed ``veomni.utils.moe_router_replay`` module.
     The controller's ``on_router_forward`` / ``begin_*`` / ``clear``
@@ -65,11 +76,16 @@ def ctrl():
 # and stable for the test's lifetime — exactly what the production code
 # relies on for FSDP2-wrapped MoE routers.
 class _FakeRouter(nn.Module):
+    # [CLASS DOC]
+    # HELPER: Empty nn.Module standing in for an MoE router; distinct instances give
+    # distinct identities.
     pass
 
 
 @pytest.fixture
 def routers():
+    # [FUNCTION DOC]
+    # HELPER: Fixture returning three distinct fake routers (three MoE layers).
     """Three distinct router instances, mimicking three MoE layers."""
     return [_FakeRouter() for _ in range(3)]
 
@@ -80,10 +96,15 @@ _TOPK = 2
 
 
 def _scores():
+    # [FUNCTION DOC]
+    # HELPER: Returns random router scores of shape [16, 8].
     return torch.randn(_NNZ, 8)
 
 
 def _idx():
+    # [FUNCTION DOC]
+    # HELPER: Returns int64 indices [16, 2] with distinct experts per row (random
+    # permutation prefix per row), matching real top-k output.
     """Return ``[_NNZ, _TOPK]`` int indices with DISTINCT entries per
     row. Distinct-per-row matters for tests that assert REPLAY returns
     the target verbatim — the duplicate-detection fallback in
@@ -99,6 +120,9 @@ def _idx():
 
 
 def _fire_all(ctrl, routers):
+    # [FUNCTION DOC]
+    # HELPER: Fires each router once in order through on_router_forward with fresh
+    # random scores and indices. Outputs: list of returned index tensors.
     """Fire each router once in order and return the controller's outputs."""
     return [ctrl.on_router_forward(r, _scores(), _idx()) for r in routers]
 
@@ -109,6 +133,9 @@ def _fire_all(ctrl, routers):
 
 
 def test_take_recorded_is_layer_major(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: after one micro-batch in RECORD, take_recorded returns [16, layers, 2]
+    # with each layer's slice equal to what that layer fired.
     """``take_recorded`` stacks layers on dim=1, so the result matches the
     trainer-side ``routed_experts`` layout ``[nnz, L, topk]``."""
     ctrl.begin_record()
@@ -122,6 +149,9 @@ def test_take_recorded_is_layer_major(ctrl, routers):
 
 
 def test_record_begin_microbatch_drops_previous_microbatch(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: repeatedly starting a micro-batch and firing all routers keeps exactly
+    # one entry per layer (previous micro-batch dropped) and the action stays RECORD.
     """The controller holds exactly one micro-batch. Re-arming must clear
     the previous one, otherwise ``take_recorded`` would stack stale layers
     and the engine's per-mb gather would see the wrong nnz."""
@@ -134,6 +164,8 @@ def test_record_begin_microbatch_drops_previous_microbatch(ctrl, routers):
 
 
 def test_take_recorded_before_any_router_fired_raises(ctrl):
+    # [FUNCTION DOC]
+    # Behavior: take_recorded with nothing fired raises RuntimeError "no router fired".
     """An empty buffer means the model's SparseMoeBlock never called the
     hook — fail with a message that points at the wiring."""
     ctrl.begin_record()
@@ -143,6 +175,8 @@ def test_take_recorded_before_any_router_fired_raises(ctrl):
 
 
 def test_take_recorded_outside_record_mode_raises(ctrl):
+    # [FUNCTION DOC]
+    # Behavior: take_recorded in REPLAY mode raises RuntimeError "requires RECORD".
     ctrl.begin_replay()
     with pytest.raises(RuntimeError, match="requires RECORD"):
         ctrl.take_recorded()
@@ -154,6 +188,10 @@ def test_take_recorded_outside_record_mode_raises(ctrl):
 
 
 def test_record_recompute_per_layer_reverse(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: after a forward pass, re-firing routers in reverse order with new
+    # indices (per-layer checkpoint recompute) adds no entries and keeps the
+    # original snapshots.
     """Per-layer checkpointing: backward replays each layer independently
     in REVERSE order. This is the realistic VeOmni MoE training case
     that breaks any monotonic-cursor design. Subsumes whole-model
@@ -176,6 +214,9 @@ def test_record_recompute_per_layer_reverse(ctrl, routers):
 
 
 def test_replay_first_step_without_prior_discovery(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: REPLAY on the very first step (no prior RECORD) returns each layer's
+    # target in fire order.
     """R3 first step: REPLAY runs before any RECORD has populated the id
     table. begin_microbatch just stashes the list; lookup happens
     lazily during forward."""
@@ -188,6 +229,9 @@ def test_replay_first_step_without_prior_discovery(ctrl, routers):
 
 
 def test_replay_per_layer_reverse_recompute(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: after a forward pass in REPLAY, reverse-order recompute returns each
+    # router's own target.
     """REPLAY recompute under per-layer checkpointing: same id ->
     same target, regardless of fire order."""
     ctrl.begin_replay()
@@ -201,6 +245,9 @@ def test_replay_per_layer_reverse_recompute(ctrl, routers):
 
 
 def test_replay_strict_missing_target_pos_raises(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: with one target for three layers, the second distinct router raises
+    # RuntimeError matching "pos=1 ... no target".
     """Layer position with no target must raise — no silent fallback."""
     ctrl.begin_replay()
     ctrl.begin_microbatch(targets=[_idx()])  # only 1 target for 3 layers
@@ -210,6 +257,9 @@ def test_replay_strict_missing_target_pos_raises(ctrl, routers):
 
 
 def test_replay_duplicate_topk_falls_back_to_native(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: targets with an all-zero row and a row with a repeated expert fall
+    # back to the native indices for those rows, while clean rows use the target.
     """Rows whose target top-k contains a duplicate must fall through to
     native routing. This is the only guard for positions that have no
     recorded routing: the pad suffix the engine appends, and the trailing
@@ -256,6 +306,9 @@ def test_replay_duplicate_topk_falls_back_to_native(ctrl, routers):
 
 
 def test_replay_target_row_count_mismatch_raises(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: a target whose row count differs from the router's token count raises
+    # RuntimeError "target has shape".
     """Defensive: a target sliced with a different SP rule than input_ids
     would silently misalign routing. The controller refuses rather than
     letting the downstream ``torch.where`` broadcast."""
@@ -271,18 +324,24 @@ def test_replay_target_row_count_mismatch_raises(ctrl, routers):
 
 
 def test_begin_microbatch_replay_without_targets_raises(ctrl):
+    # [FUNCTION DOC]
+    # Behavior: begin_microbatch without targets in REPLAY raises RuntimeError.
     ctrl.begin_replay()
     with pytest.raises(RuntimeError, match="REPLAY requires per-layer targets"):
         ctrl.begin_microbatch()
 
 
 def test_begin_microbatch_record_with_targets_raises(ctrl):
+    # [FUNCTION DOC]
+    # Behavior: begin_microbatch with targets in RECORD raises RuntimeError.
     ctrl.begin_record()
     with pytest.raises(RuntimeError, match="RECORD does not take targets"):
         ctrl.begin_microbatch(targets=[_idx()])
 
 
 def test_begin_microbatch_while_disabled_raises(ctrl):
+    # [FUNCTION DOC]
+    # Behavior: begin_microbatch while DISABLED raises RuntimeError "requires RECORD or REPLAY".
     with pytest.raises(RuntimeError, match="requires RECORD or REPLAY"):
         ctrl.begin_microbatch()
 
@@ -293,6 +352,9 @@ def test_begin_microbatch_while_disabled_raises(ctrl):
 
 
 def test_clear_resets_state(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: clear resets action to DISABLED and empties recorded, targets and the
+    # identity-to-position map.
     """clear() is the always-safe reset; state must be empty after."""
     ctrl.begin_record()
     ctrl.begin_microbatch()
@@ -312,6 +374,9 @@ def test_clear_resets_state(ctrl, routers):
 
 
 def test_record_snapshot_independent_of_source_tensor(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: mutating the source index tensor after recording does not change the
+    # recorded snapshot (it is a detached clone).
     """The captured tensor must NOT alias the source — otherwise
     autograd-graph mutations would corrupt recorded indices."""
     ctrl.begin_record()
@@ -329,6 +394,9 @@ def test_record_snapshot_independent_of_source_tensor(ctrl, routers):
 
 
 def test_disabled_passes_through_indices(ctrl, routers):
+    # [FUNCTION DOC]
+    # Behavior: while DISABLED, on_router_forward returns the input indices and leaves
+    # all internal state empty.
     """When no begin_*() has been called (DISABLED), on_router_forward
     is a no-op pass-through and does not even assign layer positions."""
     src = _idx()
@@ -345,6 +413,11 @@ def test_disabled_passes_through_indices(ctrl, routers):
 
 
 def _make_veomni_stub():
+    # [FUNCTION DOC]
+    # HELPER: Builds a mock of VeOmni's router replay hook module whose
+    # set_active_replay stores the value in a captured mapping, get_active_replay
+    # returns it, and validate_model_for_replay returns None.
+    # Outputs: (stub module, captured mapping with key "active").
     """Return a (stub_module, captured_state) tuple where ``stub_module``
     is the fake ``veomni.utils.moe_router_replay`` and
     ``captured_state['active']`` records the last value passed to
@@ -353,6 +426,8 @@ def _make_veomni_stub():
     captured = {"active": None}
 
     def _set(x):
+        # [FUNCTION DOC]
+        # HELPER: Stores x as the active replay controller.
         captured["active"] = x
 
     stub.set_active_replay.side_effect = _set
@@ -362,6 +437,10 @@ def _make_veomni_stub():
 
 
 def test_install_uninstall_roundtrip(ctrl):
+    # [FUNCTION DOC]
+    # Behavior: with the stub installed in the module table, install registers the
+    # controller as active and calls the model validator once; uninstall resets the
+    # active slot to None.
     """install() registers the controller in VeOmni's global slot and
     runs the model validator; uninstall() clears the slot back to None."""
     stub, captured = _make_veomni_stub()
@@ -375,6 +454,9 @@ def test_install_uninstall_roundtrip(ctrl):
 
 
 def test_install_without_veomni_raises(ctrl):
+    # [FUNCTION DOC]
+    # Behavior: with the hook module import blocked, install raises RuntimeError
+    # mentioning "VeOmni build" instead of ImportError.
     """If the VeOmni hook surface is missing, install() must raise a
     typed RuntimeError pointing the user at the dependency, not a raw
     ImportError."""

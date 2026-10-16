@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Fixtures/helpers build prompt groups (PromptSpec) written by a RolloutProducer thread, run blocking
+# sample / wait_for_sampleable calls in consumer threads, and use FakeRefiller as the refill callback.
+# Metric names use a "validation/" prefix because test partitions are not named "train". POLL_INTERVAL
+# is the small replay-buffer poll interval used everywhere. Covers config validation, metadata
+# classification, group clearing, oldest-first selection, blocking, async drop/wait off-policy
+# strategies, DAPO zero-variance group filtering (filter_groups_metric) with refill and surplus discard,
+# rollout-failure refill in sync and async modes, and depth-only waiting.
 """CPU tests for ReplayBuffer against a real TransferQueue instance.
 
 Producers write every trajectory before marking its prompt terminal. Consumers run in a separate
@@ -37,6 +46,8 @@ POLL_INTERVAL = 0.05
 
 @pytest.fixture(scope="module")
 def tq_init():
+    # [FUNCTION DOC]
+    # HELPER: module-scoped fixture that initializes TransferQueue, yields, then closes it.
     tq.init()
     yield
     tq.close()
@@ -44,6 +55,8 @@ def tq_init():
 
 @pytest.fixture
 def partition_id():
+    # [FUNCTION DOC]
+    # HELPER: fixture returning a unique "test-<hex>" partition name.
     """A unique partition per test to isolate TransferQueue state across tests."""
     return f"test-{uuid.uuid4().hex}"
 
@@ -61,6 +74,11 @@ def _make_rb(
     max_inflight_gen_batches: int = 1,
     sync_refill_failed_groups: bool = False,
 ) -> ReplayBuffer:
+    # [FUNCTION DOC]
+    # HELPER: constructs ReplayBuffer for trainer_mode "sync" and ReplayBufferAsync otherwise, with an empty
+    # trainer config and sampler kwargs and the given options (keyword-only; defaults: threshold 8, "drop",
+    # POLL_INTERVAL, no refill, sync, no DAPO metric, train batch 2, gen batch 1, inflight limit 1, no sync
+    # failure refill). Outputs: the buffer. Exceptions: propagates constructor validation errors.
     """Construct a ReplayBuffer with defaults that keep generic samples on-policy."""
     replay_buffer_cls = ReplayBuffer if trainer_mode == "sync" else ReplayBufferAsync
     return replay_buffer_cls(
@@ -80,9 +98,14 @@ def _make_rb(
 
 
 class FakeRefiller:
+    # [CLASS DOC]
+    # HELPER: refill callback that synchronously writes num_prompts fresh finished prompt groups.
     """Produce fresh terminal prompts when the replay buffer requests replacements."""
 
     def __init__(self, partition_id: str, global_steps: int, sessions: int = 1, rewards: list[float] | None = None):
+        # [FUNCTION DOC]
+        # HELPER: stores partition, step stamp, sessions per group, optional per-session rewards (so refilled groups
+        # survive DAPO filtering), and empty call / produced-uid logs.
         self.partition_id = partition_id
         self.global_steps = global_steps
         self.sessions = sessions
@@ -92,6 +115,10 @@ class FakeRefiller:
         self.produced_uids: list[str] = []
 
     def __call__(self, num_prompts: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: records num_prompts, builds that many finished PromptSpecs with new uids, produces them and waits
+        # for the producer (raising its error if any), records their uids and returns num_prompts.
+        # Side effects: writes to TransferQueue.
         self.calls.append(num_prompts)
         specs = [
             PromptSpec(
@@ -110,21 +137,30 @@ class FakeRefiller:
 
 
 def _sample(rb: ReplayBuffer, partition_id: str, batch_size: int, global_steps: int = 0) -> KVBatchMeta:
+    # [FUNCTION DOC]
+    # HELPER: calls rb.sample with the given step/partition/batch size and returns only the batch metadata.
     """Call ``sample`` and return just the batch (dropping the metrics dict)."""
     batch, _metrics = rb.sample(global_steps=global_steps, partition_id=partition_id, batch_size=batch_size)
     return batch
 
 
 def _uid() -> str:
+    # [FUNCTION DOC]
+    # HELPER: random hex uuid without underscores (uids are derived by splitting keys on "_").
     # uid must not contain "_" because ReplayBuffer derives it via key.split("_")[0].
     return uuid.uuid4().hex
 
 
 def _trajectory_key(uid: str, session_id: int = 0, index: int = 0) -> str:
+    # [FUNCTION DOC]
+    # HELPER: returns "<uid>_<session_id>_<index>" (defaults 0, 0).
     return f"{uid}_{session_id}_{index}"
 
 
 def _set_prompt_status(partition_id: str, uid: str, status: str, global_steps: int) -> None:
+    # [FUNCTION DOC]
+    # HELPER: overwrites the prompt key's tag with the given status and global_steps (trajectories untouched).
+    # Side effects: TransferQueue write.
     """Transition an existing prompt to a new status (e.g. running -> finished).
 
     Mirrors the rollout side flipping a GRPO group's status once it terminates.
@@ -139,6 +175,10 @@ def _set_prompt_status(partition_id: str, uid: str, status: str, global_steps: i
 
 @dataclass
 class PromptSpec:
+    # [CLASS DOC]
+    # HELPER: dataclass describing a prompt group: uid, status, number of sessions (trajectories), step stamp,
+    # optional per-session "acc" rewards, optional canonical rm_scores per session (scalar or list), and the
+    # trajectory keys filled in by the producer.
     """A prompt group and the trajectories that precede its status update."""
 
     uid: str
@@ -151,15 +191,23 @@ class PromptSpec:
 
 
 class RolloutProducer(threading.Thread):
+    # [CLASS DOC]
+    # HELPER: daemon thread that writes all trajectories of each spec before publishing the prompt's status tag.
     """Write complete trajectory groups before publishing their prompt status."""
 
     def __init__(self, partition_id: str, specs: list[PromptSpec]):
+        # [FUNCTION DOC]
+        # HELPER: stores partition and specs; error starts as None.
         super().__init__(daemon=True)
         self.partition_id = partition_id
         self.specs = specs
         self.error: Exception | None = None
 
     def run(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: for each spec and session writes key "<uid>_<session>_0" with input_ids [1,2,3], a non-prompt tag
+        # (seq_len 3, step), optional reward_extra_info acc and optional float rm_scores tensor, appending the key
+        # to the spec; then writes the prompt tag. Any exception is stored in self.error rather than raised.
         try:
             for spec in self.specs:
                 for session_id in range(spec.sessions):
@@ -189,6 +237,8 @@ class RolloutProducer(threading.Thread):
             self.error = e
 
     def join_and_check(self, timeout: float = 10.0) -> None:
+        # [FUNCTION DOC]
+        # HELPER: joins with timeout (default 10s), asserts the thread finished, and re-raises a stored error.
         self.join(timeout)
         assert not self.is_alive(), "RolloutProducer thread did not finish in time"
         if self.error is not None:
@@ -196,10 +246,14 @@ class RolloutProducer(threading.Thread):
 
 
 class SampleConsumer(threading.Thread):
+    # [CLASS DOC]
+    # HELPER: daemon thread running the blocking sample call so tests can observe blocking.
     """Runs the blocking ``ReplayBuffer.sample`` in a background thread so the test
     can assert that it stays blocked until the producer supplies enough data."""
 
     def __init__(self, rb: ReplayBuffer, partition_id: str, batch_size: int, global_steps: int = 0):
+        # [FUNCTION DOC]
+        # HELPER: stores buffer, partition, batch size and step; result/metrics/error start as None.
         super().__init__(daemon=True)
         self.rb = rb
         self.partition_id = partition_id
@@ -210,6 +264,8 @@ class SampleConsumer(threading.Thread):
         self.error: Exception | None = None
 
     def run(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: calls sample and stores the batch and metrics, or stores any exception.
         try:
             self.result, self.metrics = self.rb.sample(
                 global_steps=self.global_steps,
@@ -220,6 +276,8 @@ class SampleConsumer(threading.Thread):
             self.error = e
 
     def result_or_raise(self, timeout: float = 10.0) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # HELPER: joins with timeout, asserts finished, re-raises stored error, asserts and returns the result batch.
         self.join(timeout)
         assert not self.is_alive(), "SampleConsumer thread did not finish in time"
         if self.error is not None:
@@ -229,9 +287,13 @@ class SampleConsumer(threading.Thread):
 
 
 class WaitConsumer(threading.Thread):
+    # [CLASS DOC]
+    # HELPER: daemon thread running the blocking wait_for_sampleable.
     """Runs the blocking ``wait_for_sampleable`` so the test can assert it stays blocked."""
 
     def __init__(self, rb: ReplayBufferAsync, partition_id: str, target_count: int, global_steps: int = 0):
+        # [FUNCTION DOC]
+        # HELPER: stores buffer, partition, target count and step; metrics/error start as None.
         super().__init__(daemon=True)
         self.rb = rb
         self.partition_id = partition_id
@@ -241,6 +303,8 @@ class WaitConsumer(threading.Thread):
         self.error: Exception | None = None
 
     def run(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: calls wait_for_sampleable, storing its metrics (key set discarded) or any exception.
         try:
             _, self.metrics = self.rb.wait_for_sampleable(
                 global_steps=self.global_steps,
@@ -251,6 +315,8 @@ class WaitConsumer(threading.Thread):
             self.error = e
 
     def metrics_or_raise(self, timeout: float = 10.0) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: joins with timeout, asserts finished, re-raises stored error, asserts and returns metrics.
         self.join(timeout)
         assert not self.is_alive(), "WaitConsumer thread did not finish in time"
         if self.error is not None:
@@ -260,12 +326,16 @@ class WaitConsumer(threading.Thread):
 
 
 def _produce(partition_id: str, specs: list[PromptSpec]) -> RolloutProducer:
+    # [FUNCTION DOC]
+    # HELPER: starts and returns a RolloutProducer for the specs (caller must join_and_check).
     producer = RolloutProducer(partition_id, specs)
     producer.start()
     return producer
 
 
 def _clear_partition(partition_id: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: best-effort clear of every key listed in the partition.
     """Best-effort cleanup of every key written into a partition."""
     keys = list(tq.kv_list(partition_id=partition_id).get(partition_id, {}).keys())
     if keys:
@@ -273,6 +343,8 @@ def _clear_partition(partition_id: str) -> None:
 
 
 def _uids_of(keys: list[str]) -> set[str]:
+    # [FUNCTION DOC]
+    # HELPER: returns the set of uid prefixes (text before the first "_") of the given keys.
     return {key.split("_")[0] for key in keys}
 
 
@@ -282,18 +354,24 @@ def _uids_of(keys: list[str]) -> set[str]:
 
 
 def test_init_rejects_non_positive_threshold():
+    # [FUNCTION DOC]
+    # Threshold 0 raises AssertionError mentioning "max off policy threshold".
     """max_off_policy_threshold must be a positive integer."""
     with pytest.raises(AssertionError, match="max off policy threshold"):
         _make_rb(max_off_policy_threshold=0)
 
 
 def test_init_rejects_unknown_strategy():
+    # [FUNCTION DOC]
+    # Unknown strategy raises AssertionError mentioning "max off policy strategy".
     """max_off_policy_strategy must be one of {drop, wait}."""
     with pytest.raises(AssertionError, match="max off policy strategy"):
         _make_rb(max_off_policy_strategy="bogus")
 
 
 def test_init_rejects_non_positive_sync_dapo_inflight_limit():
+    # [FUNCTION DOC]
+    # Sync DAPO with max_inflight_gen_batches 0 raises ValueError.
     with pytest.raises(ValueError, match="max_inflight_gen_batches"):
         _make_rb(
             refill_fn=lambda _n: None,
@@ -308,6 +386,9 @@ def test_init_rejects_non_positive_sync_dapo_inflight_limit():
 
 
 def test_sync_metadata_classifies_keys(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # After producing pending/running/finished/failure prompts, a metadata sync places each uid in its status
+    # set and records exactly the trajectory keys with their tags in the partition map.
     """The poll splits prompts by status and collects trajectory tags."""
     pending = PromptSpec(uid=_uid(), status="pending", sessions=0)
     running = PromptSpec(uid=_uid(), status="running", sessions=1)
@@ -334,6 +415,8 @@ def test_sync_metadata_classifies_keys(tq_init, partition_id):
 
 
 def test_sync_metadata_unknown_status_raises(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # An unknown prompt status raises ValueError "Unknown status"; the partition is cleaned so later polls work.
     """An unrecognized prompt status is a hard error during the poll."""
     _produce(partition_id, [PromptSpec(uid=_uid(), status="bogus", sessions=0)]).join_and_check()
 
@@ -348,6 +431,10 @@ def test_sync_metadata_unknown_status_raises(tq_init, partition_id):
 
 
 def test_clear_groups_updates_active_snapshot(monkeypatch):
+    # [FUNCTION DOC]
+    # With kv_clear patched to record calls on a synthetic in-memory state, _clear_groups deletes the dropped
+    # uid and its trajectory key from TransferQueue and from partitions, all status sets, prompt steps and the
+    # DAPO classification cache, leaving the kept group intact. Inputs: monkeypatch.
     rb = _make_rb()
     pid, dropped_uid, kept_uid = "p", "drop", "keep"
     dropped_trajectory = _trajectory_key(dropped_uid)
@@ -377,6 +464,9 @@ def test_clear_groups_updates_active_snapshot(monkeypatch):
 
 
 def test_sample_returns_finished_and_failure_trajectories(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Sampling 2 returns all trajectories of the finished and failure prompts (not the running one), one tag per
+    # key, and removes the sampled prompt keys from TransferQueue while the running prompt remains.
     """sample picks trajectories belonging to finished/failure prompts and clears
     the sampled prompt keys from TransferQueue."""
     finished = PromptSpec(uid=_uid(), status="finished", sessions=2)
@@ -406,6 +496,8 @@ def test_sample_returns_finished_and_failure_trajectories(tq_init, partition_id)
 
 
 def test_sync_failure_without_trajectories_uses_padding_path_by_default(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # A failure with no trajectories is skipped by default: batch contains only the finished group, no metrics.
     finished = PromptSpec(uid=_uid(), status="finished", sessions=1)
     empty_failure = PromptSpec(uid=_uid(), status="failure", sessions=0)
     _produce(partition_id, [finished, empty_failure]).join_and_check()
@@ -421,6 +513,8 @@ def test_sync_failure_without_trajectories_uses_padding_path_by_default(tq_init,
 
 
 def test_sync_all_empty_failures_raise_without_refill(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Only empty failures and no refill: sample raises RuntimeError mentioning sync_refill_failed_groups.
     failures = [PromptSpec(uid=_uid(), status="failure", sessions=0) for _ in range(2)]
     _produce(partition_id, failures).join_and_check()
 
@@ -433,6 +527,8 @@ def test_sync_all_empty_failures_raise_without_refill(tq_init, partition_id):
 
 
 def test_sample_prioritizes_smallest_global_steps(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # With 3 ready prompts at steps 5,1,2, sampling 2 selects steps 1 and 2 and leaves the newest.
     """When more prompts are ready than ``batch_size``, sample must hand out the
     oldest ones first (smallest ``global_steps``), leaving the newer surplus."""
     # Produced out of step order on purpose; selection must follow global_steps.
@@ -457,6 +553,8 @@ def test_sample_prioritizes_smallest_global_steps(tq_init, partition_id):
 
 
 def test_sample_blocks_until_enough_then_unblocks(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # With 1 of 2 groups ready, the consumer stays blocked; after a second group is produced it returns 2 keys.
     """sample stays blocked while fewer than batch_size prompts are ready and
     returns once the producer thread supplies the missing group."""
     # One group ready up front -> not enough for batch_size=2.
@@ -482,6 +580,8 @@ def test_sample_blocks_until_enough_then_unblocks(tq_init, partition_id):
 
 
 def test_sync_grpo_step_returns_complete_groups(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # 3 prompts x 4 sessions: one sample returns all 12 trajectories, 4 per uid.
     """A synchronous PPO/GRPO step submits batch_size prompts, each a GRPO group of
     n sessions; one sample must return every trajectory as whole groups."""
     n_prompts = 3
@@ -506,6 +606,9 @@ def test_sync_grpo_step_returns_complete_groups(tq_init, partition_id):
 
 
 def test_async_overproduction_drains_in_batches_without_duplicates(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # 5 prompts x 2 sessions drained by samples of 2, 2, 1 with a metadata re-sync between calls; no prompt is
+    # returned twice and all 10 trajectories are collected exactly once.
     """An async rollouter over-produces; sequential samples drain the surplus
     batch_size complete groups at a time without ever re-selecting a prompt.
 
@@ -555,6 +658,10 @@ def test_async_overproduction_drains_in_batches_without_duplicates(tq_init, part
 
 
 def test_drop_refills_stale_groups_and_reports_metrics(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Async drop with threshold 2 at step 5: the step-0 group (staleness 6) is dropped and refilled once,
+    # the step-4 boundary group (staleness 2) and fresh group are kept, the running group is excluded; the
+    # dropped keys are removed and evicted count / staleness mean, max, min (6) metrics are reported.
     """drop discards finished groups whose staleness strictly exceeds the threshold *inside the
     polling loop*, calls ``refill_fn`` for an equal count, and returns a full, fresh batch."""
     # staleness = (global_steps - prompt_global_steps + 1); drop when staleness > threshold(=2).
@@ -603,6 +710,9 @@ def test_drop_refills_stale_groups_and_reports_metrics(tq_init, partition_id):
 
 
 def test_drop_uses_one_snapshot_per_poll_iteration(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # A stale running prompt is flipped to finished during the first refill; it must be dropped on the next
+    # poll's snapshot rather than selected, giving two refills of 1, a refilled uid sampled, and 2 evictions.
     """A stale running prompt that finishes during refill is dropped on the next snapshot.
 
     This reproduces the production race where a second metadata sync after refill exposed newly
@@ -615,6 +725,8 @@ def test_drop_uses_one_snapshot_per_poll_iteration(tq_init, partition_id):
     refiller = FakeRefiller(partition_id, global_steps=5)
 
     def finish_during_first_refill(num_prompts: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: on the first call marks the stale running prompt finished, then delegates to the refiller.
         if not refiller.calls:
             _set_prompt_status(partition_id, stale_running.uid, "finished", global_steps=0)
         return refiller(num_prompts)
@@ -644,6 +756,9 @@ def test_drop_uses_one_snapshot_per_poll_iteration(tq_init, partition_id):
 
 
 def test_wait_blocks_until_stale_inflight_finishes(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Async wait with threshold 2: a stale running prompt blocks sampling of 2 ready fresh groups; once it is
+    # marked finished the consumer returns a 2-group batch.
     """wait holds back a full batch while a stale in-flight prompt exists, then
     proceeds (without dropping it) once it terminates."""
     threshold, g = 2, 5
@@ -674,6 +789,8 @@ def test_wait_blocks_until_stale_inflight_finishes(tq_init, partition_id):
 
 
 def test_wait_keeps_stale_terminal_trajectories(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Wait strategy is dropless: a very stale finished group is returned with no metrics.
     """wait is dropless: a finished-but-very-stale group that ``drop`` would
     discard is still returned, with no drop metrics."""
     # staleness (100 - 0 + 1) = 101, far above threshold=2; "drop" would
@@ -692,6 +809,8 @@ def test_wait_keeps_stale_terminal_trajectories(tq_init, partition_id):
 
 
 def test_wait_does_not_block_when_inflight_is_fresh(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # A fresh in-flight prompt below threshold does not block; returns the two finished groups, no metrics.
     """wait proceeds immediately when every in-flight prompt is below threshold,
     and never drops (no drop metrics)."""
     threshold, g = 4, 3
@@ -716,21 +835,30 @@ def test_wait_does_not_block_when_inflight_is_fresh(tq_init, partition_id):
 
 
 def test_init_rejects_dapo_without_refill_fn():
+    # [FUNCTION DOC]
+    # DAPO filtering without refill_fn raises ValueError "requires refill_fn".
     with pytest.raises(ValueError, match="requires refill_fn"):
         _make_rb(filter_groups_metric="acc", refill_fn=None)
 
 
 def test_init_rejects_sync_failure_refill_without_refill_fn():
+    # [FUNCTION DOC]
+    # Sync failure refill without refill_fn raises ValueError "requires refill_fn".
     with pytest.raises(ValueError, match="requires refill_fn"):
         _make_rb(sync_refill_failed_groups=True, refill_fn=None)
 
 
 def test_init_rejects_batched_sync_failure_refill():
+    # [FUNCTION DOC]
+    # Sync failure refill with gen_batch_size 2 raises ValueError "requires gen_batch_size=1".
     with pytest.raises(ValueError, match="requires gen_batch_size=1"):
         _make_rb(sync_refill_failed_groups=True, refill_fn=lambda _n: None, gen_batch_size=2)
 
 
 def test_validation_never_drops_terminal_groups(tq_init):
+    # [FUNCTION DOC]
+    # In the "val" partition, stale and zero-variance DAPO groups and failures are all returned without
+    # refill or metrics (validation is exempt from eviction).
     partition_id = "val"
     _clear_partition(partition_id)
     stale_dapo = PromptSpec(uid=_uid(), status="finished", sessions=2, global_steps=0, rewards=[1.0, 1.0])
@@ -755,6 +883,8 @@ def test_validation_never_drops_terminal_groups(tq_init):
 
 
 def test_validation_ignores_sync_failure_refill(tq_init):
+    # [FUNCTION DOC]
+    # In "val", sync failure refill is not applied: only the finished group returns, no refill, no metrics.
     partition_id = "val"
     _clear_partition(partition_id)
     finished = PromptSpec(uid=_uid(), status="finished")
@@ -775,6 +905,9 @@ def test_validation_ignores_sync_failure_refill(tq_init):
 
 @pytest.mark.parametrize("strategy", ["drop", "wait"])
 def test_sync_ignores_off_policy_strategy(tq_init, partition_id, strategy):
+    # [FUNCTION DOC]
+    # Parametrized drop/wait: sync mode returns both stale and fresh groups with no metrics.
+    # Inputs: strategy parameter.
     stale = PromptSpec(uid=_uid(), status="finished", global_steps=0)
     fresh = PromptSpec(uid=_uid(), status="finished", global_steps=5)
     _produce(partition_id, [stale, fresh]).join_and_check()
@@ -789,6 +922,8 @@ def test_sync_ignores_off_policy_strategy(tq_init, partition_id, strategy):
 
 
 def test_async_failure_refills_exact_missing_count(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Async: a failure group is evicted and refilled once; the finished group is kept; failure eviction metric 1.
     finished = PromptSpec(uid=_uid(), status="finished")
     failure = PromptSpec(uid=_uid(), status="failure")
     _produce(partition_id, [finished, failure]).join_and_check()
@@ -807,6 +942,8 @@ def test_async_failure_refills_exact_missing_count(tq_init, partition_id):
 
 
 def test_sync_failure_refill_replaces_empty_failed_groups(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Sync refill on: an empty failure is replaced by one refilled group (2 groups total, metric 1).
     finished = PromptSpec(uid=_uid(), status="finished")
     failure = PromptSpec(uid=_uid(), status="failure", sessions=0)
     _produce(partition_id, [finished, failure]).join_and_check()
@@ -827,6 +964,8 @@ def test_sync_failure_refill_replaces_empty_failed_groups(tq_init, partition_id)
 
 
 def test_sync_failure_refill_replaces_multiple_empty_failed_groups(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Three empty failures are replaced by one refill of 3; the batch is exactly the refilled groups.
     failures = [PromptSpec(uid=_uid(), status="failure", sessions=0) for _ in range(3)]
     _produce(partition_id, failures).join_and_check()
 
@@ -843,6 +982,8 @@ def test_sync_failure_refill_replaces_multiple_empty_failed_groups(tq_init, part
 
 
 def test_sync_failure_refill_keeps_materializable_failed_groups(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # A failure with a trajectory is kept and sampled; no refill and no metrics.
     finished = PromptSpec(uid=_uid(), status="finished")
     failure = PromptSpec(uid=_uid(), status="failure", sessions=1)
     _produce(partition_id, [finished, failure]).join_and_check()
@@ -860,6 +1001,10 @@ def test_sync_failure_refill_keeps_materializable_failed_groups(tq_init, partiti
 
 
 def test_sync_failure_refill_does_not_drain_unrelated_inflight(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # With a finished group, an empty failure and an unrelated running prompt, sampling 1 returns the finished
+    # group within 2s without refilling or waiting for the running prompt, reports one failure eviction, and
+    # leaves the running prompt in place. Cleanup unblocks the consumer if still alive.
     finished = PromptSpec(uid=_uid(), status="finished")
     empty_failure = PromptSpec(uid=_uid(), status="failure", sessions=0)
     running = PromptSpec(uid=_uid(), status="running", sessions=0)
@@ -886,6 +1031,9 @@ def test_sync_failure_refill_does_not_drain_unrelated_inflight(tq_init, partitio
 
 
 def test_async_dapo_refills_exact_missing_count(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Async DAPO on "acc": the all-same-reward group is filtered and refilled once; the mixed group is kept;
+    # filter eviction metric 1.
     all_same = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[1.0, 1.0])
     mixed = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 1.0])
     _produce(partition_id, [all_same, mixed]).join_and_check()
@@ -908,6 +1056,10 @@ def test_async_dapo_refills_exact_missing_count(tq_init, partition_id):
 
 
 def test_dapo_classification_cache_fetches_only_new_finished_groups(tq_init, partition_id, monkeypatch):
+    # [FUNCTION DOC]
+    # Wraps kv_batch_get to record requested keys; classification of finished groups is cached so a repeat
+    # call fetches nothing new and a later group triggers a fetch of only its trajectories. Asserts filtered uid
+    # sets and per-reward counts ({1.0:1} then {0.0:1, 1.0:1}). Inputs: monkeypatch.
     first_filtered = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[1.0, 1.0])
     mixed = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 1.0])
     _produce(partition_id, [first_filtered, mixed]).join_and_check()
@@ -916,6 +1068,8 @@ def test_dapo_classification_cache_fetches_only_new_finished_groups(tq_init, par
     original_kv_batch_get = tq.kv_batch_get
 
     def recording_kv_batch_get(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: records the keys keyword as a set and delegates to the original kv_batch_get.
         requested_keys.append(set(kwargs["keys"]))
         return original_kv_batch_get(*args, **kwargs)
 
@@ -944,6 +1098,9 @@ def test_dapo_classification_cache_fetches_only_new_finished_groups(tq_init, par
 
 
 def test_dapo_reward_metric_uses_canonical_rm_scores(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # With metric "reward", grouping uses summed rm_scores (0.25+0.75 and 1.0 -> both 1.0, filtered) rather
+    # than reward_extra_info acc; the group with rm_scores 0 and 1 survives.
     same_reward = PromptSpec(
         uid=_uid(),
         status="finished",
@@ -972,6 +1129,9 @@ def test_dapo_reward_metric_uses_canonical_rm_scores(tq_init, partition_id):
 
 
 def test_terminal_eviction_reasons_has_no_cross_call_hidden_state(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Computes training eviction reasons, then an unrelated "val" lookup, then evicts with the training
+    # reasons; asserts 2 DAPO evictions and the reward breakdown {0:1, 1:1} are not overwritten.
     """An interleaved validation lookup must not overwrite a pending training breakdown."""
     all_zero = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0])
     all_one = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[1.0, 1.0])
@@ -995,6 +1155,8 @@ def test_terminal_eviction_reasons_has_no_cross_call_hidden_state(tq_init, parti
 
 
 def test_accumulate_eviction_metrics_merges_filtered_reward_counts():
+    # [FUNCTION DOC]
+    # _accumulate_eviction_metrics sums scalar counts (4+2=6) and merges reward-count dicts additively.
     """The dict-valued DAPO diagnostic accumulates additively across poll iterations."""
     from verl.trainer.ppo.v1.replay_buffer import (
         DAPO_FILTERED_REWARD_COUNTS_KEY,
@@ -1018,6 +1180,8 @@ def test_accumulate_eviction_metrics_merges_filtered_reward_counts():
 
 
 def test_dapo_reports_filtered_reward_value_breakdown(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Three no-signal groups (two acc 0, one acc 1) are evicted with breakdown {0:2, 1:1}.
     """The DAPO diagnostic maps each no-signal group's shared metric value to a count."""
     from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
 
@@ -1039,6 +1203,9 @@ def test_dapo_reports_filtered_reward_value_breakdown(tq_init, partition_id):
 
 
 def test_sync_dapo_refills_twice_and_clears_surplus(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Sync DAPO: one filtered group triggers a refill of 2 (credit doubled); one refilled group is used, the
+    # surplus group and its trajectories are deleted, with evicted 1 and discarded surplus 1 metrics.
     all_same = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0])
     mixed = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 1.0])
     _produce(partition_id, [all_same, mixed]).join_and_check()
@@ -1067,6 +1234,9 @@ def test_sync_dapo_refills_twice_and_clears_surplus(tq_init, partition_id):
 
 
 def test_sync_dapo_and_failure_refill_credits_are_combined(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Filtered group plus empty failure with batch 3: a single combined refill of 3, batch of 3 including the
+    # mixed group, metrics evicted 1, failure 1, surplus 1.
     all_same = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0])
     empty_failure = PromptSpec(uid=_uid(), status="failure", sessions=0)
     mixed = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 1.0])
@@ -1096,6 +1266,8 @@ def test_sync_dapo_and_failure_refill_credits_are_combined(tq_init, partition_id
 
 
 def test_sync_dapo_does_not_refill_when_filtered_surplus_leaves_a_full_batch(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Two valid groups already fill batch 2 after filtering one: no refill, evicted metric 1.
     all_same = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0])
     mixed = [PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 1.0]) for _ in range(2)]
     _produce(partition_id, [all_same, *mixed]).join_and_check()
@@ -1117,6 +1289,10 @@ def test_sync_dapo_does_not_refill_when_filtered_surplus_leaves_a_full_batch(tq_
 
 
 def test_sync_dapo_streams_refill_credit_with_bounded_inflight(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # With inflight limit 1 and an original prompt still running, the 2-prompt refill credit is dispatched one
+    # at a time (calls [1,1]) while sample stays blocked; after the running prompt finishes, a 2-group batch
+    # without the filtered group is returned with evicted 1 and surplus 1 metrics.
     all_same = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0])
     slow_valid = PromptSpec(uid=_uid(), status="running", sessions=2, rewards=[0.0, 1.0])
     _produce(partition_id, [all_same, slow_valid]).join_and_check()
@@ -1154,6 +1330,9 @@ def test_sync_dapo_streams_refill_credit_with_bounded_inflight(tq_init, partitio
 
 
 def test_sync_dapo_discards_unsent_credit_when_batch_fills(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # The refill callback also finishes the running original prompt; the batch fills after one refill so the
+    # remaining credit is never sent (calls [1]) and no surplus metric is reported.
     all_same = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0])
     slow_valid = PromptSpec(uid=_uid(), status="running", sessions=2, rewards=[0.0, 1.0])
     _produce(partition_id, [all_same, slow_valid]).join_and_check()
@@ -1161,6 +1340,8 @@ def test_sync_dapo_discards_unsent_credit_when_batch_fills(tq_init, partition_id
     refiller = FakeRefiller(partition_id, global_steps=1, sessions=2, rewards=[0.0, 1.0])
 
     def refill_and_finish_original(num_prompts: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: delegates to the refiller, then marks the slow original prompt finished; returns the refill result.
         result = refiller(num_prompts)
         _set_prompt_status(partition_id, slow_valid.uid, "finished", global_steps=0)
         return result
@@ -1185,6 +1366,8 @@ def test_sync_dapo_discards_unsent_credit_when_batch_fills(tq_init, partition_id
 
 
 def test_overlapping_async_eviction_reasons_refill_once(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # A group both stale and zero-variance is refilled once, while both off-policy and filter metrics count 1.
     stale_dapo = PromptSpec(uid=_uid(), status="finished", sessions=2, global_steps=0, rewards=[1.0, 1.0])
     _produce(partition_id, [stale_dapo]).join_and_check()
 
@@ -1211,6 +1394,8 @@ def test_overlapping_async_eviction_reasons_refill_once(tq_init, partition_id):
 
 
 def test_get_sampleable_count_excludes_stale_groups_without_consuming(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Sampleable count excludes the stale group (1) and neither group is removed from TransferQueue.
     fresh = PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=5)
     stale = PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=0)
     _produce(partition_id, [fresh, stale]).join_and_check()
@@ -1228,6 +1413,8 @@ def test_get_sampleable_count_excludes_stale_groups_without_consuming(tq_init, p
 
 
 def test_wait_for_sampleable_leaves_the_groups_for_sample(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Waiting for depth 2 returns empty metrics and leaves both groups for a subsequent sample.
     specs = [PromptSpec(uid=_uid(), status="finished", sessions=1) for _ in range(2)]
     _produce(partition_id, specs).join_and_check()
 
@@ -1244,6 +1431,8 @@ def test_wait_for_sampleable_leaves_the_groups_for_sample(tq_init, partition_id)
 
 
 def test_wait_for_sampleable_blocks_below_the_target(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # With 1 ready and 1 running, waiting for 2 blocks until the running prompt is finished, then returns {}.
     ready = PromptSpec(uid=_uid(), status="finished", sessions=1)
     pending = PromptSpec(uid=_uid(), status="running", sessions=1)
     _produce(partition_id, [ready, pending]).join_and_check()
@@ -1265,6 +1454,9 @@ def test_wait_for_sampleable_blocks_below_the_target(tq_init, partition_id):
 
 
 def test_wait_for_sampleable_replaces_groups_sample_would_have_evicted(tq_init, partition_id):
+    # [FUNCTION DOC]
+    # Waiting evicts and refills a stale group (one refill, metric 1); the following sample returns the
+    # refilled group.
     # Without eviction and refill the wait would sit forever on a group that can never be trained on.
     stale = PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=0)
     _produce(partition_id, [stale]).join_and_check()

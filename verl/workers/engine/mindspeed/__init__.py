@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Package for the MindSpeed (Ascend NPU, Megatron-based) training engine backend.
+# Re-exports MindspeedEngineWithLMHead and MindspeedEngineWithValueHead.
+
 from .transformer_impl import MindspeedEngineWithLMHead, MindspeedEngineWithValueHead
 
 __all__ = ["MindspeedEngineWithLMHead", "MindspeedEngineWithValueHead"]

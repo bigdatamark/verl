@@ -24,7 +24,6 @@ def initialize_system_prompt(tokenizer, **apply_chat_template_kwargs) -> list[in
     # with that many trailing tokens removed.
     # Inputs: tokenizer - tokenizer/processor with apply_chat_template; extra kwargs forwarded to apply_chat_template.
     # Outputs: list of int token ids (empty if the template has no implicit system prompt).
-    # KNOWN ISSUE: if both renderings have equal length, slicing with negative zero yields an empty list, which happens to be correct only by coincidence; any template exception propagates.
     # Side effects: none.
     """
     Initialize system prompt tokens for chat templates that support them.

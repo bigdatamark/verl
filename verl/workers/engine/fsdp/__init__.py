@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Package for the PyTorch FSDP (FSDP1/FSDP2) training engine backend.
+# Re-exports FSDPEngine, FSDPEngineWithLMHead (transformer_impl) and FSDPTurboEngineWithLMHead (fsdp_turbo_impl).
+# Side effects: importing registers these engines in the EngineRegistry via their decorators.
 from .fsdp_turbo_impl import FSDPTurboEngineWithLMHead
 from .transformer_impl import FSDPEngine, FSDPEngineWithLMHead
 

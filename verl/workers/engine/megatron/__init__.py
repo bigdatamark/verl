@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Package for the Megatron-Core training engine backend.
+# Exports MegatronEngine, MegatronEngineWithLMHead, MegatronEngineWithValueHead.
+# Side effects: if CUDA is unavailable and TORCH_CUDA_ARCH_LIST is unset, temporarily sets TORCH_CUDA_ARCH_LIST to "8.0" while importing transformer_impl (avoids CUDA JIT errors on CPU workers), then deletes it again.
+# KNOWN ISSUE: on a CPU worker where TORCH_CUDA_ARCH_LIST was already set by the user, the trailing cleanup still deletes it, discarding the user's value.
+
 
 # HACK Avoid cpu worker trigger cuda jit error
 import os

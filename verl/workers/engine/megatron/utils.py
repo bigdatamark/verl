@@ -12,11 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Small utilities for the Megatron engine backend (random seeding).
+
 
 from verl.utils.device import get_torch_device, is_device_available
 
 
 def set_random_seed(seed):
+    # [FUNCTION DOC]
+    # Seeds all random number generators for reproducible Megatron training.
+    # Behavior: seeds torch, numpy and Python random with the given seed; when an accelerator is available and at least one device exists, also seeds Megatron-Core's model-parallel CUDA RNG tracker (required for constructing layers that fork the tracker).
+    # Inputs: seed - integer seed.
+    # Outputs: none.
+    # Side effects: mutates global RNG states; lazily imports numpy, torch and megatron.core.
     import random
 
     import numpy as np

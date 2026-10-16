@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Thin wrappers around Megatron-Core dist_checkpointing for saving/loading sharded state dicts
+# with the torch_dist backend, parallelized across the data-parallel (+context-parallel) group.
+
 import megatron.core
 import torch
 from megatron.core import dist_checkpointing, mpu
@@ -32,6 +36,16 @@ def save_dist_checkpointing(
     async_save=False,
     content_metadata=None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: builds a TorchDistSaveShardedStrategy (backend "torch_dist", version 1) wrapped in
+    # FullyParallelSaveStrategyWrapper over the DP-with-CP group; calls dist_checkpointing.save with
+    # access-integrity validation enabled, async_sharded_save=async_save, and content_metadata only
+    # when provided AND megatron.core >= 0.14.0 (silently dropped otherwise).
+    # Inputs: sharded_state_dict - Megatron sharded state dict; ckpt_path - target directory;
+    # async_save - bool; content_metadata - optional metadata mapping.
+    # Outputs: whatever dist_checkpointing.save returns (an async request when async, else None).
+    # Exceptions: Megatron save/validation errors propagate.
+    # Side effects: collective file writes to ckpt_path.
     validate_sharding_integrity = True
     # Get checkpointing strategies
     save_strategy = TorchDistSaveShardedStrategy(backend="torch_dist", version=1)
@@ -54,6 +68,13 @@ def save_dist_checkpointing(
 
 
 def load_dist_checkpointing(sharded_state_dict, ckpt_dir):
+    # [FUNCTION DOC]
+    # Behavior: builds TorchDistLoadShardedStrategy wrapped in FullyParallelLoadStrategyWrapper over
+    # the DP-with-CP group; best-effort registers torch.optim.AdamW and TransformerEngine FusedAdam as
+    # torch.load safe globals (any failure ignored); loads via dist_checkpointing.load.
+    # Inputs: sharded_state_dict - template sharded state dict; ckpt_dir - checkpoint directory.
+    # Outputs: the loaded state dict.
+    # Exceptions: load errors propagate. Side effects: mutates torch serialization safe-globals; file reads.
     # Get checkpointing strategies
     load_strategy = TorchDistLoadShardedStrategy()
     load_strategy = FullyParallelLoadStrategyWrapper(
