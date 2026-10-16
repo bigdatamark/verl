@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# TorchTitan engines: TorchTitanEngine builds a torchtitan Trainer (model spec from the HF config, optimizer, LR scheduler, FSDP2/TP/PP/CP/EP parallelism, HF checkpoint loading, activation checkpointing, compile) and uses its model parts, optimizers and checkpointer under verl's training loop; includes train/eval contexts, weight export (full, sharded and delta), and the registered LM-head engine.
+# Module state: device_name resolved at import.
 """
 The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 + TP + PP)
 """
@@ -64,6 +68,12 @@ from ..utils import detach_tree, enable_full_determinism, postprocess_batch_func
 
 
 def _hf_entry_row_slots(name, spec, place, lidx, lval):
+    # [FUNCTION DOC]
+    # HELPER: Builds an HF delta entry for params whose HF slots are the dim-0 rows of the full tensor (slot e is row e).
+    # Behavior: asserts one slot per dim-0 row; for an empty delta returns zero counts. Otherwise translates local flat indices to full flat indices, counts how many fall into each row via a sorted search against row boundaries (counts moved to CPU), and returns within-row offsets as int32.
+    # Inputs: name; spec - ShardSpec with hf_slots and full_shape; place - placement; lidx - sorted local flat indices; lval - values.
+    # Outputs: (slots, dtype_str, counts, hf_idx, hf_val).
+    # Exceptions: AssertionError on slot/row mismatch.
     """Dim-0 identity slot profile: slot ``e`` IS ``full[e]``, so a position's slot is one divmod away."""
     from ..spec import translate_flat_indices
     from ..utils import _prodshape
@@ -94,6 +104,8 @@ device_name = get_device_name()
 
 
 class TorchTitanEngine(BaseEngine):
+    # [CLASS DOC]
+    # TorchTitan-backed engine. Key attributes: configs, config (Trainer.Config), trainer, parallel_dims, device_mesh, offload flags, compute_entropy_from_logits; after initialize: module (model parts list), checkpointer, optimizer, lr_scheduler.
     """
     Concrete Engine implementation using PyTorch TorchTitan parallelism.
 
@@ -108,6 +120,11 @@ class TorchTitanEngine(BaseEngine):
         optimizer_config: TorchtitanOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
+        # [FUNCTION DOC]
+        # Builds the torchtitan Trainer from verl configs.
+        # Behavior: derives torchtitan model name/flavor from the HF config and loads its model spec (with attention backend); one param group matching all params with the configured optimizer name, lr, eps, betas, weight decay; warmup steps from lr_warmup_steps or ratio of total steps; LR scheduler with decay type and min LR factor; parallelism degrees (DP replicate/shard, reshard-after-forward, TP, PP, CP, EP, spmd backend); checkpoint manager loading initial HF model-only weights from the model path; compile config; training config with optional seq_len and CPU offload when offload_policy or forward_only; activation checkpointing selective/full/none; no-op dataloader and a placeholder loss. Creates the Trainer, builds the device mesh, re-enables FSDP gradient division by DP size when dp shard is above 1, optional full determinism, offload flags and entropy function.
+        # Exceptions: KeyError for an unknown activation_checkpoint mode; import errors for unknown models.
+        # Side effects: model construction, process groups, disables autograd multithreading.
         """
         Initialize the TorchTitanEngine.
 
@@ -243,13 +260,19 @@ class TorchTitanEngine(BaseEngine):
 
     @property
     def is_param_offload_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns the param offload flag.
         return self._is_offload_param
 
     @property
     def is_optimizer_offload_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns the optimizer offload flag.
         return self._is_offload_optimizer
 
     def is_mp_src_rank_with_outputs(self):
+        # [FUNCTION DOC]
+        # True when this rank is TP rank 0, the last PP rank and CP rank 0 (each checked only when that degree is above 1).
         """
         Whether the current rank is the first rank in model parallel group that contains model outputs
         """
@@ -269,6 +292,8 @@ class TorchTitanEngine(BaseEngine):
         return is_collect
 
     def initialize(self):
+        # [FUNCTION DOC]
+        # Takes model parts and checkpointer from the trainer, loads the initial HF weights, takes optimizers/schedulers unless forward_only (None then), and offloads per offload flags.
         """
         Build the model, optimizer, and learning rate scheduler with TorchTitan parallelism.
 
@@ -297,6 +322,8 @@ class TorchTitanEngine(BaseEngine):
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
     def _init_device_mesh(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates ParallelDims from engine config degrees and world size, builds the device mesh, and disables autograd multithreading (so AC recompute on backward sees the thread-local SPMD mesh).
         """Initialize the device mesh for TorchTitan style parallelism."""
         world_size = torch.distributed.get_world_size()
         self.parallel_dims = ParallelDims(
@@ -316,21 +343,31 @@ class TorchTitanEngine(BaseEngine):
         torch.autograd.set_multithreading_enabled(False)
 
     def train_mode(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns an EngineTrainModeCtx (kwargs forwarded).
         """Return a context manager for training mode."""
         return EngineTrainModeCtx(self, **kwargs)
 
     def eval_mode(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns an EngineEvalModeCtx (kwargs forwarded).
         """Return a context manager for evaluation mode."""
         return EngineEvalModeCtx(self, **kwargs)
 
     def get_data_parallel_rank(self):
+        # [FUNCTION DOC]
+        # Returns the local rank in the data-parallel mesh, or 0 when none exists.
         mesh = self._get_data_parallel_mesh()
         return 0 if mesh is None else mesh.get_local_rank()
 
     def get_data_parallel_size(self):
+        # [FUNCTION DOC]
+        # Returns dp shard size times dp replicate size.
         return self.engine_config.data_parallel_shard_size * self.engine_config.data_parallel_replicate_size
 
     def get_data_parallel_group(self):
+        # [FUNCTION DOC]
+        # Returns the data-parallel mesh group; if none exists, WORLD when world size equals DP size, else None.
         mesh = self._get_data_parallel_mesh()
         if mesh is not None:
             return mesh.get_group()
@@ -343,12 +380,18 @@ class TorchTitanEngine(BaseEngine):
         return None
 
     def get_model_parallel_group(self):
+        # [FUNCTION DOC]
+        # Not supported; raises NotImplementedError.
         raise NotImplementedError
 
     def get_context_parallel_group(self):
+        # [FUNCTION DOC]
+        # Not supported; raises NotImplementedError.
         raise NotImplementedError
 
     def _get_data_parallel_mesh(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns the first available optional mesh among "loss", "fsdp" and "dp_replicate", or None.
         """Get the data parallel mesh, handling hybrid/fully/replicate shard modes."""
         mesh = self.parallel_dims.get_optional_mesh("loss")
         if mesh is None:
@@ -358,6 +401,11 @@ class TorchTitanEngine(BaseEngine):
         return mesh
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False):
+        # [FUNCTION DOC]
+        # Runs forward (and backward) over micro-batches.
+        # Behavior: sets sp_size to the TP size; all-reduces loss-mask token count over the DP group when one exists; stores batch_num_tokens and dp_size; splits into micro-batches (same count across DP); for each micro-batch, inside the trainer's train context (SPMD mesh), no-grad when forward_only and a profiler range, runs forward_step and backpropagates when training; post-processes outputs.
+        # Outputs: post-processed output mapping.
+        # KNOWN ISSUE: sp_size is set from tensor_parallel_size rather than a sequence/context parallel size.
         """Perform forward and optionally backward pass on a batch."""
         tu.assign_non_tensor(data, sp_size=self.engine_config.tensor_parallel_size)
 
@@ -399,6 +447,12 @@ class TorchTitanEngine(BaseEngine):
         extra_inputs: dict[str, torch.Tensor] | None = None,
         extra_kwargs: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Runs the (single, non-PP) model part on inputs with extra inputs and kwargs and gathers a DTensor result into a full tensor.
+        # Inputs: inputs - token ids; extra_inputs, extra_kwargs - keyword mappings.
+        # Outputs: prediction tensor (logits).
+        # Exceptions: NotImplementedError with pipeline parallelism; AssertionError if more than one model part.
+        # KNOWN ISSUE: extra_inputs/extra_kwargs default to None but are unpacked as mappings, which fails if they are omitted.
         """
         Perform a forward pass through the trainer model without backward.
         """
@@ -420,13 +474,20 @@ class TorchTitanEngine(BaseEngine):
         return pred
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        # [FUNCTION DOC]
+        # Abstract per-micro-batch forward; raises NotImplementedError.
         raise NotImplementedError("forward_step must be implemented in subclass")
 
     def optimizer_zero_grad(self):
+        # [FUNCTION DOC]
+        # Zeroes optimizer gradients.
         """Zero gradients."""
         self.optimizer.zero_grad()
 
     def optimizer_step(self):
+        # [FUNCTION DOC]
+        # Clips gradients over all model parts with torchtitan's clip helper (foreach, PP mesh, EP awareness) using the trainer config's training.max_norm; skips the step (zeroing grads, logging a warning) when the norm is non-finite. Returns the norm as float.
+        # KNOWN ISSUE: uses torchtitan's training.max_norm (never set from verl config) instead of the verl optimizer config's clip_grad.
         """Perform optimizer step with gradient clipping."""
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.module for p in m.parameters()],
@@ -445,12 +506,17 @@ class TorchTitanEngine(BaseEngine):
         return grad_norm.item()
 
     def lr_scheduler_step(self):
+        # [FUNCTION DOC]
+        # Steps the LR scheduler container and returns the first scheduler's first last-LR value.
         """Advance learning rate scheduler."""
         self.lr_scheduler.step()
         lr = self.lr_scheduler.schedulers[0].get_last_lr()[0]
         return lr
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+        # [FUNCTION DOC]
+        # Moves every model part and/or optimizer state between CPU and accelerator (no-op when forward_only).
+        # Exceptions: AssertionError for other devices.
         """Move model and/or optimizer to CPU or GPU."""
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
 
@@ -482,6 +548,9 @@ class TorchTitanEngine(BaseEngine):
         max_ckpt_to_keep: Optional[int] = None,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC]
+        # Saves through torchtitan's checkpointer: loads params to GPU if offloaded, points the checkpointer folder at the parent directory of local_path, sets keep_latest_k to max_ckpt_to_keep when given, saves at global_step, barriers and re-offloads.
+        # KNOWN ISSUE: hdfs_path is ignored, and the checkpoint lands in torchtitan's own step folder under the parent of local_path rather than in local_path itself.
         """Save checkpoint."""
         if self._is_offload_param:
             for module in self.module:
@@ -504,6 +573,9 @@ class TorchTitanEngine(BaseEngine):
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
     ) -> None:
+        # [FUNCTION DOC]
+        # Loads through torchtitan's checkpointer from the parent of local_path, using the step parsed from a "global_step_N" pattern in the path (latest otherwise); barriers and re-offloads params/optimizer per flags.
+        # KNOWN ISSUE: hdfs_path and del_local_after_load are ignored.
         """Load checkpoint."""
         if self._is_offload_param:
             for module in self.module:
@@ -531,6 +603,8 @@ class TorchTitanEngine(BaseEngine):
             offload_fsdp_optimizer(self.optimizer)
 
     def _to_hf_named_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Converts a torchtitan state dict to HF names via the checkpointer's state-dict adapter (if any) and, when tied embeddings caused lm_head.weight to be omitted, adds it as an alias of model.embed_tokens.weight. Returns the mapping.
         """Re-key a torchtitan state dict to HuggingFace names, values untouched."""
         # Convert TorchTitan key names to HuggingFace key names (expected by vLLM)
         sd_adapter = self.checkpointer.sd_adapter
@@ -546,6 +620,10 @@ class TorchTitanEngine(BaseEngine):
         return params
 
     def _expert_stack_slots(self, name: str, param: Any) -> Optional[list[tuple[str, tuple]]]:
+        # [FUNCTION DOC]
+        # HELPER: Detects a fused expert-stack parameter and returns its per-expert HF slot list.
+        # Behavior: requires an adapter with a from_hf_map and a param with at least 2 dims; abstracts the first number in the name (layer id) to a placeholder, finds the HF template mapping to it with exactly two placeholders, and returns one (HF name for layer and expert e, trailing shape) per dim-0 entry.
+        # Outputs: list of (hf_name, shape) or None.
         """If ``name`` is a fused expert stack, enumerate ALL its experts' HF tensors, else ``None``."""
         sd_adapter = self.checkpointer.sd_adapter
         from_hf_map = getattr(sd_adapter, "from_hf_map", None) if sd_adapter is not None else None
@@ -560,6 +638,9 @@ class TorchTitanEngine(BaseEngine):
         return [(hf_template.format(layer_id, e), slot_shape) for e in range(int(param.shape[0]))]
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
+        # [FUNCTION DOC]
+        # HELPER: Builds an HF delta entry: row-slot path for specs with hf_slots, otherwise identity.
+        # Exceptions: AssertionError if the spec carries a to_hf_chunk converter.
         """Build one parameter's final HF-coordinate delta entry: expert stack via slots, else identity."""
         from ..utils import _hf_entry_identity
 
@@ -572,6 +653,8 @@ class TorchTitanEngine(BaseEngine):
         return _hf_entry_identity(name, spec, place, lidx, lval)
 
     def get_per_tensor_param_delta_shard(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns (generator of HF-coordinate delta entries, None) via hf_delta_export over the shard export, the snapshot mapping (created if absent) and _hf_delta_entry. Requires prior prime_delta_snapshots.
         """Yield FINAL HF-coordinate delta entries per parameter; needs a prior :meth:`prime_delta_snapshots`."""
         from ..utils import hf_delta_export
 
@@ -580,6 +663,8 @@ class TorchTitanEngine(BaseEngine):
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
     def _assert_shard_export_supported(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Raises NotImplementedError when pipeline parallelism is enabled (non-lockstep export order); other layouts are accepted.
         """Reject PP, the one layout whose local shard is not a block; every FSDP2 layout is one."""
         pd = self.parallel_dims
         if pd.pp_enabled:
@@ -592,6 +677,9 @@ class TorchTitanEngine(BaseEngine):
         # TP, EP and HSDP replicate all stay blocks, so derive_dtensor_placement handles them.
 
     def get_per_tensor_param_shard(self, **kwargs):
+        # [FUNCTION DOC]
+        # Exports local shards for sharded/delta sync.
+        # Behavior: rejects PP; merges state dicts of all model parts; separates expert stacks (with slot tables) from other params; converts others to HF names; returns a generator yielding (hf_name, flat bf16 local shard on device, ShardSpec) for dense params, then (torchtitan name, flat local shard, spec with hf_slots) for each expert stack; PEFT config None.
         """Yield this rank's *local* shard ``(hf_name, local_flat_bf16, ShardSpec)`` instead of the full tensor."""
         self._assert_shard_export_supported()
         raw = {}
@@ -610,6 +698,8 @@ class TorchTitanEngine(BaseEngine):
         from ..spec import ShardSpec
 
         def _shard(param):
+            # [FUNCTION DOC]
+            # HELPER: Moves a param to the device, casts floating values to bf16, takes the DTensor local shard and flattens it.
             p = param.to(device, non_blocking=True)
             # The wire speaks bf16, but mixed precision keeps fp32 masters: cast before the diff sees them.
             if p.is_floating_point():
@@ -618,6 +708,8 @@ class TorchTitanEngine(BaseEngine):
             return local.reshape(-1)
 
         def _gen():
+            # [FUNCTION DOC]
+            # HELPER: Generator yielding dense HF-named shards followed by expert-stack shards with slot tables.
             for name, param in params.items():
                 yield name, _shard(param), ShardSpec.from_param(param)
             # Keyed by the torchtitan name: the entry is the stack, not any one HF tensor.
@@ -629,6 +721,10 @@ class TorchTitanEngine(BaseEngine):
         return _gen(), None
 
     def get_per_tensor_param(self, **kwargs):
+        # [FUNCTION DOC]
+        # Exports full HF-named weights for rollout sync.
+        # Behavior: loads all model parts to GPU, merges their state dicts, re-offloads if param offload is on, separates expert stacks, converts dense param names to HF. The generator yields dense params (DTensors gathered on device and cast to bf16; plain tensors as is), then for each expert stack gathers the full stack in bf16 and yields a clone of each expert slice under its HF name, one stack at a time.
+        # Outputs: (generator, None) - PEFT not supported.
         for module in self.module:
             load_fsdp_model_to_gpu(module)
 
@@ -654,6 +750,8 @@ class TorchTitanEngine(BaseEngine):
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
 
         def _gen():
+            # [FUNCTION DOC]
+            # HELPER: Generator yielding dense HF weights then per-expert slices of gathered expert stacks.
             # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
             for name, param in dense.items():
                 if isinstance(param, DTensor):
@@ -675,16 +773,24 @@ class TorchTitanEngine(BaseEngine):
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
+    # [CLASS DOC]
+    # Eval-mode context for TorchTitan: sets all model parts to eval, and on exit reshards them when dp shard size is above 1.
     def __init__(self, engine: TorchTitanEngine, **kwargs):
+        # [FUNCTION DOC]
+        # Creates the context in "eval" mode; kwargs forwarded.
         super().__init__(engine=engine, mode="eval", **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Asserts the engine type, runs base entry and sets each model part to eval mode.
         assert isinstance(self.engine, TorchTitanEngine)
         super().__enter__()
         for module in self.engine.module:
             module.eval()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Reshards each model part when dp shard size is above 1, then runs base exit.
         assert isinstance(self.engine, TorchTitanEngine)
 
         # Reshard the root FSDP module
@@ -696,16 +802,24 @@ class EngineEvalModeCtx(BaseEngineCtx):
 
 
 class EngineTrainModeCtx(BaseEngineCtx):
+    # [CLASS DOC]
+    # Train-mode context for TorchTitan: sets model parts to train on entry, optionally zeroes grads on exit.
     def __init__(self, engine: TorchTitanEngine, **kwargs):
+        # [FUNCTION DOC]
+        # Creates the context in "train" mode; kwargs forwarded.
         super().__init__(engine=engine, mode="train", **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Asserts the engine type, runs base entry and sets each model part to train mode.
         assert isinstance(self.engine, TorchTitanEngine)
         super().__enter__()
         for module in self.engine.module:
             module.train()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Zeroes grads if zero_grad_on_exit or an exception occurred, then runs base exit.
         assert isinstance(self.engine, TorchTitanEngine)
         if self.zero_grad_on_exit or exc_type is not None:
             self.engine.optimizer_zero_grad()
@@ -714,9 +828,16 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu"])
 class TorchTitanEngineWithLMHead(TorchTitanEngine):
+    # [CLASS DOC]
+    # TorchTitan causal-LM engine (registered for language_model, backend torchtitan, cuda/npu) computing per-token log-probs and optional entropy.
     """TorchTitan engine implementation for language models with LM head."""
 
     def prepare_model_inputs(self, micro_batch: TensorDict):
+        # [FUNCTION DOC]
+        # Builds model inputs from a nested micro-batch.
+        # Behavior: requires NO_PADDING. Remove-padding: packs ids to (1, total) and positions to (1, total) or (k, 1, total); labels are ids rolled left by one; builds attention masks for the configured attention type from ids and positions. Padded: labels are rolled packed ids; ids padded with pad_token_id and positions with 0 (3D transposed) to max length; attention mask of ones over valid tokens. Extra inputs carry positions (plus multi-modal inputs); extra kwargs carry attention masks. With CP enabled, ids, labels and kwargs are split by torchtitan's CP input preparation.
+        # Outputs: (input_ids, extra_inputs, extra_kwargs, output_args with "labels").
+        # Exceptions: AssertionError for other pad modes.
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
@@ -789,6 +910,13 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         return input_ids, extra_inputs, extra_kwargs, output_args
 
     def prepare_model_outputs(self, logits, output_args, micro_batch: TensorDict):
+        # [FUNCTION DOC]
+        # Converts logits to nested log-probs (and entropy).
+        # Behavior: remove-padding: squeezes labels/logits, divides logits by temperature out of place, computes log-probs (in-place backward unless entropy needed) and entropy (chunked/plain/checkpointed), and nests by input offsets. Padded: divides logits in place, optional entropy, narrows each row to its length, concatenates, computes log-probs and nests.
+        # Inputs: logits; output_args; micro_batch.
+        # Outputs: mapping with log_probs and optionally entropy.
+        # Exceptions: AssertionError for other pad modes.
+        # KNOWN ISSUE: temperature is used directly from the batch without per-token expansion, so a per-sample temperature tensor would not broadcast correctly against packed logits; under CP the local (sharded) outputs are nested with full-sequence offsets.
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
@@ -856,6 +984,10 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         return model_output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        # [FUNCTION DOC]
+        # Runs one micro-batch: moves to device, prepares inputs, runs the model under bf16 autocast, prepares outputs, and computes loss/metrics with the DP group (dummy loss 1.0 when forward-only without a loss function).
+        # Outputs: (loss, mapping with detached model_output, float loss, metrics).
+        # Exceptions: AssertionError when loss_function is None while training.
         device_name = get_device_name()
         micro_batch = micro_batch.to(get_device_id())
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
