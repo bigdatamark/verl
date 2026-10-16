@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Factory and model-family resolution for Continuous Token builders. Holds an enum of builder family names, a
+# registry from family to builder class (text and VL), an exact mapping from HuggingFace config model_type to family,
+# and a mapping from unified text families to their VL counterparts; functions resolve "auto" families, validate
+# family/processor pairing and instantiate the right builder. Uses a module logger for info/warning messages.
 """Continuous Token builder factory and model-family resolution."""
 
 from __future__ import annotations
@@ -42,6 +47,10 @@ logger = logging.getLogger(__name__)
 
 
 class ContinuousTokenModelFamily(str, Enum):
+    # [CLASS DOC]
+    # String-valued enum of Continuous Token builder families (AUTO, DEFAULT, text families such as qwen/minimax/glm/
+    # gemma4/gptoss/deepseek and VL families such as vldefault/qwenvl/kimivl/glm4v/deepseekvl2/deepseekv4). Overrides
+    # string conversion and formatting to render members as their plain value (StrEnum substitute for Python 3.10).
     # ``enum.StrEnum`` needs Python 3.11, but verl supports 3.10, so mix in ``str`` and keep its
     # ``__str__``/``__format__`` to render a member as its value.
     __str__ = str.__str__
@@ -151,6 +160,10 @@ _TEXT_TO_VL_FAMILY: dict[ContinuousTokenModelFamily, ContinuousTokenModelFamily]
 
 
 def get_continuous_token_builder_class(model_family: str | ContinuousTokenModelFamily) -> type[Any]:
+    # [FUNCTION DOC]
+    # Returns the builder class registered for a family after normalizing it.
+    # Inputs: model_family - string or enum member. Outputs: builder class.
+    # Exceptions: ValueError for unknown names (from normalization) or for families without a registry entry (e.g. AUTO).
     family = _normalize_model_family(model_family)
     try:
         return _CONTINUOUS_TOKEN_BUILDER_REGISTRY[family]
@@ -162,6 +175,8 @@ def get_continuous_token_builder_class(model_family: str | ContinuousTokenModelF
 
 
 def list_continuous_token_builder_families() -> tuple[str, ...]:
+    # [FUNCTION DOC]
+    # Returns the tuple of supported family value strings (registry keys, in registration order).
     return CONTINUOUS_TOKEN_BUILDER_FAMILIES
 
 
@@ -171,6 +186,10 @@ def resolve_continuous_token_model_family(
     hf_model_type: str | None = None,
     has_multimodal_processor: bool = False,
 ) -> ContinuousTokenModelFamily:
+    # [FUNCTION DOC]
+    # Normalizes model_family; if not AUTO, logs and returns it. Otherwise infers the family from hf_model_type and
+    # whether a multimodal processor exists, logs the result and returns it.
+    # Outputs: enum member. Exceptions: ValueError from normalization. Side effects: info logs.
     """Resolve ``auto`` to a concrete family, or canonicalize an explicit family."""
     family = _normalize_model_family(model_family)
     if family != ContinuousTokenModelFamily.AUTO:
@@ -194,6 +213,10 @@ def infer_continuous_token_model_family(
     hf_model_type: str | None = None,
     has_multimodal_processor: bool = False,
 ) -> ContinuousTokenModelFamily:
+    # [FUNCTION DOC]
+    # Looks up the normalized hf_model_type in the exact model_type-to-family mapping and returns the match; otherwise
+    # logs a warning and returns VL_DEFAULT when a multimodal processor is present, else DEFAULT.
+    # Outputs: enum member. Side effects: warning log on fallback.
     """Infer a builder from the root ``config.json`` ``model_type`` field.
 
     Matching is exact. Repository paths, tokenizer names, nested configs, and
@@ -225,6 +248,15 @@ def create_continuous_token_builder(
     processor: Any | None = None,
     **builder_kwargs: Any,
 ) -> Any:
+    # [FUNCTION DOC]
+    # Creates the Continuous Token builder instance.
+    # Behavior: decides whether processor is multimodal (has an image_processor), resolves the family and builder class.
+    # VL run: if the class supports multimodal, construct it with tokenizer, processor, chat_template_kwargs,
+    # mm_processor_kwargs and extra kwargs; else if the family is in the unified text-to-VL mapping, upgrade (warning when
+    # upgrading to the generic VL default, info otherwise) and construct the upgraded VL class the same way; else raise
+    # ValueError (text family paired with a processor). Text run: raise ValueError if the class requires multimodal;
+    # otherwise construct it with tokenizer, chat_template_kwargs and extra kwargs (no processor or mm kwargs).
+    # Outputs: builder instance. Exceptions: ValueError as described plus builder constructor errors. Side effects: logging.
     """Instantiate the Continuous Token builder inferred from the root Hugging Face ``model_type``.
 
     Inference uses an exact registry lookup on the root Hugging Face config's
@@ -311,11 +343,15 @@ def create_continuous_token_builder(
 
 
 def _is_multimodal_processor(processor: Any | None) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True when processor is not None and has a non-None image_processor attribute.
     """Whether ``processor`` is a multimodal processor (has an image processor)."""
     return processor is not None and getattr(processor, "image_processor", None) is not None
 
 
 def _normalize_hf_model_type(hf_model_type: str | None) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns the stripped, lowercased model_type, or None when not a string or empty after stripping.
     """Normalize a root Hugging Face ``model_type`` value."""
     if not isinstance(hf_model_type, str):
         return None
@@ -324,6 +360,11 @@ def _normalize_hf_model_type(hf_model_type: str | None) -> str | None:
 
 
 def _normalize_model_family(model_family: str | ContinuousTokenModelFamily) -> ContinuousTokenModelFamily:
+    # [FUNCTION DOC]
+    # HELPER: Converts a family name into the enum. Enum members are returned as is; other values must be non-empty
+    # strings, which are stripped, lowercased and stripped of all non-alphanumeric characters (so "qwen-2.5" style names
+    # collapse to "qwen25") before enum lookup.
+    # Exceptions: ValueError for empty/non-string input or unknown names (message lists auto plus supported families).
     if isinstance(model_family, ContinuousTokenModelFamily):
         return model_family
     if not isinstance(model_family, str) or not model_family:

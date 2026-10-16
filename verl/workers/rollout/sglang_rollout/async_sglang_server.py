@@ -12,6 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Async SGLang rollout server. Defines SGLangHttpServer, a Ray actor (one per node of a
+# rollout replica) that launches SGLang's tokenizer manager / scheduler / detokenizer
+# subprocesses in-process and serves SGLang's FastAPI app via uvicorn on node rank 0, and
+# SGLangReplica, the RolloutReplica that places those actors on the right nodes/GPUs.
+# Also provides prompt-logprob reshaping so SGLang teachers match the vLLM contract.
+# Module state: logger (INFO level), visible_devices_keyword (platform env var name such as
+# CUDA_VISIBLE_DEVICES, resolved at import).
 import asyncio
 import dataclasses
 import json
@@ -76,6 +84,22 @@ def _extract_prompt_logprobs_sglang(
     sequence_length: int,
     result_dict: dict[str, list],
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Convert SGLang per-input-token logprobs in meta_info into the vLLM-style
+    # prompt_ids / prompt_logprobs lists used by distillation teachers.
+    # Behavior: reads meta_info "input_token_logprobs" (list of (logprob, token_id, _) triples)
+    # and, when num_prompt_logprobs > 0, "input_top_logprobs" (per position, a ranked list of
+    # triples). Skips position 0 (no predicting context). For each later position: if K == 0
+    # emits a single-element row with the sampled token id/logprob; otherwise emits the K
+    # top entries in SGLang's best-first order. Appends one trailing dummy row of zeros of
+    # width max(K, 1) so the row count equals the sequence length.
+    # Inputs: meta_info - SGLang response meta dict; num_prompt_logprobs - K (>= 0);
+    # sequence_length - expected row count (prompt length); result_dict - dict to fill.
+    # Outputs: None; writes result_dict["prompt_ids"] (list of int lists) and
+    # result_dict["prompt_logprobs"] (list of float lists).
+    # Exceptions: AssertionError if a position has fewer/more than K top entries or the final
+    # row count differs from sequence_length (e.g. logprob_start_len was not 0).
+    # Side effects: mutates result_dict.
     """Shape SGLang input-logprobs into the vLLM ``extract_prompt_logprobs`` contract.
     Populates ``result_dict`` with two ``[sequence_length, max(num_prompt_logprobs, 1)]``
     lists — ``prompt_ids`` and ``prompt_logprobs`` — so the distillation teacher
@@ -121,6 +145,17 @@ def _extract_prompt_logprobs_sglang(
 
 
 class SGLangHttpServer:
+    # [CLASS DOC]
+    # Ray-actor-hosted SGLang server for one node of a rollout replica. Node rank 0 runs the
+    # HTTP server and handles all control calls (sleep/wake/flush/pause/profile); other
+    # nodes only launch scheduler subprocesses and return early from control methods.
+    # Supports HYBRID / COLOCATED / STANDALONE rollout modes, LoRA served as an adapter,
+    # FP8 quantization, MTP speculative decoding, MoE routing replay, prometheus metrics,
+    # discrete-mode profiling, and prefill/decode (PD) disaggregation where a prefill server
+    # fans each request out to itself plus a random decode peer.
+    # Key attributes: config (RolloutConfig dataclass), model_config (HFModelConfig),
+    # rollout_mode, workers, replica_rank, node_rank, nnodes, base_gpu_id, global_steps
+    # (weight version, set externally), tokenizer_manager (after launch), server address/port.
     """SGLang http server in single node, this is equivalent to launch server with command line:
     ```
     python -m sglang.launch_server --node-rank 0 --nnode 1 ...
@@ -149,6 +184,22 @@ class SGLangHttpServer:
         disaggregation_role: str = "null",
         disaggregation_bootstrap_port: Optional[int] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: prints a summary line, sets the visible-devices env var to
+        # cuda_visible_devices, validates disaggregation_role, converts config/model_config to
+        # dataclasses, defaults max_model_len to the model's max_position_embeddings, stores
+        # topology, resolves the node IP (brackets stripped), builds the rollout profiler
+        # controller (only torch/npu tools supported; others log a warning and disable profiling)
+        # with replica_world_size = tp * dp * pp, and records the global ranks to keep when
+        # relocating traces. For multi-node replicas, node rank 0 reserves a free master port
+        # (keeping the socket alive) for NCCL init.
+        # Inputs: config/model_config (DictConfig or dataclass); rollout_mode; workers - training
+        # worker actor handles on this node; replica_rank, node_rank, nnodes; cuda_visible_devices
+        # - comma list; base_gpu_id - first GPU index for SGLang; disaggregation_role -
+        # "null"|"prefill"|"decode"; disaggregation_bootstrap_port - optional PD bootstrap port.
+        # Exceptions: AssertionError for bad role; ValueError if max_model_len exceeds
+        # max_position_embeddings.
+        # Side effects: mutates os.environ, binds a socket on multi-node rank 0, logs.
         print(
             f"SGLang http server: {rollout_mode=}, {replica_rank=}, {node_rank=}, "
             f"{nnodes=}, {cuda_visible_devices=}, role={disaggregation_role}"
@@ -229,20 +280,36 @@ class SGLangHttpServer:
             )
 
     def get_master_address(self):
+        # [FUNCTION DOC]
+        # Return (master_address, master_port) used for multi-node NCCL init; both None on
+        # single-node replicas or before being set on non-zero ranks.
         """Get master address and port for init NCCL process group."""
         return self._master_address, self._master_port
 
     def get_server_address(self):
+        # [FUNCTION DOC]
+        # Return (server_address, server_port) of the HTTP server.
+        # Exceptions: AssertionError if launch_server has not set the port yet.
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
 
     async def set_pd_peer(self, decode_peers: list, bootstrap_host: str):
+        # [FUNCTION DOC]
+        # Record PD-disaggregation peers on a prefill server: the decode server actor handles to
+        # dispatch to and the bootstrap host decode servers connect to.
+        # Exceptions: AssertionError if decode_peers is not a non-empty list.
+        # Side effects: overwrites _pd_decode_peers (copied) and _pd_bootstrap_host.
         assert isinstance(decode_peers, list) and decode_peers
         self._pd_decode_peers = list(decode_peers)
         self._pd_bootstrap_host = bootstrap_host
 
     def _prepend_cu12_lib_to_ld_library_path(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Make the CUDA 12 runtime libs from the nvidia.cuda_runtime pip package
+        # discoverable by prepending its "lib" directory to LD_LIBRARY_PATH (needed by NIXL/UCX).
+        # No-op if the package is not importable (logs a warning), the directory is missing, or
+        # it is already on the path. Side effects: mutates os.environ, logs.
         """Ray runtime_env.pip installs cu12 into a transient venv, not the usual
         site-packages. NIXL's UCX plugin dlopens libcudart.so.12 from
         LD_LIBRARY_PATH; wrong path ⇒ scheduler subprocess dies with SIGABRT."""
@@ -264,6 +331,36 @@ class SGLangHttpServer:
         logger.info(f"Prepended {cu12_lib} to LD_LIBRARY_PATH for NIXL/UCX dlopen.")
 
     async def launch_server(self, master_address: str = None, master_port: int = None):
+        # [FUNCTION DOC]
+        # Build SGLang ServerArgs from config and launch the engine subprocesses; on node rank 0
+        # also start the HTTP server.
+        # Behavior: for PD roles fixes LD_LIBRARY_PATH; on non-zero ranks of multi-node replicas
+        # adopts the given master address/port. Pops attention_backend, mm_attention_backend and
+        # custom_weight_loader from engine_kwargs["sglang"]; appends the delta loader FQN when the
+        # checkpoint engine backend is "delta_sharded". Default attention backend: "aiter" on ROCm,
+        # "flashinfer" for sglang >= 0.5.12, else "fa3". FP8 quantization builds a block quant
+        # config passed via json_model_override_args (requires sglang >= 0.5.5). Base args include
+        # model path, dtype, memory fraction, cuda graph toggle, memory saver on, tp = tp*dp, dp,
+        # ep, node rank, load format, nnodes, max running requests, skip tokenizer/warmup, plus
+        # remaining engine_kwargs overriding. Adds LoRA args when serving LoRA as adapter;
+        # dist_init_addr (IPv6 bracketed) for multi-node; served_model_name (basename) and metrics
+        # when prometheus or RL insight logging is on; enable_weights_cpu_backup (if the field
+        # exists) for COLOCATED/HYBRID or LoRA; PD disaggregation args (mode, transfer backend,
+        # host, bootstrap port, decode tp, IB device); routed-experts return; MTP speculative
+        # args (requires sglang >= 0.5.6, forces weight and draft weight CPU backup).
+        # Monkey-patches sglang's _set_envs_and_config with verl's version, sets
+        # SGLANG_BLOCK_NONZERO_RANK_CHILDREN=0, launches subprocesses using the API appropriate
+        # for the installed sglang version (>=0.5.10 Engine._launch_subprocesses, >=0.5.7 with
+        # explicit process funcs, else legacy). Non-zero node ranks return here. Rank 0 sets the
+        # global HTTP state, warmup attributes on the app, optional prometheus middleware, runs
+        # uvicorn and marks the server status Up.
+        # Inputs: master_address/master_port - required on non-zero ranks of multi-node replicas.
+        # Outputs: None; sets tokenizer_manager, template_manager, scheduler_info, _server_port,
+        # _server_task.
+        # Exceptions: AssertionError (missing master info, old sglang for fp8); ValueError
+        # (unsupported quantization, old sglang for MTP).
+        # Side effects: spawns processes, patches sglang globals and the shared FastAPI app,
+        # mutates os.environ, pops keys from config engine_kwargs in place.
         if self._disaggregation_role != "null":
             self._prepend_cu12_lib_to_ld_library_path()
 
@@ -478,6 +575,10 @@ class SGLangHttpServer:
         self.tokenizer_manager.server_status = ServerStatus.Up
 
     async def wake_up(self):
+        # [FUNCTION DOC]
+        # Restore GPU memory after sleep (node rank 0 only). COLOCATED resumes kv_cache (plus
+        # weights unless LoRA adapter mode) then flushes the cache; STANDALONE resumes kv_cache and
+        # flushes. Exceptions: ValueError in HYBRID mode (weights are woken during update_weights).
         if self.node_rank != 0:
             return
 
@@ -498,10 +599,17 @@ class SGLangHttpServer:
 
     @property
     def lora_as_adapter(self) -> bool:
+        # [FUNCTION DOC]
+        # True when LoRA is served as a separate adapter rather than merged (delegates to
+        # lora_served_as_adapter on model_config).
         """See :func:`verl.workers.rollout.sglang_rollout.utils.lora_served_as_adapter`."""
         return lora_served_as_adapter(self.model_config)
 
     async def sleep(self):
+        # [FUNCTION DOC]
+        # Release GPU memory (node rank 0 and only when free_cache_engine is set). HYBRID and
+        # COLOCATED release kv_cache and weights (only kv_cache in LoRA adapter mode); STANDALONE
+        # releases kv_cache only. Side effects: calls into the tokenizer manager.
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
@@ -525,10 +633,14 @@ class SGLangHttpServer:
             await self.tokenizer_manager.release_memory_occupation(obj, None)
 
     async def clear_kv_cache(self):
+        # [FUNCTION DOC]
+        # Flush SGLang's KV/prefix cache on node rank 0; no-op elsewhere.
         if self.node_rank == 0:
             await self.tokenizer_manager.flush_cache()
 
     async def release_kv_cache(self):
+        # [FUNCTION DOC]
+        # Release only kv_cache memory (node rank 0, free_cache_engine enabled), keeping weights.
         """Release only kv_cache GPU memory, keeping model weights intact."""
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
@@ -536,6 +648,9 @@ class SGLangHttpServer:
         await self.tokenizer_manager.release_memory_occupation(obj, None)
 
     async def resume_kv_cache(self):
+        # [FUNCTION DOC]
+        # Resume kv_cache memory and flush the cache (node rank 0, free_cache_engine enabled);
+        # counterpart of release_kv_cache.
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
@@ -554,6 +669,33 @@ class SGLangHttpServer:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
     ) -> TokenOutput:
+        # [FUNCTION DOC]
+        # Generate a completion for one tokenized prompt and return a TokenOutput.
+        # Behavior: PD dispatch - on a prefill server with decode peers and no bootstrap_room,
+        # draws a random 63-bit room and random decode peer, concurrently runs a local prefill
+        # call (request id suffix "_P") and the remote decode call ("_D") with the same
+        # bootstrap host/port/room, and returns the decode output. Otherwise: computes the
+        # remaining context budget (max_model_len - prompt len - 1); determines max_new_tokens
+        # from sampling_params "max_new_tokens", else vLLM-style "max_tokens", else
+        # min(response_length, prompt_length + response_length - prompt len), clamped to
+        # [0, budget]. Pops "logprobs" (return per-token logprobs) and "prompt_logprobs"
+        # (K; forces logprob return, sets logprob_start_len 0 and top_logprobs_num K when K>0).
+        # Builds a GenerateReqInput with rid, input ids, sampling params, image/video data,
+        # optional routed-experts and bootstrap fields, LoRA adapter name in adapter mode; awaits
+        # the first item of the tokenizer manager's generate stream inside an RL-insight trace.
+        # Extracts finish reason type; with logprobs, uses output ids and logprobs only when
+        # lengths match, else logs an error (when lengths differ) and returns empty tokens/logprobs.
+        # Routed experts: numpy array from meta_info when skip_tokenizer_init, else extracted and
+        # reshaped to (-1, num_hidden_layers, num_experts_per_tok). extra_fields contains
+        # global_steps, optional prompt_ids/prompt_logprobs, and MTP spec-decoding stats
+        # (spec_num_draft_tokens / accepted / verify steps).
+        # Inputs: prompt_ids - token ids; sampling_params - dict (mutated: keys popped/added);
+        # request_id; image_data/video_data - optional multimodal payloads; bootstrap_* - PD fields.
+        # Outputs: TokenOutput(token_ids, log_probs or None, routed_experts, stop_reason, extra_fields).
+        # Exceptions: ValueError if the prompt exceeds max_model_len; AttributeError when routing
+        # replay is on but hf_config lacks the MoE attributes; AssertionError on budget mismatch.
+        # KNOWN ISSUE: prompt_ids is annotated as torch.Tensor but is used as a list of ids (len,
+        # JSON request field).
         # PD top-level dispatch: prefill mints a bootstrap_room and fans out
         # paired local-prefill + remote-decode calls; decode returns the tokens
         # (prefill only materialises KV and pushes via NIXL). Random peer
@@ -724,20 +866,30 @@ class SGLangHttpServer:
         )
 
     async def set_global_steps(self, global_steps: int):
+        # [FUNCTION DOC]
+        # Store the weight version (global_steps) attached to future generation outputs.
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
     async def abort_all_requests(self):
+        # [FUNCTION DOC]
+        # Pause SGLang generation in "abort" mode, aborting in-flight requests (node rank 0 only).
         if self.node_rank != 0:
             return
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
 
     async def resume_generation(self):
+        # [FUNCTION DOC]
+        # Continue SGLang generation after a pause (node rank 0 only).
         if self.node_rank != 0:
             return
         await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
 
     async def start_profile(self, **kwargs):
+        # [FUNCTION DOC]
+        # Start the SGLang profiler when profiling is enabled, this replica is selected and the
+        # profiler is in discrete mode; profiler args built from the profiler config/tool config.
+        # No-op if the server has not launched (no tokenizer_manager). kwargs are ignored.
         if (
             self.profiler_controller.check_enable()
             and self.profiler_controller.check_this_rank()
@@ -752,6 +904,10 @@ class SGLangHttpServer:
             await tokenizer_manager.start_profile(**profile_args)
 
     async def stop_profile(self):
+        # [FUNCTION DOC]
+        # Stop the SGLang profiler under the same conditions as start_profile, then relocate the
+        # produced trace files into the configured save path keeping only the requested global
+        # ranks. Side effects: moves files on disk.
         if (
             self.profiler_controller.check_enable()
             and self.profiler_controller.check_this_rank()
@@ -774,6 +930,9 @@ class SGLangHttpServer:
 
 
 class SGLangReplica(RolloutReplica):
+    # [CLASS DOC]
+    # RolloutReplica implementation that runs one SGLangHttpServer Ray actor per node of the
+    # replica, pinned to the node of the corresponding training workers.
     def __init__(
         self,
         replica_rank: int,
@@ -784,12 +943,28 @@ class SGLangReplica(RolloutReplica):
         is_teacher_model: bool = False,
         name_suffix: str = "",
     ):
+        # [FUNCTION DOC]
+        # Initialize the base replica and set server_class to the Ray-remote SGLangHttpServer.
+        # Inputs: same as RolloutReplica (replica rank, configs, gpus_per_node, reward/teacher
+        # flags, actor name suffix).
         super().__init__(
             replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
         )
         self.server_class = ray.remote(SGLangHttpServer)
 
     async def launch_servers(self):
+        # [FUNCTION DOC]
+        # Create and launch the per-node server actors.
+        # Behavior: queries every worker for (node id, visible devices); when Ray's NOSET env var
+        # for visible devices is set, computes base_gpu_id = (replica_rank * replica_world_size)
+        # mod gpus_per_node (warning logged). For each node rank, takes that node's slice of
+        # workers, unions and sorts their device ids into a comma list, chooses an actor name
+        # (sglang_server[_reward|_teacher]_{replica}_{node}{suffix}), and creates the actor with
+        # hard node affinity, platform env vars and max_concurrency. Then fetches master address
+        # from server 0 for multi-node, launches all servers concurrently, and records server 0 as
+        # the handle and its "host:port" (IPv6 bracketed) as _server_address.
+        # Exceptions: AssertionError if worker count differs from world_size.
+        # Side effects: creates named Ray actors, appends to self.servers.
         """Launch http server in each node."""
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
@@ -888,6 +1063,9 @@ class SGLangReplica(RolloutReplica):
         )
 
     async def abort_all_requests(self, reject_request: bool = False):
+        # [FUNCTION DOC]
+        # Abort ongoing requests via the node-rank-0 server only. reject_request=True is not
+        # supported (logs a warning; later requests just wait for resume).
         """Abort all ongoing generation requests on the primary server.
 
         SGLang control RPCs are only served by the node-rank 0 server for a
@@ -905,5 +1083,7 @@ class SGLangReplica(RolloutReplica):
         await self.servers[0].abort_all_requests.remote()
 
     async def resume_generation(self):
+        # [FUNCTION DOC]
+        # Resume generation on the node-rank-0 server.
         """Resume generation on the primary server after abort_all_requests."""
         await self.servers[0].resume_generation.remote()
