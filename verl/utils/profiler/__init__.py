@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Profiling utilities for verl workers. Re-exports the profiler config types and rollout-engine
+# profiler helpers (from .config), GPU memory logging and timers (from .performance), and the
+# DistProfiler dispatcher (from .profile). The range-marker API (mark_start_range, mark_end_range,
+# mark_annotate, marked_timer) is chosen at import time: NVTX implementations when NVTX is
+# available, else MSTX implementations when an Ascend NPU is available, else no-op markers from
+# .profile with the plain timer from .performance.
 from ..device import is_npu_available
 from ..import_utils import is_nvtx_available
 from .config import (

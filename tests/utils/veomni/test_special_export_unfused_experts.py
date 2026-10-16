@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Multi-GPU torchrun test (8 ranks: a 2 x 4 mesh of expert-FSDP by expert-parallel
+# dims, NCCL over TCP from MASTER_ADDR/MASTER_PORT env vars) verifying that the
+# VeOmni Qwen3.5-MoE parameter handler exports fused, EP-sharded and FSDP-sharded
+# expert weights as unfused per-expert HF weights that reassemble exactly into the
+# original fused gate_up_proj and down_proj tensors.
 import os
 
 import torch
@@ -24,12 +30,18 @@ from verl.workers.engine.veomni.utils import MOE_PARAM_HANDERS, default_moe_para
 
 
 def get_by_path(obj, path: str):
+    # [FUNCTION DOC]
+    # HELPER: Follows a dotted attribute path from obj. Outputs: the final attribute.
+    # Exceptions: AttributeError for a missing segment.
     for part in path.split("."):
         obj = getattr(obj, part)
     return obj
 
 
 def set_by_path(obj, path: str, value):
+    # [FUNCTION DOC]
+    # HELPER: Follows all but the last segment of a dotted path and sets the last
+    # attribute to value. Side effects: mutates the target object.
     parts = path.split(".")
     for part in parts[:-1]:
         obj = getattr(obj, part)
@@ -37,6 +49,16 @@ def set_by_path(obj, path: str, value):
 
 
 def get_per_tensor_param(model, device_mesh):
+    # [FUNCTION DOC]
+    # HELPER: Generator over the model's DTensor parameters: gathers each to its full
+    # per-EP-rank local tensor, then for each EP rank in turn broadcasts that rank's
+    # shard within the EP group (into a reused buffer on other ranks) and yields the
+    # (name, tensor) pairs produced by the qwen3_5_moe handler (default handler if not
+    # registered) with expert_id_base equal to source rank times local expert count.
+    # Non-DTensor parameters are skipped.
+    # Inputs: model; device_mesh with an "ep" dim. Side effects: collectives.
+    # Note: yielded tensors may alias the reused buffer; callers must copy before the
+    # next iteration (the test clones).
     ep_rank, ep_size, ep_group = (
         device_mesh["ep"].get_local_rank(),
         device_mesh["ep"].size(),
@@ -56,6 +78,18 @@ def get_per_tensor_param(model, device_mesh):
 
 
 def test_veomni_export_unfused_experts():
+    # [FUNCTION DOC]
+    # Behavior: seeds RNG, initializes the process group and mesh, builds a default
+    # Qwen3.5-MoE decoder layer, initializes the expert weights normally (std 0.01)
+    # and snapshots the state dict; shards each expert param along the expert dim
+    # across EP ranks (replacing it with the local shard), fully shards the experts
+    # module along dim 1 over the expert-FSDP dim, exports all per-expert params
+    # (printing names/shapes on rank 0), groups them by expert index parsed from the
+    # name into gate, up and down lists, stacks them in expert order, concatenates
+    # gate and up on dim 1, and asserts both equal the original fused tensors.
+    # Exceptions: KeyError if required env vars are missing; AssertionError on mismatch.
+    # KNOWN ISSUE: the process group is never destroyed, and the expert index parse
+    # assumes names of the form ...experts.<idx>.<proj>.weight.
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)

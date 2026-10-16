@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Dataclass configs for each profiling backend (Nsight, torch profiler + schedule, torch memory,
+# msprobe precision debugger, Ascend NPU) and the per-worker ProfilerConfig, plus helpers that map
+# verl's unified config to vLLM/SGLang engine profiler arguments and that relocate rollout-engine
+# trace files from per-replica sub-directories into the flat save_path layout. All configs derive
+# from BaseConfig (DictConfig-like access); validation is done with assertions in __post_init__.
 import json
 import os
 import re
@@ -28,6 +34,9 @@ from verl.base_config import BaseConfig
 
 @dataclass
 class NsightToolConfig(BaseConfig):
+    # [CLASS DOC]
+    # Config for the Nsight Systems backend. Fields: discrete (one nsys database per task vs one shared
+    # per training step), name ("nsight"). No validation.
     """Nsight tool config."""
 
     "True for each task has its own database, False for all tasks in one training step share one database."
@@ -35,11 +44,17 @@ class NsightToolConfig(BaseConfig):
     name: str = "nsight"
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # No-op validation hook. Inputs/outputs: none. Exceptions/side effects: none.
         pass
 
 
 @dataclass
 class TorchProfilerScheduleConfig(BaseConfig):
+    # [CLASS DOC]
+    # torch.profiler.schedule parameters applied per update mini-batch (see existing docstring for
+    # semantics with discrete mode). All counts must be non-negative ints; scheduling is enabled only
+    # when active > 0.
     """Schedule for ``torch.profiler.schedule``, applied at the granularity of update
     mini-batches (``profiler.step()`` is advanced once per mini-batch of the actor/critic
     update loop, never on the whole-batch stages like the log-prob forwards or rollout).
@@ -81,6 +96,9 @@ class TorchProfilerScheduleConfig(BaseConfig):
     name: str = "torch_schedule"
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: checks that skip_first, wait, warmup, active, repeat are ints and >= 0.
+        # Exceptions: AssertionError on a non-int or negative value. Side effects: none.
         """config validation logics go here"""
         for field_name in ("skip_first", "wait", "warmup", "active", "repeat"):
             value = getattr(self, field_name)
@@ -89,12 +107,17 @@ class TorchProfilerScheduleConfig(BaseConfig):
 
     @property
     def enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Outputs: True when active > 0. Exceptions/side effects: none.
         """Scheduling only takes effect when at least one active mini-batch is requested."""
         return self.active > 0
 
 
 @dataclass
 class TorchProfilerToolConfig(BaseConfig):
+    # [CLASS DOC]
+    # Config for the torch profiler backend: which activity contents to collect, discrete mode, optional
+    # response-token window (for engine-side profiling), and optional mini-batch schedule.
     """Torch profiler tool config.
 
     By default a profiled step is collected whole: ``global_profiler.steps`` picks which RL
@@ -125,6 +148,13 @@ class TorchProfilerToolConfig(BaseConfig):
     name: str = "torch"
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: asserts every entry in contents is one of cuda/cpu/memory/shapes/stack, that contents is a
+        # list, that profile_token_start/end are non-negative ints when set, and that end > start when both set.
+        # Exceptions: AssertionError on violation.
+        # KNOWN ISSUE: the list-type assertion runs after iterating contents, so a non-list iterable value is
+        # iterated (and may fail the membership check) before the type check is reached.
+        # Side effects: none.
         """config validation logics go here"""
         __support_contents = ["cuda", "cpu", "memory", "shapes", "stack"]
         for content in self.contents:
@@ -144,6 +174,8 @@ class TorchProfilerToolConfig(BaseConfig):
 
 @dataclass
 class TorchMemoryToolConfig(BaseConfig):
+    # [CLASS DOC]
+    # Config for the torch CUDA/NPU memory snapshot profiler (see docstring for field meanings).
     """Torch memory profiler tool config. CUDA/NPU OOM snapshots are enabled automatically.
 
     Args:
@@ -159,6 +191,9 @@ class TorchMemoryToolConfig(BaseConfig):
     name: str = "torch_memory"
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: asserts trace_alloc_max_entries, stack_depth and memory_snapshot_num_steps are positive ints.
+        # Exceptions: AssertionError on violation. Side effects: none.
         """config validation logics go here"""
         assert isinstance(self.trace_alloc_max_entries, int), (
             f"trace_alloc_max_entries must be int, got {type(self.trace_alloc_max_entries)}"
@@ -178,6 +213,9 @@ class TorchMemoryToolConfig(BaseConfig):
 
 @dataclass
 class PrecisionDebuggerToolConfig(BaseConfig):
+    # [CLASS DOC]
+    # Config for the msprobe precision debugger: optional msprobe config file path, deprecated steps list,
+    # optional list of stage names to collect, and strict mode flag.
     """Precision debugger tool config (msprobe)."""
 
     name: str = "precision_debugger"
@@ -192,6 +230,9 @@ class PrecisionDebuggerToolConfig(BaseConfig):
     strict: bool = False
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: type-checks config_path (str), steps (list), stages (list) when set, and strict (bool).
+        # Exceptions: AssertionError on wrong types. Side effects: none.
         if self.config_path is not None:
             assert isinstance(self.config_path, str), f"config_path must be str, got {type(self.config_path)}"
         if self.steps is not None:
@@ -203,6 +244,10 @@ class PrecisionDebuggerToolConfig(BaseConfig):
 
 @dataclass
 class NPUToolConfig(NsightToolConfig):
+    # [CLASS DOC]
+    # Config for the Ascend NPU profiler (inherits discrete from NsightToolConfig): contents
+    # (npu/cpu/memory/shapes/module/stack), collection level, whether to auto-parse results, and an
+    # optional response-token window.
     """NPU profiler too; config."""
 
     # options: npu, cpu, memory, shapes, module, stack
@@ -225,6 +270,10 @@ class NPUToolConfig(NsightToolConfig):
     name: str = "npu"
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: asserts contents is a list, level is str, analysis is bool, each content is allowed, level
+        # is one of level_none/level0/level1/level2, and token window bounds as in TorchProfilerToolConfig.
+        # Exceptions: AssertionError on violation. Side effects: none.
         """config validation logics go here"""
         assert isinstance(self.contents, list), f"Profiler contents must be of type list, got {type(self.contents)}"
         assert isinstance(self.level, str), f"Profiler level must be of type str, got {type(self.level)}"
@@ -248,6 +297,10 @@ class NPUToolConfig(NsightToolConfig):
 
 @dataclass
 class ProfilerConfig(BaseConfig):
+    # [CLASS DOC]
+    # Per-worker profiler configuration: chosen tool name, enable flag, which ranks to profile, output
+    # save_path, tool-specific config, global tool config, and finish-hook options (relocation of results
+    # and a once-after-last-step shell command with its rank selection). See docstring for details.
     """Worker profiler config.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -292,6 +345,12 @@ class ProfilerConfig(BaseConfig):
     finish_hook_ranks: list[int] = field(default_factory=list)
 
     def union(self, other: "ProfilerConfig") -> "ProfilerConfig":
+        # [FUNCTION DOC]
+        # Behavior: merges two configs of the same tool: booleans OR-ed, rank lists set-unioned (order not
+        # preserved), save_path and tool_config taken from self, global_tool_config and finish_hook_cmd taken
+        # from self if truthy else other.
+        # Inputs: other - ProfilerConfig. Outputs: new ProfilerConfig.
+        # Exceptions: AssertionError if tools differ. Side effects: none.
         assert self.tool == other.tool, f"Cannot union ProfilerConfig with different tools: {self.tool} vs {other.tool}"
         return ProfilerConfig(
             tool=self.tool,
@@ -308,6 +367,11 @@ class ProfilerConfig(BaseConfig):
         )
 
     def intersect(self, other: "ProfilerConfig") -> "ProfilerConfig":
+        # [FUNCTION DOC]
+        # Behavior: like union but booleans AND-ed and rank lists set-intersected; save_path/tool_config from
+        # self; global_tool_config and finish_hook_cmd from self if truthy else other.
+        # Inputs: other - ProfilerConfig. Outputs: new ProfilerConfig.
+        # Exceptions: AssertionError if tools differ. Side effects: none.
         assert self.tool == other.tool, (
             f"Cannot intersect ProfilerConfig with different tools: {self.tool} vs {other.tool}"
         )
@@ -326,6 +390,9 @@ class ProfilerConfig(BaseConfig):
         )
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: asserts ranks and finish_hook_ranks are set/list/tuple and finish_hook_cmd is str or None.
+        # Exceptions: AssertionError on violation. Side effects: none.
         """config validation logics go here"""
         assert isinstance(self.ranks, set | list | tuple), (
             f"Profiler ranks must be of type list, got {type(self.ranks)}"
@@ -339,6 +406,9 @@ class ProfilerConfig(BaseConfig):
 
 
 def rollout_trace_dir(profiler_config: ProfilerConfig, rank: int) -> str:
+    # [FUNCTION DOC]
+    # Outputs: path save_path/agent_loop_rollout_replica_<rank>. Exceptions: TypeError if save_path is None.
+    # Side effects: none.
     """Return the directory an inference engine writes the traces of ``rank`` to.
 
     Engine-side profiling is per replica, so each replica gets its own sub-directory of
@@ -348,6 +418,11 @@ def rollout_trace_dir(profiler_config: ProfilerConfig, rank: int) -> str:
 
 
 def rollout_profiler_global_ranks(profiler_config: Optional["ProfilerConfig"]) -> Optional[set[int]]:
+    # [FUNCTION DOC]
+    # Behavior: returns None if config is None or all_ranks is truthy; otherwise the set of configured
+    # ranks converted to int, or None if that set is empty.
+    # Inputs: profiler_config - any object with all_ranks/ranks attributes, or None.
+    # Outputs: set of ints or None. Exceptions: ValueError if a rank is not int-convertible. Side effects: none.
     """The exact global GPU ranks a rollout replica should surface traces for, or ``None`` to keep
     every trace.
 
@@ -375,6 +450,12 @@ _ROLLOUT_TRACE_MULTI_DIM_RE = re.compile(r"(?:^|[-_.])(?:DP|PP|EP)-\d+", re.IGNO
 
 
 def rollout_trace_local_rank(name: str, world_size: int) -> Optional[int]:
+    # [FUNCTION DOC]
+    # Behavior: returns None if world_size <= 1 or the name contains a DP-/PP-/EP- segment; else tries the
+    # TP-<n> pattern then the rank<n> pattern (case-insensitive, segment-anchored); first match's number is
+    # returned if within [0, world_size), else None. No match -> None.
+    # Inputs: name - trace file name; world_size - GPUs in the replica.
+    # Outputs: int or None. Exceptions: none. Side effects: none.
     """The GPU's linear rank within its replica (``0..world_size-1``), read from an engine trace
     file name, or ``None`` when it cannot be determined unambiguously.
 
@@ -403,6 +484,17 @@ def relocate_rollout_traces(
     world_size: int = 1,
     keep_global_ranks: Optional[Iterable[int]] = None,
 ) -> list[str]:
+    # [FUNCTION DOC]
+    # Behavior: returns [] when relocate_results is falsy or the replica sub-directory does not exist.
+    # Otherwise, for each entry in the sub-directory (sorted by name): computes the local tp rank (via
+    # rollout_trace_local_rank) and global rank = rank*world_size + local; builds prefix
+    # "rollout-replica<rank>_" or "rollout-replica<rank>-globalrank<g>_" when global rank known; skips
+    # entries with a known global rank not in keep_global_ranks; moves the entry to save_path/<prefix><name>.
+    # Inputs: profiler_config; rank - replica index; world_size - GPUs per replica; keep_global_ranks -
+    # optional iterable of ints (None keeps all).
+    # Outputs: list of destination paths actually moved.
+    # Exceptions: move failures are caught, printed, and skipped.
+    # Side effects: moves files/dirs on disk; prints errors to stdout.
     """Move the engine traces of replica ``rank`` up into ``save_path``. No-op unless
     ``relocate_results`` is set.
 
@@ -468,6 +560,15 @@ def relocate_rollout_traces(
 def build_vllm_profiler_args(
     profiler_config: ProfilerConfig, tool_config: BaseConfig, rank: int, legacy_env: bool = True
 ) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: returns {} if either config is falsy or tool_config lacks contents. Derives with_stack
+    # ("stack" or "module" in contents), record_shapes, with_memory and the save dir (rollout_trace_dir).
+    # If legacy_env, exports VLLM_TORCH_PROFILER_DIR / _WITH_STACK / _RECORD_SHAPES / _WITH_PROFILE_MEMORY
+    # ("1"/"0"). Converts token window to delay_iterations (start or 0) and max_iterations (end - delay, or 0
+    # meaning unbounded).
+    # Outputs: dict with key "profiler_config" holding a JSON string (profiler "torch", dir, flags,
+    # delay/max iterations, ignore_frontend "true").
+    # Exceptions: none explicit. Side effects: may mutate os.environ.
     """
     Build arguments and environment variables for vLLM profiler.
 
@@ -529,6 +630,12 @@ def build_vllm_profiler_args(
 
 
 def build_sglang_profiler_args(profiler_config: ProfilerConfig, tool_config: BaseConfig, rank: int) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: returns {} if either config is falsy or tool_config lacks contents; warns if "memory"
+    # requested (unsupported). start_step = profile_token_start (may be None); num_steps = end - (start or 0)
+    # when end set, else None.
+    # Outputs: dict with output_dir (rollout_trace_dir), with_stack, record_shapes, start_step, num_steps.
+    # Exceptions: none. Side effects: may emit a UserWarning.
     """
     Build arguments for SGLang profiler.
 

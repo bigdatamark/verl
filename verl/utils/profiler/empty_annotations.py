@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# No-op implementations of the range-marker API (mark_start_range, mark_end_range, mark_annotate) used
+# when no profiling backend (NVTX/MSTX) is available. Signatures mirror the real backends.
 from typing import Callable, Optional
 
 
@@ -21,10 +24,14 @@ def mark_start_range(
     domain: Optional[str] = None,
     category: Optional[str] = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # No-op. Inputs: message, color, domain, category - all ignored. Outputs: None.
     pass
 
 
 def mark_end_range(range_id: str) -> None:
+    # [FUNCTION DOC]
+    # No-op. Inputs: range_id - ignored. Outputs: None.
     pass
 
 
@@ -34,7 +41,11 @@ def mark_annotate(
     domain: Optional[str] = None,
     category: Optional[str] = None,
 ) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: returns an identity decorator. Inputs: ignored. Outputs: decorator returning func unchanged.
     def decorator(func):
+        # [FUNCTION DOC]
+        # HELPER: Identity decorator; returns func unchanged.
         return func
 
     return decorator

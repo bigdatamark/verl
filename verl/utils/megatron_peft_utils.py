@@ -11,10 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# PEFT (LoRA) helpers for Megatron models: counting adapter params, printing a summary, and
+# converting the Megatron LoRA config to a PEFT config dict for rollout engines.
+
 """Utilities for PEFT (Parameter-Efficient Fine-Tuning) of Megatron in VERL."""
 
 
 def count_adapter_parameters(model):
+    # [FUNCTION DOC]
+    # Behavior: unwraps the model (first chunk if a list); sums numel of all params as total and of
+    # params whose name contains "lora" or "adapter" (case-insensitive) AND require grad as adapter.
+    # Inputs: model - Megatron model or list of chunks.
+    # Outputs: (adapter_params, total_params, percentage 0-100; 0 when total is 0).
     """Count the number of trainable adapter parameters.
 
     Args:
@@ -44,6 +54,9 @@ def count_adapter_parameters(model):
 
 
 def print_adapter_info(model):
+    # [FUNCTION DOC]
+    # Behavior: prints a framed summary of total/adapter params and trainable percentage.
+    # Inputs: model. Outputs: none. Side effects: stdout.
     """Print information about adapter parameters in the model."""
     adapter_params, total_params, percentage = count_adapter_parameters(model)
 
@@ -56,6 +69,11 @@ def print_adapter_info(model):
 
 
 def build_peft_config_for_vllm(lora_config: dict) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: returns a dict with task_type CAUSAL_LM, peft_type LORA, r from "rank" (default 0),
+    # lora_alpha from "alpha" (default 32), target_modules "all-linear" placeholder, bias "none",
+    # lora_dropout from "dropout" (default 0.0).
+    # Inputs: lora_config - mapping. Outputs: dict. Exceptions: ImportError without peft.
     """Build the ``peft_config`` every rollout backend receives, from megatron's LoRA config.
 
     Args:

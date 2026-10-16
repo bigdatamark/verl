@@ -89,6 +89,13 @@
 
 # ruff: noqa: B028, UP038, UP007, E721, E501
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Vendored copy of torch.distributed._state_dict_utils from torch 2.7 (used because the torch 2.6 set_model_state_dict
+# path can OOM). Provides a generic recursive state-dict walker with per-type callbacks (ShardedTensor, DTensor, plain
+# tensor), gather/offload/copy/CPU-clone helpers, a structure-similarity check, rank-0 broadcast or local distribution
+# of a full state dict into a (possibly DTensor-sharded) local state dict, and DCP-style flatten/unflatten utilities.
+# Distributed types are imported only when torch.distributed is available.
+
 import copy
 import io
 import math
@@ -114,6 +121,8 @@ def _identity_func(
     device: Optional[torch.device],
     companion_obj: Any,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: callback that returns obj unchanged (ignores pg, device, companion).
     return obj
 
 
@@ -122,6 +131,13 @@ def _all_gather_sharded_tensor(
     pg: Optional[dist.ProcessGroup] = None,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: all-gather a ShardedTensor sharded along dim 0 into a full tensor. Each rank contributes its first
+    # local shard flattened (moved to the process group's device, zero-padded to a uniform chunk size of
+    # ceil(dim0/world) rows' worth of elements), or zeros if it has no shard; gathers into one flat buffer, trims to total
+    # numel and reshapes to the global size.
+    # Inputs: sharded_tensor; pg - default group if None; device - gather device (default the group's default device).
+    # Outputs: full tensor on the gather device. Side effects: collective communication.
     if pg is None:
         pg = distributed_c10d._get_default_group()
     world_size = dist.get_world_size(pg)
@@ -152,6 +168,8 @@ def _all_gather_sharded_tensor(
 
 
 class CompanionMismatch(Exception):
+    # [CLASS DOC]
+    # Exception raised when a companion object's structure, keys, dtype or size does not match the state dict.
     pass
 
 
@@ -169,6 +187,17 @@ def _iterate_state_dict(
     type_check: bool = True,
     non_blocking: bool = True,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: recursively walk a state dict. ShardedTensor/DTensor/Tensor leaves go to their callback (called with
+    # value, pg, device, companion); int/float/str/bytes/BytesIO/None pass through; dicts and lists/tuples recurse (with the
+    # companion's matching child; tuples are rebuilt as tuples); other types are deep-copied if type_check is False, else
+    # rejected. After processing, if ranks_only is empty or this rank is in it: tensor results are moved to CPU when
+    # cpu_offload and no companion; with a companion, the result is copied into the companion (into its local tensor for
+    # DTensor) and the companion is returned. Ranks not in ranks_only get an empty dict for dicts, else None.
+    # Inputs: see docstring. Outputs: new structure with processed leaves.
+    # Exceptions: CompanionMismatch on structural mismatch; ValueError on unsupported types when type_check.
+    # KNOWN ISSUE: for a dict mismatch the message logic is inverted: it is empty when the companion is a dict (key
+    # mismatch) and calls keys() on the non-dict companion otherwise, which raises AttributeError instead.
     """Iterate through the state dict, applying the given functions to each tensor type.
 
     Args:
@@ -279,6 +308,11 @@ def _gather_state_dict(
     ranks_only: tuple[int, ...] = (),
     type_check: bool = True,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: gather all ShardedTensors (all-gather, moved back to the local shard device) and DTensors
+    # (redistributed to all-Replicate placements, converted to local, waiting on async collectives) into full tensors,
+    # leaving plain tensors as-is; honors cpu_offload, ranks_only and type_check.
+    # Outputs: gathered state dict. Side effects: collective communication.
     """
     Given a state_dict, this API gathers all the ShardedTensors or DTensors in
     the state_dict.
@@ -308,6 +342,8 @@ def _gather_state_dict(
     """
 
     def sharded_tensor_func(value, pg, device, companion_obj):
+        # [FUNCTION DOC]
+        # HELPER: ShardedTensor callback: all-gather and move to the local shard's device (CPU if no shards).
         # ShardedTensor does not seem to record the original device type.
         # So if the tensor is moved to CPU, we won't know the original type.
         # As a result, we have to rely on the user to tell us the correct one.
@@ -321,6 +357,10 @@ def _gather_state_dict(
         return value
 
     def dtensor_func(value, pg, device, companion_obj):
+        # [FUNCTION DOC]
+        # HELPER: DTensor callback: move to the mesh device type if needed (compares a device with a device-type string, so it
+        # effectively always calls the move), redistribute to Replicate on all mesh dims, take the local tensor and wait if
+        # asynchronous.
         if value.device != value.device_mesh.device_type:
             value = value.to(value.device_mesh.device_type)
         # FSDP all_gather: [Shard(0)] -> [Replicate()]
@@ -360,6 +400,9 @@ def _offload_state_dict_to_cpu(
     ranks_only: tuple[int, ...] = (),
     type_check: bool = True,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: walk the state dict with identity callbacks and cpu_offload so all tensors are moved to CPU.
+    # Inputs: state_dict; ranks_only; type_check. Outputs: new state dict. (The docstring's pg argument does not exist.)
     """
     Given a state_dict, this API offload all the tensors to CPU memory.
 
@@ -401,6 +444,11 @@ def _copy_state_dict(
     non_blocking: bool = False,
     type_check: bool = True,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: under no_grad, copy every tensor of state_dict into the matching tensor of copy_state_dict (same
+    # structure required), returning a structure whose leaves are the companion tensors.
+    # Inputs: state_dict; copy_state_dict; non_blocking; type_check.
+    # Exceptions: CompanionMismatch on structural mismatch. Side effects: writes into copy_state_dict tensors.
     """
     Copies all tensors in a given state dict into a different state_dict with the
     same structure. Additionally, a copied state dict with the same value references
@@ -448,6 +496,14 @@ def _copy_state_dict(
 def _create_cpu_state_dict(
     state_dict: dict[str, Any], pin_memory: bool = False, share_memory: bool = False
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: under no_grad, create a structurally identical state dict where each tensor is a new uninitialized CPU
+    # tensor of the same size and dtype, optionally in shared memory and/or pinned (shared+pinned registers the memory with
+    # cudaHostRegister and unregisters on garbage collection). DTensors are moved/copied to CPU with a new local tensor.
+    # Non-tensor values are deep-copied (type_check off).
+    # Inputs: state_dict; pin_memory; share_memory. Outputs: new state dict (values not copied).
+    # Exceptions: AssertionError if CUDA host registration fails.
+    # Note: zero-dim tensors become a new scalar tensor holding 0 of the same dtype (contents are not preserved).
     """
     Given a state_dict, create another state_dict with the same structure and elements.
     However, all tensors in the returned state_dict are new tensors on CPU. These
@@ -469,6 +525,8 @@ def _create_cpu_state_dict(
         device: Optional[torch.device],
         _: Any,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: tensor callback allocating the empty CPU tensor as described above.
         if len(obj.size()) == 0:
             return torch.tensor(0, dtype=obj.dtype)
 
@@ -478,6 +536,8 @@ def _create_cpu_state_dict(
             if pin_memory:
 
                 def unpin_memory(t):
+                    # [FUNCTION DOC]
+                    # HELPER: unregisters pinned host memory for a tensor. Exceptions: AssertionError on non-zero CUDA error code.
                     succ = int(torch.cuda.cudart().cudaHostUnregister(t.data_ptr()))
                     assert succ == 0, f"Unpinning shared memory failed with error-code: {succ}"
 
@@ -502,6 +562,9 @@ def _create_cpu_state_dict(
         device: Optional[torch.device],
         _: Any,
     ) -> DTensor:
+        # [FUNCTION DOC]
+        # HELPER: DTensor callback: CPU copy of the DTensor with its local tensor replaced by a fresh CPU tensor (zero-dim
+        # returned as is).
         if len(obj.size()) == 0:
             return obj
 
@@ -530,6 +593,12 @@ def _check_state_dict_similarity(
     state_dict: dict[str, Any],
     compared_state_dict: dict[str, Any],
 ) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: walk state_dict with compared_state_dict as companion, raising on structure, dtype or size mismatch
+    # of plain tensors (DTensor/ShardedTensor leaves are not compared).
+    # Outputs: True if similar, False on CompanionMismatch.
+    # Note: when structures match the walk still copies matching tensors into the companion, so compared_state_dict is
+    # overwritten with state_dict's tensor values as a side effect.
     """
     Given two state_dicts, check if the structures are the same. And
     if a [key, tensor] pair exist in one state_dict there must be
@@ -545,6 +614,8 @@ def _check_state_dict_similarity(
         device: Optional[torch.device],
         companion_obj: Any,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: callback raising CompanionMismatch when dtype or size differ, else returning obj.
         if companion_obj.dtype != obj.dtype or companion_obj.size() != obj.size():
             raise CompanionMismatch
         return obj
@@ -569,6 +640,8 @@ def _check_state_dict_similarity(
 
 
 class _TensorInfo(NamedTuple):
+    # [CLASS DOC]
+    # NamedTuple (size, dtype) describing a tensor without its data; broadcast in place of large tensors.
     size: torch.Size
     dtype: torch.dtype
 
@@ -580,6 +653,14 @@ def _broadcast_tensors(
     device: torch.device,
     pg: Optional[dist.ProcessGroup] = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: for each key build a tensor on device: rank 0 uses its full tensor, other ranks allocate an empty
+    # tensor from the broadcast tensor info. Record in local_state_dict either the full tensor or, for DTensor entries, a
+    # pair of (local DTensor, full tensor); keys absent locally are skipped. Broadcast all tensors from rank 0 (coalesced if
+    # more than one), then distribute pairs into shards.
+    # Inputs: full_state_dict - rank0 tensors or tensor infos; local_state_dict; keys; device; pg (default group if None).
+    # Side effects: collective communication; mutates local_state_dict.
+    # Note: rank checks use the global rank, so rank 0 of the default group must be the source.
     tensors = []
     for key in keys:
         if dist.get_rank() == 0:
@@ -619,6 +700,12 @@ def _distribute_tensors(
     device: torch.device,
     pg: Optional[dist.ProcessGroup] = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: for each key whose local entry is a (DTensor, full tensor) pair, compute this rank's local shard
+    # shape and offset for the DTensor placements and slice the full tensor accordingly. If the DTensor is on meta device,
+    # build a new DTensor from a cloned slice with the original shape and stride; otherwise copy the slice into the
+    # existing local tensor. Store the result under the key.
+    # Side effects: mutates local_state_dict and existing DTensor storage.
     if pg is None:
         pg = dist.distributed_c10d._get_default_group()
     for key in keys:
@@ -662,6 +749,14 @@ def _broadcast_state_dict(
     strict: bool = False,
     cpu_offload: bool = False,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: rank 0 builds a summary of its full state dict (non-tensors as-is, scalars on CPU, other tensors
+    # as size/dtype info) and broadcasts it as an object. Every rank copies non-tensor values into existing local keys, then
+    # for each tensor key broadcasts it individually (to limit memory) into local_state_dict, optionally moving to CPU.
+    # With strict, local keys absent from the global set are removed.
+    # Inputs: full_state_dict (meaningful on rank 0); local_state_dict; device; pg; strict; cpu_offload.
+    # Side effects: collectives; mutates local_state_dict.
+    # Note: zero-dim tensors are carried in the object broadcast and assigned only if the key exists locally.
     # Broadcast from rank0's `full_state_dict` to all ranks' `local_state_dict`.
     # If strict is True, any keys in `local_state_dict` but not in `full_state_dict`
     # will be removed from `local_state_dict`.
@@ -719,6 +814,13 @@ def _distribute_state_dict(
     device: torch.device,
     pg: Optional[dist.ProcessGroup] = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: every rank holds the full state dict; for each entry, non-tensors and scalars are written into the
+    # local dict, tensors replace existing local entries: DTensor entries are re-sharded with distribute_tensor using the
+    # local placements, plain tensors moved to device; keys missing locally are skipped.
+    # Side effects: mutates local_state_dict; distribute_tensor may communicate.
+    # KNOWN ISSUE: the check skipping keys not in full_state_dict is always false (iterating that same dict); it was likely
+    # meant to check local_state_dict, and as written non-tensor values are added even for keys absent locally.
     # Full_state_dict = True, broadcast_from_rank0 = False here. Each rank has
     # full_state_dict. Skip the broadcast in ``_broadcast_state_dict`` and
     # distribute tensors in each rank
@@ -758,6 +860,9 @@ def _traverse_state_dict(
     state_dict: STATE_DICT_TYPE,
     visitor: Callable[[OBJ_PATH, Any], None],
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: depth-first walk; mappings extend the path with the string key, lists/tuples with the integer index;
+    # any other value invokes visitor(path, value).
     """
     Invoke ``visitor`` for each value recursively in ``state_dict``.
     Mapping, list, and tuple will be flattened and other value types are treated
@@ -765,6 +870,8 @@ def _traverse_state_dict(
     """
 
     def _traverse_obj(path: OBJ_PATH, value: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: recursive step of the traversal.
         if isinstance(value, Mapping):
             for k, v in value.items():
                 _traverse_obj(path + (str(k),), v)
@@ -781,6 +888,11 @@ def _traverse_state_dict(
 def _flatten_state_dict(
     state_dict: STATE_DICT_TYPE,
 ) -> tuple[STATE_DICT_TYPE, FLATTEN_MAPPING]:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: flatten nested containers into a single-level mapping keyed by the dot-joined path, recording each
+    # key's original path.
+    # Outputs: (flattened mapping, mapping from flat key to path tuple).
+    # Exceptions: ValueError on duplicate flat keys.
     """
     Flatten ``state_dict`` made of nested dicts and lists into a top level dictionary.
 
@@ -794,6 +906,8 @@ def _flatten_state_dict(
     mappings: FLATTEN_MAPPING = {}
 
     def flat_copy(path: OBJ_PATH, value: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: visitor storing the value and path under the dot-joined key; raises on duplicates.
         new_fqn = ".".join(map(str, path))
         if new_fqn in flattened:
             raise ValueError(f"duplicated flatten key {new_fqn}")
@@ -805,10 +919,16 @@ def _flatten_state_dict(
 
 
 def _set_element(root_dict: STATE_DICT_TYPE, path: OBJ_PATH, value: Any) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: walk/create containers along path (dict when the next key is a string, list when an integer,
+    # extending lists with None as needed) and set value at the final key.
+    # Side effects: mutates root_dict.
     """Set ``value`` in ``root_dict`` along the ``path`` object path."""
     cur_container = cast(CONTAINER_TYPE, root_dict)
 
     def extend_list(lst: list[Any], idx: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: pads a list with None until index idx is valid.
         while len(lst) <= idx:
             lst.append(None)
 
@@ -833,6 +953,9 @@ def _set_element(root_dict: STATE_DICT_TYPE, path: OBJ_PATH, value: Any) -> None
 
 
 def _unflatten_state_dict(state_dict: STATE_DICT_TYPE, mapping: FLATTEN_MAPPING) -> STATE_DICT_TYPE:
+    # [FUNCTION DOC]
+    # HELPER: Behavior: rebuild a nested state dict by setting each flat value at its recorded path.
+    # Outputs: nested mapping. Exceptions: KeyError if a key lacks a mapping.
     """Restore the original nested state_dict according to ``mapping`` and the flattened ``state_dict``."""
     nested: STATE_DICT_TYPE = {}
     for key, value in state_dict.items():

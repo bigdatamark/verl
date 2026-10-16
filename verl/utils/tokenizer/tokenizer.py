@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tokenizer and multimodal processor helpers: loading HuggingFace tokenizers/processors with verl-specific fixes
+# (pad token defaults, gemma-2 eos fix, binding VLM rope-index methods onto processors), normalizing token-id outputs
+# across transformers 4/5, resolving multimodal special token ids and building processor call kwargs.
 """Utils for tokenization."""
 
 import types
@@ -26,6 +30,14 @@ __all__ = [
 
 
 def normalize_token_ids(tokenized_output) -> list[int]:
+    # [FUNCTION DOC]
+    # Converts various tokenizer outputs into a flat list of Python ints.
+    # Behavior: if the input is a dict with input_ids, or any object with an input_ids attribute, take that field; convert
+    # tensors/arrays via their list conversion; convert tuples to lists; unwrap a single-row nested list/tuple; then convert
+    # every element to int (calling item() first on scalar-tensor-like elements).
+    # Inputs: tokenized_output - list, tuple, tensor, dict or BatchEncoding. Outputs: list of int.
+    # Exceptions: TypeError if the result is not list-like or an element is not int-convertible.
+    # Side effects: none.
     """Normalize tokenizer outputs into a flat ``list[int]``.
 
     This handles Transformers 4/5 differences where ``apply_chat_template(tokenize=True)``
@@ -63,6 +75,12 @@ def normalize_token_ids(tokenized_output) -> list[int]:
 
 
 def get_processor_token_id(processor, token_name: str) -> int | None:
+    # [FUNCTION DOC]
+    # Resolves a special token id named by token_name (e.g. "image", "video") from a processor.
+    # Behavior: return None if processor is None; if the processor has an attribute token_name+"_token_id" that is not None,
+    # return it as int; else if it has token_name+"_token" and a tokenizer attribute, convert the token string to an id and
+    # return it as int if not None; otherwise None.
+    # Outputs: int or None. Side effects: none.
     """Resolve a multimodal special token id from a processor.
 
     Newer processors may expose ``image_token``/``video_token`` strings instead
@@ -90,6 +108,10 @@ def get_processor_token_id(processor, token_name: str) -> int | None:
 
 
 def _split_videos_and_metadata(videos):
+    # [FUNCTION DOC]
+    # HELPER: Splits a video list that may contain (frames, metadata) tuples.
+    # Inputs: videos - None or iterable. Outputs: (None, None) for None; if the first item is a tuple, returns
+    # (list of values, list of metadata) by unzipping all items; otherwise (list of videos, None).
     if videos is None:
         return None, None
     videos = list(videos)
@@ -109,6 +131,15 @@ def build_multimodal_processor_inputs(
     mm_processor_kwargs=None,
     return_tensors: str = "pt",
 ):
+    # [FUNCTION DOC]
+    # Builds the keyword arguments and invokes the processor for a multimodal sample.
+    # Behavior: copies mm_processor_kwargs; if audio is given and no sampling_rate was set, takes the processor's
+    # feature_extractor sampling_rate (when available) as int; splits videos into values and metadata; defaults
+    # return_tensors; if metadata exists, defaults video_metadata to it and do_sample_frames to False; assembles text,
+    # images, videos plus kwargs, adds audio only when not None, then calls the processor.
+    # Inputs: processor - callable HF processor; text, images, videos, audio, mm_processor_kwargs, return_tensors (default "pt").
+    # Outputs: whatever the processor returns (typically a BatchFeature). Exceptions: processor errors propagate.
+    # Side effects: none beyond the processor call.
     """Build kwargs for multimodal processor calls.
 
     This keeps the existing VL flow intact while extending it with audio-aware
@@ -135,6 +166,10 @@ def build_multimodal_processor_inputs(
 
 
 def set_pad_token_id(tokenizer):
+    # [FUNCTION DOC]
+    # Ensures a tokenizer has a pad token: if pad_token_id is None sets it to eos_token_id, and if pad_token is None sets
+    # it to eos_token, emitting a warning in each case.
+    # Inputs: tokenizer. Outputs: none. Side effects: mutates tokenizer, issues warnings.
     """Set pad_token_id to eos_token_id if it is None.
 
     Args:
@@ -150,6 +185,13 @@ def set_pad_token_id(tokenizer):
 
 
 def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kwargs):
+    # [FUNCTION DOC]
+    # Loads a HuggingFace tokenizer via AutoTokenizer.
+    # Behavior: if correct_gemma2 and the path string contains "gemma-2-2b-it", warns and forces eos_token to
+    # "<end_of_turn>" and eos_token_id to 107 via kwargs; loads the tokenizer with kwargs; if correct_pad_token, applies
+    # set_pad_token_id.
+    # Inputs: name_or_path; correct_pad_token (default True); correct_gemma2 (default True); extra kwargs for from_pretrained.
+    # Outputs: tokenizer. Exceptions: loading errors propagate. Side effects: warnings, may download files.
     """Create a huggingface pretrained tokenizer which correctness handles eos and pad tokens.
 
     Args:
@@ -180,6 +222,16 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
 
 
 def hf_processor(name_or_path, **kwargs):
+    # [FUNCTION DOC]
+    # Loads a HuggingFace multimodal processor, returning None for text-only models.
+    # Behavior: loads AutoProcessor; returns None immediately if it is a plain tokenizer. Loads AutoConfig and attaches it
+    # as processor.config. Chooses a model class by processor class name (Qwen2VL, Qwen2.5VL, Qwen3VL, Glm4v, Glm46V); for
+    # Mllama does nothing; for Gemma4 replaces validate_inputs with a no-op; any other name raises ValueError. If a model
+    # class was chosen, binds its get_rope_index (and get_vision_position_ids if present) as methods of the processor.
+    # Any exception (including the ValueError above) is caught, a warning issued and processor set to None. Finally, a
+    # processor whose class name lacks "Processor" is discarded (None).
+    # Inputs: name_or_path; kwargs forwarded to from_pretrained. Outputs: processor or None.
+    # Side effects: mutates the processor object, warnings, may download files.
     """Create a huggingface processor to process multimodal data.
 
     Args:

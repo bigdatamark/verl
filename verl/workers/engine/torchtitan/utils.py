@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Utilities for the torchtitan training engine integration in verl.
+# Provides: a no-op dataloader to satisfy torchtitan's Trainer, a mapping and auto-derivation
+# from HuggingFace model configs to torchtitan model name/flavor, re-enabling FSDP gradient
+# division, construction of document-aware attention masks (flex BlockMask or varlen
+# cumulative-seqlen metadata) from packed position ids, and a generator that yields
+# per-tensor weights for rollout weight sync under Expert Parallel (all-gathering experts).
+# Side effects at import: creates a module logger; requires torch and torchtitan installed.
 import importlib
 import logging
 import re
@@ -37,6 +45,9 @@ logger = logging.getLogger(__name__)
 
 
 class NoOpDataLoader(BaseDataLoader):
+    # [CLASS DOC]
+    # Dataloader stub implementing torchtitan's BaseDataLoader interface; verl feeds data itself.
+    # Iteration yields nothing; checkpoint state is an empty mapping and loading state is ignored.
     """A no-op dataloader for use when verl manages its own data loading.
 
     Satisfies the BaseDataLoader interface required by torchtitan's Trainer
@@ -46,18 +57,30 @@ class NoOpDataLoader(BaseDataLoader):
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
+        # [CLASS DOC]
+        # Empty config dataclass (keyword-only, slotted) subclassing BaseDataLoader.Config so the
+        # stub can be registered/constructed through torchtitan's config system.
         pass
 
     def __init__(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: accepts and ignores any keyword arguments. Outputs: none. Side effects: none.
         pass
 
     def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Behavior: returns an iterator over an empty list, so iteration ends immediately.
+        # Outputs: an empty iterator of (input dict, label tensor) pairs.
         return iter([])
 
     def state_dict(self):
+        # [FUNCTION DOC]
+        # Behavior: returns an empty mapping as checkpoint state. Side effects: none.
         return {}
 
     def load_state_dict(self, state_dict):
+        # [FUNCTION DOC]
+        # Behavior: ignores the given state. Inputs: state_dict - any. Outputs: none.
         pass
 
 
@@ -78,6 +101,20 @@ _HF_MODEL_TYPE_TO_TORCHTITAN_NAME = {
 
 
 def derive_torchtitan_name_and_flavor(hf_config) -> tuple[str, str]:
+    # [FUNCTION DOC]
+    # Behavior: reads hf_config.model_type and maps it via the module-level HF-to-torchtitan table
+    # to a torchtitan model name. Imports the module torchtitan.models.<name>, takes its
+    # model_registry callable, and locates the flavor-name list by scanning the module's attributes
+    # for the first dict whose attribute name ends with "_configs". For each flavor in that order,
+    # builds its model config via the registry and compares dim with hidden_size, layer count
+    # (n_layers attribute, or length of a "layers" attribute when n_layers is missing/falsy) with
+    # num_hidden_layers, and vocab_size; returns on the first full match.
+    # Inputs: hf_config - HuggingFace config object with model_type, hidden_size,
+    # num_hidden_layers, vocab_size.
+    # Outputs: (torchtitan model name, flavor name) tuple.
+    # Exceptions: ValueError if model_type is missing, unmapped, if no "_configs" dict is found, or
+    # if no flavor matches; ImportError propagates if the torchtitan module cannot be imported.
+    # Side effects: imports a module; logs the chosen name/flavor at info level.
     """Derive torchtitan model name and flavor from a HuggingFace config.
 
     The name is mapped from ``hf_config.model_type``. The flavor is found by
@@ -149,6 +186,11 @@ def derive_torchtitan_name_and_flavor(hf_config) -> tuple[str, str]:
 
 
 def enable_fsdp_gradient_division(model: nn.Module, dp_size: int) -> None:
+    # [FUNCTION DOC]
+    # Behavior: walks every submodule of the model and, for each FSDP-wrapped module, sets its
+    # gradient divide factor to dp_size as a float so reduced gradients are averaged.
+    # Inputs: model - module (or model part); dp_size - data-parallel world size.
+    # Outputs: none. Side effects: mutates FSDP module configuration in place.
     """
     Re-enable FSDP's automatic gradient division.
 
@@ -172,6 +214,15 @@ def get_attention_masks(
     positions: torch.Tensor,
     attn_type: str,
 ) -> AttentionMasksType:
+    # [FUNCTION DOC]
+    # Behavior: dispatches on attn_type: "flex" or "flex_flash" builds a flex-attention BlockMask
+    # combining causal and per-document masks; "varlen" builds varlen cumulative-seqlen metadata.
+    # Documents within packed sequences are inferred from position resets.
+    # Inputs: input_batch - token ids [batch, seq]; positions - position ids [batch, seq];
+    # attn_type - attention backend name.
+    # Outputs: attention mask object appropriate to the backend.
+    # Exceptions: TypeError for any other attn_type.
+    # Side effects: none (varlen path performs one device-to-host sync).
     match attn_type:
         case "flex" | "flex_flash":
             # flex_flash is FlexAttention with the FLASH kernel backend; it uses
@@ -190,12 +241,24 @@ def get_attention_masks(
 
 
 def _get_document_mask_mod(positions: torch.Tensor) -> _mask_mod_signature:
+    # [FUNCTION DOC]
+    # HELPER: Builds a flex-attention mask function restricting attention to the same document.
+    # Behavior: computes a per-row document index by marking positions where the difference from
+    # the previous position is not 1 (first column always marked via a dummy previous value of
+    # first position minus 1) and taking the cumulative sum along the sequence.
+    # Inputs: positions - [batch, seq] position ids.
+    # Outputs: a mask function of (batch, head, query index, key index) returning true when both
+    # indices fall in the same document of that batch row. Side effects: none.
     # Detect boundaries from position resets
     first_dummy_value = positions[:, :1] - 1
     position_diff = torch.diff(positions, prepend=first_dummy_value, dim=-1)
     sequence_indices = (position_diff != 1).cumsum(-1)  # [batch, seq]
 
     def document_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Mask function closed over the document index tensor.
+        # Inputs: b, h, q_idx, kv_idx - index tensors (h unused).
+        # Outputs: boolean tensor, true where query and key share a document id in row b.
         return sequence_indices[b, q_idx] == sequence_indices[b, kv_idx]
 
     return document_mask
@@ -205,6 +268,12 @@ def _get_flex_attention_masks(
     input_batch: torch.Tensor,
     positions: torch.Tensor,
 ) -> AttentionMasksType:
+    # [FUNCTION DOC]
+    # HELPER: Builds a flex-attention BlockMask that is the logical AND of the causal mask and the
+    # document mask, with batch size B, no head dimension (None), and query/key length equal to
+    # the sequence length.
+    # Inputs: input_batch - [batch, seq] token ids (only shape used); positions - [batch, seq].
+    # Outputs: the created BlockMask. Side effects: none.
     mask_mods = [get_causal_mask_mod()]
     B = input_batch.shape[0]
     mask_mods.append(_get_document_mask_mod(positions=positions))
@@ -212,6 +281,17 @@ def _get_flex_attention_masks(
 
 
 def _create_varlen_metadata_for_document(input_batch: torch.Tensor, positions: torch.Tensor) -> VarlenMetadata:
+    # [FUNCTION DOC]
+    # HELPER: Builds varlen attention metadata treating the whole batch as one packed stream.
+    # Behavior: marks document starts where the position difference is not 1 (column 0 forced to
+    # true). For each batch row, takes start indices, appends seq_len, deduplicates consecutive
+    # values, records document lengths as successive differences, and offsets the start indices by
+    # row_index times seq_len. Concatenates all rows' starts plus the final total length
+    # (batch*seq) into one int32 cumulative-seqlen tensor. max seqlen is the maximum document
+    # length across all rows (0 if batch is empty).
+    # Inputs: input_batch - [batch, seq] (shape/device only); positions - [batch, seq].
+    # Outputs: VarlenMetadata with identical q/k cumulative lengths and identical q/k max lengths.
+    # Side effects: one device-to-host sync to read the max length.
     """
     Creates cumulative sequence length indices needed for variable length attention
 
@@ -276,6 +356,10 @@ _EXPERT_PATTERN = re.compile(r"\.layers\.(\d+)\..*\.experts\.(\d+)\.(.*)")
 
 
 def _parse_expert_name(name: str) -> tuple[int, int, str] | None:
+    # [FUNCTION DOC]
+    # HELPER: Regex-searches the expert parameter pattern ".layers.<L>.<anything>.experts.<E>.<suffix>".
+    # Inputs: name - parameter name. Outputs: (layer id int, expert id int, suffix string) on match,
+    # otherwise None. Side effects: none.
     """Parse layer_id, expert_id, weight_suffix from expert param name."""
     match = _EXPERT_PATTERN.search(name)
     if match:
@@ -284,6 +368,13 @@ def _parse_expert_name(name: str) -> tuple[int, int, str] | None:
 
 
 def _make_expert_name_template(name: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Replaces the layer/expert portion of a name with a template whose expert index is a
+    # format placeholder, keeping the layer id and suffix.
+    # Inputs: name - an expert parameter name. Outputs: template string with "{}" for expert id.
+    # KNOWN ISSUE: the replacement hardcodes ".mlp.experts." while the regex allows any path between
+    # the layer id and "experts"; names using a different intermediate path would be rewritten
+    # incorrectly.
     """Convert 'model.layers.0.mlp.experts.3.w1' -> 'model.layers.0.mlp.experts.{}.w1'"""
     return _EXPERT_PATTERN.sub(lambda m: f".layers.{m.group(1)}.mlp.experts.{{}}.{m.group(3)}", name)
 
@@ -294,6 +385,27 @@ def iter_per_tensor_params_ep(
     ep_group: torch.distributed.ProcessGroup,
     ep_size: int,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
+    # [FUNCTION DOC]
+    # Behavior: partitions params into non-expert entries and expert entries (only names containing
+    # "mlp.experts." that also match the expert regex), grouping experts by (layer id, suffix) and
+    # then by expert id. Clears the input mapping to release references. First yields each
+    # non-expert param: DTensors are moved to device, materialized via full_tensor, and cast to
+    # bfloat16; plain tensors are yielded unchanged. Then, for each (layer, suffix) group in sorted
+    # order, moves each local expert (sorted by expert id, materializing DTensors) to device, stacks
+    # them on a new leading dim, all-gathers the stacks across the EP group, concatenates along dim 0,
+    # and yields each expert row under a name built from the template with the global index
+    # (0..total-1), cast to bfloat16 and cloned. Frees temporaries and empties the CUDA cache after
+    # each group.
+    # Inputs: params - mapping name to tensor/DTensor (HF naming); device - target device id;
+    # ep_group - process group for all-gather; ep_size - number of EP ranks.
+    # Outputs: generator of (name, tensor) pairs.
+    # Exceptions: collective errors propagate; all ranks must have the same group structure and
+    # the same number of local experts per group.
+    # Side effects: empties the caller's params mapping; issues collective all-gathers; frees CUDA
+    # cache.
+    # KNOWN ISSUE: non-DTensor non-expert params are yielded without moving to device or casting to
+    # bfloat16, unlike DTensor ones. Global expert ids assume each rank owns a contiguous block of
+    # experts in rank order; local expert ids are discarded.
     """Yield (name, tensor) pairs for weight sync with Expert Parallel.
 
     Gathers expert weights across EP ranks one (layer, weight_type) group
