@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Base class and registry for the v1 PPO trainers built on TransferQueue (TQ). The trainer sets
+# up worker groups (actor/ref/critic), LLM rollout servers, checkpoint engine, reward and teacher
+# managers, dataloaders and a replay buffer. Rollout is decoupled: prompts are submitted to an
+# external AgentLoopManager which writes trajectories into TQ; each training step samples
+# finished prompt groups from the replay buffer and runs reward, old/ref log-prob, values,
+# advantages, critic and actor updates on the TQ-resident batch (operating on KVBatchMeta
+# handles and fetching/putting only needed fields). Subclasses (sync / colocated async /
+# separate async) customize behavior via the on_* hooks and prepare_step, and are registered by
+# name with register_trainer.
+
 import json
 import logging
 import math
@@ -94,6 +105,9 @@ from verl.workers.utils.padding import response_from_nested, response_to_nested
 
 
 def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Mutates sampling params for greedy decoding (top_p 1.0, top_k -1, temperature 0).
+    # Duplicate of the identically named helper in agent_loop_tq.
     params["top_p"] = 1.0
     params["top_k"] = -1
     params["temperature"] = 0
@@ -104,6 +118,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 def _tq_supports_checkpoint() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True when the installed TQ version parses as >= 0.1.9 and exposes callable
+    # save_checkpoint and load_checkpoint; false on unparseable/missing version.
     """Whether the installed TransferQueue can snapshot/restore its state for checkpoint consistency."""
     try:
         version_supported = Version(getattr(tq, "__version__", "")) >= Version("0.1.9")
@@ -117,6 +134,9 @@ def _tq_supports_checkpoint() -> bool:
 
 
 def _count_tq_prompt_groups(partition_id: str = "train") -> int:
+    # [FUNCTION DOC]
+    # HELPER: Counts entries tagged is_prompt in the given TQ partition (0 when the listing is empty).
+    # Side effects: TQ metadata read.
     """Number of prompt groups currently registered in a TransferQueue partition."""
     data = tq.kv_list(partition_id)
     if not data:
@@ -125,6 +145,13 @@ def _count_tq_prompt_groups(partition_id: str = "train") -> int:
 
 
 class PPOTrainer(ABC):
+    # [CLASS DOC]
+    # Abstract base trainer. Key state: config; checkpoint callback; role usage flags; optional
+    # in-reward KL controller; trainer_mode (sync or an async mode) and parameter_sync_step (number
+    # of local updates per weight sync, default 1); replay buffer; MoE load-balance metrics
+    # accumulator; local_trigger_step (index of the current local update); count of prompts
+    # restored from a TQ checkpoint; plus everything created in _setup and fit (worker groups,
+    # managers, dataloaders, loggers, global_steps, timing).
     """Base class for PPO trainer.
 
     Args:
@@ -132,6 +159,10 @@ class PPOTrainer(ABC):
     """
 
     def __init__(self, config: DictConfig):
+        # [FUNCTION DOC]
+        # Behavior: stores config, builds the checkpoint callback and role flags, the KL controller when
+        # use_kl_in_reward, reads trainer mode and parameter_sync_step from trainer.v1.<mode>, builds the
+        # replay buffer and MoE metrics accumulator, initializes counters.
         self.config = config
         self.checkpoint_callback = build_checkpoint_callback(config)
         self.use_critic = need_critic(self.config)
@@ -151,6 +182,15 @@ class PPOTrainer(ABC):
         self._restored_tq_prompt_count = 0
 
     def _build_replay_buffer(self) -> ReplayBuffer:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: chooses a custom sampler class loaded from
+        # trainer.v1.sampler.custom_sampler.{path,name} when both set, else ReplayBuffer (sync) or
+        # ReplayBufferAsync. Passes mode, mode config, off-policy threshold/strategy, sampler kwargs and
+        # the refill function. For built-in samplers also passes the DAPO metric and
+        # sync_refill_failed_groups; for the sync buffer additionally train_batch_size, gen_batch_size
+        # (1 when DAPO or failed refill is enabled, else data.gen_batch_size or train_batch_size) and
+        # max_inflight_gen_batches (from filter_groups when DAPO is on, else 1).
+        # Outputs: replay buffer instance.
         """Instantiate the replay buffer (or a user-provided custom sampler).
 
         Set ``trainer.v1.sampler.custom_sampler.{path,name}`` to plug in a custom
@@ -199,6 +239,12 @@ class PPOTrainer(ABC):
         return sampler_cls(**replay_buffer_kwargs)
 
     def _resolve_filter_groups_metric(self) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: returns None unless algorithm.filter_groups.enable. Requires a metric name;
+        # asserts the reward is available at sampling time (no reward model, or reward model with its
+        # own resource pool); warns that max_num_gen_batches is ignored.
+        # Outputs: metric name string or None.
+        # Exceptions: ValueError for missing metric; AssertionError for colocated reward model.
         """Resolve DAPO's group metric and verify that rollout computes it before sampling."""
         filter_groups = self.config.algorithm.get("filter_groups", None)
         filter_enabled = bool(filter_groups is not None and filter_groups.get("enable", False))
@@ -226,6 +272,8 @@ class PPOTrainer(ABC):
         return str(filter_metric)
 
     def init(self):
+        # [FUNCTION DOC]
+        # Behavior: runs _setup then the on_init_end hook.
         """Initialize all components of the trainer.
 
         1. WorkerGroup: actor, critic, reference with model engine: FSDP/Megatron/VeOmni/...
@@ -238,6 +286,23 @@ class PPOTrainer(ABC):
         self.on_init_end()
 
     def _setup(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: initializes tokenizer, dataloaders, dump executor and resource pool manager,
+        # creates pools. Sets ref_in_actor (LoRA rank > 0 or adapter path). Actor role is Actor if
+        # mapped, else ActorRolloutRef, else ActorRollout; registers it. When the role is a plain Actor
+        # and a separate reference is needed, registers RefPolicy. When a critic is used, builds a value
+        # model TrainingWorkerConfig with profiler config. Spawns colocated worker groups (with profile
+        # and nsys options, device). Critic: reset and set value loss. Actor group init_model; reference
+        # group is the separate RefPolicy group (initialized), the actor-rollout-ref group, or the actor
+        # group when ref_in_actor. Creates the reward loop manager (RM pool when reward model enabled),
+        # optional teacher manager and distillation config, the LLM server manager (or an empty one when
+        # the subclass set _enable_hybrid_replicas false), and a checkpoint engine manager forced to the
+        # "naive" backend. Sleeps replicas and loads the checkpoint.
+        # Exceptions: AssertionError for nsys without worker options.
+        # Side effects: launches Ray actors/servers; sets many attributes.
+        # KNOWN ISSUE: critic engine max_token_len_per_gpu is set from ppo_infer_max_token_len_per_gpu
+        # instead of ppo_max_token_len_per_gpu (the legacy trainer uses the latter), so the critic
+        # training token budget silently follows the inference setting.
         self._init_tokenizer()
         self._init_dataloader()
         self._init_dump_executor()
@@ -408,10 +473,14 @@ class PPOTrainer(ABC):
         logger.info("all initialize finished, ready to fit")
 
     def get_llm_client(self) -> LLMServerClient:
+        # [FUNCTION DOC]
+        # Behavior: returns the LLM server manager's client.
         """Get the LLM server client for rollout generation."""
         return self.llm_server_manager.get_client()
 
     def get_teacher_client(self) -> Optional[dict[str, LLMServerClient]]:
+        # [FUNCTION DOC]
+        # Behavior: returns the teacher manager's clients when a teacher is used, else None.
         """Get the On-Policy Distillation teacher server clients.
 
         Returns:
@@ -420,10 +489,24 @@ class PPOTrainer(ABC):
         return self.teacher_model_manager.get_client() if self.use_teacher_policy else None
 
     def get_reward_handles(self) -> list[ray.actor.ActorHandle]:
+        # [FUNCTION DOC]
+        # Behavior: returns the reward loop manager's worker handles (None when rewards are colocated).
         """Get the handles of reward loop workers."""
         return self.reward_loop_manager.reward_loop_worker_handles
 
     def fit(self, agent_loop_manager: AgentLoopManager):
+        # [FUNCTION DOC]
+        # Behavior: stores the agent loop manager; initializes SkipManager and the tracking, validation
+        # generation and DAPO reward-table loggers. Optionally validates before training (returning
+        # after shutdown when val_only). Computes the current epoch, advances global_steps to the next
+        # step, reissues in-flight prompts restored from a checkpoint, initializes profiling flags and
+        # calls on_train_begin. Loop while epochs and steps remain: run step() inside the "step" timer
+        # with profiling; save a checkpoint per save_freq or on the last step; on_step_end and sync
+        # metrics; validate per test_freq or last step; compute metrics; optionally dump rollout data;
+        # clear the batch's keys from TQ; pop the DAPO reward-count diagnostic and log it separately;
+        # log metrics; advance step and epoch; on the last step shut down dumps and return. Calls
+        # on_train_end and shuts down dumps when the loop exits otherwise.
+        # Side effects: whole training run.
         """Fit the trainer with the agent loop manager.
 
         Args:
@@ -545,6 +628,13 @@ class PPOTrainer(ABC):
         self._shutdown_dump_executor()
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # Behavior: asserts train_batch_size is divisible by parameter_sync_step; sample size =
+        # train_batch_size / parameter_sync_step. Runs prepare_step (metrics added to the aggregator),
+        # then parameter_sync_step local updates via _step_once, aggregating each update's metrics
+        # weighted by its non-padding sample count, and concatenating keys/tags.
+        # Outputs: combined KVBatchMeta of all local batches. Side effects: updates metrics,
+        # local_trigger_step.
         train_batch_size = self.config.data.train_batch_size
         assert train_batch_size % self.parameter_sync_step == 0, (
             f"train_batch_size ({train_batch_size}) must be divisible by "
@@ -574,6 +664,12 @@ class PPOTrainer(ABC):
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # Behavior: samples a batch from the replay buffer (gen timer, sample hooks, off-policy metrics,
+        # temperature recorded in extra_info); computes colocated reward when there are no streaming
+        # reward workers; balances; computes old log-probs, reference log-probs (if used), values (if
+        # used), advantages, critic update (if used) and actor update once critic warmup has passed.
+        # Outputs: the KVBatchMeta after the pipeline.
         """Run a single local update: sample one mini-batch and perform the full PPO pipeline once."""
         # 1. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
@@ -628,14 +724,25 @@ class PPOTrainer(ABC):
     # ------------------------------ abstract methods ------------------------------
 
     def on_init_end(self):
+        # [FUNCTION DOC]
+        # Hook called after initialization; default no-op.
         """Called after the initialization ends."""
         return
 
     def on_train_begin(self):
+        # [FUNCTION DOC]
+        # Hook called before the training loop starts; default no-op.
         """Called before the training loop starts."""
         return
 
     def _add_async_warmup_batches(self, num_warmup_batches: int | float) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: no-op when rollout TQ skipping is enabled or the count is <= 0. Target
+        # prompts = floor(num_warmup_batches * train_batch_size / gen_batch_size) * gen_batch_size;
+        # submits only the prompts missing beyond those restored from a TQ checkpoint, logging either
+        # the skip or the number added.
+        # Inputs: num_warmup_batches - possibly fractional batch count.
+        # Side effects: dataloader fetches and rollout submissions.
         """Fill the async prefetch window without duplicating checkpointed prompt groups.
 
         Fractional values are supported: e.g. 1.5 with train_batch_size=64 adds
@@ -665,27 +772,40 @@ class PPOTrainer(ABC):
         )
 
     def on_train_end(self):
+        # [FUNCTION DOC]
+        # Hook called after the training loop ends; default no-op.
         """Called after the training loop ends."""
         return
 
     def on_validate_begin(self):
+        # [FUNCTION DOC]
+        # Hook called before validation; default no-op.
         """Called before the validation loop starts."""
         return
 
     def on_validate_end(self):
+        # [FUNCTION DOC]
+        # Hook called after validation; default no-op.
         """Called after the validation loop ends."""
         return
 
     def on_step_begin(self):
+        # [FUNCTION DOC]
+        # Hook called at the start of each training step; default no-op.
         """Called at the beginning of each training step."""
         return
 
     @abstractmethod
     def on_step_end(self):
+        # [FUNCTION DOC]
+        # Abstract hook called at the end of each training step (e.g. weight sync); subclasses must
+        # implement it and may stash weight-sync metrics in _pending_sync_metrics.
         """Called at the end of each training step."""
         return
 
     def _consume_sync_metrics(self) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Returns and resets the weight-sync metrics stashed by on_step_end (empty dict if none).
         """Weight-sync stats stashed by ``on_step_end`` (e.g. the delta engines'
         changed ratio / wire payload), merged into this step's logged metrics."""
         metrics = getattr(self, "_pending_sync_metrics", None) or {}
@@ -693,17 +813,23 @@ class PPOTrainer(ABC):
         return metrics
 
     def on_sample_begin(self):
+        # [FUNCTION DOC]
+        # Hook called before sampling from the replay buffer; default no-op.
         """Called at the beginning of sampling batch from replay buffer."""
         return
 
     @abstractmethod
     def on_sample_end(self):
+        # [FUNCTION DOC]
+        # Abstract hook called after sampling a batch from the replay buffer; subclasses must implement.
         """Called after sampling a batch from replay buffer."""
         return
 
     # ------------------------------ common methods ------------------------------
 
     def _get_n_gpus_for_throughput(self) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Returns the trainer-side GPU count from the resource pool manager; overridable.
         """Return the total number of GPUs used for throughput normalization.
 
         By default this is the trainer-side GPU count from the resource pool
@@ -713,6 +839,9 @@ class PPOTrainer(ABC):
         return self.resource_pool_manager.get_n_gpus()
 
     def _init_tokenizer(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds the HF model config dataclass and stores its tokenizer and processor (processor
+        # may be None for text-only models).
         """Initialize tokenizer and processor from the model config."""
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.actor_rollout_ref.model)
         self.tokenizer = model_config.tokenizer
@@ -720,6 +849,16 @@ class PPOTrainer(ABC):
         self.processor = model_config.processor
 
     def _init_dataloader(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: creates train/val datasets. Forces data.gen_batch_size to 1 (warning if the
+        # user set another value) whenever exact refill counts are needed: async modes, DAPO, or sync
+        # failed-group refill. Builds a stateful train dataloader (batch size gen_batch_size or
+        # train_batch_size, drop_last, configured sampler) with a lazily created iterator, and the val
+        # dataloader (val_batch_size or whole dataset). steps_per_epoch = dataset size //
+        # train_batch_size; total_training_steps from epochs or the explicit override. Writes
+        # total_training_steps * parameter_sync_step into actor/critic optimizer configs (warning on
+        # failure) since the LR scheduler steps once per local update.
+        # Side effects: mutates config; sets dataset/dataloader/step attributes.
         """Initialize train and validate dataloader."""
         self.train_dataset = create_rl_dataset(
             self.config.data.train_files,
@@ -800,6 +939,16 @@ class PPOTrainer(ABC):
             logger.warning(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _init_resource_pool_mgr(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: builds the role -> Ray worker class and role -> pool name mappings. Actor
+        # role is Actor when hybrid replicas are disabled, else ActorRolloutRef when a separate reference
+        # is needed (not ref_in_actor), else ActorRollout; all use ActorRolloutRefWorker on
+        # "global_pool". A plain Actor with separate reference also maps RefPolicy. Critic uses
+        # TrainingWorker. Pools: global_pool = n_gpus_per_node per node times nnodes; reward_pool when
+        # the reward model has its own pool (positive sizes required), otherwise the reward model config
+        # sizes are overwritten with the trainer's and it maps to global_pool; teacher_pool when
+        # distillation is enabled (positive sizes required). Creates the ResourcePoolManager.
+        # Exceptions: ValueError for non-positive pool sizes. Side effects: mutates reward config.
         config = self.config
         # role => worker class
         self.role_worker_mapping = {}
@@ -862,6 +1011,16 @@ class PPOTrainer(ABC):
         self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
 
     def _load_checkpoint(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: sets global_steps to 0. Mode disable -> return; auto -> latest global_step
+        # folder under default_local_dir (absolute), returning when none; resume_path -> validated
+        # explicit path. Sets global_steps from the folder name, loads actor and optional critic
+        # checkpoints, restores dataloader state from data.pt when present (warning otherwise), and in
+        # async modes with TQ checkpoint support loads the TQ snapshot from <folder>/transfer_queue and
+        # records how many prompt groups were restored.
+        # Exceptions: AssertionError for an invalid resume path.
+        # KNOWN ISSUE: an unknown resume_mode is only logged; execution continues and fails with an
+        # undefined global_step_folder (NameError) instead of a clear error.
         self.global_steps = 0
 
         # 1. find latest checkpoint folder
@@ -922,6 +1081,13 @@ class PPOTrainer(ABC):
                 logger.info(f"Restored {self._restored_tq_prompt_count} training prompt groups from TransferQueue")
 
     def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: async modes with TQ checkpoint support only. Lists the partition, collects
+        # prompt uids whose status is pending or running, fetches their persisted prompt data, clears any
+        # partial trajectories for them, stamps the current global step into the batch, re-tags them as
+        # pending at the current step, and resubmits them to the agent loop manager.
+        # Inputs: partition_id. Outputs: number of re-issued prompts (0 when none/unsupported).
+        # Side effects: TQ reads/writes/deletes; rollout submission.
         """Restart checkpointed pending/running prompt groups from their persisted prompt data."""
         if self.trainer_mode == "sync" or not _tq_supports_checkpoint():
             return 0
@@ -960,6 +1126,14 @@ class PPOTrainer(ABC):
         return len(inflight_uids)
 
     def _save_checkpoint(self):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: like the legacy trainer: max-to-keep resolution (deprecated
+        # remove_previous_ckpt_in_save forces 1), saves actor and optional critic (with optional HDFS
+        # remote paths) and dataloader state data.pt under <default_local_dir>/global_step_<N>; in async
+        # modes with support, saves a TQ snapshot with global_steps metadata. If actor checkpoint
+        # async_save is set, skips the latest-iteration tracker and notifies the checkpoint callback with
+        # async_save true; otherwise writes latest_checkpointed_iteration.txt and notifies the callback.
+        # Side effects: filesystem writes; remote calls; callback.
         """Save actor, critic, and dataloader checkpoints to local (and optionally remote) storage."""
         from verl.utils.fs import local_mkdir_safe
 
@@ -1044,6 +1218,21 @@ class PPOTrainer(ABC):
         )
 
     def _validate(self) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Behavior: for each validation batch: assigns fresh uids, records expected session counts per
+        # (data_source, uid) from per-sample __rollout_n__ or val_kwargs.n, converts to a TensorDict
+        # with global_steps and validate markers, registers each prompt in TQ partition "val" as pending,
+        # submits to the agent loop manager, and samples all its groups back from the replay buffer.
+        # With colocated rewards, sleeps replicas, computes rewards, and resyncs weights. For multi-output
+        # sessions keeps only the highest output index per "<uid>_<session>" as the metrics sample.
+        # Decodes all prompts/responses (padded with pad id), fetches uid, rm_scores, num_turns,
+        # reward_model, data_source and extra_fields for final keys, accumulating uids, texts, summed
+        # scores, turns, rewards, reward extra info (aligned with None for missing keys), ground truths
+        # and data sources. Clears the batch from TQ. Afterwards logs sample generations and, when
+        # validation_data_dir is set, dumps all outputs sorted by (uid, session, index) with per-session
+        # final scores/gts/extra info plus uid keys. Returns validation metrics using expected counts
+        # (failed sessions count as acc 0).
+        # Outputs: metrics dict. Side effects: TQ, rollout, logging, file dumps.
         # Lists to collect samples for the table
         sample_uids = []
         sample_inputs = []
@@ -1218,6 +1407,10 @@ class PPOTrainer(ABC):
         )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: no-op when trainer.log_val_generations is 0; otherwise sorts (input,
+        # output, score) triples by input, shuffles with a fixed seed 42, keeps the first N and logs them
+        # via the validation generations logger at the current step.
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
         generations_to_log = self.config.trainer.log_val_generations
         if generations_to_log == 0:
@@ -1239,6 +1432,11 @@ class PPOTrainer(ABC):
 
     @staticmethod
     def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: creates dump_path and writes "<global_steps>.jsonl", one JSON object per
+        # sample with input, output, gts, score, step and every extra info list whose length equals the
+        # sample count; numpy scalars/arrays are converted to native values.
+        # Exceptions: TypeError for values that cannot be serialized. Side effects: file write, print.
         """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{global_steps}.jsonl")
@@ -1257,6 +1455,9 @@ class PPOTrainer(ABC):
                 base_data[k] = v
 
         def json_encode_default(obj):
+            # [FUNCTION DOC]
+            # HELPER: JSON fallback encoder: numpy integer/float/bool to native int/float/bool, objects with
+            # a tolist method to lists; anything else raises TypeError.
             if isinstance(obj, np.integer):
                 return int(obj)
             elif isinstance(obj, np.floating):
@@ -1275,6 +1476,9 @@ class PPOTrainer(ABC):
         print(f"Dumped generations to {filename}")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: submits a background write for the current global step, then drops completed
+        # futures after re-raising any failure among them.
         """Dump rollout/validation samples as JSONL asynchronously."""
         global_steps = self.global_steps
         future = self._dump_executor.submit(
@@ -1298,11 +1502,15 @@ class PPOTrainer(ABC):
         self._dump_futures = still_pending
 
     def _init_dump_executor(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates a single-thread executor and an empty pending-futures list.
         """Create or recreate the dump executor and futures list."""
         self._dump_executor = ThreadPoolExecutor(max_workers=1)
         self._dump_futures = []
 
     def _shutdown_dump_executor(self):
+        # [FUNCTION DOC]
+        # HELPER: Waits for all pending dumps (re-raising errors), clears them, shuts the executor down.
         """Drain pending dump futures and shut down the executor."""
         for f in self._dump_futures:
             f.result()
@@ -1310,6 +1518,12 @@ class PPOTrainer(ABC):
         self._dump_executor.shutdown(wait=True)
 
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: inside the "dump_rollout_generations" timer, fetches uid, prompts, responses,
+        # rm_scores and reward_model for the batch from TQ, pads and decodes texts, sums scores, extracts
+        # ground truths, sorts all samples by (uid, session index, output index) parsed from keys, and
+        # dumps them asynchronously with the trajectory keys as "uid".
+        # Side effects: TQ read, timing entry, background file write.
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
@@ -1362,6 +1576,12 @@ class PPOTrainer(ABC):
         sample_turns,
         expected_acc_counts: dict[tuple[str, str], int] | None = None,
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: processes validation metrics (with expected acc counts) and names each metric
+        # val-core/<source>/<var>/<metric> when var is the core variable ("acc" if present else
+        # "reward"), the metric name starts with mean/maj/best and uses the largest sample count N;
+        # otherwise val-aux/.... Adds val-aux/num_turns/min/max/mean when turn counts exist.
+        # Outputs: flat metrics dict.
         data_src2var2metric2val = process_validation_metrics(
             data_sources,
             sample_uids,
@@ -1394,6 +1614,9 @@ class PPOTrainer(ABC):
         return metric_dict
 
     def _rollout_server_managers(self) -> list:
+        # [FUNCTION DOC]
+        # HELPER: Returns the LLM server managers whose engines participate in rollout profiling (the
+        # hybrid manager when present). Subclasses extend the list.
         """LLM server managers whose inference engines take part in rollout profiling.
 
         Subclasses owning additional replicas (e.g. the standalone rollout of separate-async
@@ -1403,16 +1626,26 @@ class PPOTrainer(ABC):
         return [manager for manager in managers if manager is not None]
 
     def _start_rollout_profiling(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Starts profiling on every rollout server manager.
         """Start rollout profiling."""
         for manager in self._rollout_server_managers():
             manager.start_profile()
 
     def _stop_rollout_profiling(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Stops profiling on every rollout server manager.
         """Stop rollout profiling."""
         for manager in self._rollout_server_managers():
             manager.stop_profile()
 
     def _start_profiling(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: decides whether to start profiling this step (in continuous mode only at the
+        # first step of a consecutive profiled run, else whenever the current step is profiled); starts
+        # it on each distinct trainer worker group (actor-rollout with role "train", then reference and
+        # critic only if not aliases) and on rollout servers.
+        # Side effects: remote profiler start.
         """Start profiling for all worker groups if profiling is enabled."""
         do_profile = (
             not self.prev_step_profile and self.curr_step_profile
@@ -1442,6 +1675,14 @@ class PPOTrainer(ABC):
             self._start_rollout_profiling()
 
     def _stop_profiling(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: computes whether the next step is profiled, decides whether to stop now (in
+        # continuous mode only at the end of a consecutive profiled run), shifts prev/curr profile
+        # flags, and if stopping, stops each distinct worker group with run_command true only on the
+        # last profiled step (max configured step) or the final training step.
+        # Note: rollout server profiling is not stopped here; subclasses call _stop_rollout_profiling
+        # at the point where generation for the step has finished.
+        # Side effects: remote profiler stop; mutates profiling flags.
         """Stop profiling for all worker groups if profiling is enabled."""
         this_step_profile = self.curr_step_profile
         self.next_step_profile = (
@@ -1479,6 +1720,12 @@ class PPOTrainer(ABC):
                 self.critic_wg.stop_profile(run_command=run_command)
 
     def _fetch_one_gen_batch(self) -> TensorDict:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: lazily creates the dataloader iterator and fetches the next batch, restarting
+        # the iterator when an epoch is exhausted; assigns fresh uuid strings per row (based on
+        # raw_prompt length) and converts to a TensorDict.
+        # Outputs: TensorDict of gen_batch_size prompts.
+        # Exceptions: StopIteration if the dataloader is empty.
         """Fetch one ``gen_batch_size`` chunk from the dataloader."""
         try:
             if self.train_dataloader_it is None:
@@ -1492,6 +1739,11 @@ class PPOTrainer(ABC):
         return tu.get_tensordict(batch_dict)
 
     def _next_train_batch(self, num_prompts: int | None = None) -> TensorDict:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: num_prompts defaults to train_batch_size; must be a positive multiple of
+        # gen_batch_size. Fetches the needed number of chunks, concatenates them when more than one,
+        # and stamps the current global step.
+        # Outputs: TensorDict. Exceptions: ValueError for invalid counts.
         """Fetch and coalesce the requested number of prompts."""
         train_batch_size = self.config.data.train_batch_size
         if num_prompts is None:
@@ -1509,6 +1761,11 @@ class PPOTrainer(ABC):
         return batch
 
     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: registers each prompt uid in TQ partition "train" tagged pending with the
+        # current global step; in async modes also stores the prompt's non-NonTensorData fields for
+        # checkpoint recovery. Then submits the batch to the agent loop manager.
+        # Outputs: number of prompts submitted. Side effects: TQ writes, rollout submission.
         """Register prompts in TransferQueue and dispatch them for generation."""
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
         if self.trainer_mode != "sync":
@@ -1527,21 +1784,38 @@ class PPOTrainer(ABC):
         return len(batch)
 
     def _add_prompts_to_generate(self, num_prompts: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Fetches exactly num_prompts prompts and submits them. Used as the replay buffer's
+        # refill function. Outputs: number submitted.
         """Add an exact number of prompts to the AgentLoopManager."""
         batch = self._next_train_batch(num_prompts)
         return self._submit_batch_to_rollout(batch)
 
     @SkipManager.annotate_tq(role="rollout_tq", phase="submit")
     def _add_batch_to_generate(self):
+        # [FUNCTION DOC]
+        # HELPER: Fetches and submits one full training batch (train_batch_size prompts); wrapped by
+        # SkipManager so rollout submission can be skipped/replayed.
         """Add one training batch to the AgentLoopManager."""
         batch = self._next_train_batch()
         self._submit_batch_to_rollout(batch)
 
     def prepare_step(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: default per-step preparation: submit one training batch to rollout; returns empty
+        # metrics. Subclasses override (e.g. async prefetching). Outputs: metrics dict.
         self._add_batch_to_generate()
         return {}
 
     def _compute_reward_colocate(self, batch: KVBatchMeta, metrics: dict | None = None) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: fetches prompts, responses and raw_prompt from TQ, derives per-sample lengths
+        # from the jagged offsets, pads both, rebuilds a right-padded attention mask over
+        # [prompts | responses], wraps them with raw prompts into a DataProto, runs the reward model, and
+        # writes rm_scores (trimmed back to each response length as a jagged tensor) and any reward
+        # extra keys back to TQ.
+        # Inputs: batch; metrics - accepted but unused. Outputs: the same KVBatchMeta.
+        # Exceptions: AssertionError without a reward loop manager. Side effects: TQ read/write.
         """Compute the reward score with a colocated reward model."""
         assert self.reward_loop_manager is not None, "RewardLoopManager is None"
 
@@ -1597,11 +1871,18 @@ class PPOTrainer(ABC):
 
     @staticmethod
     def _lengths_to_mask(lengths: torch.Tensor, width: int) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Returns an int64 mask [rows, width] with ones in the first lengths[i] columns of row i.
         """Build a right-padded mask of shape (len(lengths), width) from per-row valid lengths."""
         positions = torch.arange(width, device=lengths.device).unsqueeze(0)
         return (positions < lengths.unsqueeze(1)).to(torch.int64)
 
     def _get_required_batch_multiple(self, dp_size: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: starts from dp_size; takes the lcm with the critic global mini batch
+        # (critic ppo_mini_batch_size * rollout.n) when a critic is used, and with the actor global mini
+        # batch when the actor will be updated this step (critic warmup passed).
+        # Outputs: int multiple the batch size must satisfy.
         """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
         required_multiple = dp_size
 
@@ -1621,6 +1902,12 @@ class PPOTrainer(ABC):
         return required_multiple
 
     def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: gets (and caches) the actor DP size, pads the batch with synthetic samples to
+        # the required multiple, computes workloads from tag seq_len, computes equal-size balanced
+        # partitions, reorders batch keys/tags by partition, and records balance stats.
+        # Inputs: batch; metrics - dict to update; logging_prefix; keep_minibatch - accepted but unused.
+        # Outputs: the (possibly enlarged, reordered) KVBatchMeta. Side effects: TQ writes for padding.
         """Reorder the data on single controller such that each dp rank gets similar total tokens."""
         # get actor dp size
         role, worker_group = "actor", self.actor_rollout_wg
@@ -1647,6 +1934,16 @@ class PPOTrainer(ABC):
         return batch
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: bypass mode (rollout_correction.bypass_mode): copies rollout_log_probs to
+        # old_log_probs in TQ and returns. Otherwise sets extra_info (entropy on, no loss, rollout
+        # temperature), runs actor log-prob computation (workers write log_probs/entropy to TQ), asserts
+        # the output size, fetches entropy, log_probs, response_mask (and responses, rollout_log_probs
+        # when rollout logprobs are computed), converts log_probs/entropy to response-aligned nested
+        # tensors, writes old_log_probs and entropy back to TQ, then computes the aggregated
+        # actor/entropy metric and, when rollout logprobs exist, rollout-vs-actor debug metrics.
+        # Outputs: KVBatchMeta returned by the TQ put (non-bypass) or the input batch (bypass).
+        # Side effects: remote compute, TQ read/write, metrics updates.
         """Compute the old log prob of the batch."""
         # Operating Mode Selection:
         # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1708,6 +2005,12 @@ class PPOTrainer(ABC):
         return batch
 
     def _compute_ref_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: sets extra_info (no entropy, no loss, temperature, and no_lora_adapter when
+        # ref_in_actor); computes reference log-probs via the actor group (adapter disabled) or the
+        # reference group; asserts output size; fetches log_probs and response_mask, converts to
+        # response-aligned nested form and writes "ref_log_prob" to TQ.
+        # Outputs: the input batch. Side effects: remote compute, TQ read/write.
         """Compute the reference log prob of the batch."""
         # 1. compute log probs
         metadata = {
@@ -1734,6 +2037,11 @@ class PPOTrainer(ABC):
         return batch
 
     def _compute_values(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: sets extra_info (no loss, temperature), runs critic inference and waits on
+        # its futures, fetches values and response_mask, converts values to response-aligned nested form
+        # and writes them back to TQ.
+        # Outputs: the input batch. Side effects: remote compute, TQ read/write.
         """Compute the values of the batch."""
         # 1. compute value
         batch.extra_info.update(
@@ -1756,6 +2064,15 @@ class PPOTrainer(ABC):
         return batch
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: fetches uid, response_mask, rm_scores, rollout_log_probs, old_log_probs,
+        # ref_log_prob and values, pads into a DataProto with token_level_scores = rm_scores and uids as
+        # an object array. Applies the in-reward KL penalty (or copies scores to rewards), rollout
+        # correction in decoupled mode when rollout log-probs exist, then multi-trajectory advantage
+        # computation using the trajectory keys. Writes advantages and returns (plus
+        # token_level_rewards with KL-in-reward, plus response_mask and rollout_is_weights with rollout
+        # correction) back to TQ as nested tensors aligned to the original response mask.
+        # Outputs: KVBatchMeta from the TQ put. Side effects: TQ read/write; KL controller update.
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
@@ -1817,6 +2134,11 @@ class PPOTrainer(ABC):
         return batch
 
     def _update_critic(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: sets extra_info for critic training (global and mini batch size =
+        # critic.ppo_mini_batch_size * rollout.n, epochs, seed, shuffle, temperature), trains, waits for
+        # the result, prefixes metrics with "critic/", renames critic/mfu to perf/mfu/critic, reduces
+        # and merges them. Outputs: the input batch.
         """Update the critic network."""
         ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
@@ -1840,6 +2162,12 @@ class PPOTrainer(ABC):
         return batch
 
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: sets extra_info for actor training: entropy calculation (calculate_entropy or
+        # nonzero entropy_coeff), distillation top-k and distillation-only flags (top-k without task
+        # rewards or policy gradient), global/mini batch size = actor ppo_mini_batch_size * rollout.n,
+        # epochs, seed, shuffle, temperature. Calls update_actor, prefixes metrics "actor/", renames
+        # actor/mfu to perf/mfu/actor, reduces and merges. Outputs: the input batch.
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
@@ -1881,6 +2209,24 @@ class PPOTrainer(ABC):
         return batch
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
+        # [FUNCTION DOC]
+        # HELPER: Behavior: builds a non-padding mask from tags; fetches prompts, responses,
+        # response_mask, values, advantages, returns, rm_scores, token_level_rewards, num_turns (plus
+        # routed_experts when MoE load-balance metrics are due); derives prompt/response lengths from
+        # jagged offsets and global_token_num; reads min/max_global_steps of non-padding tags. When MTP
+        # rollout is enabled, fetches extra_fields and extracts per-request spec-decode stats only if all
+        # samples report them. Pads into a DataProto (scores = rm_scores; rewards default to scores;
+        # length tensors), selects non-padding rows (all rows if every row is padding) and attaches
+        # __num_turns__. Adds training/global_step and epoch, MoE load-balance, data, timing,
+        # throughput (GPU count from _get_n_gpus_for_throughput), variance proxy, training/num_turns
+        # stats, spec-decode stats (non-padding only), and off-policy stats: trajectory span (max - min
+        # + 1), staleness lower bound (global_steps - 1 - max) and worst case (global_steps - 1 - min),
+        # each mean/max/min.
+        # Inputs: batch; metrics - dict to update; timing_raw; global_steps; epoch. Outputs: none.
+        # Side effects: TQ reads; MoE accumulator updates.
+        # KNOWN ISSUE: tags min_global_steps/max_global_steps come from extra_fields and may be None,
+        # which makes the integer array conversion fail; and if every sample were padding the
+        # off-policy arrays would be empty and max/min would raise.
         # 1. collect necessary fields from TransferQueue for computing metrics
         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
         fields = [
@@ -2012,9 +2358,18 @@ TRAINER_REGISTRY: dict[str, type[PPOTrainer]] = {}
 
 
 def register_trainer(name: str):
+    # [FUNCTION DOC]
+    # Behavior: returns a class decorator that registers a PPOTrainer subclass under name
+    # (re-registering the same class is allowed).
+    # Inputs: name - registry key. Outputs: decorator returning the class unchanged.
     """Class decorator that registers a :class:`PPOTrainer` subclass under ``name``."""
 
     def decorator(cls: type[PPOTrainer]) -> type[PPOTrainer]:
+        # [FUNCTION DOC]
+        # HELPER: Behavior: validates cls is a PPOTrainer subclass, rejects a name already bound to a
+        # different class, stores it in TRAINER_REGISTRY.
+        # Exceptions: TypeError for non-subclasses; ValueError for conflicting names.
+        # Side effects: mutates the global registry.
         if not (isinstance(cls, type) and issubclass(cls, PPOTrainer)):
             raise TypeError(f"register_trainer expected a PPOTrainer subclass, got {cls!r}")
         existing = TRAINER_REGISTRY.get(name)
@@ -2030,6 +2385,9 @@ def register_trainer(name: str):
 
 
 def get_trainer_cls(name: str) -> type[PPOTrainer]:
+    # [FUNCTION DOC]
+    # Behavior: looks up a registered trainer class by name.
+    # Outputs: the class. Exceptions: ValueError listing available names when unknown.
     """Return the :class:`PPOTrainer` subclass registered under ``name``."""
     try:
         return TRAINER_REGISTRY[name]

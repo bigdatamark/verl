@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Simple console / rank-aware logging helpers used by trainers and workers: a console metrics
+# logger (LocalLogger), a base class for rank-filtered logging decorators, and free functions that
+# print or log with rank prefixes and optional timestamps.
+
 """
 A Ray logger will receive logging info from different processes.
 """
@@ -24,6 +30,12 @@ import torch
 
 
 def concat_dict_to_str(dict: dict, step):
+    # [FUNCTION DOC]
+    # HELPER: Formats a metrics mapping as one line.
+    # Behavior: starts with "step:<step>", appends "key:value" (value pretty-formatted) for each entry
+    # whose value is a numbers.Number (non-numeric entries skipped), joins with " - ".
+    # Inputs: dict - metric name to value; step - step label.
+    # Outputs: the joined string. Exceptions/side effects: none.
     output = [f"step:{step}"]
     for k, v in dict.items():
         if isinstance(v, numbers.Number):
@@ -33,6 +45,8 @@ def concat_dict_to_str(dict: dict, step):
 
 
 class LocalLogger:
+    # [CLASS DOC]
+    # Console tracking backend with the flush/log interface of other trackers.
     """
     A local logger that logs messages to the console.
 
@@ -41,17 +55,26 @@ class LocalLogger:
     """
 
     def __init__(self, print_to_console=True):
+        # [FUNCTION DOC]
+        # Inputs: print_to_console - whether log() prints. Side effects: stores the flag.
         self.print_to_console = print_to_console
 
     def flush(self):
+        # [FUNCTION DOC]
+        # No-op, provided for interface compatibility.
         pass
 
     def log(self, data, step):
+        # [FUNCTION DOC]
+        # Behavior: if printing enabled, prints concat_dict_to_str(data, step) with flush.
+        # Inputs: data - metric mapping; step - step. Outputs: none. Side effects: stdout.
         if self.print_to_console:
             print(concat_dict_to_str(data, step=step), flush=True)
 
 
 class DecoratorLoggerBase:
+    # [CLASS DOC]
+    # Base for logging decorators; holds role/logger/level/rank settings and picks a logging function.
     """
     Base class for all decorators that log messages.
 
@@ -66,6 +89,10 @@ class DecoratorLoggerBase:
     def __init__(
         self, role: str, logger: logging.Logger = None, level=logging.DEBUG, rank: int = 0, log_only_rank_0: bool = True
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores role, logger, level, rank, log_only_rank_0; sets logging_function to
+        # log_by_logging, or to log_by_print when logger is None.
+        # Inputs: see class docstring. Outputs: none. Side effects: attribute assignment.
         self.role = role
         self.logger = logger
         self.level = level
@@ -76,10 +103,16 @@ class DecoratorLoggerBase:
             self.logging_function = self.log_by_print
 
     def log_by_print(self, log_str):
+        # [FUNCTION DOC]
+        # Behavior: prints "<role> <log_str>" (flushed) unless log_only_rank_0 is set and rank != 0.
+        # Inputs: log_str. Side effects: stdout.
         if not self.log_only_rank_0 or self.rank == 0:
             print(f"{self.role} {log_str}", flush=True)
 
     def log_by_logging(self, log_str):
+        # [FUNCTION DOC]
+        # Behavior: logs "<role> <log_str>" at the configured level via the logger, with the same rank filter.
+        # Inputs: log_str. Exceptions: ValueError if no logger is set. Side effects: logging output.
         if self.logger is None:
             raise ValueError("Logger is not initialized")
         if not self.log_only_rank_0 or self.rank == 0:
@@ -87,6 +120,9 @@ class DecoratorLoggerBase:
 
 
 def print_rank_0(message):
+    # [FUNCTION DOC]
+    # Behavior: prints (flushed) only on global rank 0 when torch.distributed is initialized,
+    # otherwise always prints. Inputs: message. Outputs: none. Side effects: stdout.
     """If distributed is initialized, print only on rank 0."""
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
@@ -96,6 +132,9 @@ def print_rank_0(message):
 
 
 def print_with_rank(message: str, rank: int = 0, log_only_rank_0: bool = False):
+    # [FUNCTION DOC]
+    # Behavior: prints "[Rank <rank>] <message>" unless log_only_rank_0 is True and rank != 0.
+    # Inputs: message, rank, log_only_rank_0. Outputs: none. Side effects: stdout.
     """_summary_
     Print a message with rank information.
     This function prints the message only if `log_only_rank_0` is False or if the rank is 0.
@@ -110,6 +149,9 @@ def print_with_rank(message: str, rank: int = 0, log_only_rank_0: bool = False):
 
 
 def print_with_rank_and_timer(message: str, rank: int = 0, log_only_rank_0: bool = False):
+    # [FUNCTION DOC]
+    # Behavior: same as print_with_rank but prefixes the current local time as
+    # "[YYYY-MM-DD HH:MM:SS]". Inputs/Outputs/Side effects: as print_with_rank.
     """_summary_
     Print a message with rank information and a timestamp.
     This function prints the message only if `log_only_rank_0` is False or if the rank is 0.
@@ -126,6 +168,10 @@ def print_with_rank_and_timer(message: str, rank: int = 0, log_only_rank_0: bool
 
 
 def log_with_rank(message: str, rank, logger: logging.Logger, level=logging.INFO, log_only_rank_0: bool = False):
+    # [FUNCTION DOC]
+    # Behavior: logs "[Rank <rank>] <message>" at the given level via logger unless log_only_rank_0
+    # is True and rank != 0. Inputs: message, rank, logger, level, log_only_rank_0.
+    # Outputs: none. Side effects: logging output.
     """_summary_
     Log a message with rank information using a logger.
     This function logs the message only if `log_only_rank_0` is False or if the rank is 0.

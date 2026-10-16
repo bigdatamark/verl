@@ -11,3 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# Megatron-LM helper package (checkpointing, memory, optimizer, pipeline/sequence/tensor
+# parallel utilities and MoE router replay). The package init contains no code.

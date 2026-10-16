@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Core checkpoint-engine abstractions for transferring trainer (actor) weights to rollout replicas: tensor chunk
+# metadata, a backend registry, the abstract engine interface (plus a cached variant), the colocated "naive" engine,
+# the Ray worker that hosts an engine next to an inference server, the driver-side manager orchestrating a sync, and
+# async helpers that split weights into byte chunks and merge them back.
+
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -32,6 +39,10 @@ from verl.workers.rollout.utils import ensure_async_iterator
 
 @dataclass
 class TensorMeta:
+    # [CLASS DOC]
+    # Metadata describing one byte-chunk of a weight tensor in transit: tensor name, full shape and dtype, the chunk's byte
+    # offset and size within the flattened tensor, and the chunk's byte offset within the transport bucket (None when not
+    # yet placed).
     name: str
     """The name of the weight tensor."""
     shape: torch.Size
@@ -47,6 +58,9 @@ class TensorMeta:
 
 
 class CheckpointEngineRegistry:
+    # [CLASS DOC]
+    # Process-global, class-level registry mapping backend name -> engine class, plus a mapping of engine module name ->
+    # ImportError for optional backends that failed to import (used to enrich lookup errors).
     """Checkpoint engine registry."""
 
     _registry: dict[str, type["CheckpointEngine"]] = {}
@@ -58,6 +72,10 @@ class CheckpointEngineRegistry:
     _import_errors: dict[str, ImportError] = {}
 
     def register(backend: str):
+        # [FUNCTION DOC]
+        # Decorator factory (called on the class, not an instance): returns a decorator that stores the decorated class under
+        # backend in the registry (overwriting any previous entry) and returns the class unchanged.
+        # Inputs: backend - name string. Outputs: the decorator.
         """Register a checkpoint engine.
 
         Args:
@@ -65,6 +83,8 @@ class CheckpointEngineRegistry:
         """
 
         def wrapper(cls: type["CheckpointEngine"]):
+            # [FUNCTION DOC]
+            # HELPER: Registers cls under the captured backend name and returns cls.
             CheckpointEngineRegistry._registry[backend] = cls
             return cls
 
@@ -72,6 +92,8 @@ class CheckpointEngineRegistry:
 
     @classmethod
     def record_import_error(cls, module: str, error: ImportError):
+        # [FUNCTION DOC]
+        # Stores the ImportError for the named engine module (overwrites an earlier entry). Side effects: mutates class state.
         """Record an engine module that could not be imported.
 
         Args:
@@ -82,6 +104,10 @@ class CheckpointEngineRegistry:
 
     @classmethod
     def get(cls, backend: str) -> type["CheckpointEngine"]:
+        # [FUNCTION DOC]
+        # Returns the class registered for backend.
+        # Exceptions: ValueError listing the sorted registered backends and, if any were recorded, every failed engine module
+        # with its error, when backend is not registered.
         """Get the checkpoint engine class.
 
         Args:
@@ -100,6 +126,9 @@ class CheckpointEngineRegistry:
 
     @classmethod
     def new(cls, backend: str, *args, **kwargs) -> "CheckpointEngine":
+        # [FUNCTION DOC]
+        # Looks up backend via get and instantiates it with the given positional and keyword arguments. Outputs: the instance.
+        # Exceptions: as get, plus whatever the constructor raises.
         """Create a new checkpoint engine instance.
 
         Args:
@@ -114,6 +143,12 @@ class CheckpointEngineRegistry:
 
 
 class CheckpointEngine(ABC):
+    # [CLASS DOC]
+    # Abstract weight-transfer engine. Lifecycle per sync: prepare (allocate/register buffers, return metadata) on every
+    # worker, build_topology (class-level, from all metadata) to produce per-rank init kwargs, init_process_group, then
+    # send_weights on actor ranks / receive_weights on rollout ranks, and finally finalize.
+    # Class attribute wire_format tells the receiving server adapter how receive_weights yields data: "named_tensors"
+    # (name, tensor) pairs, or "delta_flush" (named_tensors, is_last) flushes.
     """CheckpointEngine is an abstraction to transfer weights from actor to rollout.
 
     In actor process:
@@ -135,6 +170,10 @@ class CheckpointEngine(ABC):
 
     @abstractmethod
     def prepare(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Abstract. Allocates (and optionally registers) the transfer bucket and returns this worker's metadata dict used for
+        # topology building. Exceptions: NotImplementedError in the base.
+        # KNOWN ISSUE: the docstring documents a worker_group argument that the signature does not take.
         """Prepare checkpoint engine before each step send_weights/receive_weights.
 
         1. Allocate weight bucket.
@@ -154,6 +193,10 @@ class CheckpointEngine(ABC):
     def build_topology(
         cls, actor_wg_world_size: int, rollout_world_size: int, metadata: list[dict]
     ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
+        # [FUNCTION DOC]
+        # Abstract class method. From the actor world size, rollout world size and the list of prepare metadata (actor ranks
+        # first, then rollout ranks), returns two dicts (actor kwargs, rollout kwargs) whose values are lists with one entry
+        # per rank of the respective group, later dispatched to init_process_group. Exceptions: NotImplementedError in the base.
         """Build communication topology between all workers.
 
         Args:
@@ -179,6 +222,8 @@ class CheckpointEngine(ABC):
 
     @abstractmethod
     def init_process_group(self, **kwargs):
+        # [FUNCTION DOC]
+        # Abstract. Joins the communication group using one rank's slice of build_topology kwargs.
         """Init process group for checkpoint engine.
 
         Args:
@@ -188,6 +233,8 @@ class CheckpointEngine(ABC):
 
     @abstractmethod
     def finalize(self):
+        # [FUNCTION DOC]
+        # Abstract. Frees (and optionally deregisters) buffers and may destroy the process group after a sync.
         """Finalize checkpoint engine after each step send_weights/receive_weights.
 
         1. Free weight bucket.
@@ -202,6 +249,8 @@ class CheckpointEngine(ABC):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Abstract async. Consumes an iterator of (name, tensor) and transmits them; global_steps optionally tags the version.
         """Send the weights of the model.
 
         Args:
@@ -215,6 +264,8 @@ class CheckpointEngine(ABC):
         self,
         global_steps: int | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # [FUNCTION DOC]
+        # Abstract async generator. Yields received weights in the format given by wire_format; global_steps optionally tags the version.
         """Receive the weights of the model.
 
         Args:
@@ -227,6 +278,9 @@ class CheckpointEngine(ABC):
 
 
 class CheckpointEngineWithCache(CheckpointEngine):
+    # [CLASS DOC]
+    # Abstract engine that additionally keeps received weights in a local cache (shared memory, disk, ...) so rollout can
+    # pull them later without interrupting in-flight requests.
     """Checkpoint engine with local cache: shm, disk, etc. This allow to synchronize weights without interrupting
     rollout ongoing requests (partial rollout). After requests exhausted, rollout can get weights from local cache.
 
@@ -235,6 +289,8 @@ class CheckpointEngineWithCache(CheckpointEngine):
 
     @abstractmethod
     async def get_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # [FUNCTION DOC]
+        # Abstract async generator yielding (name, tensor) from the local cache.
         """Get the weights of the model from local cache.
 
         Yields:
@@ -245,6 +301,9 @@ class CheckpointEngineWithCache(CheckpointEngine):
 
 @CheckpointEngineRegistry.register("naive")
 class ColocatedCheckpointEngine(CheckpointEngine):
+    # [CLASS DOC]
+    # Registered as "naive". For actor and rollout sharing a GPU/process: send_weights merely stores the generator and
+    # receive_weights yields from it. Topology/process-group methods are unsupported. Methods are synchronous.
     """Checkpoint engine for actor and rollout colocated on same GPU.
 
     In actor process:
@@ -256,20 +315,30 @@ class ColocatedCheckpointEngine(CheckpointEngine):
     """
 
     def __init__(self, bucket_size: int, is_master: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Stores bucket_size (bytes) and is_master flag; neither is used by the transfer logic.
         self.bucket_size = bucket_size
         self.is_master = is_master
 
     def prepare(self):
+        # [FUNCTION DOC]
+        # Unsupported; raises NotImplementedError.
         raise NotImplementedError
 
     def init_process_group(self, **kwargs):
+        # [FUNCTION DOC]
+        # Unsupported; raises NotImplementedError.
         raise NotImplementedError
 
     def finalize(self):
+        # [FUNCTION DOC]
+        # Unsupported; raises NotImplementedError.
         raise NotImplementedError
 
     @classmethod
     def build_topology(cls, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Unsupported; raises NotImplementedError.
         raise NotImplementedError
 
     def send_weights(
@@ -277,6 +346,8 @@ class ColocatedCheckpointEngine(CheckpointEngine):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores the weights iterator on the instance (lazy; nothing is consumed). global_steps is ignored.
         """Send the weights of the model.
 
         Args:
@@ -289,6 +360,9 @@ class ColocatedCheckpointEngine(CheckpointEngine):
         self,
         global_steps: int | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # [FUNCTION DOC]
+        # Generator yielding every item from the stored weights iterator, then clears it. global_steps is ignored.
+        # Exceptions: TypeError if send_weights was not called first (stored value missing raises AttributeError, or None after a previous receive).
         """Receive the weights of the model.
 
         Args:
@@ -302,6 +376,9 @@ class ColocatedCheckpointEngine(CheckpointEngine):
 
 
 class CheckpointEngineWorker(Worker):
+    # [CLASS DOC]
+    # Single-controller Worker (made a Ray actor below as _worker_cls) colocated with an inference engine process. Creates
+    # the configured checkpoint engine and a server adapter (rollout class) used to push received weights into the engine.
     """CheckpointEngineWorker colocated with inference engine's WorkerProc on same GPU.
 
     Args:
@@ -318,6 +395,14 @@ class CheckpointEngineWorker(Worker):
         *args,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores configs; validates that backend "delta_sharded" is only used with sglang or vllm rollouts (else
+        # NotImplementedError); computes bucket size as update_weights_bucket_megabytes x 2^20 bytes; imports
+        # custom_backend_module (if set) so plugins can register; instantiates the engine from the registry with the bucket size
+        # and backend-specific engine_kwargs; keeps extra args; if no server_adapter is given, constructs the rollout class for
+        # (rollout name, mode) with those extra args, configs and no device mesh; finally initializes a global CPU gloo process
+        # group via Ray (no timeout).
+        # Exceptions: NotImplementedError as above; ValueError for unknown backends.
         super().__init__()
         self.rollout_config = rollout_config
         self.model_config = model_config
@@ -352,6 +437,9 @@ class CheckpointEngineWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
+        # [FUNCTION DOC]
+        # Ray method dispatched to all ranks, non-blocking. Gets the engine's receive_weights generator and awaits the server
+        # adapter's update_weights with it, the global_steps, and the engine's wire_format (default "named_tensors").
         weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
         await self.server_adapter.update_weights(
             weights,
@@ -361,15 +449,22 @@ class CheckpointEngineWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Ray method with DP_COMPUTE dispatch, non-blocking: calls the named method on the engine with the given arguments and
+        # returns its result (used for prepare / init_process_group / finalize).
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_replica_rank(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the server adapter's replica_rank.
         """Get replica rank from the underlying rollout server adapter."""
         return self.server_adapter.replica_rank
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def is_leader_rank(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns the server adapter's is_leader_rank flag.
         """Get leader rank flag from the underlying rollout server adapter."""
         return self.server_adapter.is_leader_rank
 
@@ -378,6 +473,10 @@ _worker_cls = ray.remote(CheckpointEngineWorker)
 
 
 class CheckpointEngineManager:
+    # [CLASS DOC]
+    # Driver-side coordinator of weight sync between the actor worker group and rollout replicas. Holds the config, backend
+    # name and resolved backend class, the actor worker group, and a mutable replica list. Async methods are wrapped with
+    # auto_await so they can be called from sync or async code.
     """Checkpoint engine manager to coordinate weight synchronization between actor and rollout replicas.
 
     - ME: model engine, FSDP, MCore, VeOmni, export full tensor generator `get_per_tensor_param`
@@ -412,6 +511,9 @@ class CheckpointEngineManager:
         actor_wg: RayWorkerGroup,
         replicas: list[RolloutReplica],
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores config and backend, imports custom_backend_module (if set), resolves the backend class from the registry
+        # (ValueError if unknown), and stores actor_wg and replicas (the list is kept by reference).
         self.config = config
         self.backend = config.backend
         import_external_libs(self.config.custom_backend_module or None)
@@ -420,6 +522,11 @@ class CheckpointEngineManager:
         self.replicas = replicas
 
     def build_process_group(self, rollout: RayWorkerGroup):
+        # [FUNCTION DOC]
+        # Calls prepare on every actor and rollout rank and gathers metadata (actor ranks first); builds topology via the
+        # backend class; asserts every kwargs list matches its group's world size (AssertionError otherwise); adds method
+        # "init_process_group" for every rank and invokes it on all ranks of both groups, waiting for completion.
+        # Inputs: rollout - temporary worker group of all replica workers.
         """Build process group for actor worker group and rollout replicas."""
         actor_wg = self.actor_wg
 
@@ -447,6 +554,8 @@ class CheckpointEngineManager:
         )
 
     def add_replicas(self, replicas: list[RolloutReplica]):
+        # [FUNCTION DOC]
+        # Appends replicas to the managed list (the process group is rebuilt on the next update_weights).
         """Add rollout replicas to the manager for elastic scale up, will rebuild process group.
 
         Args:
@@ -455,6 +564,8 @@ class CheckpointEngineManager:
         self.replicas.extend(replicas)
 
     def remove_replicas(self, replicas: list[RolloutReplica]):
+        # [FUNCTION DOC]
+        # Removes the given replicas (by identity/hash) from the managed list, building a new list.
         """Remove rollout replicas from the manager for elastic scale down, will rebuild process group.
 
         Args:
@@ -465,16 +576,22 @@ class CheckpointEngineManager:
 
     @auto_await
     async def sleep_replicas(self):
+        # [FUNCTION DOC]
+        # Concurrently calls sleep on all replicas (frees weights and KV cache).
         """Sleep all rollout replicas: free weight and kv_cache device memory."""
         await asyncio.gather(*[r.sleep() for r in self.replicas])
 
     @auto_await
     async def wake_up_replicas(self):
+        # [FUNCTION DOC]
+        # Concurrently calls wake_up on all replicas.
         """Resume all rollout replicas: recover kv_cache and weights device memory."""
         await asyncio.gather(*[r.wake_up() for r in self.replicas])
 
     @auto_await
     async def abort_replicas(self, reject_request: bool = False):
+        # [FUNCTION DOC]
+        # Concurrently aborts all in-flight requests on every replica, passing reject_request (default False).
         """Abort all in-flight requests on every replica.
 
         Args:
@@ -485,11 +602,15 @@ class CheckpointEngineManager:
 
     @auto_await
     async def resume_generation_replicas(self):
+        # [FUNCTION DOC]
+        # Concurrently resumes generation on all replicas.
         """Resume generation on all replicas after abort_all_requests."""
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
 
     @auto_await
     async def release_kv_cache_replicas(self):
+        # [FUNCTION DOC]
+        # Concurrently releases only the KV cache on all replicas (weights stay in place).
         """Release kv_cache of all rollout replicas before NCCL weight sync.
 
         Unlike sleep_replicas(), this only frees the kv_cache and leaves model
@@ -500,6 +621,8 @@ class CheckpointEngineManager:
 
     @auto_await
     async def resume_kv_cache_replicas(self):
+        # [FUNCTION DOC]
+        # Concurrently restores the KV cache on all replicas.
         """Restore kv_cache of all rollout replicas after NCCL weight sync.
 
         Counterpart to release_kv_cache_replicas().
@@ -508,6 +631,14 @@ class CheckpointEngineManager:
 
     @auto_await
     async def update_weights(self, global_steps: int = None):
+        # [FUNCTION DOC]
+        # Performs one weight sync. For backend "naive": calls the actor group's update_weights (colocated mode) and returns {}.
+        # Otherwise: abort replicas' requests; build a temporary Ray worker group from all replicas' workers using the
+        # checkpoint-engine worker class; release KV caches; build the process group; run actor update_weights and rollout
+        # update_weights concurrently and wait; merge dict results from the actor ranks into sync metrics; call finalize on
+        # all ranks; resume KV caches; resume generation.
+        # Inputs: global_steps - optional version tag. Outputs: dict of merged sync metrics (later ranks overwrite same keys).
+        # Side effects: extensive remote calls; replica request state is interrupted and resumed.
         """Update weights from actor worker group to rollout replicas.
 
         Args:
@@ -565,6 +696,10 @@ class CheckpointEngineManager:
 async def split_weight_chunks(
     weights: Generator[tuple[str, torch.Tensor], None, None], bucket_size: int, meta_only: bool = False
 ) -> AsyncGenerator[tuple[TensorMeta, torch.Tensor | None], None]:
+    # [FUNCTION DOC]
+    # Async generator splitting each (name, tensor) from a sync or async iterator into byte chunks of at most bucket_size
+    # bytes, yielding (TensorMeta with chunk offset/size and offset None, chunk as a uint8 view or None when meta_only).
+    # Zero-byte tensors yield nothing. The tensor must be viewable as flat (contiguous).
     """Split the weight into chunks.
 
     Args:
@@ -594,6 +729,13 @@ async def split_weight_chunks(
 async def merge_weight_chunks(
     chunks: Generator[tuple[TensorMeta, torch.Tensor], None, None], bucket_size: int
 ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+    # [FUNCTION DOC]
+    # Async generator inverse of split_weight_chunks over an async iterator of (TensorMeta, uint8 chunk). Tensors whose total
+    # byte size fits in bucket_size are yielded immediately as a dtype/shape view of the chunk (no copy). Larger tensors are
+    # assembled into a freshly allocated tensor on the chunk's device, requiring chunks in order starting at offset 0, and
+    # yielded once the last byte arrives.
+    # Exceptions: AssertionError on non-uint8 chunks, interleaved tensors, or out-of-order offsets.
+    # KNOWN ISSUE: annotated as taking a Generator but iterated with async-for, so it requires an async iterable.
     """Merge the weight chunks into the original weight.
 
     Args:

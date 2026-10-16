@@ -29,6 +29,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Autograd wrapper around the fused Triton "linear + cross-entropy" kernels in the sibling
+# kernels module. Computes per-token log-probabilities of the label and the softmax entropy of
+# (hidden @ weight^T) / temperature without materializing the full logits tensor; optionally
+# the vocab dimension is sharded across a process group (tensor-parallel vocab).
+# Exposes linear_cross_entropy, an alias for LinearCrossEntropy.apply.
+
 import typing
 
 import torch
@@ -36,6 +43,9 @@ import torch.distributed as dist
 
 
 class LinearCrossEntropy(torch.autograd.Function):
+    # [CLASS DOC]
+    # torch.autograd.Function whose forward returns (logprobs, entropy) and whose backward returns
+    # gradients for hidden and weight only (labels/temperature/reduction/group get None).
     @staticmethod
     def forward(
         ctx,
@@ -46,6 +56,22 @@ class LinearCrossEntropy(torch.autograd.Function):
         reduction: typing.Optional[str] = "none",
         dist_process_group: typing.Optional[dist.ProcessGroup] = None,
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: asserts temperature is a float and reduction is a str; inside an NVTX range, lazily
+        # imports the kernels module, maps reduction (lower-cased) to the kernel enum number, flattens
+        # hidden to 2-D (tokens, hidden_size) and labels to 1-D if needed, then calls
+        # efficient_entropy_forward(hidden, weight, labels, REDUCTION, temperature, group).
+        # Inputs: ctx - autograd context; hidden - (..., hidden_size); weight - (vocab[/shard], hidden_size);
+        # labels - token ids, any shape flattening to the token count; temperature - float divisor of
+        # logits; reduction - "none"/"sum"/"mean" style string understood by the kernel module;
+        # dist_process_group - optional group across which vocab is split.
+        # Outputs: tuple (logprobs, entropy) as returned by the kernel (flattened / reduced per REDUCTION,
+        # NOT reshaped back to the original hidden shape).
+        # Exceptions: AssertionError on wrong temperature/reduction types; kernel errors propagate.
+        # Side effects: saves hidden, weight, labels and kernel intermediates (max, accumulate, entropy_b)
+        # for backward; stores original hidden shape, reduction enum, group, temperature and
+        # should_return_fp32_grad=False on ctx.
+        # KNOWN ISSUE: the default temperature 1.0 passes, but an int temperature (e.g. 1) fails the assert.
         """_summary_
 
         Args:
@@ -88,6 +114,13 @@ class LinearCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dlogprobs: torch.Tensor, dentropy: torch.Tensor) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: retrieves saved tensors and settings, calls efficient_entropy_backward with the
+        # upstream gradients of logprobs and entropy, and reshapes d_hidden to the original hidden shape.
+        # Inputs: ctx; dlogprobs, dentropy - upstream gradients matching forward outputs.
+        # Outputs: tuple (d_hidden, d_weight, None, None, None, None).
+        # Exceptions: kernel errors propagate.
+        # Side effects: NVTX range only.
         from . import kernels
 
         with torch.cuda.nvtx.range("LinearCrossEntropy-backward"):

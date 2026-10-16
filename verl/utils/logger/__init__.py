@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Logger utilities package. Re-exports from aggregate_logger: LocalLogger, DecoratorLoggerBase,
+# print_rank_0, print_with_rank, print_with_rank_and_timer and log_with_rank.
+
 
 from .aggregate_logger import (
     DecoratorLoggerBase,

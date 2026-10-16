@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Legacy CLI tool converting verl actor checkpoints (FSDP per-rank .pt shards or
+# legacy Megatron mp_rank_* model.pt shards) into a HuggingFace model directory
+# (weights, optional LoRA adapter, processor, tokenizer), optionally uploading to
+# the HF Hub, or testing the merged weights against a reference HF model.
+# Subcommands: merge (--target_dir, --hf_upload_path, --private) and test
+# (--test_hf_dir); shared: --backend fsdp|megatron, --local_dir, deprecated
+# --hf_model_path, --tie-word-embedding, --is-value-model.
+
 """
 This script is used to merge huggingface model and test verl checkpoints from FSDP and Megatron backends.
 
@@ -71,6 +80,10 @@ AutoModelForVision2Seq = get_auto_model_for_vision2seq()
 
 @dataclass
 class ModelMergerConfig:
+    # [CLASS DOC]
+    # Settings for one merge/test run. hf_upload is derived (not an init argument):
+    # true only for merge with a non-empty hf_upload_path. local_dir also serves as
+    # the default HF config path.
     operation: str  # 'merge' or 'test'
     backend: str
     local_dir: str
@@ -85,6 +98,9 @@ class ModelMergerConfig:
     hf_upload: bool = field(init=False)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: computes hf_upload; for operation "test" clears target_dir,
+        # hf_upload_path and private.
         self.hf_upload = self.operation == "merge" and bool(self.hf_upload_path)
         if self.operation == "test":
             self.target_dir = None
@@ -93,7 +109,16 @@ class ModelMergerConfig:
 
 
 class BaseModelMerger(ABC):
+    # [CLASS DOC]
+    # Abstract merger holding config, the resolved HF config path and the loaded
+    # AutoConfig; provides model-class selection, generation-config patching, LoRA
+    # extraction, HF saving and Hub upload. Subclasses implement merge_and_save.
     def __init__(self, config: ModelMergerConfig):
+        # [FUNCTION DOC]
+        # Behavior: stores config; if deprecated hf_model_path is given, prints a
+        # warning and uses it as config path. Then prefers <path>/model/huggingface (v2
+        # Megatron layout), else <path>/huggingface, else the path itself, and loads
+        # AutoConfig from it. Exceptions: HF errors if no config found.
         self.config = config
         self.hf_model_config_path = config.hf_model_config_path
 
@@ -116,6 +141,13 @@ class BaseModelMerger(ABC):
         self.model_config = AutoConfig.from_pretrained(self.hf_model_config_path)
 
     def get_transformers_auto_model_class(self):
+        # [FUNCTION DOC]
+        # Behavior: picks the transformers auto class. If architectures is missing/empty,
+        # infers from model_type: contains "vision"/"vl" -> vision2seq; "causal", "gpt",
+        # "llama", "qwen" -> causal LM. Otherwise by first architecture name:
+        # ForTokenClassification -> token classification, ForCausalLM -> causal LM,
+        # ForConditionalGeneration -> vision2seq.
+        # Exceptions: NotImplementedError when nothing matches.
         # Handle case where architectures might be None or empty
         if self.model_config.architectures is None or len(self.model_config.architectures) == 0:
             # Try to infer from model_type if architectures is missing
@@ -140,6 +172,10 @@ class BaseModelMerger(ABC):
         raise NotImplementedError(f"Unknown architecture {self.model_config.architectures}")
 
     def patch_model_generation_config(self, model):
+        # [FUNCTION DOC]
+        # Behavior: if the model can generate, replaces its generation_config with one
+        # loaded from the HF config path; on OSError prints a warning and keeps the
+        # derived one. Returns the model.
         """
         The generation_config created from model config may be different to the pretrained model,
         this may lead to error when generating: https://github.com/verl-project/verl/issues/1246
@@ -156,6 +192,16 @@ class BaseModelMerger(ABC):
         return model
 
     def save_lora_adapter(self, state_dict: dict[str, torch.Tensor]):
+        # [FUNCTION DOC]
+        # Behavior: if no key contains "lora_", returns None. Otherwise pops all LoRA
+        # entries (renaming ".default.weight" to ".weight"), collects target module names
+        # (third-from-last name component), sets rank as the smaller dimension of the
+        # last LoRA tensor, builds a peft LoraConfig dict (lora_alpha 0, enum fields
+        # converted to values), writes adapter_config.json and adapter_model.safetensors
+        # under target_dir/lora_adapter, then renames remaining keys by stripping
+        # "base_model.model." and ".base_layer" segments. Returns the adapter dir.
+        # Side effects: mutates state_dict in place; writes files.
+        # KNOWN ISSUE: lora_alpha is hardcoded to 0 (comment says an error should be raised but none is), producing an adapter with zero scaling.
         """
         Save lora adapter to safetensors.
 
@@ -213,6 +259,12 @@ class BaseModelMerger(ABC):
         return lora_path
 
     def save_hf_model_and_tokenizer(self, state_dict: dict[str, torch.Tensor]):
+        # [FUNCTION DOC]
+        # Behavior: instantiates the auto model class from config on the meta device
+        # (bf16), materializes empty CPU storage, patches generation config, extracts the
+        # LoRA adapter, saves the model with the given state_dict to target_dir, then
+        # saves the HF processor (if any) and tokenizer (warning and skipping if the
+        # tokenizer cannot be created). Side effects: writes files, prints.
         auto_model_class = self.get_transformers_auto_model_class()
         with init_empty_weights():
             model = auto_model_class.from_config(self.model_config, torch_dtype=torch.bfloat16)
@@ -242,6 +294,9 @@ class BaseModelMerger(ABC):
             tokenizer.save_pretrained(self.config.target_dir)
 
     def upload_to_huggingface(self):
+        # [FUNCTION DOC]
+        # Behavior: creates (or reuses) the Hub repo hf_upload_path with the privacy
+        # flag and uploads target_dir as a model repo. Side effects: network I/O.
         from huggingface_hub import HfApi
 
         api = HfApi()
@@ -250,11 +305,18 @@ class BaseModelMerger(ABC):
 
     @abstractmethod
     def merge_and_save(self):
+        # [FUNCTION DOC]
+        # Abstract: perform the backend-specific merge then save or test. Raises NotImplementedError.
         raise NotImplementedError("Subclasses should implement this method")
 
 
 class FSDPModelMerger(BaseModelMerger):
+    # [CLASS DOC]
+    # Merger for FSDP checkpoints stored as model_world_size_{W}_rank_{r}.pt files.
     def _get_world_size(self) -> int:
+        # [FUNCTION DOC]
+        # HELPER: scans local_dir for the rank-0 shard filename and returns its world size.
+        # Exceptions: FileNotFoundError if none matches.
         """Extracts the FSDP world_size from checkpoint filenames (e.g., 'model_world_size_8_rank_0.pt')."""
         for filename in os.listdir(self.config.local_dir):
             match = re.match(r"model_world_size_(\d+)_rank_0\.pt", filename)
@@ -265,6 +327,8 @@ class FSDPModelMerger(BaseModelMerger):
         )
 
     def _load_rank_zero_state_dict(self, world_size: int) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: loads the rank-0 shard on CPU (full unpickling allowed) and returns it.
         return torch.load(
             Path(self.config.local_dir) / f"model_world_size_{world_size}_rank_0.pt",
             map_location="cpu",
@@ -272,6 +336,10 @@ class FSDPModelMerger(BaseModelMerger):
         )
 
     def _extract_device_mesh_info(self, state_dict: dict, world_size: int) -> tuple[np.ndarray, tuple[str, ...]]:
+        # [FUNCTION DOC]
+        # HELPER: inspects the alphabetically first key; if it is a DTensor returns its
+        # device mesh array and dim names, else a 1-D mesh holding world_size with name ("fsdp",).
+        # KNOWN ISSUE: the non-DTensor mesh is an array containing the value world_size (shape (1,)), so the shard count derived from mesh.shape[-1] becomes 1 rather than world_size.
         """
         Retrieves sharding information (device_mesh, mesh_dim_names) from a DTensor in the state_dict.
         If no DTensor is found, infers a simple FSDP mesh based on world_size.
@@ -294,6 +362,10 @@ class FSDPModelMerger(BaseModelMerger):
     def _calculate_shard_configuration(
         self, mesh: np.ndarray, mesh_dim_names: tuple[str, ...]
     ) -> tuple[int, tuple[int, ...]]:
+        # [FUNCTION DOC]
+        # HELPER: asserts dim names are ("fsdp",) or ("ddp","fsdp") and returns
+        # (total shards = size of last mesh dim, mesh_shape = (that size,)). A "tp"
+        # branch exists but is unreachable because of the assert.
         """Calculates the total number of shards and the shape of the device mesh."""
         assert mesh_dim_names in (("fsdp",), ("ddp", "fsdp")), f"Unsupported mesh_dim_names {mesh_dim_names}"
 
@@ -308,6 +380,9 @@ class FSDPModelMerger(BaseModelMerger):
         return total_shards, mesh_shape
 
     def _merge_by_placement(self, tensors: list[torch.Tensor], placement: Placement) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: replicate -> first tensor; shard -> concatenation along the shard dim
+        # (contiguous); partial or anything else -> NotImplementedError.
         """Merges a list of tensors based on their DTensor placement"""
         if placement.is_replicate():
             return tensors[0]
@@ -321,9 +396,20 @@ class FSDPModelMerger(BaseModelMerger):
     def _load_and_merge_state_dicts(
         self, world_size: int, total_shards: int, mesh_shape: tuple[int, ...], mesh_dim_names: tuple[str, ...]
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: loads all total_shards rank files in parallel (up to 32 threads) on
+        # CPU. For each key of rank 0, gathers per-rank tensors in rank order as bf16
+        # (local tensors for DTensors), recording placements (dropping a leading
+        # dp/ddp dim) and asserting consistency across ranks. Then merges each key:
+        # DTensor keys via their single placement (FSDP only; 2-D meshes raise
+        # NotImplementedError), plain tensors by concatenation on dim 0.
+        # Outputs: mapping from name to full bf16 tensor.
+        # Side effects: drains loaded shard dicts to save memory; shows tqdm progress.
         model_state_dict_lst = [None] * total_shards
 
         def process_one_shard(rank: int, model_state_dict_lst: list):
+            # [FUNCTION DOC]
+            # HELPER: loads one rank's shard file and stores it at its rank slot; returns it.
             model_path = Path(self.config.local_dir) / f"model_world_size_{world_size}_rank_{rank}.pt"
             state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
             model_state_dict_lst[rank] = state_dict
@@ -382,6 +468,11 @@ class FSDPModelMerger(BaseModelMerger):
         return state_dict
 
     def merge_and_save(self):
+        # [FUNCTION DOC]
+        # Behavior: determines world size, loads rank 0 to infer mesh info, computes
+        # shard config, loads and merges all shards; then for "test" requires
+        # test_hf_dir and validates, for "merge" saves the HF model and optionally
+        # uploads. Exceptions: ValueError for missing test_hf_dir or unknown operation.
         world_size = self._get_world_size()
         rank_zero_state_dict = self._load_rank_zero_state_dict(world_size)
 
@@ -405,6 +496,10 @@ class FSDPModelMerger(BaseModelMerger):
             raise ValueError(f"Unknown operation: {self.config.operation}")
 
     def _test_state_dict(self, state_dict: dict[str, torch.Tensor]):
+        # [FUNCTION DOC]
+        # HELPER: loads the reference HF model from test_hf_dir in bf16 and asserts the
+        # merged dict has exactly the same keys, and per key equal shape, dtype and
+        # values within 1e-6 tolerance. Prints success. Exceptions: AssertionError.
         auto_model_class = self.get_transformers_auto_model_class()
 
         hf_model = auto_model_class.from_pretrained(self.config.test_hf_dir, torch_dtype=torch.bfloat16)
@@ -439,7 +534,17 @@ class FSDPModelMerger(BaseModelMerger):
 
 
 class MegatronModelMerger(BaseModelMerger):
+    # [CLASS DOC]
+    # Merger for legacy Megatron checkpoints: directories mp_rank_TT[_PPP] each with
+    # model.pt holding a list of per-virtual-pipeline-stage state dicts. Converts
+    # Megatron-core names to HF names via an ordered substring mapping and merges
+    # tensor-parallel shards.
     def __init__(self, config: ModelMergerConfig):
+        # [FUNCTION DOC]
+        # Behavior: overrides config.hf_model_config_path with the HF config/tokenizer
+        # path derived from local_dir, runs base init, and defines the ordered
+        # Megatron->HF name substring mapping (longer keys listed before their prefixes).
+        # Side effects: mutates the passed config.
         from verl.utils.megatron_utils import \
             get_hf_config_and_tokenizer_checkpoint_path
 
@@ -484,6 +589,9 @@ class MegatronModelMerger(BaseModelMerger):
         }
 
     def _get_tp_pp_rank_from_sharded_dir(self, sharded_dir: str) -> tuple[int, int]:
+        # [FUNCTION DOC]
+        # HELPER: parses "mp_rank_TT_PPP" into (tp, pp) or "mp_rank_TT" into (tp, 0).
+        # Exceptions: AssertionError for other names.
         tp_rank = pp_rank = None
         rank_list = sharded_dir.split("_")[2:]
         if re.match(r"mp_rank_(\d\d)_(\d\d\d)", sharded_dir):
@@ -498,6 +606,9 @@ class MegatronModelMerger(BaseModelMerger):
         return tp_rank, pp_rank
 
     def _check_megatron_checkpoint_path(self, model_path: str) -> tuple[list[str], int, int]:
+        # [FUNCTION DOC]
+        # HELPER: lists shard dirs (sorted), asserts each holds model.pt, and computes
+        # tp/pp sizes as max rank + 1. Outputs: (dirs, tp_size, pp_size).
         """
         Validates the Megatron checkpoint structure (presence of 'model.pt' in sharded directories).
         Determines TP and PP sizes from directory names.
@@ -520,6 +631,17 @@ class MegatronModelMerger(BaseModelMerger):
         tp_size: int,
         is_value_model: bool = False,
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: merges TP shards of one parameter.
+        # - linear_fc1.weight: split each shard in half into gate/up, concatenate each
+        #   across ranks along dim 0; returns [gate, up].
+        # - linear_qkv (non-layernorm): with q-per-kv ratio from config, split each
+        #   shard into its per-partition query groups and each group into q, k, v
+        #   chunks; concatenate q, k, v across all; returns [q, k, v].
+        # - layer norms, router, or value-model output layer: replicated, returns rank 0's.
+        # - otherwise concatenates along dim 1 for linear_fc2.weight and
+        #   linear_proj (row parallel), else dim 0.
+        # Exceptions: AssertionError on head-count divisibility violations.
         if "linear_fc1.weight" in key:
             # if the tensor is gate and proj
             gate_lst = []
@@ -571,9 +693,14 @@ class MegatronModelMerger(BaseModelMerger):
     def _load_state_dicts(
         self, model_ckpt_path: str, sharded_dirs: list[str], tp_size: int, pp_size: int
     ) -> list[list[dict]]:
+        # [FUNCTION DOC]
+        # HELPER: loads every shard's model.pt in parallel (up to 32 threads) into a
+        # pp x tp grid. Outputs: list indexed [pp][tp] of loaded objects.
         model_state_dict_lst = [[None for _ in range(tp_size)] for _ in range(pp_size)]
 
         def _process_one_megatron_shard(sharded_dir: str):
+            # [FUNCTION DOC]
+            # HELPER: loads one model.pt and places it into the grid by its parsed ranks.
             model_file_path = Path(model_ckpt_path) / sharded_dir / "model.pt"
             state_dict = torch.load(model_file_path, map_location="cpu", weights_only=False)
             tp_rank, pp_rank = self._get_tp_pp_rank_from_sharded_dir(sharded_dir)
@@ -587,6 +714,11 @@ class MegatronModelMerger(BaseModelMerger):
         return model_state_dict_lst
 
     def _check_megatron_state_key(self, key: str) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: validates a Megatron key: raises ValueError for keys starting with
+        # "model."; accepts (prints skip) keys containing embedding.word_embeddings or
+        # output_layer; otherwise raises ValueError unless the key starts with "decoder".
+        # KNOWN ISSUE: annotated to return bool but always returns None.
         """
         Checks if the key is a valid Megatron state key.
 
@@ -613,6 +745,16 @@ class MegatronModelMerger(BaseModelMerger):
     def _merge_state_dicts(
         self, model_state_dict_lst: list[list[dict]], tp_size: int, pp_size: int
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: for each virtual stage then each pipeline stage, iterates the tp-rank-0
+        # keys, skipping "extra_state" keys and (with tie_word_embedding) output_layer.
+        # Validates and maps each key to an HF name; for names under "model.layers.",
+        # offsets the local layer number by the cumulative layer count of earlier
+        # stages. Merges TP shards and stores single tensors directly, qkv lists as
+        # q/k/v names and gate/up lists as gate/up names. After each stage, adds the
+        # highest local layer index + 1 to the cumulative count.
+        # Outputs: HF-named state dict. Exceptions: AssertionError if a name cannot be mapped.
+        # KNOWN ISSUE: vpp_size is len of the first loaded object, assuming model.pt holds a list per virtual stage; a stage with no decoder layers would still advance the layer offset by 1.
         state_dict = {}
         vpp_size = len(model_state_dict_lst[0][0])
         layers_cum = 0
@@ -663,6 +805,9 @@ class MegatronModelMerger(BaseModelMerger):
         return state_dict
 
     def merge_and_save(self):
+        # [FUNCTION DOC]
+        # Behavior: resolves the model checkpoint dir, validates shard layout, loads and
+        # merges shards, then tests or saves/uploads as in FSDPModelMerger.merge_and_save.
         from verl.utils.megatron_utils import get_model_checkpoint_path
 
         model_ckpt_path = get_model_checkpoint_path(self.config.local_dir)
@@ -685,6 +830,11 @@ class MegatronModelMerger(BaseModelMerger):
             raise ValueError(f"Unknown operation: {self.config.operation}")
 
     def _test_state_dict(self, state_dict: dict[str, torch.Tensor]):
+        # [FUNCTION DOC]
+        # HELPER: loads test_hf_dir/model.safetensors and, for each merged name, skips
+        # empty names, biases missing from the reference, rotary inv_freq and (when tied)
+        # lm_head; raises RuntimeError if a name is absent from the reference; asserts
+        # equal dtype and closeness (atol 1e-2, rtol 5e-2).
         """
         Compares the merged Megatron state_dict against a reference safetensors model.
         Applies necessary name mappings from Megatron to Hugging Face conventions using _replace_name.
@@ -706,6 +856,10 @@ class MegatronModelMerger(BaseModelMerger):
             torch.testing.assert_close(loaded_weight, param, atol=1e-2, rtol=5e-2)
 
     def _replace_name(self, megatron_name: str, name_mapping: dict[str, str]) -> str:
+        # [FUNCTION DOC]
+        # HELPER: finds the first mapping key contained in the Megatron name, replaces
+        # "decoder" with "model" and that key with the HF counterpart, returning the result.
+        # KNOWN ISSUE: returns None when no mapping matches despite the str annotation.
         for m_name, v_name in name_mapping.items():
             if m_name not in megatron_name:
                 continue
@@ -718,6 +872,11 @@ class MegatronModelMerger(BaseModelMerger):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: parses CLI args (merge/test subcommands sharing backend options),
+    # builds ModelMergerConfig (creating target_dir for merge), instantiates the
+    # FSDP or Megatron merger and runs merge_and_save.
+    # Exceptions: NotImplementedError for unknown operation/backend; argparse exits on bad usage.
     parser = argparse.ArgumentParser(description="verl model merger")
     subparsers = parser.add_subparsers(dest="operation", required=True, help="Specify 'merge' or 'test' operation.")
 
