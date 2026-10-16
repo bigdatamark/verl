@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Loss functions used by the model-engine based actor/critic workers. Each takes
+# (config, model_output, data, dp_group) and returns (loss tensor, metrics dict), where metrics may
+# be Metric objects carrying their cross-micro-batch aggregation type. data carries global batch
+# info (dp_size, batch_num_tokens, global_batch_size) used to normalize over the global mini-batch.
 
 import torch
 from tensordict import TensorDict
@@ -26,6 +31,18 @@ from verl.workers.utils.padding import no_padding_2_padding
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+    # [FUNCTION DOC]
+    # Behavior: negative log-likelihood SFT loss. Reads pad_mode (default NO_PADDING), dp_size and
+    # batch_num_tokens. In no-padding mode, flattens nested log_probs and loss_mask, rolls the mask left
+    # by one token to align with predictions, and computes minus the masked sum of log-probs divided by
+    # batch_num_tokens times dp_size. Otherwise uses log_probs with the boolean response_mask the same way.
+    # Inputs: config - unused; model_output - mapping with log_probs; data - TensorDict; dp_group - unused.
+    # Outputs: (scalar loss, empty metrics dict).
+    # Exceptions: KeyError on missing keys.
+    # Side effects: none.
+    # KNOWN ISSUE: rolling the flattened mask wraps across sample boundaries (each sample's first mask
+    # token moves to the previous sample's last position, and the global first moves to the end); this
+    # is harmless only if the first token of each sample has loss_mask 0.
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]
     batch_num_tokens = data["batch_num_tokens"]
@@ -55,6 +72,21 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
 
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+    # [FUNCTION DOC]
+    # Behavior: converts nested log_probs (and entropy if present) to padded response tensors. Writes
+    # dp_size, batch_num_tokens, global_batch_size and loss_scale_factor into config.global_batch_info.
+    # Chooses SUM aggregation for loss metrics if dp_size > 1 or any of those normalizers is set,
+    # else MEAN. Selects response_mask, old_log_probs, advantages (plus rollout_is_weights and
+    # ref_log_prob when present) and converts to padded tensors. Looks up the policy loss function by
+    # config.policy_loss loss_mode (default "vanilla") and calls it; its metrics are wrapped with MEAN
+    # aggregation and actor/pg_loss is recorded. If entropy exists, subtracts entropy_coeff times the
+    # aggregated entropy loss. If use_kl_loss, computes per-token KL against ref_log_prob with
+    # kl_loss_type, aggregates it, adds kl_loss_coef times it, and records kl_loss and kl_coef.
+    # Inputs: config - ActorConfig; model_output - mapping with log_probs and optional entropy; data -
+    # TensorDict; dp_group - unused.
+    # Outputs: (policy loss tensor, metrics dict).
+    # Exceptions: KeyError if use_kl_loss is set but ref_log_prob is absent; errors from loss lookup.
+    # Side effects: mutates config.global_batch_info.
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
     entropy = model_output.get("entropy", None)
@@ -145,6 +177,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
 
 def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=None):
+    # [FUNCTION DOC]
+    # Behavior: converts nested predicted values to padded response tensor; selects SUM metric
+    # aggregation when dp_size > 1 or any global normalizer / loss_scale_factor is set, else MEAN;
+    # pads values, returns, response_mask; computes clipped value loss and clip fraction with
+    # cliprange_value and loss_agg_mode, normalized by the global batch info.
+    # Inputs: config - CriticConfig; model_output - mapping with values; data - TensorDict; dp_group - unused.
+    # Outputs: (value loss, metrics with critic/vf_loss, critic/vf_clipfrac, critic/vpred_mean).
+    # Exceptions: KeyError on missing keys.
+    # Side effects: .item() calls cause device sync.
     """value loss
 
     Args:

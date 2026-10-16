@@ -12,9 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
+# [MODULE DOC]
+# Hendrycks MATH reward (adapted from lm-eval-harness): extracts the last \boxed answer from the
+# model output, normalizes both it and the ground truth with a series of string fixes, and scores
+# 1.0 for exact equality after normalization, else 0.0.
 
 
 def compute_score(solution_str, ground_truth) -> float:
+    # [FUNCTION DOC]
+    # Extracts the last boxed string, unwraps it, and returns 1.0 if is_equiv with ground_truth, else 0.0.
+    # Exceptions: any exception during extraction is caught and printed; score stays 0.0.
+    # Side effects: prints exceptions to stdout.
     retval = 0.0
     try:
         string_in_last_boxed = last_boxed_only_string(solution_str)
@@ -30,6 +38,10 @@ def compute_score(solution_str, ground_truth) -> float:
 
 # string normalization from https://github.com/EleutherAI/lm-evaluation-harness/blob/master/lm_eval/tasks/hendrycks_math.py
 def is_equiv(str1, str2, verbose=False):
+    # [FUNCTION DOC]
+    # Compares two answers after strip_string normalization. Both None -> True (prints a warning);
+    # exactly one None -> False. If normalization raises, falls back to raw string equality.
+    # Inputs: str1, str2, verbose - print normalized strings. Outputs: bool.
     if str1 is None and str2 is None:
         print("WARNING: Both None")
         return True
@@ -47,6 +59,10 @@ def is_equiv(str1, str2, verbose=False):
 
 
 def remove_boxed(s):
+    # [FUNCTION DOC]
+    # HELPER: Unwraps a boxed string. If it contains "\boxed " (space form) returns everything after
+    # that prefix; otherwise strips leading "\boxed{" and trailing "}".
+    # Exceptions: AssertionError if the expected prefix/suffix is missing.
     if "\\boxed " in s:
         left = "\\boxed "
         assert s[: len(left)] == left
@@ -61,6 +77,11 @@ def remove_boxed(s):
 
 
 def last_boxed_only_string(string):
+    # [FUNCTION DOC]
+    # HELPER: Returns the last boxed expression in string. If "\boxed " (space form) occurs anywhere,
+    # returns "\boxed " plus the text after its last occurrence up to the next "$". Otherwise finds the
+    # last "\boxed" (or, failing that, "\fbox") and scans forward with brace counting to the matching
+    # close brace, returning the substring or None if no marker / unbalanced braces.
     idx = string.rfind("\\boxed")
     if "\\boxed " in string:
         return "\\boxed " + string.split("\\boxed ")[-1].split("$")[0]
@@ -88,6 +109,11 @@ def last_boxed_only_string(string):
 
 
 def fix_fracs(string):
+    # [FUNCTION DOC]
+    # HELPER: Adds braces to shorthand \frac arguments: for each segment after "\frac" not starting
+    # with "{", wraps the first two characters as {a}{b} (or {a}b when the second is "{"), keeping the
+    # rest. Returns the original string unchanged if a segment has fewer than 2 characters.
+    # KNOWN ISSUE: an empty segment (string ending in "\frac") raises IndexError on the first-char check.
     substrs = string.split("\\frac")
     new_str = substrs[0]
     if len(substrs) > 1:
@@ -120,6 +146,9 @@ def fix_fracs(string):
 
 
 def fix_a_slash_b(string):
+    # [FUNCTION DOC]
+    # HELPER: Converts a simple "int/int" string (exactly one slash, both sides canonical integers)
+    # to "\frac{a}{b}"; returns the input unchanged otherwise.
     if len(string.split("/")) != 2:
         return string
     a = string.split("/")[0]
@@ -135,6 +164,9 @@ def fix_a_slash_b(string):
 
 
 def remove_right_units(string):
+    # [FUNCTION DOC]
+    # HELPER: If "\text{ " occurs, returns the part before it (assumes it introduces units).
+    # Exceptions: AssertionError if "\text{ " occurs more than once.
     # "\\text{ " only ever occurs (at least in the val set) when describing units
     if "\\text{ " in string:
         splits = string.split("\\text{ ")
@@ -145,6 +177,10 @@ def remove_right_units(string):
 
 
 def fix_sqrt(string):
+    # [FUNCTION DOC]
+    # HELPER: Wraps a single character following "\sqrt" in braces when not already braced
+    # (e.g. sqrt3 -> sqrt{3}). Returns input unchanged if no "\sqrt".
+    # KNOWN ISSUE: a string ending in "\sqrt" leaves an empty segment and raises IndexError.
     if "\\sqrt" not in string:
         return string
     splits = string.split("\\sqrt")
@@ -160,6 +196,13 @@ def fix_sqrt(string):
 
 
 def strip_string(string):
+    # [FUNCTION DOC]
+    # Normalizes a math answer string. In order: remove newlines and "\!"; collapse double
+    # backslashes; tfrac/dfrac -> frac; remove \left, \right, degree markers and escaped dollars;
+    # strip right units; remove percent signs; " ." -> " 0." and "{." -> "{0."; return early if empty;
+    # prefix "0" if starting with "."; drop a short (<=2 char) "x =" prefix; fix_sqrt; remove spaces;
+    # fix_fracs; exact "0.5" -> "\frac{1}{2}"; fix_a_slash_b. Outputs: normalized string.
+    # Exceptions: may propagate errors from helpers (callers catch them).
     # linebreaks
     string = string.replace("\n", "")
 

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Ascend NPU profiling backend built on torch_npu and MSTX markers: MSTX implementations of the
+# range-marker API, an MSTX-annotated timer, a factory for torch_npu profiler objects, and the
+# NPUProfiler DistProfiler backend. Importing requires torch_npu.
 # Inspired from https://gitee.com/ascend/MindSpeed-RL/blob/master/mindspeed_rl/utils/utils.py
 import functools
 import logging
@@ -28,6 +32,9 @@ from .profile import DistProfiler, ProfilerConfig
 
 
 def mark_start_range(message: Optional[str] = None) -> None:
+    # [FUNCTION DOC]
+    # Behavior: starts an MSTX range with the message. Outputs: the range id returned by mstx.range_start
+    # (annotated None but actually returns the id). Exceptions: from torch_npu. Side effects: emits a marker.
     """Start a mark range in the profiler.
 
     Args:
@@ -38,6 +45,8 @@ def mark_start_range(message: Optional[str] = None) -> None:
 
 
 def mark_end_range(range_id: str) -> None:
+    # [FUNCTION DOC]
+    # Behavior: ends the MSTX range with the given id. Outputs: mstx return value. Side effects: emits a marker.
     """End a mark range in the profiler.
 
     Args:
@@ -48,6 +57,9 @@ def mark_end_range(range_id: str) -> None:
 
 
 def mark_annotate(message: Optional[str] = None) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: returns a decorator wrapping a function in an MSTX range named message or the function name.
+    # Outputs: decorator. Side effects: markers on each call of the decorated function.
     """Decorate a function to annotate a mark range along with the function life cycle.
 
     Args:
@@ -56,6 +68,8 @@ def mark_annotate(message: Optional[str] = None) -> Callable:
     """
 
     def decorator(func):
+        # [FUNCTION DOC]
+        # HELPER: Wraps func with mstx.mstx_range(message or func.__name__) and returns the wrapped function.
         profile_message = message or func.__name__
         return mstx.mstx_range(profile_message)(func)
 
@@ -64,6 +78,14 @@ def mark_annotate(message: Optional[str] = None) -> Callable:
 
 @contextmanager
 def marked_timer(name: str, timing_raw: dict[str, float], *args: Any, **kwargs: Any) -> None:
+    # [FUNCTION DOC]
+    # Behavior: warns (logging) if extra positional/keyword args are passed (unsupported, e.g. NVTX color);
+    # opens an MSTX range named name, delegates timing to performance._timer (which accumulates elapsed
+    # seconds into timing_raw[name]), then closes the range.
+    # Inputs: name; timing_raw - mutable mapping of name to seconds; extra args ignored.
+    # Outputs: generator-based context manager yielding None.
+    # KNOWN ISSUE: if the body raises, mark_end_range is skipped (no try/finally), leaving the range open.
+    # Side effects: mutates timing_raw; emits markers; may log warnings.
     """Context manager for timing with MSTX markers.
 
     This utility function measures the execution time of code within its context,
@@ -95,6 +117,15 @@ def get_npu_profiler(
     role: Optional[str] = None,
     profile_step: Optional[str] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: maps profile_level string to torch_npu ProfilerLevel; appends profile_step then role as
+    # sub-directories of the save path when given; requires torch_npu >= 2.1; builds an experimental config
+    # (DB export, data simplification, msprof_tx on, excluding the "communication" mstx domain); always
+    # collects CPU activity, plus NPU when contents is None or includes "npu"; enables modules/stack/shapes/
+    # memory when contents is None or lists them; trace handler writes to the save path with analysis flag.
+    # Inputs: see docstring. Outputs: an unstarted torch_npu.profiler.profile object.
+    # Exceptions: ValueError for unknown level; RuntimeError for torch_npu < 2.1.
+    # Side effects: none until started.
     """Generate and return an NPU profiler object.
 
     Args:
@@ -162,6 +193,10 @@ def get_npu_profiler(
 
 
 class NPUProfiler(DistProfiler):
+    # [CLASS DOC]
+    # DistProfiler backend for Ascend NPU. In continuous mode (discrete False) one profiler spans start/stop,
+    # guarded by a class-level counter so only one profiler is active per process; in discrete mode each
+    # annotated function call creates, starts and stops its own profiler.
     """
     NPU profiler. Initialized in a worker to control the NPU profiler.
     """
@@ -169,6 +204,14 @@ class NPUProfiler(DistProfiler):
     _define_count = 0
 
     def __init__(self, rank: int, config: ProfilerConfig, tool_config: NPUToolConfig, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: defaults config to a disabled ProfilerConfig when falsy; asserts tool_config is given when
+        # enabled; stores discrete, contents, level, analysis from tool_config and save_path from config.
+        # Inputs: rank (unused); config; tool_config; kwargs ignored.
+        # Exceptions: AssertionError when enabled without tool_config.
+        # KNOWN ISSUE: when tool_config is None and profiling is disabled, attribute access on tool_config raises
+        # AttributeError right after the assertion passes. Docstring wrongly names NsightSystemsProfiler.
+        # Side effects: sets instance attributes.
         """Initialize the NsightSystemsProfiler.
 
         Args:
@@ -188,6 +231,10 @@ class NPUProfiler(DistProfiler):
         self.analysis = tool_config.analysis
 
     def start(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: in continuous mode and if no profiler is active process-wide (class counter 0), creates a
+        # profiler (save path/role sub-dir), starts it and increments the counter. Discrete mode: no-op.
+        # Inputs: kwargs - optional "role". Side effects: starts profiling; mutates class counter.
         role = kwargs.get("role", None)
         if not self.discrete and NPUProfiler._define_count == 0:
             self.profile_npu = get_npu_profiler(
@@ -201,12 +248,17 @@ class NPUProfiler(DistProfiler):
             NPUProfiler._define_count += 1
 
     def stop(self):
+        # [FUNCTION DOC]
+        # Behavior: in continuous mode and when the counter is 1, steps and stops the active profiler and
+        # decrements the counter. Otherwise no-op. Side effects: flushes trace via on_trace_ready.
         if not self.discrete and NPUProfiler._define_count == 1:
             self.profile_npu.step()
             self.profile_npu.stop()
             NPUProfiler._define_count -= 1
 
     def step(self):
+        # [FUNCTION DOC]
+        # No-op (see docstring for why it must exist). Outputs: None.
         """No-op per-mini-batch hook.
 
         The actor update loop calls this once per mini-batch to drive the torch profiler's
@@ -220,6 +272,13 @@ class NPUProfiler(DistProfiler):
         return
 
     def annotate(self, message: Optional[str] = None, role: Optional[str] = None, **kwargs_outer) -> Callable:
+        # [FUNCTION DOC]
+        # Behavior: returns a decorator; the wrapped function is surrounded by an MSTX range named message, role,
+        # or the function name. In discrete mode a fresh profiler (with role sub-dir) is started before and
+        # stepped+stopped after the call.
+        # Inputs: message, role; extra kwargs ignored. Outputs: decorator.
+        # KNOWN ISSUE: exceptions in the wrapped function skip range end and profiler stop (no try/finally).
+        # Side effects: profiling and file output.
         """Decorate a Worker member function to profile the current rank in the current training step.
 
         Requires the target function to be a member function of a Worker,
@@ -233,8 +292,12 @@ class NPUProfiler(DistProfiler):
         """
 
         def decorator(func):
+            # [FUNCTION DOC]
+            # HELPER: Builds the functools.wraps wrapper for func.
             @functools.wraps(func)
             def wrapper(*args, **kwargs_inner):
+                # [FUNCTION DOC]
+                # HELPER: Runs func with the profiling behavior described in annotate; returns func's result.
                 # Prefer the stage label (`role`, e.g. "actor_compute_log_prob"): it names both the
                 # role and the function, which the method name alone cannot do for a colocated
                 # worker. Fall back to the method name for stages that declare no role.

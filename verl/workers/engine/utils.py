@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Backend-agnostic helpers shared by verl training engines: full determinism setup, padding of
+# packed (remove-padding) inputs, micro-batch preparation (dynamic token-budget or fixed size),
+# detaching/aggregating per-micro-batch outputs, and the DTensor-generic half of the
+# sharded-delta HuggingFace weight export (snapshot priming, diffing, identity entry builder)
+# consumed by the delta checkpoint engine.
 
 import os
 import random
@@ -29,6 +35,15 @@ from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic
 
 
 def enable_full_determinism(seed: int):
+    # [FUNCTION DOC]
+    # Behavior: sets environment variables for deterministic hashing, cuBLAS workspace, flash
+    # attention, NCCL (deterministic, Ring algo, Simple proto), and defaults
+    # VERL_DISABLE_FLASH_ATTN_CE to "1" only if unset; on NPU also sets HCCL_DETERMINISTIC and
+    # CLOSE_MATMUL_K_SHIFT. Seeds Python random, NumPy, torch, and the device RNGs (current and all
+    # devices). Enables torch deterministic algorithms in warn-only mode, sets cuDNN deterministic,
+    # disables cuDNN benchmark, and disables cuDNN entirely.
+    # Inputs: seed - integer seed. Outputs: none.
+    # Side effects: mutates process environment and global RNG/backend state.
     """
     Helper function for reproducibility in distributed training.
     See https://pytorch.org/docs/stable/notes/randomness.html for details.
@@ -69,6 +84,14 @@ def pad_packed_inputs(
     pad_size: int,
     pad_value: float = 0,
 ):
+    # [FUNCTION DOC]
+    # Behavior: if pad_size is not positive returns the inputs unchanged. Otherwise right-pads the
+    # token tensor along its last dim with pad_size copies of pad_value. If position ids are given,
+    # appends positions 0..pad_size-1 (same dtype/device) along the last dim; for 3-D mRoPE layout
+    # (rope_dim, 1, nnz) the appended positions are replicated over rope_dim.
+    # Inputs: input_ids_rmpad - (1, total_nnz); position_ids_rmpad - (1, nnz), (rope_dim, 1, nnz) or
+    # None; pad_size - number of tokens to add; pad_value - fill value for tokens.
+    # Outputs: (padded input ids, padded position ids or None). Side effects: none.
     """Right-pad a packed ``(1, total_nnz)`` batch by ``pad_size`` tokens.
 
     Mirrors the padding :func:`verl.utils.ulysses.ulysses_pad` applies to reach a multiple of the
@@ -97,6 +120,21 @@ def prepare_micro_batches(
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
 ):
+    # [FUNCTION DOC]
+    # Behavior: reads non-tensor flags from data: use_dynamic_bsz (default true), sp_size (default 1),
+    # force_group_size (default 1). With dynamic bsz, requires "max_token_len_per_gpu" in data and
+    # splits with the token budget max_token_len_per_gpu*sp_size via rearrange_micro_batches,
+    # forwarding the dp group, divisibility, same-count-across-dp, minimum count, balance flag and
+    # force_group_size; returns its batches and reorder index list. Otherwise splits into
+    # len(data) / (micro_batch_size_per_gpu * force_group_size) equal chunks, with no index list.
+    # Inputs: data - TensorDict batch with the metadata above; dp_group - process group for syncing
+    # micro-batch counts; num_batches_divided_by, same_micro_num_in_dp, min_num_micro_batch,
+    # use_dynamic_bsz_balance - forwarded to dynamic batching only.
+    # Outputs: (list of micro-batch TensorDicts, index list or None).
+    # Exceptions: AssertionError if max_token_len_per_gpu missing in dynamic mode, or batch size not
+    # divisible in fixed mode.
+    # KNOWN ISSUE: in fixed mode each chunk holds micro_batch_size_per_gpu*force_group_size samples,
+    # not micro_batch_size_per_gpu as the name suggests (equal only when force_group_size is 1).
     """
     Prepare micro batches from data.
     """
@@ -131,6 +169,12 @@ def prepare_micro_batches(
 
 
 def detach_tree(obj):
+    # [FUNCTION DOC]
+    # Behavior: recursively returns a copy of the structure where every tensor that requires grad is
+    # replaced by its detached version; dicts, lists and tuples are rebuilt with the same container
+    # type; other objects returned as-is.
+    # Inputs: obj - arbitrary nested structure. Outputs: structure with no grad-attached tensors.
+    # Side effects: none.
     """Strip the autograd graph from reported tensors, keeping the data.
 
     Every backend accumulates one per-micro-batch output entry for the whole
@@ -156,6 +200,16 @@ def detach_tree(obj):
 
 
 def postprocess_batch_func(output_lst, indices, data: TensorDict):
+    # [FUNCTION DOC]
+    # Behavior: requires pad_mode (default NO_PADDING) to be NO_PADDING. Gathers each micro-batch's
+    # "model_output" entries by key, flattens each key's nested tensors into their components, and
+    # rebuilds one jagged nested tensor per key; if use_dynamic_bsz (default true) reorders it back to
+    # original sample order using indices. Collects every micro-batch "loss" into a list and merges
+    # "metrics" dicts by appending values per key.
+    # Inputs: output_lst - list of per-micro-batch dicts; indices - reorder indices from
+    # prepare_micro_batches; data - original TensorDict (for flags).
+    # Outputs: dict with "model_output" (key to nested tensor), "loss" (list), "metrics" (key to list).
+    # Exceptions: AssertionError for other pad modes.
     """postprocess the output of a forward_backward_batch.
     output_lst is a list of dict containing outputs for each micro-batch
     reorder entropy and outputs. Return None for other pp ranks
@@ -229,6 +283,8 @@ def postprocess_batch_func(output_lst, indices, data: TensorDict):
 
 
 def _prodshape(shape) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the product of the integer-cast dimensions of a shape (1 for empty shape).
     n = 1
     for x in shape:
         n *= int(x)
@@ -236,6 +292,14 @@ def _prodshape(shape) -> int:
 
 
 def _hf_entry_identity(name, spec, place, lidx, lval):
+    # [FUNCTION DOC]
+    # HELPER: Identity per-param entry builder for delta export (HF name equals weight name).
+    # Behavior: converts shard-local flat indices to whole-parameter flat indices via the placement
+    # (skipped when empty), casts to int32, and builds a single-slot result.
+    # Inputs: name - param name; spec - export spec with full_shape; place - placement; lidx - local
+    # flat indices; lval - delta values.
+    # Outputs: tuple of (list with one (name, full shape) slot, dtype string without "torch." prefix,
+    # int64 count tensor of length 1 holding number of indices, int32 global indices, values).
     """Identity profile: the param IS its own single slot (weight name == HF name)
     -- translate the shard-local delta to within-param coordinates. int32
     positions: the wire is int32 anyway and the engine asserts the range."""
@@ -248,6 +312,19 @@ def _hf_entry_identity(name, spec, place, lidx, lval):
 
 
 def hf_delta_export(gen, snaps: dict, entry_fn):
+    # [FUNCTION DOC]
+    # Behavior: generator over (name, local shard, spec) from gen. For each, flattens the detached
+    # contiguous shard and requires a matching-size snapshot in snaps. Uses the spec's explicit
+    # placement triple (place, contributes, gather group) when spec.place is set, otherwise derives
+    # it from the DTensor spec. If this rank contributes, computes indices/values where the shard
+    # differs from the snapshot (moved to the shard device); otherwise uses empty index/value
+    # tensors. Copies the current shard into the snapshot (non-blocking), then yields the
+    # entry_fn result extended with the gather group.
+    # Inputs: gen - iterable of (name, tensor, spec); snaps - mapping name to CPU flat snapshot;
+    # entry_fn - builder taking (name, spec, place, lidx, lval).
+    # Outputs: generator of (slots, dtype_str, counts, hf_idx, hf_val, gather_group).
+    # Exceptions: AssertionError when the seed snapshot is missing or wrong size.
+    # Side effects: overwrites snapshots in place.
     """STEADY export: wrap a raw ``(name, local_shard, spec)`` exporter into final
     HF-coordinate delta entries ``(slots, dtype_str, counts, hf_idx, hf_val,
     gather_group)`` -- diff against the pinned snapshot, refresh it, then hand the
@@ -284,6 +361,13 @@ def hf_delta_export(gen, snaps: dict, entry_fn):
 
 
 def prime_delta_snapshots(gen, snaps: dict, pin: bool) -> None:
+    # [FUNCTION DOC]
+    # Behavior: for each (name, shard, spec) from gen, flattens the detached contiguous shard; if
+    # snaps lacks a same-size snapshot, allocates a CPU tensor (pinned when pin is true) and stores
+    # it; then copies the shard into it non-blocking.
+    # Inputs: gen - iterable of (name, tensor, spec); snaps - mapping mutated in place; pin - use
+    # pinned host memory. Outputs: none.
+    # Side effects: allocates host memory and mutates snaps.
     """Snapshot each rank's current shards to CPU as the steady diff base. Run
     right after the seed's full-weight sync: weights do not move during the
     sync, so the snapshots equal exactly what the rollout side received.

@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Math-Verify based reward. Verification runs in a lazily-created, shared spawn-context process
+# pool (4 workers) so math_verify's signal-based timeouts work and calls can be bounded with a
+# timeout. If math_verify is not installed, a placeholder TimeoutException is defined and an
+# install hint is printed at import time.
 
 import multiprocessing
 import threading
@@ -22,6 +27,8 @@ try:
 except ImportError:
 
     class TimeoutException(Exception):
+        # [CLASS DOC]
+        # HELPER: Fallback exception type used only when math_verify is not installed.
         pass
 
     print("To use Math-Verify, please install it first by running `pip install math-verify`.")
@@ -31,6 +38,9 @@ _pool_lock = threading.Lock()
 
 
 def _get_pool():
+    # [FUNCTION DOC]
+    # HELPER: Returns the module-global ProcessPoolExecutor, creating it on first use with
+    # double-checked locking (4 workers, spawn context). Side effects: may start worker processes.
     global _pool
     if _pool is None:
         with _pool_lock:
@@ -40,6 +50,10 @@ def _get_pool():
 
 
 def _verify_in_subprocess(ground_truth_boxed: str, model_output: str) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Runs in a pool worker. Parses gold with LaTeX extraction and prediction with expression
+    # plus LaTeX extraction; if both yield candidates returns 1.0 if any (gold, pred) pair verifies,
+    # else 0.0. Outputs: float. Exceptions: propagates math_verify errors to the caller via the future.
     """Run math_verify in a subprocess where signal.alarm() works."""
     from math_verify.grader import verify
     from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
@@ -55,6 +69,11 @@ def _verify_in_subprocess(ground_truth_boxed: str, model_output: str) -> float:
 
 
 def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0, timeout: float = 30.0) -> float:
+    # [FUNCTION DOC]
+    # Wraps ground_truth in "\boxed{...}", submits verification to the pool and waits up to timeout
+    # seconds. Returns the verification score; timeout_score on futures timeout or math_verify
+    # TimeoutException; 0.0 on any other exception (printed).
+    # Side effects: creates the process pool on first call; prints errors.
     ret_score = 0.0
     ground_truth_boxed = "\\boxed{" + ground_truth + "}"
     try:

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Conversions between batch tensor layouts used by workers: left-right padded batches
+# (prompt left-padded, response right-padded, shape batch x seq_len), "no-padding" batches made of
+# jagged nested tensors (one variable-length row per sample), and padded response-only tensors.
+# Model outputs computed on the no-padding layout are shifted left by one token (token t's logit
+# predicts token t+1), which the response-extraction helpers account for.
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
@@ -21,6 +27,23 @@ from verl.utils.attention_utils import index_first_axis, unpad_input
 
 
 def left_right_2_no_padding(data: TensorDict) -> TensorDict:
+    # [FUNCTION DOC]
+    # Behavior: asserts the four required keys exist. Pops input_ids; records max_seq_len (input
+    # width) and max_response_len (response_mask width) as non-tensor data. Removes padding from
+    # input_ids using attention_mask (unpad_input), storing the flat-token gather indices as
+    # non-tensor "indices", and rebuilds input_ids as a jagged nested tensor using the cumulative
+    # sequence lengths as offsets. For each sample, selects position ids at valid mask positions
+    # (supports 1-D per-sample positions or multi-row e.g. 4 x seq_len rope positions) and packs them
+    # into a jagged nested tensor. Sets loss_mask to the same object as response_mask. If a
+    # non-nested routed_experts tensor exists, flattens batch/seq dims, gathers by indices and nests
+    # it with the same offsets. If both teacher_logprobs and teacher_ids exist, does the same for each.
+    # Inputs: data - TensorDict with input_ids, attention_mask, response_mask, position_ids
+    # (batch x seq_len, or batch x 4 x seq_len), optional routed_experts / teacher_logprobs / teacher_ids.
+    # Outputs: the same TensorDict, mutated in place, with nested input_ids/position_ids/loss_mask.
+    # Exceptions: AssertionError if a required key is missing.
+    # Side effects: mutates and returns the input TensorDict.
+    # KNOWN ISSUE: docstring says attention_mask (and "response") are removed, but the code leaves
+    # attention_mask (and any other keys) in the TensorDict; only input_ids is replaced.
     """
     Convert TensorDict from left-right padding to no-padding format.
 
@@ -95,6 +118,20 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
 
 
 def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: takes the flat token values (nested values, or the tensor itself). Computes per-sample
+    # prompt and response lengths: if prompts are nested, from nested offsets (max_response_len taken
+    # from non-tensor data, or the longest response if unset); otherwise from attention_mask sums over
+    # the prompt and response column ranges, with max_response_len set to the responses width. Sums
+    # lengths to cumulative sequence end offsets, asserts the total matches the token count and that no
+    # prompt length is zero. For each sample, takes the slice ending one token before the sequence end
+    # and of response length (the one-token left shift), right-pads it on the sequence dim to
+    # max_response_len (trailing dims unpadded), and stacks the results.
+    # Inputs: tensor - nested or flat (total_tokens, ...) model output; data - TensorDict with prompts,
+    # responses, and attention_mask when not nested; optional non-tensor max_response_len.
+    # Outputs: dense tensor of shape batch x max_response_len x trailing dims, zero padded.
+    # Exceptions: AssertionError on token count mismatch, zero-length prompt, or nested attention_mask.
+    # Side effects: none; .item() calls cause device sync.
     """Slice response from unpad model output.
 
     Args:
@@ -142,6 +179,13 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
 
 
 def build_attention_mask_from_nested(input_ids: torch.Tensor, max_seq_len: int | None = None) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: from nested input ids, compute each sequence length from offsets, use max_seq_len or
+    # the longest length, and produce a mask where position j of row i is 1 iff j is less than length i.
+    # Inputs: input_ids - nested jagged tensor; max_seq_len - optional output width.
+    # Outputs: int32 tensor batch x max_seq_len on the values' device (right-padded mask).
+    # Exceptions: AssertionError if input_ids is not nested.
+    # Side effects: none.
     """Build a padded full-sequence attention mask from nested input ids."""
     assert input_ids.is_nested, "input_ids must be a nested tensor"
     device = input_ids.values().device
@@ -153,6 +197,16 @@ def build_attention_mask_from_nested(input_ids: torch.Tensor, max_seq_len: int |
 
 
 def embeds_padding_2_no_padding(data: TensorDict) -> TensorDict:
+    # [FUNCTION DOC]
+    # Behavior: converts prompt_embeds with its mask to nested form via the inner helper, and does the
+    # same for negative_prompt_embeds/negative_prompt_embeds_mask when negative_prompt_embeds is a tensor.
+    # Selection uses the boolean mask, so it works for any mask though the docstring expects a
+    # left-contiguous valid region.
+    # Inputs: data - TensorDict with prompt_embeds (batch x seq x dim) and prompt_embeds_mask, optional
+    # negative counterparts.
+    # Outputs: the same TensorDict, mutated, with nested embeds and nested all-true masks.
+    # Exceptions: KeyError if the negative mask is missing while negative embeds exist.
+    # Side effects: mutates the input TensorDict.
     """
     Convert TensorDict from prompt embeds with padding to no-padding format.
 
@@ -170,6 +224,10 @@ def embeds_padding_2_no_padding(data: TensorDict) -> TensorDict:
     """
 
     def _to_nested(embeds: torch.Tensor, mask: torch.Tensor):
+        # [FUNCTION DOC]
+        # HELPER: for each row, select embeddings at positions where the mask is true and the
+        # corresponding (all-true) mask values; return two jagged nested tensors (embeds, mask).
+        # Inputs: embeds - batch x seq x dim; mask - batch x seq. Side effects: none.
         """Strip padding from (bs, seq_len, dim) embeds using the boolean mask and return nested tensors."""
         embeds_list, mask_list = [], []
         for i in range(mask.shape[0]):
@@ -192,6 +250,14 @@ def embeds_padding_2_no_padding(data: TensorDict) -> TensorDict:
 
 
 def response_from_nested(tensor: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: for each sample, using the nested tensor's offsets as sequence ends and response lengths
+    # from response_mask offsets, take the response-length slice ending one token before the sequence
+    # end (left-shift alignment) and pack slices into a jagged nested tensor.
+    # Inputs: tensor - nested full-sequence model output; response_mask - nested response mask.
+    # Outputs: nested tensor of per-sample response values.
+    # Exceptions: ValueError from strict zip if batch sizes differ.
+    # Side effects: none.
     """Extract response from nested model output.
 
     Args:
@@ -211,6 +277,13 @@ def response_from_nested(tensor: torch.Tensor, response_mask: torch.Tensor) -> t
 
 
 def response_to_nested(tensor: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: asserts response_mask is nested; for each row of the padded tensor keeps the first
+    # response-length entries and packs them into a jagged nested tensor.
+    # Inputs: tensor - padded batch x response_len; response_mask - nested response mask.
+    # Outputs: nested tensor batch x jagged response_len.
+    # Exceptions: AssertionError if response_mask is not nested.
+    # Side effects: none.
     """Convert padded response tensor to nested tensor.
 
     Args:

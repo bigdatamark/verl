@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Monkey patches for Megatron-Core MoE TopKRouter enabling "router replay": recording the top-k
+# expert indices chosen per token during one pass (e.g. rollout/log-prob) and forcing the same
+# expert choices in later forward and backward-recompute passes, so routing is consistent between
+# inference and training. Adapted from slime's routing_replay. On import failure of MoE utilities
+# (e.g. NPU), a warning is issued and the AlltoAll dispatcher patch is skipped.
+
 import inspect
 import types
 import warnings
@@ -36,12 +44,19 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class RouterReplayAction(Enum):
+    # [CLASS DOC]
+    # Enum of per-layer replay modes: RECORD (compute natively and store indices), REPLAY_FORWARD
+    # (use the target indices set for this step), REPLAY_BACKWARD (pop queued indices FIFO, for
+    # activation-recomputation passes).
     RECORD = "record"
     REPLAY_FORWARD = "replay_forward"
     REPLAY_BACKWARD = "replay_backward"
 
 
 class RouterReplay:
+    # [CLASS DOC]
+    # Per-MoE-layer replay state. A class-level list router_instances holds every instance in
+    # construction order (one per router/layer); static methods act on all of them globally.
     """
     A class to manage the recording and replaying of MoE routing decisions.
     It holds all router instances and provides static methods to globally
@@ -53,6 +68,11 @@ class RouterReplay:
 
     @staticmethod
     def set_replay_data(all_layers_topk_indices: list):
+        # [FUNCTION DOC]
+        # Behavior: assigns all_layers_topk_indices[i] as target indices of the i-th registered instance
+        # (no replay mask). Inputs: list of index tensors, one per layer, in registration order.
+        # Exceptions: ValueError if the list length differs from the number of instances.
+        # Side effects: mutates each instance (also appends to their backward queues).
         """
         Distributes the topk indices for all layers to their respective RouterReplay instances.
         :param all_layers_topk_indices: A list of tensors, where each tensor contains the
@@ -69,6 +89,8 @@ class RouterReplay:
 
     @staticmethod
     def get_recorded_data() -> list:
+        # [FUNCTION DOC]
+        # Behavior: returns each instance's recorded indices (None where nothing was recorded), in order.
         """
         Collects the recorded topk indices from all RouterReplay instances.
         :return: A list of tensors, each containing the recorded topk indices for a layer.
@@ -77,11 +99,17 @@ class RouterReplay:
 
     @staticmethod
     def clear_global_indices():
+        # [FUNCTION DOC]
+        # Behavior: calls clear_indices on every instance. Side effects: resets state.
         """Clears the recorded and target topk indices in all instances."""
         for router in RouterReplay.router_instances:
             router.clear_indices()
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Behavior: initializes target/recorded indices, mask and action to None and empty backward
+        # queues, and registers self in the global router_instances list.
+        # Side effects: appends to class-level list.
         """Initializes a RouterReplay instance for a specific layer."""
         self.target_topk_idx = None  # For replay
         self.target_replay_mask = None
@@ -92,6 +120,10 @@ class RouterReplay:
         RouterReplay.router_instances.append(self)
 
     def set_target_indices(self, topk_indices: torch.Tensor, replay_mask: torch.Tensor | None = None):
+        # [FUNCTION DOC]
+        # Behavior: sets the forward-replay target indices and optional per-token replay mask, and also
+        # appends both to the backward replay FIFO queues.
+        # Inputs: topk_indices (num_tokens, topk); replay_mask - optional (num_tokens,) bool-like.
         """Sets the target topk indices for replay."""
         self.target_topk_idx = topk_indices
         self.target_replay_mask = replay_mask
@@ -99,14 +131,30 @@ class RouterReplay:
         self.replay_backward_mask_list.append(replay_mask)
 
     def get_recorded_indices(self):
+        # [FUNCTION DOC]
+        # Returns the last recorded index tensor (or None).
         """Returns the recorded topk indices."""
         return self.recorded_topk_idx
 
     def record_indices(self, topk_indices: torch.Tensor):
+        # [FUNCTION DOC]
+        # Stores topk_indices as the recorded indices (overwrites).
         """Records the topk indices."""
         self.recorded_topk_idx = topk_indices
 
     def get_replay_topk(self, scores, topk, num_groups=None, group_topk=None, default_compute_topk=None):
+        # [FUNCTION DOC]
+        # Behavior: RECORD -> run default_compute_topk, record indices, return its (probs, indices).
+        # REPLAY_FORWARD with targets set -> use target indices/mask; REPLAY_BACKWARD with a non-empty
+        # queue -> pop the oldest indices/mask; otherwise fall back to default_compute_topk. For replayed
+        # indices: move to scores' device; if a mask is given, compute native top-k and take replayed
+        # indices for masked-in tokens and native ones elsewhere. Returns (scores gathered at the indices
+        # along dim 1, indices).
+        # Inputs: scores (num_tokens, num_experts); topk; num_groups/group_topk for group-limited routing;
+        # default_compute_topk - callable(scores, topk, num_groups=, group_topk=) returning (values, indices).
+        # Exceptions: RuntimeError if, with a mask, target and native index shapes differ or mask length
+        # != number of tokens.
+        # Side effects: may record indices or pop from backward queues.
         """Select native or replayed experts using the current replay action."""
         action = self.router_replay_action
         if action == RouterReplayAction.RECORD:
@@ -136,6 +184,8 @@ class RouterReplay:
         return scores.gather(1, indices), indices
 
     def clear_indices(self):
+        # [FUNCTION DOC]
+        # Resets recorded/target indices, mask and both backward queues.
         """Clears the recorded and target topk indices."""
         self.recorded_topk_idx = None
         self.target_topk_idx = None
@@ -144,21 +194,29 @@ class RouterReplay:
         self.replay_backward_mask_list = []
 
     def set_router_replay_action(self, router_replay_action: RouterReplayAction):
+        # [FUNCTION DOC]
+        # Sets this layer's action.
         """Sets the router replay action for this layer."""
         self.router_replay_action = router_replay_action
 
     def clear_router_replay_action(self):
+        # [FUNCTION DOC]
+        # Sets this layer's action to None (native routing).
         """Clears the router replay action for this layer."""
         self.router_replay_action = None
 
     @staticmethod
     def set_global_router_replay_action(router_replay_action: RouterReplayAction):
+        # [FUNCTION DOC]
+        # Sets the action on every registered instance.
         """Sets the router replay action for all router instances."""
         for router in RouterReplay.router_instances:
             router.set_router_replay_action(router_replay_action)
 
     @staticmethod
     def clear_global_router_replay_action():
+        # [FUNCTION DOC]
+        # Clears the action on every registered instance.
         """Clears the router replay action for all router instances."""
         for router in RouterReplay.router_instances:
             router.clear_router_replay_action()
@@ -176,12 +234,31 @@ def _patched_topk_routing_with_score_function(
     router_replay: RouterReplay,
     scaling_factor: float,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Replay-aware re-implementation of Megatron's topk_routing_with_score_function.
+    # Behavior: defines a top-k selector (group-limited top-k when group_topk is set, else plain top-k
+    # along experts) routed through router_replay when present. softmax: with pre-softmax, softmax
+    # over all experts (fp32 then cast) then top-k on probabilities; otherwise top-k on raw logits
+    # then softmax over the selected k. sigmoid: sigmoid scores; if expert_bias given, select with
+    # scores+bias but gather unbiased scores; normalize selected scores to sum 1 when topk > 1 (eps
+    # 1e-20). Multiply probs by scaling_factor if truthy. Scatter into dense (num_tokens, num_experts)
+    # routing_probs and a bool routing_map, using index_put_ when deterministic algorithms are
+    # enabled, scatter otherwise.
+    # Inputs: logits (num_tokens, num_experts); topk; use_pre_softmax; num_groups; group_topk;
+    # score_function "softmax"|"sigmoid"; expert_bias tensor or None; fused (unused); router_replay
+    # instance or None; scaling_factor.
+    # Outputs: (routing_probs, routing_map), both (num_tokens, num_experts).
+    # Exceptions: ValueError for unknown score_function; RuntimeError from replay alignment.
+    # KNOWN ISSUE: the fused argument is accepted but ignored (no fused kernel path).
     """
     Patched version of topk_routing_with_score_function that supports router replay.
     """
     num_tokens, num_experts = logits.shape
 
     def _compute_topk(scores, topk, num_groups=None, group_topk=None):
+        # [FUNCTION DOC]
+        # HELPER: Native top-k: group_limited_topk when group_topk is truthy, else torch top-k on dim 1.
+        # Returns (values, indices).
         if group_topk:
             return group_limited_topk(
                 scores=scores,
@@ -195,6 +272,9 @@ def _patched_topk_routing_with_score_function(
             return torch.topk(scores, k=topk, dim=1)
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
+        # [FUNCTION DOC]
+        # HELPER: Uses _compute_topk directly when no router_replay, else delegates to
+        # router_replay.get_replay_topk with _compute_topk as fallback.
         if router_replay is None:
             return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
         return router_replay.get_replay_topk(
@@ -245,6 +325,11 @@ def _patched_topk_routing_with_score_function(
 
 
 def _get_aux_loss_coeff(_self, aux_loss_type: str) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Returns the configured moe_aux_loss_coeff for aux_loss_type: if routing_type is a str
+    # equal to it, the scalar coeff; if a list, the coeff at the matching index (0.0 if missing or
+    # out of range); else 0.0.
+    # Inputs: _self - router; aux_loss_type str. Outputs: float.
     """Return the aux loss coeff for the given auxiliary loss type.
     If the auxiliary loss type is not found, return 0.0.
     """
@@ -261,6 +346,9 @@ def _get_aux_loss_coeff(_self, aux_loss_type: str) -> float:
 
 
 def _is_aux_loss_enabled(_self) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if any of "aux_loss", "seq_aux_loss", "global_aux_loss" has a positive coefficient.
+    # Bound onto routers lacking an is_aux_loss_enabled method.
     """Check if the auxiliary loss is enabled."""
     for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss"]:
         if _get_aux_loss_coeff(_self, aux_loss_type) > 0:
@@ -269,6 +357,18 @@ def _is_aux_loss_enabled(_self) -> bool:
 
 
 def patched_routing(self, logits: torch.Tensor, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Behavior: replacement for TopKRouter.routing. Flattens logits from (seq, batch, experts) to
+    # (tokens, experts), applies z-loss, then sinkhorn balancing or the replay-aware top-k routing
+    # (using moe_router_fusion if the config has it). Applies token dropping when a capacity factor is
+    # set. Lazily binds is_aux_loss_enabled if missing; in training with grad enabled and aux loss on,
+    # computes aux-loss routing scores and applies aux, sequence-aux and global-aux losses to probs.
+    # When expert bias is enabled and grad is on, accumulates per-expert token counts.
+    # Inputs: self - TopKRouter; logits (seq, batch, num_experts); extra args ignored.
+    # Outputs: (probs, routing_map) of shape (tokens, num_experts).
+    # Side effects: may set an attribute on self; updates local_tokens_per_expert.
+    # KNOWN ISSUE: the aux-loss path reads self.config.moe_router_fusion directly, which raises
+    # AttributeError on Megatron versions lacking the field (the main path guards with getattr).
     """Top-k routing function
 
     Args:
@@ -340,6 +440,22 @@ def patched_routing(self, logits: torch.Tensor, *args, **kwargs):
 
 
 def apply_router_replay_patch():
+    # [FUNCTION DOC]
+    # Behavior: idempotently installs router replay. Clears registered RouterReplay instances. If the
+    # AlltoAll dispatcher exists and is unpatched, wraps its preprocess so that, when replay is enabled,
+    # no drop/pad, no capacity factor and no quantization padding, num_out_tokens is set to the actual
+    # count of routed entries (replayed duplicates collapse in the routing map). If the installed
+    # TopKRouter has native replay (a hash-routing method and routing taking input_ids), only wraps
+    # hash routing to record indices (token-to-expert table lookup, or top-k of logits under forced
+    # load balancing / forced bias), exposes this RouterReplay class in Megatron's router module and
+    # returns. Otherwise: adds a keyword-only enable_routing_replay parameter to
+    # TransformerConfig.__init__'s signature metadata (before **kwargs), wraps TransformerConfig.__init__
+    # to strip that kwarg when unsupported natively and set it as an attribute, and patches TopKRouter
+    # __init__ (creating a RouterReplay per router when enable_routing_replay or
+    # moe_enable_routing_replay is set) and routing (patched_routing). Marker attributes prevent
+    # double patching.
+    # Inputs/Outputs: none.
+    # Side effects: global monkey patching of Megatron classes; prints messages.
     """
     Applies the monkey patch for MoE Router Replay functionality.
     This patch dynamically adds the 'enable_routing_replay' attribute to TransformerConfig
@@ -350,6 +466,8 @@ def apply_router_replay_patch():
     RouterReplay.router_instances.clear()
 
     def _router_replay_enabled(config):
+        # [FUNCTION DOC]
+        # HELPER: True if config has truthy enable_routing_replay or moe_enable_routing_replay.
         return getattr(config, "enable_routing_replay", False) or getattr(config, "moe_enable_routing_replay", False)
 
     # Duplicate replayed routes collapse in routing_map, so the dispatcher must
@@ -358,6 +476,9 @@ def apply_router_replay_patch():
         original_preprocess = MoEAlltoAllTokenDispatcher.preprocess
 
         def patched_preprocess(self, routing_map):
+            # [FUNCTION DOC]
+            # HELPER: Calls the original dispatcher preprocess, then overrides num_out_tokens with the number
+            # of set routing-map entries under the replay conditions above; returns the original result.
             result = original_preprocess(self, routing_map)
             if (
                 _router_replay_enabled(self.config)
@@ -385,6 +506,10 @@ def apply_router_replay_patch():
 
         @wraps(original_hash_routing)
         def hash_routing_with_recording(self, logits, input_ids):
+            # [FUNCTION DOC]
+            # HELPER: Calls the original hash routing; in RECORD mode records expert indices from the
+            # token-id-to-expert table (indexed by transposed, flattened input_ids), or from top-k logits when
+            # forced load balancing/bias is configured. Returns the original output.
             output = original_hash_routing(self, logits, input_ids)
             if self.router_replay is not None and self.router_replay.router_replay_action == RouterReplayAction.RECORD:
                 indices = self.tid2eid[input_ids.T.reshape(-1)].long()
@@ -434,6 +559,9 @@ def apply_router_replay_patch():
         # Define new __init__ method that safely handles enable_routing_replay parameter
         @wraps(original_tf_config_init)
         def patched_tf_config_init(self, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Reads enable_routing_replay from kwargs (removing it if the native init does not accept
+            # it), calls the original init, then sets the attribute on the instance.
             # Simple solution: remove the unknown parameter before calling original constructor
             enable_routing_replay = kwargs.get("enable_routing_replay", False)
             if "enable_routing_replay" not in native_params:
@@ -457,6 +585,9 @@ def apply_router_replay_patch():
 
     # Step 3: Define the new __init__ method
     def patched_init(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Calls the original TopKRouter init, sets router_replay to None, or to a new RouterReplay
+        # instance when replay is enabled in self.config.
         original_init(self, *args, **kwargs)
         self.router_replay = None
         if _router_replay_enabled(self.config):

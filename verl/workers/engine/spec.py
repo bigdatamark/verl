@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Declarative shard-export contract (ShardSpec, BlockPlacement) plus pure-math helpers to derive per-rank placement, contribution flag and gather group from DTensor mesh/placements and to translate shard-local flat indices to full-tensor flat indices.
+# Side effects: holds a module-level cache of created gather process groups keyed by sorted rank tuple.
 """The shard-export contract between training engines and the sharded delta engine.
 
 ``BaseEngine.get_per_tensor_param_shard`` yields ``(name, local_shard, ShardSpec)``
@@ -57,6 +61,8 @@ __all__ = ["BlockPlacement", "ShardSpec", "derive_dtensor_placement", "translate
 
 @dataclass
 class ShardSpec:
+    # [CLASS DOC]
+    # Dataclass describing one exported local shard: full_shape, optional DTensor mesh/placements, optional explicit override (place, gather_group, contributes), and optional HF conversion hooks (to_hf_chunk, hf_slots). See field comments for semantics.
     """Declarative placement descriptor for one exported local parameter shard."""
 
     # Logical (full) tensor shape; the distribution facts below refer to it.
@@ -93,12 +99,17 @@ class ShardSpec:
 
     @classmethod
     def from_param(cls, param: torch.Tensor) -> ShardSpec:
+        # [FUNCTION DOC]
+        # Builds a ShardSpec from a parameter: for a DTensor uses its shape, device_mesh and placements (as tuple); otherwise only full_shape (unsharded).
+        # Inputs: param - tensor or DTensor. Outputs: new ShardSpec.
         if isinstance(param, DTensor):
             return cls(full_shape=tuple(param.shape), mesh=param.device_mesh, placements=tuple(param.placements))
         return cls(full_shape=tuple(param.shape))
 
 
 def _prod(xs: tuple | list) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the product of the elements (cast to int); 1 for empty input.
     n = 1
     for x in xs:
         n *= int(x)
@@ -106,6 +117,8 @@ def _prod(xs: tuple | list) -> int:
 
 
 def _row_major_strides(shape: tuple | list) -> tuple:
+    # [FUNCTION DOC]
+    # HELPER: Computes row-major (C-order) strides for a shape; returns a tuple, empty for empty shape.
     strides, acc = [], 1
     for d in reversed([int(x) for x in shape]):
         strides.append(acc)
@@ -115,6 +128,8 @@ def _row_major_strides(shape: tuple | list) -> tuple:
 
 @dataclass(frozen=True)
 class BlockPlacement:
+    # [CLASS DOC]
+    # Frozen dataclass: a rank's shard as a hyper-rectangular block of the full tensor, with local_shape, global_offset and full_shape tuples.
     """This rank's local shard is one hyper-rectangular block of the full tensor:
     ``full[o0:o0+l0, o1:o1+l1, ...]`` with ``local_shape=(l0, l1, ...)`` and
     ``global_offset=(o0, o1, ...)``. Produced by :func:`derive_dtensor_placement` for every
@@ -128,14 +143,20 @@ class BlockPlacement:
 
     @property
     def local_strides(self) -> tuple:
+        # [FUNCTION DOC]
+        # Row-major strides of the local block shape.
         return _row_major_strides(self.local_shape)
 
     @property
     def full_strides(self) -> tuple:
+        # [FUNCTION DOC]
+        # Row-major strides of the full tensor shape.
         return _row_major_strides(self.full_shape)
 
     @property
     def is_flat_contiguous(self) -> bool:
+        # [FUNCTION DOC]
+        # True when all dims after dim 0 have equal local and full sizes (block is one contiguous flat range).
         """True when the block is one contiguous flat range (only dim 0 is cut).
 
         Then every trailing dim is whole, so the trailing offsets are all zero
@@ -145,11 +166,15 @@ class BlockPlacement:
 
     @property
     def flat_offset(self) -> int:
+        # [FUNCTION DOC]
+        # Flat start offset of the block: global_offset[0] times the product of the trailing full dims; 0 when full_shape is empty. Only valid when is_flat_contiguous.
         """Flat start of the block; only meaningful when ``is_flat_contiguous``."""
         return int(self.global_offset[0]) * _prod(self.full_shape[1:]) if self.full_shape else 0
 
 
 def _shard_dim(p) -> Optional[int]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the tensor dim cut by a placement (Shard or _StridedShard detected by class name), else None.
     """Which tensor dim this placement cuts, or None. ``is_shard()`` misses ``_StridedShard`` on torch 2.13."""
     if p.is_shard():
         return int(p.dim)
@@ -157,6 +182,11 @@ def _shard_dim(p) -> Optional[int]:
 
 
 def _assert_even_strided(spec: ShardSpec, placements: tuple) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Validates that strided sharding divides evenly.
+    # Behavior: only acts if any placement is _StridedShard; accumulates, per tensor dim, the product of mesh dim sizes cutting it, and checks the full size is divisible.
+    # Inputs: spec - ShardSpec with mesh; placements - tuple.
+    # Exceptions: NotImplementedError on uneven division.
     """Strided offsets assume equal shards, and switch every tensor dim to that rule -- so check them all."""
     if not any(type(p).__name__ == "_StridedShard" for p in placements):
         return
@@ -175,6 +205,11 @@ def _assert_even_strided(spec: ShardSpec, placements: tuple) -> None:
 
 
 def translate_flat_indices(lidx: torch.Tensor, place: int | BlockPlacement) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Translates shard-local flat indices to full-tensor flat indices.
+    # Behavior: int place - adds it (skips when 0); flat-contiguous block - adds flat_offset; otherwise, for each dim, floor-divides the remaining index by the local stride to get the coordinate, subtracts it, and accumulates (coordinate + offset) times the full stride.
+    # Inputs: lidx - integer tensor of local flat indices; place - int or BlockPlacement.
+    # Outputs: tensor of full flat indices (may be the input itself when no offset).
     """Map shard-local flat positions to full-tensor flat positions.
 
     ``place`` is what the caller's dispatch produced (``spec.place`` or
@@ -200,6 +235,13 @@ def translate_flat_indices(lidx: torch.Tensor, place: int | BlockPlacement) -> t
 
 
 def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, bool, Optional[ProcessGroup]]:
+    # [FUNCTION DOC]
+    # Derives (place, contributes, gather_group) for this rank from a mesh+placements spec.
+    # Behavior: unsharded spec - returns 0, contributes only on global rank 0 (or True when distributed is not initialized), no group. Otherwise finds shard mesh dims, validates strided evenness, marks contributes false if the rank's coordinate is non-zero on any Replicate dim (coord None keeps True). No shard dims - returns 0, contributes, None. Else computes local shape/global offset to build a BlockPlacement; group is the single shard dim's mesh subgroup, or a cached group spanning all shard dims.
+    # Inputs: spec - ShardSpec with place None.
+    # Outputs: tuple described above.
+    # Exceptions: AssertionError if spec.place is set; NotImplementedError from the strided check.
+    # Side effects: may create new process groups.
     """Derive ``(place, contributes, gather_group)`` for THIS rank from a spec
     whose distribution is fully declared by ``mesh`` + ``placements`` (or is
     unsharded). Specs carrying an explicit exporter override (``spec.place``)
@@ -260,6 +302,13 @@ _GATHER_GROUPS: dict[tuple, ProcessGroup] = {}
 
 
 def _shard_dims_group(mesh: DeviceMesh, shard_dims: list[int]) -> ProcessGroup:
+    # [FUNCTION DOC]
+    # HELPER: Returns the process group of ranks obtained by varying shard mesh dims while fixing this rank's coordinate on the other dims.
+    # Behavior: iterates over every combination of the other dims' indices, collects sorted rank tuples of the resulting sub-mesh, creates (or reuses from the module cache) a group for each, and selects the one matching this rank's coordinate. All combinations are created on every rank so new_group is called collectively in the same order.
+    # Inputs: mesh - DeviceMesh; shard_dims - list of mesh dims.
+    # Outputs: ProcessGroup.
+    # Exceptions: AssertionError if the rank is outside the mesh or no group matches.
+    # Side effects: calls dist.new_group (collective) and mutates the cache.
     """The ranks reached by varying the Shard mesh dims, with this rank's coordinate fixed on the others."""
     import itertools
 

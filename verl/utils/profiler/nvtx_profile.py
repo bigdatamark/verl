@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# NVIDIA Nsight Systems profiling backend: NVTX implementations of the range-marker API, an NVTX-
+# annotated timer, and NsightSystemsProfiler, which drives profiler start/stop via the active platform
+# (e.g. CUDA profiler API) and can relocate nsys reports out of Ray's fixed log dir
+# (RAY_NSIGHT_LOG_DIR). Importing requires the nvtx package.
 import functools
 import glob
 import logging
@@ -46,6 +51,9 @@ def mark_start_range(
     domain: Optional[str] = None,
     category: Optional[str] = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: starts an NVTX range with given message/color/domain/category.
+    # Outputs: the NVTX range id (annotated None). Side effects: emits a marker.
     """Start a mark range in the profiler.
 
     Args:
@@ -62,6 +70,8 @@ def mark_start_range(
 
 
 def mark_end_range(range_id: str) -> None:
+    # [FUNCTION DOC]
+    # Behavior: ends the NVTX range with the given id. Side effects: emits a marker.
     """End a mark range in the profiler.
 
     Args:
@@ -77,6 +87,9 @@ def mark_annotate(
     domain: Optional[str] = None,
     category: Optional[str] = None,
 ) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: returns a decorator that wraps a function in nvtx.annotate with message (or function name)
+    # and the given color/domain/category. Outputs: decorator.
     """Decorate a function to annotate a mark range along with the function life cycle.
 
     Args:
@@ -91,6 +104,8 @@ def mark_annotate(
     """
 
     def decorator(func):
+        # [FUNCTION DOC]
+        # HELPER: Applies nvtx.annotate to func and returns the wrapped function.
         profile_message = message or func.__name__
         return nvtx.annotate(profile_message, color=color, domain=domain, category=category)(func)
 
@@ -105,6 +120,13 @@ def marked_timer(
     domain: Optional[str] = None,
     category: Optional[str] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: opens an NVTX range named name, delegates to performance._timer to accumulate elapsed
+    # seconds into timing_raw[name], then closes the range.
+    # Inputs: name; timing_raw - mutable mapping; color/domain/category - NVTX attributes.
+    # Outputs: generator context manager yielding None.
+    # KNOWN ISSUE: range is not closed if the body raises (no try/finally).
+    # Side effects: mutates timing_raw; emits markers.
     """Context manager for timing with NVTX markers.
 
     This utility function measures the execution time of code within its context,
@@ -128,9 +150,20 @@ def marked_timer(
 
 
 class NsightSystemsProfiler(DistProfiler):
+    # [CLASS DOC]
+    # DistProfiler backend for Nsight Systems. Continuous mode: start/stop toggle the platform profiler
+    # around the whole step. Discrete mode: each annotated call toggles it individually.
     """Nsight system profiler. Installed in a worker to control the Nsight system profiler."""
 
     def __init__(self, rank: int, config: Optional[ProfilerConfig], tool_config: Optional[NsightToolConfig], **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: defaults config to ProfilerConfig(ranks=[]) when falsy; asserts tool_config given when
+        # enabled; stores discrete from tool_config.
+        # Inputs: rank (unused); config; tool_config; kwargs ignored.
+        # Exceptions: AssertionError when enabled without tool_config.
+        # KNOWN ISSUE: with tool_config None and profiling disabled, reading tool_config.discrete raises
+        # AttributeError.
+        # Side effects: sets self.discrete.
         """Initialize the NsightSystemsProfiler.
 
         Args:
@@ -145,10 +178,14 @@ class NsightSystemsProfiler(DistProfiler):
         self.discrete: bool = tool_config.discrete
 
     def start(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: calls platform profiler_start unless discrete. Inputs: kwargs ignored. Side effects: starts capture.
         if not self.discrete:
             get_platform().profiler_start()
 
     def stop(self):
+        # [FUNCTION DOC]
+        # Behavior: calls platform profiler_stop unless discrete. Side effects: stops capture.
         if not self.discrete:
             get_platform().profiler_stop()
 
@@ -160,6 +197,13 @@ class NsightSystemsProfiler(DistProfiler):
         save_file_prefix: Optional[str] = None,
         source_dir: Optional[str] = None,
     ) -> list[str]:
+        # [FUNCTION DOC]
+        # Behavior: returns [] (with warning) if save_path falsy. Globs source_dir (default RAY_NSIGHT_LOG_DIR)
+        # for files named worker_process_<current pid>.*; returns [] (info log) if none. Otherwise creates
+        # save_path, and moves each match to save_path/<role prefix_><hostname>_<basename>; FileNotFoundError is
+        # ignored, other OSError logged as warning. Logs a summary when anything moved.
+        # Inputs/Outputs: see docstring. Exceptions: none propagated from moves; makedirs errors propagate.
+        # Side effects: filesystem moves, directory creation, logging.
         """Move this process's Nsight reports out of Ray's fixed log dir into ``save_path``.
 
         Ray hardcodes the Nsight output directory and offers no way to change it, which makes the
@@ -218,6 +262,8 @@ class NsightSystemsProfiler(DistProfiler):
         return moved
 
     def step(self):
+        # [FUNCTION DOC]
+        # No-op (see docstring). Outputs: None.
         """No-op per-mini-batch hook.
 
         The actor update loop calls this once per mini-batch to drive the torch profiler's
@@ -238,6 +284,12 @@ class NsightSystemsProfiler(DistProfiler):
         category: Optional[str] = None,
         **kwargs_outer,
     ) -> Callable:
+        # [FUNCTION DOC]
+        # Behavior: returns a decorator; wrapped call is surrounded by an NVTX range named message, the "role"
+        # kwarg, or function name; in discrete mode platform profiler start/stop wrap the call.
+        # Inputs: message, color, domain, category; kwargs_outer may contain "role". Outputs: decorator.
+        # KNOWN ISSUE: exceptions skip range end / profiler stop.
+        # Side effects: profiling markers and capture toggling.
         """Decorate a Worker member function to profile the current rank in the current training step.
 
         Requires the target function to be a member function of a Worker, which has a member field `profiler` with
@@ -255,8 +307,12 @@ class NsightSystemsProfiler(DistProfiler):
         """
 
         def decorator(func):
+            # [FUNCTION DOC]
+            # HELPER: Builds the functools.wraps wrapper for func.
             @functools.wraps(func)
             def wrapper(*args, **kwargs_inner):
+                # [FUNCTION DOC]
+                # HELPER: Runs func with the profiling behavior described in annotate; returns its result.
                 # Prefer the stage label (`role`, e.g. "actor_compute_log_prob"): it names both the
                 # role and the function, which the method name alone cannot do for a colocated
                 # worker. Fall back to the method name for stages that declare no role.

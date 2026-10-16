@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# VeOmni training-engine backend package. Re-exports the VeOmni engine classes (base engine,
+# language-model-head variant, value-head variant) from the transformer implementation module.
 
 from .transformer_impl import VeOmniEngine, VeOmniEngineWithLMHead, VeOmniEngineWithValueHead
 

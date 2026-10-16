@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# DeepSeek-V4 prompt encoder and its Continuous Token builder. Defines the special-token strings (BOS, EOS, User,
+# Assistant, latest_reminder, think tags, DSML tool-call markers), quick-instruction task tokens, the max-effort
+# reasoning preamble and the tool / response-format prompt templates, plus a string encoder for OpenAI-format
+# conversations and a builder that tokenizes via that encoder instead of a jinja chat template.
 """Prompt encoding and Continuous Token support for the DeepSeek-V4 series.
 
 DeepSeek-V4 does not use a role/content markup like ChatML. Turns are delimited by dedicated
@@ -106,6 +111,9 @@ RESPONSE_FORMAT_TEMPLATE = "## Response Format:\n\nYou MUST strictly adhere to t
 
 
 def _to_json(value: Any) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Serializes a value to JSON keeping non-ASCII characters; on any failure retries with ASCII escaping.
+    # Outputs: JSON string. Exceptions: the fallback's serialization error propagates (e.g. non-serializable objects).
     try:
         return json.dumps(value, ensure_ascii=False)
     except Exception:
@@ -113,6 +121,9 @@ def _to_json(value: Any) -> str:
 
 
 def _text_of(content: Any) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns "" for None, the string itself for str, the concatenation of text fields of parts whose type is
+    # "text" for lists, and the string conversion of anything else.
     """Flatten a message content into text, accepting both plain strings and typed part lists."""
     if content is None:
         return ""
@@ -124,6 +135,10 @@ def _text_of(content: Any) -> str:
 
 
 def render_tools(tools: list[dict[str, Any]]) -> str:
+    # [FUNCTION DOC]
+    # Renders the tool prompt: serializes each tool's "function" entry (or the tool itself) as JSON, joins them with
+    # newlines and fills TOOLS_TEMPLATE with the DSML and think tokens.
+    # Inputs: tools - list of OpenAI-format tool dicts. Outputs: string.
     """Render OpenAI-format tool schemas into the DSML tool prompt."""
     schemas = [_to_json(tool.get("function", tool)) for tool in tools]
     return TOOLS_TEMPLATE.format(
@@ -135,6 +150,13 @@ def render_tools(tools: list[dict[str, Any]]) -> str:
 
 
 def _render_tool_call(tool_call: dict[str, Any]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Renders one tool call as a DSML invoke block.
+    # Behavior: takes the "function" sub-dict (or the call itself); parses string arguments as JSON, wrapping
+    # unparseable strings (and any non-dict result) as a single "arguments" key; emits one parameter element per argument
+    # with string="true" and the raw value for strings, otherwise string="false" and JSON value; wraps them in an invoke
+    # element named after the function, separated by newlines.
+    # Outputs: string. Side effects: none.
     function = tool_call.get("function", tool_call)
     arguments = function.get("arguments")
     if isinstance(arguments, str):
@@ -164,6 +186,25 @@ def encode_messages(
     drop_thinking: bool = True,
     reasoning_effort: Optional[str] = None,
 ) -> str:
+    # [FUNCTION DOC]
+    # Encodes a conversation into the DeepSeek-V4 prompt string.
+    # Behavior:
+    # - thinking is active when enable_thinking and reasoning_effort is not "none"; reasoning dropping is active only if
+    # drop_thinking and no tools are present (either the tools argument or any message's tools field).
+    # - last_user is the index of the last user/tool/developer message (-1 if none).
+    # - Emit BOS if requested, the max-effort preamble if thinking and effort is "max"/"xhigh", and the rendered tools.
+    # - Per message: system/developer emit content text (developer prefixed with the User token) plus any per-message tools
+    # and response_format block; latest_reminder emits its token plus content; user/tool emit the User token only at the
+    # start of a run of user/tool messages (else a blank-line separator), tool content wrapped in tool_result tags;
+    # assistant emits the Assistant token and think block (think start plus reasoning_content/reasoning only when thinking
+    # and either not dropping or after last_user, then think end) unless the previous message had a task, then content,
+    # optional DSML tool_calls block, and EOS. Other roles raise ValueError.
+    # - If a message has a task and is last or followed by assistant/latest_reminder: validate it against TASK_TOKENS
+    # (ValueError otherwise); for "action" first emit Assistant plus think start/end; then emit the task token.
+    # - Finally append Assistant plus think start (thinking) or think end, if add_generation_prompt and the last message
+    # has no task.
+    # Inputs: messages, tools, and keyword flags as named. Outputs: concatenated prompt string.
+    # Exceptions: ValueError for unsupported roles/tasks; KeyError if a message lacks "role". Side effects: none.
     """Encode a conversation into a DeepSeek-V4 prompt.
 
     Args:
@@ -258,6 +299,10 @@ def encode_messages(
 
 
 class DeepSeekV4ContinuousTokenBuilder(ContinuousTokenBuilder):
+    # [CLASS DOC]
+    # Continuous Token builder for DeepSeek-V4 that renders through encode_messages and tokenizes the text without
+    # adding special tokens, so incremental turns are encoded exactly like a full re-render. Inserts the EOS token
+    # after an assistant turn when generation stopped before emitting it.
     """DeepSeek-V4 turn boundary handling, rendered by :func:`encode_messages`.
 
     Unlike the other builders this one does not diff two ``apply_chat_template`` renders. The turn
@@ -269,6 +314,10 @@ class DeepSeekV4ContinuousTokenBuilder(ContinuousTokenBuilder):
     """
 
     def __init__(self, tokenizer: Any, **kwargs: Any):
+        # [FUNCTION DOC]
+        # Initializes the base builder, resolves the EOS token id (require_token_id raises if missing) and reads
+        # enable_thinking (or "thinking"), drop_thinking (default True) and reasoning_effort from the builder's chat template
+        # kwargs. Side effects: stores these on the instance.
         super().__init__(tokenizer, **kwargs)
         self._eos_id = require_token_id(tokenizer, EOS_TOKEN)
         template_kwargs = self.chat_template_kwargs
@@ -286,6 +335,9 @@ class DeepSeekV4ContinuousTokenBuilder(ContinuousTokenBuilder):
         audios: list[Any] | None = None,
         mm_inputs_out: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Tokenizes the initial prompt (with BOS and tools). Multimodal arguments are ignored (text-only model).
+        # Outputs: list of int token ids.
         del images, videos, audios, mm_inputs_out
         return self._encode(messages, tools=tools, add_bos_token=True)
 
@@ -296,6 +348,12 @@ class DeepSeekV4ContinuousTokenBuilder(ContinuousTokenBuilder):
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Tokenizes only the messages appended since previous_messages.
+        # Behavior: asserts updated_messages extends previous_messages (base-class check); returns [] if nothing appended;
+        # raises ValueError if the appended run ends with an assistant message; checks prefix stability; encodes the appended
+        # messages without tools, without BOS and with drop_thinking off (generation prompt included).
+        # Outputs: list of int token ids. Exceptions: ValueError from the checks.
         self._assert_append_only(previous_messages, updated_messages)
         appended_messages = updated_messages[len(previous_messages) :]
         if not appended_messages:
@@ -319,6 +377,9 @@ class DeepSeekV4ContinuousTokenBuilder(ContinuousTokenBuilder):
         add_bos_token: bool,
         drop_thinking: bool | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Encodes messages with encode_messages (generation prompt on, instance thinking settings, drop_thinking
+        # override when given) and tokenizes the text with add_special_tokens off, normalized to a list of ints.
         text = encode_messages(
             messages,
             tools=tools,
@@ -336,6 +397,10 @@ class DeepSeekV4ContinuousTokenBuilder(ContinuousTokenBuilder):
         *,
         tools: list[dict[str, Any]] | None,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Rejects incremental appends that a full re-render would change: when thinking and drop_thinking are both on,
+        # no tools are present (argument or any previous message), and any previous message is an assistant turn, raises
+        # ValueError. Otherwise returns None.
         """Reject appends whose prefix a full re-render would not reproduce.
 
         ``drop_thinking`` keeps reasoning only for assistant turns after the last user turn, so
@@ -362,6 +427,11 @@ class DeepSeekV4ContinuousTokenBuilder(ContinuousTokenBuilder):
         previous_messages: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> MergeResult:
+        # [FUNCTION DOC]
+        # HELPER: Merges appended context tokens into the runtime sequence: copies runtime ids; if there are appended ids,
+        # the last previous message was an assistant and the runtime does not already end with EOS, appends EOS and records it
+        # as inserted. Returns a MergeResult of kind "context" with the concatenated ids, appended count and inserted ids.
+        # Extra kwargs are ignored.
         prefix = list(runtime_token_ids)
         inserted_token_ids: list[int] = []
         previous_role = previous_messages[-1].get("role") if previous_messages else None
