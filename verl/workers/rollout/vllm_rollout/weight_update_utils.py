@@ -25,6 +25,11 @@ def split_buffer_updates(
     Returns the parameter updates, the buffer updates, and the model's
     ``named_buffers`` map so callers can reuse it without re-iterating.
     """
+# [MODULE DOC]
+# Helpers for applying incoming weight updates (name, tensor pairs) to a rollout model,
+# separating registered buffers (which weight loaders typically skip) from parameters
+# so buffers can be copied in-place directly. Defines the alias WeightUpdate as a pair of
+# (parameter/buffer name, tensor).
     named_buffers = dict(model.named_buffers())
     param_updates, buffer_updates = [], []
     for name, tensor in weights:
@@ -33,6 +38,13 @@ def split_buffer_updates(
         else:
             param_updates.append((name, tensor))
     return param_updates, buffer_updates, named_buffers
+    # [FUNCTION DOC]
+    # Behavior: build a name-to-tensor mapping of the model's named buffers, then partition the
+    # incoming updates, preserving order, into those whose name is a buffer and all others.
+    # Inputs: model - module whose buffers are inspected; weights - list of (name, tensor) pairs.
+    # Outputs: tuple of (parameter updates list, buffer updates list, buffer name-to-tensor mapping).
+    # Exceptions: none raised directly.
+    # Side effects: none (the weight list is consumed only by iteration).
 
 
 @torch.no_grad()
@@ -54,6 +66,16 @@ def apply_buffer_updates(
 
         target = named_buffers[name]
         if target.shape != tensor.shape:
+    # [FUNCTION DOC]
+    # Behavior: runs under no-grad. Returns 0 immediately if there are no buffer updates. Otherwise
+    # uses the supplied buffer mapping (or builds one from the model), and for each update whose name
+    # exists in the mapping, verifies the shapes match, casts the source tensor to the target buffer's
+    # device and dtype, and copies it into the buffer in place. Unknown names are silently skipped.
+    # Inputs: model - target module; buffer_updates - list of (name, tensor); named_buffers - optional
+    # precomputed buffer mapping (e.g. from split_buffer_updates).
+    # Outputs: number of buffers actually copied.
+    # Exceptions: ValueError when a buffer's shape differs from the update tensor's shape.
+    # Side effects: mutates model buffers in place; blocking device transfers.
             raise ValueError(
                 f"Buffer shape mismatch for {name}: expected {tuple(target.shape)}, got {tuple(tensor.shape)}"
             )

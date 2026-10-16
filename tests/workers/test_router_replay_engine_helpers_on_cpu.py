@@ -282,7 +282,7 @@ class TestPrepareRouterReplayInputs:
 
 class TestPrepareModelOutputs:
     # [CLASS DOC]
-    #
+    # Tests the routed-experts addendum of prepare_model_outputs (parent implementation stubbed).
     """``super().prepare_model_outputs`` needs a real HF model output, so it is
     stubbed out here — these tests only cover the routed-experts addendum."""
 

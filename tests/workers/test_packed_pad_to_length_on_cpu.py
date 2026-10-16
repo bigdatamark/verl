@@ -138,7 +138,7 @@ class TestPadPackedInputs:
 @ENGINE_CLASSES
 class TestGetPackedPadSize:
     # [CLASS DOC]
-    #
+    # Tests for _get_packed_pad_size bucket rounding, run for both FSDP and VeOmni engines.
     """``VeOmniEngine`` subclasses ``FSDPEngine`` without going through its ``__init__``,
     so both engines are checked against the same inherited helper."""
 
@@ -200,7 +200,7 @@ class TestDistillationGuard:
 
 class TestGatherAndUnpadPacked:
     # [CLASS DOC]
-    #
+    # Tests for _gather_and_unpad_packed without Ulysses SP (pure suffix trim).
     """Without Ulysses SP there is nothing to all-gather, so the helper degenerates to
     trimming the suffix that ``prepare_model_inputs`` appended."""
 

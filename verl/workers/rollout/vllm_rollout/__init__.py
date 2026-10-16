@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Package for the vLLM rollout backend. On import it re-exports ServerAdapter from
+# the vllm_rollout submodule and verifies that the vllm distribution is installed.
+# Side effects at import: raises PackageNotFoundError if vllm is not installed;
+# when the ROCM_PATH env var is set, normalizes the module-level
+# vllm_package_version to its leading numeric "major.minor[.patch]" part, raising
+# ValueError if it cannot be matched.
+# Module-level names: vllm_package_name ("vllm"), vllm_package_version (str).
+# KNOWN ISSUE: the ValueError message begins with "Warning:" although it is raised as an error.
 import os
 from importlib.metadata import PackageNotFoundError, version
 
@@ -18,6 +27,9 @@ from .vllm_rollout import ServerAdapter  # noqa: F401
 
 
 def get_version(pkg):
+    # [FUNCTION DOC]
+    # HELPER: Return the installed version string of distribution pkg, or None when it is
+    # not installed (PackageNotFoundError swallowed). No side effects.
     try:
         return version(pkg)
     except PackageNotFoundError:

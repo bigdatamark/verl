@@ -144,7 +144,7 @@ def _make_mocks(peft_config=None, params_by_base_sync_done=None):
 
 class TestAdapterModeFirstIteration:
     # [CLASS DOC]
-    #
+    # Adapter mode, first iteration (base not yet synced): base sync must precede the adapter sync.
     """First iteration in adapter mode: base_sync_done=False."""
 
     def test_sends_base_before_adapter(self):
@@ -245,7 +245,7 @@ class TestAdapterModeFirstIteration:
 
 class TestAdapterModeSubsequentIterations:
     # [CLASS DOC]
-    #
+    # Adapter mode, later iterations (base synced, sleep_level 1): adapter-only sync, no weight resume.
     """Subsequent iterations in adapter mode: base_sync_done=True, sleep_level=1."""
 
     def test_single_update_weights_call(self):
@@ -301,7 +301,7 @@ class TestAdapterModeSubsequentIterations:
 
 class TestMergeMode:
     # [CLASS DOC]
-    #
+    # Merge mode (peft_merge True, no peft_config): one standard sync and normal weight resume.
     """Merge mode: peft_merge=True, peft_config=None (merged into base)."""
 
     def test_single_update_weights_call(self):
@@ -367,7 +367,7 @@ class TestMergeMode:
 
 class TestNonLora:
     # [CLASS DOC]
-    #
+    # Non-LoRA models: one standard sync; the adapter path is never entered.
     """Non-LoRA model: peft_config=None, peft_merge=False."""
 
     def test_single_update_weights_call(self):

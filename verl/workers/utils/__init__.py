@@ -11,3 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Package verl.workers.utils: shared utilities for worker implementations, including
+# loss functions for actor/critic/SFT training (losses) and conversions between padded,
+# left-right padded and nested (no-padding) tensor layouts (padding).
+# Importing the package has no side effects; it re-exports nothing.

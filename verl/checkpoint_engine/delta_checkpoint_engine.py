@@ -11,6 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Delta-sharded checkpoint engine (registered as "delta_sharded"): NCCL weight sync for disaggregated rollout that
+# ships only changed (position, value) pairs. Extends NCCLCheckpointEngine's ZMQ-manifest + ray.util.collective
+# broadcast machinery. Sender: the first (seed) sync streams the full HF export values-only; later syncs batch the
+# backend's per-shard HF deltas, gather them to rank 0, bucket them into size-bounded flushes and broadcast each
+# immediately. Receiver: yields each flush as (named tensors, is_last) for the rollout adapter's delta loader.
+# Each flush = one ZMQ manifest (topic + pickled meta dict: is_full, encoding, is_last, terminal_empty, element counts,
+# value dtype, spec with params/checksum) followed by up to two NCCL broadcasts (positions bytes, then values bytes).
+# cupy is imported with importlib.metadata.distributions patched to return nothing (avoids slow/conflicting plugin scans).
+
 """Delta weight-sync checkpoint engine (NCCL transport) for DISAGGREGATED rollout.
 
 Puts the delta on the trainer->rollout wire: the trainer byte-diffs against a
@@ -73,6 +84,8 @@ logger = logging.getLogger(__name__)
 
 
 def _prodshape(shape) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the product of the dimensions of shape as an int (1 for an empty shape).
     n = 1
     for x in shape:
         n *= int(x)
@@ -81,6 +94,9 @@ def _prodshape(shape) -> int:
 
 @dataclass(slots=True)
 class _FlushPiece:
+    # [CLASS DOC]
+    # HELPER: Slotted record of one (possibly sliced) parameter delta awaiting an indices flush: name, dtype string, full
+    # shape list, flat in-parameter positions tensor and matching values tensor.
     """One (possibly sliced) per-parameter piece buffered for a pending indices flush."""
 
     name: str
@@ -92,6 +108,9 @@ class _FlushPiece:
 
 @dataclass(slots=True)
 class _ValuesPiece:
+    # [CLASS DOC]
+    # HELPER: Slotted record of one whole parameter's flat values awaiting a values-only (seed) flush: name, dtype string,
+    # shape list, flat values tensor.
     """One whole parameter's flat values buffered for the seed sync's values-only flush."""
 
     name: str
@@ -101,6 +120,11 @@ class _ValuesPiece:
 
 
 class _FlushBucket:
+    # [CLASS DOC]
+    # HELPER: Byte-capped bucketing pipeline with one-flush lookahead. Pieces accumulate until their byte total reaches cap;
+    # seal then publishes the previously pending flush with is_last False and assembles the current pieces into the new
+    # pending flush. The caller emits the final pending flush with is_last True. assemble(pieces) builds a flush;
+    # publish(flush, is_last) sends it.
     """One-flush-lookahead bucket pipeline, shared by the steady loop and both
     seed streams. Pieces accumulate until ``cap`` bytes; ``seal`` assembles them
     into the single pending flush, first emitting the previous pending with
@@ -112,6 +136,8 @@ class _FlushBucket:
     __slots__ = ("cap", "pieces", "nbytes", "pending", "_assemble", "_publish")
 
     def __init__(self, cap: int, assemble, publish):
+        # [FUNCTION DOC]
+        # HELPER: Stores cap (as int), the assemble and publish callbacks, and empty piece/byte/pending state.
         self.cap = int(cap)
         self.pieces: list = []
         self.nbytes = 0
@@ -120,12 +146,17 @@ class _FlushBucket:
         self._publish = publish
 
     def add(self, piece, nbytes: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Appends a piece, adds its byte count, and seals when the total reaches or exceeds cap.
         self.pieces.append(piece)
         self.nbytes += int(nbytes)
         if self.nbytes >= self.cap:
             self.seal()
 
     def seal(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: No-op with no pieces; otherwise emits any pending flush as non-last, assembles the pieces into the new
+        # pending flush, and resets pieces and byte count.
         if not self.pieces:
             return
         self.emit(is_last=False)
@@ -133,12 +164,18 @@ class _FlushBucket:
         self.pieces, self.nbytes = [], 0
 
     def emit(self, is_last: bool) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If a pending flush exists, publishes it with the given is_last and clears it.
         if self.pending is not None:
             self._publish(self.pending, is_last)
             self.pending = None
 
 
 def _bucket_sliced(bkt: _FlushBucket, name: str, dtype_str: str, shape, aidx: torch.Tensor, aval: torch.Tensor) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Splits one parameter's positions/values into consecutive slices of at most MAX_ENTRY_ELEMS elements and adds
+    # each to the bucket as a _FlushPiece, with byte cost = elements x (4 position bytes + value element size).
+    # Inputs: bkt - bucket; name, dtype_str, shape - parameter identity; aidx/aval - aligned 1-D tensors.
     """Slice one param's (idx, val) delta into <= MAX_ENTRY_ELEMS pieces and bucket
     them (bounds the receiver-side decode transient; the masked apply is sequential,
     so splitting is transparent). Bucket bytes = actual wire bytes (int32 positions
@@ -153,6 +190,11 @@ def _bucket_sliced(bkt: _FlushBucket, name: str, dtype_str: str, shape, aidx: to
 
 
 class _GatherQueue:
+    # [CLASS DOC]
+    # HELPER: Batches slot-keyed delta entries (slots list of (name, shape), dtype string, per-slot counts, idx, val) per
+    # process group, flushing a group's queue once it holds batch_k entries (count-only trigger, identical on every rank so
+    # collectives stay in lockstep). A flush gathers all entries of the batch to rank 0 in one batched sparse gather
+    # (bounded per round by max_round_bytes) and, on rank 0, calls consume(name, dtype_str, shape, numel, idx, val) per slot.
     """Per-gather-group batching of slot-keyed queue entries
     ``(slots, dtype_str, counts, idx, val)``. Entries carry FINAL-coordinate
     payloads (identity specs: one slot = the param itself; converter specs: the
@@ -170,6 +212,9 @@ class _GatherQueue:
     __slots__ = ("batch_k", "max_round_bytes", "is_r0", "_consume", "_queues")
 
     def __init__(self, batch_k: int, max_round_bytes: int, is_r0: bool, consume):
+        # [FUNCTION DOC]
+        # HELPER: Stores batch size (at least 1), per-round byte cap, whether this is rank 0, the consume callback, and an empty
+        # mapping from process-group identity to (group, entry list).
         self.batch_k = max(int(batch_k), 1)
         self.max_round_bytes = int(max_round_bytes)
         self.is_r0 = is_r0
@@ -177,16 +222,27 @@ class _GatherQueue:
         self._queues: dict[int, tuple] = {}  # id(pg) -> (pg, [entries])
 
     def put(self, pg, slots: list, dtype_str: str, counts: torch.Tensor, idx: torch.Tensor, val: torch.Tensor):
+        # [FUNCTION DOC]
+        # HELPER: Appends an entry to the queue for pg (creating it on first use, keyed by object identity) and flushes that
+        # queue when it reaches batch_k entries.
         _pg, entries = self._queues.setdefault(id(pg), (pg, []))
         entries.append((slots, dtype_str, counts, idx, val))
         if len(entries) >= self.batch_k:
             self._flush(pg, entries)
 
     def flush_all(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Flushes every group's remaining entries (in insertion order of groups).
         for pg, entries in self._queues.values():
             self._flush(pg, entries)
 
     def _flush(self, pg, entries: list) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Takes a copy of the entries and clears the queue. For pg None (unsharded params) rank 0 consumes each slot
+        # directly by slicing idx/val by the per-slot counts; other ranks drop the entries. Otherwise concatenates counts (moved
+        # to the idx device), idx and val across the batch, calls gather_slot_entries_to_rank0 on pg, and on rank 0 consumes the
+        # gathered (idx, val) pairs in slot order. No-op for an empty queue.
+        # Side effects: collective communication on pg for every rank.
         """One gather round for one group's queue."""
         if not entries:
             return
@@ -221,6 +277,12 @@ class _GatherQueue:
 
 @CheckpointEngineRegistry.register("delta_sharded")
 class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
+    # [CLASS DOC]
+    # Sparse-delta NCCL checkpoint engine. wire_format is "delta_flush". MAX_ENTRY_ELEMS (64M) caps changed elements per
+    # DeltaParam entry to bound receiver decode memory. Instance state adds: encoding ("indices" only), verify_every K
+    # (dense verification sweep every K-th steady sync; 0 disables), batch_gather (params per gather batch) and whether the
+    # seed sync has been done. Relies on parent state: rank, is_master, ip/listen_port, socket, topic, group_name,
+    # bucket_size and rollout_dtype.
     """Sparse delta weight sync over NCCL, diffed on each rank's local shard.
 
     Reuses NCCLCheckpointEngine's group/zmq machinery but moves only changed
@@ -251,6 +313,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
     wire_format = "delta_flush"
 
     def prepare(self) -> WorkerMetadata:
+        # [FUNCTION DOC]
+        # Returns WorkerMetadata with this node id and, on the master, a MasterMetadata (zmq ip/port, single sender); skips the
+        # parent's fixed double-bucket buffer allocation.
         # Delta broadcasts small per-flush buffers directly, so skip the parent's
         # 2 * bucket_size fixed buffers. Still hand back the master zmq endpoint
         # that build_topology() distributes to the rollout workers.
@@ -268,6 +333,11 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
     # including during the full seed. Each ZMQ manifest + NCCL broadcast carries ``is_last``;
     # rollout adapters then forward that flush over same-GPU IPC to their backend-specific consumer.
     def _publish_flush(self, flush: DeltaFlush, first: bool, is_last: bool) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sends an indices flush: ZMQ topic plus meta (is_full = first, encoding, is_last, counts, value dtype, spec with
+        # param descriptors and checksum), then copies the positions (moved to GPU) and values as bytes into fresh cupy buffers
+        # and broadcasts positions then values from rank 0 over the collective group. Staging into cupy-owned memory avoids
+        # allocator reuse races with the asynchronous broadcast.
         meta = {
             "is_full": first,
             "encoding": self.encoding,
@@ -299,6 +369,10 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
     def _publish_values_flush(
         self, params: list[DeltaParam], values: torch.Tensor, is_last: bool, verify: bool = False
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sends a values-only seed/verify flush tagged encoding "dense" (is_full True, zero positions, spec including
+        # verify and is_last flags and a checksum over empty positions plus values), then broadcasts only the value bytes via a
+        # cupy staging buffer.
         """Publish a values-only (full-coverage, positions-free) flush -- used by the first
         sync. The wire encoding tag stays ``"dense"`` -- it is protocol, shared with the
         receiver's delta_loader decode."""
@@ -329,6 +403,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         collective.broadcast(val_cp, src_rank=0, group_name=self.group_name)
 
     def _release_staging_pool(self, phase: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Frees all cached blocks of cupy's default memory pool back to CUDA and logs (warning level) the bytes held and
+        # device free memory before/after. Inputs: phase - label for the log.
         """Return the cupy staging pool's blocks to CUDA and log the evidence:
         ``held`` is what the pool would have kept from the device without this
         release, and the device-free delta shows the memory actually coming
@@ -349,6 +426,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         )
 
     def _publish_terminal(self, first: bool) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sends only a manifest marking the end of the stream with no data (terminal_empty True, is_last True); no broadcast.
         """End-of-stream marker when zero flushes were produced (no broadcast, just a signal)."""
         meta = {"is_full": first, "encoding": self.encoding, "is_last": True, "terminal_empty": True}
         self.socket.send_string(self.topic, flags=zmq.SNDMORE)
@@ -356,6 +435,13 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
 
     # ---- rollout worker side ----
     def receive_weights(self, global_steps: int | None = None) -> Iterator[tuple[list[tuple[str, torch.Tensor]], bool]]:
+        # [FUNCTION DOC]
+        # Rollout-side generator. Loops: receives topic and meta; stops on terminal_empty; allocates a GPU uint8 values buffer
+        # (val_numel x element size of val_dtype) and, for non-dense encodings, a positions buffer of pos_numel bytes; receives
+        # positions (if any) then values by broadcast; yields a list [("__delta_spec__", JSON spec bytes on GPU),
+        # ("__positions__", position bytes) if present, ("__values__", values viewed as val_dtype)] together with is_last; drops
+        # references after the consumer resumes; stops after the last flush. Logs the flush count.
+        # Exceptions: AssertionError if called on rank 0 (rank must be > 0).
         """Yield delta flushes for the rollout adapter to consume.
 
         Each ``(named_tensors, is_last)`` item contains a JSON manifest, optional
@@ -398,6 +484,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
     def __init__(
         self, *args, encoding: str = "indices", batch_gather: int = 32, verify_every: int = 0, **kwargs
     ) -> None:
+        # [FUNCTION DOC]
+        # Calls the parent constructor with remaining args, then stores encoding (asserting it is "indices"), verify_every and
+        # batch_gather as ints and marks the seed as not yet done. Exceptions: AssertionError for other encodings.
         super().__init__(*args, **kwargs)
         assert encoding == "indices", f"delta_sharded ships only the 'indices' position encoding; got {encoding!r}"
         self.encoding = encoding
@@ -410,6 +499,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         self.batch_gather = int(batch_gather)
 
     def _verify_due(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Returns False when verify_every <= 0; otherwise increments a lazily created steady-sync counter and returns
+        # True every verify_every-th call.
         """True on every K-th steady sync when constructed with ``verify_every=K``."""
         if self.verify_every <= 0:
             return False
@@ -417,6 +509,12 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         return self._steady_count % self.verify_every == 0
 
     def _assemble_flush(self, per_param: list[_FlushPiece]) -> DeltaFlush:
+        # [FUNCTION DOC]
+        # HELPER: Builds an indices DeltaFlush from pieces: for each piece asserts the parameter has fewer than 2^31 elements,
+        # converts positions to int32, and records a DeltaParam with byte ranges into the positions buffer (4 bytes each) and
+        # element ranges into the values buffer. Concatenates values (or an empty rollout-dtype GPU tensor) and positions viewed
+        # as bytes (or empty), computes the checksum over both, and returns the flush (positions stay on GPU despite the field name).
+        # Exceptions: AssertionError for oversized parameters.
         """Build one DeltaFlush (indices encoding) from rank 0's gathered per-param deltas.
 
         ``per_param``: :class:`_FlushPiece` entries whose ``idx`` are within-parameter
@@ -473,6 +571,14 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         global_steps: int | None = None,
         verify: bool = False,
     ) -> dict[str, float] | None:
+        # [FUNCTION DOC]
+        # HELPER: Streams a full HF export values-only. Every rank iterates weights (assembly may be collective), asserting no
+        # duplicate names and casting floating tensors to rollout_dtype; non-master ranks discard tensors and return None.
+        # Rank 0 buckets flat values into bucket_size flushes published via _publish_values_flush, seals and emits the last
+        # flush with is_last True (or a terminal marker when nothing was produced), releases the cupy pool, and logs timing.
+        # Inputs: weights - iterator of (name, tensor); global_steps - for logging; verify - marks a verification sweep.
+        # Outputs: None when no elements (or non-master), else metrics dict (changed_ratio 1.0, changed_elems, payload MiB, flushes).
+        # Exceptions: AssertionError on duplicate names.
         """First sync: stream the backend's FULL HF export over the values-only wire.
 
         ``weights`` is ``get_per_tensor_param()`` -- every backend already knows how
@@ -488,6 +594,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         wire_bytes = 0
 
         def _assemble_values(pieces: list[_ValuesPiece]):
+            # [FUNCTION DOC]
+            # HELPER: Concatenates piece values into one flat tensor and builds DeltaParam descriptors with empty position ranges
+            # and consecutive value ranges. Outputs: (params list, values tensor).
             params = []
             val_off = 0
             for piece in pieces:
@@ -508,6 +617,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             return params, torch.cat([piece.flat for piece in pieces])
 
         def _publish_values(pending, is_last: bool) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Publishes a pending (params, values) as a values-only flush and updates the flush and byte counters.
             nonlocal n_flushes, wire_bytes
             params, values = pending
             self._publish_values_flush(params, values, is_last=is_last, verify=verify)
@@ -571,6 +682,19 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         engine,
         global_steps: int | None = None,
     ) -> dict[str, float] | None:
+        # [FUNCTION DOC]
+        # Drives one sync from the training engine object (not a weight iterator). All actor ranks call it.
+        # Seed (first call): streams engine.get_per_tensor_param() via _send_full_seed, then calls engine.prime_delta_snapshots()
+        # to pin the diff base, marks seeded, and returns the seed metrics.
+        # Steady: iterates engine.get_per_tensor_param_delta_shard() entries (slots, dtype, counts, idx, val, group) into a
+        # gather queue (batch size batch_gather, round cap bucket_size); rank 0 consumes gathered slot deltas, counting total and
+        # changed elements and wire bytes and slicing them into the bucket. After flushing the queue, decides whether a
+        # verification sweep is due; rank 0 seals and emits the last delta flush with is_last True unless a sweep follows (or
+        # sends a terminal marker if nothing was produced and no sweep follows). If due, every rank runs a full values-only
+        # sweep with verify set. Rank 0 then releases the cupy pool.
+        # Outputs: None for non-master ranks or when no elements were seen; else metrics (changed ratio, changed elems, payload
+        # MiB, flushes). Exceptions: AssertionError if rank > 0 (non-zero trainer ranks are expected to have negative rank).
+        # KNOWN ISSUE: when a verification sweep runs, its metrics are discarded and the cupy pool is released twice; harmless.
         """Drive one weight sync from the TRAINING ENGINE (unlike the full-sync
         engines, which consume a weights iterator): the seed/steady phase choice
         and the snapshot prime are this engine's own state machine, so the worker
@@ -601,6 +725,8 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
         wire_bytes = 0
 
         def _publish_steady(flush, is_last: bool) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Publishes an indices flush (first False) and increments the flush counter.
             nonlocal n_flushes
             self._publish_flush(flush, first=False, is_last=is_last)
             n_flushes += 1
@@ -617,6 +743,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
             aidx: torch.Tensor | None,
             aval: torch.Tensor | None,
         ) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Rank-0 consume callback: adds the slot's full element count to the total; if it has changes, adds changed
+            # elements and wire bytes and slices the delta into the bucket.
             nonlocal total_elems, changed_elems, wire_bytes
             total_elems += int(full_numel)
             if aidx is None or aidx.numel() == 0:
