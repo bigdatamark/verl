@@ -11,6 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU tests for receiver-side weight-name normalization used by the vLLM colocated
+# worker extension when syncing weights into a LoRA-enabled vLLM model. At import
+# time the real weight_update_utils.py and vllm_rollout/utils.py (plus the real
+# verl/utils/vllm/utils.py providing resolve_weight_name and the module-level flag
+# _HAS_LORA_LOAD_WEIGHTS) are loaded with vLLM and heavy verl modules stubbed.
+# Tests drive resolve_weight_name against fake models' parameter namespaces to
+# check when a ".base_layer" path segment is stripped, kept or added (depending on
+# the vLLM version flag, whether the parent module has a real base_layer child,
+# the hf-to-vllm mapper, packed module mapping, and fused-MoE expert aliases), and
+# check the worker's _update_weights / update_weights_from_ipc paths (base sync
+# resolves names; adapter sync passes LoRA tensors through and accumulates them
+# across buckets into a single add_lora call). The two IPC tests need real vLLM.
 
 """CPU tests for the receiver-side weight-name normalization in
 ``vLLMColocateWorkerExtension``.
@@ -36,6 +49,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_weight_update_utils():
+    # [FUNCTION DOC]
+    # HELPER: Loads weight_update_utils.py directly from its file path as a module
+    # named "weight_update_utils". Outputs: the module.
+    # KNOWN ISSUE: module_from_spec is called before asserting the spec is non-None.
     module_path = _REPO_ROOT / "verl/workers/rollout/vllm_rollout/weight_update_utils.py"
     spec = importlib.util.spec_from_file_location("weight_update_utils", module_path)
     module = importlib.util.module_from_spec(spec)
@@ -45,6 +62,18 @@ def _load_weight_update_utils():
 
 
 def _load_vllm_rollout_utils():
+    # [FUNCTION DOC]
+    # HELPER: Installs fake modules for vllm (outputs, lora layers/base without
+    # load_weights, lora request/utils/worker_manager/models), verl.third_party.vllm
+    # (sleep level 1, version 0.8.0), verl.utils.vllm (fake TensorLoRARequest and
+    # VLLMHijack), its patch and quant-utils submodules (no-op functions), and the
+    # preloaded weight_update_utils; then loads the real verl/utils/vllm/utils.py,
+    # exposes its resolve_weight_name and flag on the fake package, loads
+    # vllm_rollout/utils.py under its real module name, attaches the real utils
+    # module as _vllm_utils_real, and finally restores every replaced module entry.
+    # Outputs: the loaded vllm_rollout utils module.
+    # Side effects: temporary module-table mutation; deliberately does not stub the
+    # platform module to avoid leaking a fake into verl.utils.device.
     """Load ``vllm_rollout/utils.py`` with heavyweight deps stubbed (no GPU/vLLM needed)."""
     module_name = "verl.workers.rollout.vllm_rollout.utils"
     module_path = _REPO_ROOT / "verl/workers/rollout/vllm_rollout/utils.py"
@@ -52,6 +81,8 @@ def _load_vllm_rollout_utils():
     fake_outputs = types.ModuleType("vllm.outputs")
 
     class _FakeRequestOutput:
+        # [CLASS DOC]
+        # HELPER: Placeholder for vLLM RequestOutput.
         pass
 
     fake_outputs.RequestOutput = _FakeRequestOutput
@@ -66,6 +97,9 @@ def _load_vllm_rollout_utils():
     fake_lora_base = types.ModuleType("vllm.lora.layers.base")
 
     class _FakeBaseLayerWithLoRA:
+        # [CLASS DOC]
+        # HELPER: Placeholder BaseLayerWithLoRA lacking load_weights, so the version flag
+        # evaluates False (released-vLLM behavior).
         pass
 
     fake_lora_base.BaseLayerWithLoRA = _FakeBaseLayerWithLoRA
@@ -82,7 +116,12 @@ def _load_vllm_rollout_utils():
     fake_vllm_utils = types.ModuleType("verl.utils.vllm")
 
     class _FakeTensorLoRARequest:
+        # [CLASS DOC]
+        # HELPER: Fake TensorLoRARequest storing lora_name, lora_int_id, lora_path,
+        # peft_config and lora_tensors from keyword args.
         def __init__(self, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Copies the five known keyword args onto attributes (None if absent).
             self.lora_name = kwargs.get("lora_name")
             self.lora_int_id = kwargs.get("lora_int_id")
             self.lora_path = kwargs.get("lora_path")
@@ -90,8 +129,12 @@ def _load_vllm_rollout_utils():
             self.lora_tensors = kwargs.get("lora_tensors")
 
     class _FakeVLLMHijack:
+        # [CLASS DOC]
+        # HELPER: Fake VLLMHijack with a no-op hijack.
         @staticmethod
         def hijack():
+            # [FUNCTION DOC]
+            # HELPER: Does nothing; returns None.
             return None
 
     fake_vllm_utils.TensorLoRARequest = _FakeTensorLoRARequest
@@ -184,6 +227,9 @@ resolve_weight_name = _vllm_utils_real.resolve_weight_name
 
 
 class _FakeMapper:
+    # [CLASS DOC]
+    # HELPER: Minimal vLLM WeightsMapper stand-in: for each name, replaces the first
+    # occurrence of each mapping key substring with its value, in mapping order.
     """Minimal stand-in for vLLM ``WeightsMapper``.
 
     Mimics substring-based ``orig_to_new_substr`` / ``orig_to_new_stacked``
@@ -193,9 +239,13 @@ class _FakeMapper:
     """
 
     def __init__(self, mapping: dict[str, str]):
+        # [FUNCTION DOC]
+        # HELPER: Stores the substring mapping.
         self.mapping = mapping
 
     def apply_list(self, names: list[str]) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Applies the substring replacements to each name. Outputs: new list.
         out = []
         for name in names:
             mapped = name
@@ -207,40 +257,63 @@ class _FakeMapper:
 
 
 class _FakeModel:
+    # [CLASS DOC]
+    # HELPER: Fake vLLM model exposing named_parameters/named_buffers, an optional
+    # hf_to_vllm_mapper and packed_modules_mapping, and a recording load_weights.
     """A fake vLLM model exposing only the introspection surface the resolver uses."""
 
     def __init__(self, params: dict[str, torch.Tensor], *, mapper=None, packed=None):
+        # [FUNCTION DOC]
+        # HELPER: Copies the name-to-tensor mapping and stores mapper and packed mapping.
         # name -> tensor (for named_parameters / named_buffers)
         self._params = dict(params)
         self.hf_to_vllm_mapper = mapper
         self.packed_modules_mapping = packed
 
     def named_parameters(self, remove_duplicate: bool = False):
+        # [FUNCTION DOC]
+        # HELPER: Yields (name, tensor) pairs; remove_duplicate is ignored.
         del remove_duplicate
         yield from self._params.items()
 
     def named_buffers(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns an empty iterator (no buffers).
         return iter(())
 
     def load_weights(self, weights):
+        # [FUNCTION DOC]
+        # HELPER: Records the names of the given (name, tensor) pairs in self.loaded.
+        # Side effects: sets self.loaded.
         # Record resolved names for assertions.
         self.loaded = [name for name, _ in weights]
 
 
 class _FakeVllmConfig:
+    # [CLASS DOC]
+    # HELPER: Fake vLLM config with speculative and quant configs and an empty model config.
     def __init__(self, speculative_config=None, quant_config=None):
+        # [FUNCTION DOC]
+        # HELPER: Stores speculative_config and quant_config; model_config is an empty namespace.
         self.speculative_config = speculative_config
         self.quant_config = quant_config
         self.model_config = types.SimpleNamespace()
 
 
 def _make_worker(model):
+    # [FUNCTION DOC]
+    # HELPER: Creates a worker extension instance without running its constructor and
+    # attaches a model runner namespace holding the model, a fake vLLM config and no drafter.
     worker = object.__new__(vLLMColocateWorkerExtension)
     worker.model_runner = types.SimpleNamespace(model=model, vllm_config=_FakeVllmConfig(), drafter=None)
     return worker
 
 
 def _resolve(worker, model, name):
+    # [FUNCTION DOC]
+    # HELPER: Builds the set of parameter and buffer names of the model and calls
+    # resolve_weight_name(model, name, names). The worker argument is unused.
+    # Outputs: resolved name.
     del worker  # resolve_weight_name is a pure function (no worker state)
     names = {n for n, _ in model.named_parameters(remove_duplicate=False)}
     names.update(n for n, _ in model.named_buffers())
@@ -248,6 +321,9 @@ def _resolve(worker, model, name):
 
 
 def _mapped(worker, model, name):
+    # [FUNCTION DOC]
+    # HELPER: Applies the model's hf_to_vllm mapper to one name (identity if no
+    # mapper or empty result). The worker argument is unused.
     mapper = getattr(model, "hf_to_vllm_mapper", None)
     if mapper is None:
         return name
@@ -262,6 +338,9 @@ def _mapped(worker, model, name):
 
 
 def test_vision_merger_base_layer_is_stripped():
+    # [FUNCTION DOC]
+    # Behavior: a plain (non-LoRA-wrapped) vision merger linear receives
+    # ".base_layer" names for weight and bias; both resolve to the unwrapped names.
     """Qwen3.5-VL ``merger.linear_fc1.base_layer.weight`` -> ``merger.linear_fc1.weight``."""
     model = _FakeModel(
         {
@@ -283,6 +362,9 @@ def test_vision_merger_base_layer_is_stripped():
 
 
 def test_mixed_model_vision_merger_strips_on_released_vllm():
+    # [FUNCTION DOC]
+    # Behavior: on released vLLM (flag False) in a mixed model, merger names are
+    # stripped while a LoRA-wrapped language q_proj base_layer name is kept as is.
     """vLLM 0.26.0 (_HAS_LORA_LOAD_WEIGHTS=False) with a mixed model: the
     vision merger's ``.base_layer.`` is stripped (no real base_layer child),
     while a coexisting LoRA-wrapped language leaf keeps the suffix."""
@@ -305,6 +387,11 @@ def test_mixed_model_vision_merger_strips_on_released_vllm():
 
 
 def test_mixed_model_with_prefix_rewriting_mapper():
+    # [FUNCTION DOC]
+    # Behavior: with a prefix-rewriting mapper, the has-base-layer check uses the
+    # mapped name: the language gate's base_layer name (in Bridge prefix) is kept,
+    # and merger names (Bridge prefix) are stripped, all returned in the incoming
+    # unmapped prefix.
     """The Qwen3.5-VL regression: the Bridge exports language params under
     ``model.language_model.`` and the merger under ``model.visual.``, while the
     live vLLM namespace is ``language_model.model.`` / ``visual.``. vLLM's
@@ -351,6 +438,12 @@ def test_mixed_model_with_prefix_rewriting_mapper():
 
 
 def test_lora_wrapped_base_layer_gets_stripped(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: on newer vLLM (flag True) a LoRA-wrapped leaf's ".base_layer" is
+    # stripped to the inner name.
+    # Inputs: monkeypatch - sets the flag.
+    # KNOWN ISSUE: the preceding section banner says LoRA-wrapped params KEEP
+    # .base_layer, which contradicts this test (that only holds on released vLLM).
     """A LoRA-wrapped leaf with .base_layer is stripped: vLLM's
     BaseLayerWithLoRA.load_weights delegates to AutoWeightsLoader(base_layer)
     which expects the inner name (no base_layer. prefix)."""
@@ -367,6 +460,9 @@ def test_lora_wrapped_base_layer_gets_stripped(monkeypatch):
 
 
 def test_missing_base_layer_not_added_on_newer_vllm(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: on newer vLLM, a name without ".base_layer" is not suffixed even
+    # though the model only has the base_layer form.
     """On newer vLLM, incoming without .base_layer is NOT suffixed --
     BaseLayerWithLoRA.load_weights delegates to AutoWeightsLoader(base_layer)
     expecting inner names."""
@@ -383,6 +479,9 @@ def test_missing_base_layer_not_added_on_newer_vllm(monkeypatch):
 
 
 def test_missing_base_layer_is_added_on_released_vllm():
+    # [FUNCTION DOC]
+    # Behavior: on released vLLM, a name without ".base_layer" whose base_layer form
+    # exists is suffixed with ".base_layer".
     """On released vLLM (no BaseLayerWithLoRA.load_weights), an incoming leaf
     without ``.base_layer`` is suffixed so the model's load_weights recurses
     into the ``base_layer`` child and matches the real param."""
@@ -398,6 +497,9 @@ def test_missing_base_layer_is_added_on_released_vllm():
 
 
 def test_suffixed_leaf_is_kept_on_released_vllm():
+    # [FUNCTION DOC]
+    # Behavior: on released vLLM, an incoming base_layer name matching a real
+    # parameter is kept.
     """On released vLLM, an incoming ``.base_layer.`` leaf is kept as-is
     (the loader recurses and matches the suffixed param -- the strip is gated
     off when the model has ``.base_layer`` params and the version is old)."""
@@ -418,6 +520,9 @@ def test_suffixed_leaf_is_kept_on_released_vllm():
 
 
 def test_expert_alias_base_layer_gets_stripped():
+    # [FUNCTION DOC]
+    # Behavior: a non-leaf expert alias "experts.base_layer.gate_up_proj" is stripped
+    # to "experts.gate_up_proj" when that parameter exists.
     """``experts.base_layer.gate_up_proj`` (non-leaf) -> ``experts.gate_up_proj`` when that exists."""
     model = _FakeModel(
         {
@@ -431,6 +536,10 @@ def test_expert_alias_base_layer_gets_stripped():
 
 
 def test_packed_routed_expert_alias_routed_through_base_layer():
+    # [FUNCTION DOC]
+    # Behavior: when the model's experts are LoRA-wrapped (parameters exist under
+    # experts.base_layer.routed_experts), packed aliases experts.gate_up_proj and
+    # experts.down_proj are rerouted under experts.base_layer.
     """Qwen3.5 routed experts: Bridge exports packed ``experts.gate_up_proj``
     (non-leaf). vLLM's LoRA-wrapped MoE (``FusedMoE3DWithLoRA``) has no
     ``load_weights``, so AutoWeightsLoader can't dispatch it -- route it under
@@ -453,6 +562,8 @@ def test_packed_routed_expert_alias_routed_through_base_layer():
 
 
 def test_packed_routed_expert_alias_not_routed_without_lora():
+    # [FUNCTION DOC]
+    # Behavior: without a LoRA experts.base_layer, the packed alias is unchanged.
     """Without a LoRA experts.base_layer, packed aliases stay unchanged
     (AutoWeightsLoader dispatches directly to the MoERunner)."""
     model = _FakeModel({"language_model.model.layers.0.mlp.experts.gate_up_proj": torch.empty(0)})
@@ -472,6 +583,9 @@ def test_packed_routed_expert_alias_not_routed_without_lora():
 
 
 def test_unpacked_proj_exists_via_packed_owner():
+    # [FUNCTION DOC]
+    # Behavior: an unpacked q_proj name whose packed owner qkv_proj exists is
+    # returned unchanged.
     """An unpacked alias whose packed owner exists is returned unchanged."""
     model = _FakeModel(
         {"language_model.model.layers.0.self_attn.qkv_proj.weight": torch.empty(0)},
@@ -484,6 +598,10 @@ def test_unpacked_proj_exists_via_packed_owner():
 
 
 def test_stacked_gdn_in_proj_not_double_mapped(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: on newer vLLM, the GDN in_proj_qkv name (whose mapped stacked owner
+    # in_proj_qkvz has a base_layer) is returned unchanged, so mapping it afterwards
+    # yields in_proj_qkvz.weight exactly once (no double mapping).
     """GDN ``in_proj_qkv`` is NOT suffixed with ``.base_layer`` on newer vLLM --
     the name stays unmapped so vLLM's mapper stacks it cleanly."""
     monkeypatch.setattr(_vllm_utils_real, "_HAS_LORA_LOAD_WEIGHTS", True)
@@ -505,6 +623,9 @@ def test_stacked_gdn_in_proj_not_double_mapped(monkeypatch):
 
 
 def test_shared_expert_packed_owner_no_base_layer_on_newer_vllm(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: on newer vLLM, a shared-expert gate_proj name is returned unchanged
+    # and maps to gate_up_proj.weight.
     """On newer vLLM, shared expert gate_proj.weight is NOT suffixed with
     .base_layer -- vLLM's mapper stacks gate_proj -> gate_up_proj and
     BaseLayerWithLoRA.load_weights handles the inner name."""
@@ -526,6 +647,9 @@ def test_shared_expert_packed_owner_no_base_layer_on_newer_vllm(monkeypatch):
 
 
 def test_mapper_alias_left_to_vllm_mapper():
+    # [FUNCTION DOC]
+    # Behavior: a logical alias absent from the model is returned unchanged (left
+    # for vLLM's mapper) even though the mapper maps it to an existing parameter.
     """A logical alias absent on the model is returned unchanged (not pre-mapped)."""
     model = _FakeModel(
         {"language_model.model.layers.0.mlp.experts.base_layer.w13_weight": torch.empty(0)},
@@ -549,6 +673,8 @@ def test_mapper_alias_left_to_vllm_mapper():
 
 
 def test_already_matching_name_is_noop():
+    # [FUNCTION DOC]
+    # Behavior: a name that exactly matches a parameter is returned unchanged.
     model = _FakeModel({"language_model.model.layers.0.self_attn.q_proj.weight": torch.empty(0)})
     worker = _make_worker(model)
 
@@ -558,6 +684,8 @@ def test_already_matching_name_is_noop():
 
 
 def test_truly_unknown_name_strips_base_layer(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: on newer vLLM, an unknown name still has ".base_layer." stripped.
     """Even unknown names have ``.base_layer.`` stripped on newer vLLM."""
     monkeypatch.setattr(_vllm_utils_real, "_HAS_LORA_LOAD_WEIGHTS", True)
     model = _FakeModel({"a.base_layer.weight": torch.empty(0)})
@@ -567,6 +695,9 @@ def test_truly_unknown_name_strips_base_layer(monkeypatch):
 
 
 def test_drafter_drops_base_layer_wholesale():
+    # [FUNCTION DOC]
+    # Behavior: for a model with no base_layer parameters (e.g. an MTP drafter), the
+    # segment is stripped from every name whether or not the result exists.
     """A model with no ``.base_layer`` params (e.g. the MTP drafter) has the
     suffix stripped wholesale from every name, regardless of whether the
     stripped form ultimately exists."""
@@ -583,6 +714,10 @@ def test_drafter_drops_base_layer_wholesale():
 
 
 def test_update_weights_resolves_names_before_load(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: on newer vLLM, _update_weights in the LoRA base-sync phase (peft config
+    # set, base sync not done) passes resolved names to load_weights: merger name
+    # stripped and q_proj base_layer name stripped.
     # LoRA base-sync phase (peft_config set, base_sync_done=False): the vLLM model
     # is LoRA-wrapped (has ``.base_layer``), so the resolver reconciles incoming
     # names against it. (``peft_config=None`` is the non-LoRA / merge path where the
@@ -610,12 +745,17 @@ def test_update_weights_resolves_names_before_load(monkeypatch):
 
 
 def test_lora_adapter_path_skips_normalization():
+    # [FUNCTION DOC]
+    # Behavior: in the adapter phase (peft config set, base sync done) LoRA tensors
+    # are not normalized; add_lora is called with exactly the incoming tensor names.
     """LoRA adapter tensors (peft_config + base_sync_done) keep .base_layer — vLLM expects it."""
     model = _FakeModel({"language_model.model.layers.0.self_attn.q_proj.base_layer.weight": torch.empty(0)})
 
     added = []
 
     def _add_lora(request):
+        # [FUNCTION DOC]
+        # HELPER: Records the set of tensor names of the LoRA request.
         added.append(set(request.lora_tensors))
 
     worker = _make_worker(model)
@@ -636,18 +776,30 @@ def test_lora_adapter_path_skips_normalization():
 
 
 class _FakeBucketReceiver:
+    # [CLASS DOC]
+    # HELPER: Fake bucketed receiver invoking the callback once per scripted
+    # (weights, is_last) bucket.
     """Drives the on_bucket_received callback with a scripted bucket sequence."""
 
     def __init__(self, buckets):
+        # [FUNCTION DOC]
+        # HELPER: Stores the bucket script.
         # buckets: list of (weights_list, is_last)
         self._buckets = buckets
 
     def receive_weights(self, on_bucket_received):
+        # [FUNCTION DOC]
+        # HELPER: Calls on_bucket_received(weights, is_last) for each bucket in order.
         for weights, is_last in self._buckets:
             on_bucket_received(weights, is_last)
 
 
 def test_update_weights_from_ipc_accumulates_lora_across_buckets(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: with the receiver patched to deliver two LoRA buckets, the adapter
+    # path calls add_lora exactly once with both tensors and the first bucket's value
+    # intact (cloned, not a reused view). Skipped without vLLM.
+    # Side effects: patches the receiver class and worker attributes.
     """A LoRA adapter split across two buckets yields one add_lora with all tensors."""
     # Unlike the resolver tests above (which fully stub sys.modules), this drives the
     # real update_weights_from_ipc path and imports the actual bucketed_weight_transfer
@@ -672,6 +824,8 @@ def test_update_weights_from_ipc_accumulates_lora_across_buckets(monkeypatch):
     added = []
 
     def _add_lora(request):
+        # [FUNCTION DOC]
+        # HELPER: Records a copy of the LoRA request's tensor mapping.
         added.append(dict(request.lora_tensors))
 
     worker = _make_worker(model)
@@ -694,6 +848,10 @@ def test_update_weights_from_ipc_accumulates_lora_across_buckets(monkeypatch):
 
 
 def test_update_weights_from_ipc_standard_loads_per_bucket(monkeypatch):
+    # [FUNCTION DOC]
+    # Behavior: standard base sync (no peft config) loads each bucket immediately,
+    # in order (q.weight then k.weight), with post-load processing stubbed out.
+    # Skipped without vLLM.
     """Standard (non-LoRA) base sync loads every bucket immediately (no accumulation)."""
     # See the note above: needs the real bucketed_weight_transfer (vllm-backed), which
     # the `cpu` extra can't provide, so it is skipped here and run in vllm.yml.

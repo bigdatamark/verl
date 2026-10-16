@@ -14,6 +14,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# PPO trainer variant for resource-separated setups (trainer and rollout on different GPU pools), used as the base for
+# fully-async and one-step-off-policy training. Splits RayPPOTrainer's monolithic fit loop into overridable per-stage
+# hook methods (generate, reward, log-prob, ref, critic, advantage, updates, weight sync, validation, checkpoint,
+# profiling, metrics) and syncs weights to rollout replicas through a CheckpointEngineManager.
+
 """
 PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
@@ -50,6 +57,10 @@ from verl.utils.metric import reduce_metrics
 
 
 class SeparateRayPPOTrainer(RayPPOTrainer):
+    # [CLASS DOC]
+    # Trainer with explicit per-step state (global_steps, epoch, profiling flags, metrics, timing_raw, reward tensor and
+    # extra infos, last validation metrics, checkpoint manager). Subclasses must implement _create_actor_rollout_classes
+    # and typically _init_async_rollout_manager (which must set async_rollout_manager and llm_server_manager).
     """
     Support for the initialization and fit process of Ray Trainer in the resource-separated scenario:
         - Fully async policy
@@ -72,6 +83,11 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         train_sampler: Optional[Sampler] = None,
         device_name=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: calls the base trainer initializer with config, tokenizer, role mapping, resource pool manager, worker
+        # group class, processor, datasets, collate_fn, sampler and device name, then initializes all per-step state to defaults.
+        # Inputs: as in RayPPOTrainer; reward_fn and val_reward_fn are accepted but unused.
+        # Side effects: sets instance attributes (base class builds dataloaders etc.).
         super().__init__(
             config,
             tokenizer,
@@ -103,6 +119,11 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self.checkpoint_manager = None
 
     def init_workers(self):
+        # [FUNCTION DOC]
+        # Behavior: creates resource pools, worker classes, worker groups, initializes models, the reward loop and the async
+        # rollout manager, then builds a CheckpointEngineManager (custom class from rollout.checkpoint_manager_class FQN if set,
+        # else verl.checkpoint_engine's) with the checkpoint engine config, the actor worker group and the rollout replicas.
+        # Side effects: launches Ray workers; sets many attributes.
         """Initialize distributed training workers using Ray backend.
 
         Creates:
@@ -130,19 +151,30 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         )
 
     def _init_resource_pools(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates Ray resource pools and an empty role->class dict per pool.
         self.resource_pool_manager.create_resource_pool()
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
     def _create_worker_classes(self):
+        # [FUNCTION DOC]
+        # HELPER: Registers the actor/rollout, critic, reference policy and reward model worker classes.
         self._create_actor_rollout_classes()
         self._create_critic_class()
         self._create_reference_policy_class()
         self._create_reward_model_class()
 
     def _create_actor_rollout_classes(self):
+        # [FUNCTION DOC]
+        # Abstract hook for creating actor/rollout worker classes. Exceptions: always raises NotImplementedError.
         raise NotImplementedError
 
     def _create_critic_class(self):
+        # [FUNCTION DOC]
+        # HELPER: If a critic is used, converts the critic config to a dataclass (kept as orig_critic_cfg), requires the fsdp
+        # strategy and copies token-length limits into its FSDP engine config, builds an optional profiler config, wraps it all
+        # in a TrainingWorkerConfig for a value model, and registers the critic class on its resource pool.
+        # Exceptions: NotImplementedError for non-fsdp strategies.
         # create critic
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
@@ -180,6 +212,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
     def _create_reference_policy_class(self):
+        # [FUNCTION DOC]
+        # HELPER: If a reference policy is used, registers its worker class (with actor_rollout_ref config and RefPolicy role)
+        # on its resource pool.
         # create reference policy if needed
         if self.use_reference_policy:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
@@ -192,6 +227,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
 
     def _create_reward_model_class(self):
+        # [FUNCTION DOC]
+        # HELPER: If a reward model is used, registers its worker class with the reward model config on its resource pool.
         # create a reward model if reward_fn is None
         if self.use_rm:
             # we create a RM here
@@ -202,6 +239,12 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
 
     def _init_worker_groups(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds worker group kwargs (register-center timeout, profile steps and nsys worker options when nsys is the
+        # tool, device name), then for each resource pool creates a colocated worker class and worker group and spawns per-role
+        # groups, storing them in all_wg.
+        # Exceptions: AssertionError if nsys profiling lacks worker_nsight_options.
+        # Side effects: launches Ray actors.
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`.
@@ -237,6 +280,11 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self.all_wg = all_wg
 
     def _init_models(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes models: the critic group (reset and set a value-loss function bound to the critic config), the
+        # reference group if separate from the actor, the reward model group, and finally the actor/rollout group (last so the
+        # rollout engine can estimate KV cache memory better).
+        # Side effects: remote model initialization.
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
             self.critic_wg.reset()
@@ -261,6 +309,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self.actor_rollout_wg.init_model()
 
     def _init_reward_loop(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates the RewardLoopManager with the full config and the reward model resource pool (or None without RM).
         from verl.experimental.reward_loop import RewardLoopManager
 
         # initalize reward loop manager
@@ -273,9 +323,18 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         )
 
     def _init_async_rollout_manager(self):
+        # [FUNCTION DOC]
+        # Hook for subclasses to create the async rollout manager; no-op here.
         pass
 
     def fit(self):
+        # [FUNCTION DOC]
+        # Behavior: creates the tracking logger, loads any checkpoint and syncs weights to rollout, optionally runs validation
+        # before training (returning early if val_only), creates a progress bar, starts from step 1, initializes profiling
+        # flags, and iterates epochs and batches calling fit_step until is_last_step.
+        # KNOWN ISSUE: the docstring refers to a fit_refactor method that does not exist in this class.
+        # Exceptions: AssertionError if initial validation returns empty metrics.
+        # Side effects: logging, checkpoint loading, remote calls.
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC
@@ -339,6 +398,13 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                     return
 
     def fit_step(self, batch_dict: Any = None):
+        # [FUNCTION DOC]
+        # Behavior: resets per-step metrics/timing/reward state, prepares the step and starts profiling, then inside a "step"
+        # timer runs: get batch, generate, compute reward, old log-prob, ref log-prob, critic values, advantage, update critic,
+        # update actor, update weights, dump data; afterwards validation, checkpointing, stop profiling, metric collection,
+        # experimental dataset hook and post-step processing.
+        # Inputs: batch_dict - one raw dataloader batch.
+        # KNOWN ISSUE: the docstring's step list mentions "compute reward" twice and omits ref/critic value steps.
         """
         Single-step training template method. Handles all logic for one training step.
 
@@ -380,11 +446,18 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self._fit_postprocess_step()
 
     def _fit_prepare_step(self):
+        # [FUNCTION DOC]
+        # HELPER: Finalizes pending async calls on the actor group (non-blocking) if supported, and sets is_last_step when
+        # global_steps reaches total_training_steps.
         if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
             self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
         self.is_last_step = self.global_steps >= self.total_training_steps
 
     def _fit_start_profile(self, should_profiler=None):
+        # [FUNCTION DOC]
+        # HELPER: Decides whether to start profiling this step: forced by should_profiler when given (also updating
+        # curr_step_profile), else the current-step flag (only on the first of continuous profiled steps when
+        # profile_continuous_steps is on), and starts profiling under a timer.
         timing_raw = self.timing_raw
         if should_profiler is not None:
             self.curr_step_profile = should_profiler
@@ -400,6 +473,10 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             self._start_profiling(do_profile)
 
     def _fit_get_batch(self, batch_dict: dict) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Converts the batch dict into a DataProto, records the rollout temperature in meta_info, and assigns a unique
+        # uid string per sample.
+        # Outputs: DataProto.
         batch = DataProto.from_single_dict(batch_dict)
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         # add uid
@@ -407,6 +484,20 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_generate(self, batch: DataProto = None) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Generation stage.
+        # Behavior: builds the generation batch, tags it with global_steps, repeats it rollout.n times (interleaved). For REMAX,
+        # marks those as sampled and appends one greedy (non-sampled) copy per prompt in the same request. Generates via the
+        # async rollout manager (with optional profiling), sleeps the rollout replicas, records timings, splits sampled output
+        # from baseline output and drops the sampling flag. For REMAX, computes baseline rewards (via colocated RM when needed),
+        # stores the per-prompt summed rm_scores as reward_baselines. Repeats the original batch rollout.n times and unions the
+        # generated output, adds response_mask if missing, optionally balances tokens across DP ranks, records global token
+        # counts and collects images_seqlens from multimodal inputs that contain image_grid_thw.
+        # Inputs: batch - prompt batch. Outputs: the expanded batch with responses.
+        # KNOWN ISSUE: assumes non_tensor_batch always has "multi_modal_inputs" (KeyError otherwise); REMAX assumes
+        # "rm_scores" exists in the baseline output even without a reward model.
+        # KNOWN ISSUE: profiling is started on async_rollout_manager but stopped on llm_server_manager.
+        # Side effects: remote generation; replica sleep; updates metrics/timing.
         metrics = self.metrics
         timing_raw = self.timing_raw
         gen_batch = self._get_gen_batch(batch)
@@ -486,6 +577,10 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_compute_reward(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Computes reward model scores via the colocated RM if needed and not already present, then extracts the
+        # reward tensor and extra infos into self.reward_tensor / self.reward_extra_infos_dict.
+        # Outputs: batch (possibly with rm_scores added).
         timing_raw = self.timing_raw
         with marked_timer("reward", timing_raw, color="yellow"):
             # compute reward model score
@@ -500,6 +595,13 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_compute_log_prob(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Old log-prob stage. In rollout-correction bypass mode, uses rollout log-probs as old log-probs. Otherwise
+        # recomputes old log-probs, logs the aggregated entropy and MFU, drops entropies, resolves duplicate routed_experts
+        # (keeps the batch's copy unless router replay mode is "R2", where the recomputed one is kept), unions the result and
+        # adds debug metrics when rollout log-probs exist.
+        # Outputs: batch with old_log_probs.
+        # Exceptions: AssertionError if old_log_probs is missing afterwards.
         metrics = self.metrics
         timing_raw = self.timing_raw
         # Operating Mode Selection:
@@ -558,6 +660,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Adds reference log-probs when a reference policy is used.
         timing_raw = self.timing_raw
         if self.use_reference_policy:
             with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
@@ -566,6 +670,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_compute_critic(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Adds critic value estimates when a critic is used.
         timing_raw = self.timing_raw
         if self.use_critic:
             with marked_timer("values", timing_raw, color="cyan"):
@@ -574,6 +680,12 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_compute_advantage(self, batch) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Advantage stage on the driver: sets token_level_scores from the reward tensor and adds extra reward infos as
+        # arrays; applies the KL penalty in reward if enabled (else rewards equal scores); in decoupled rollout-correction mode
+        # with rollout log-probs, computes IS weights/rejection sampling; then computes advantages with the configured
+        # estimator, gamma, lambda, rollout.n and GRPO std normalization.
+        # Outputs: batch with token_level_rewards and advantages/returns.
         metrics = self.metrics
         timing_raw = self.timing_raw
         reward_tensor = self.reward_tensor
@@ -630,6 +742,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_update_critic(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Updates the critic when used and merges its reduced metrics. Outputs: batch unchanged.
         metrics = self.metrics
         timing_raw = self.timing_raw
         if self.use_critic:
@@ -640,6 +754,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_update_actor(self, batch: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # HELPER: Updates the actor once critic warmup has passed (critic_warmup <= global_steps) and merges reduced metrics.
         metrics = self.metrics
         timing_raw = self.timing_raw
         # implement critic warmup
@@ -653,6 +769,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_update_weights(self):
+        # [FUNCTION DOC]
+        # HELPER: After critic warmup, syncs actor weights to the rollout replicas via the checkpoint manager and merges any
+        # returned sync metrics.
         timing_raw = self.timing_raw
         if self.config.trainer.critic_warmup <= self.global_steps:
             # update weights from trainer to rollout
@@ -664,6 +783,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 self.metrics.update(sync_metrics)
 
     def _fit_dump_data(self, batch: DataProto):
+        # [FUNCTION DOC]
+        # HELPER: Logs rollout generations to trainer.rollout_data_dir if configured.
         timing_raw = self.timing_raw
         reward_extra_infos_dict = self.reward_extra_infos_dict
         # Log rollout generations if enabled
@@ -672,6 +793,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
     def _fit_validate(self):
+        # [FUNCTION DOC]
+        # HELPER: Runs validation when test_freq > 0 and either last step or step is a multiple of test_freq; keeps the last
+        # step's metrics and merges validation metrics.
         metrics = self.metrics
         timing_raw = self.timing_raw
         if self.config.trainer.test_freq > 0 and (
@@ -684,6 +808,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             metrics.update(val_metrics)
 
     def _fit_save_checkpoint(self):
+        # [FUNCTION DOC]
+        # HELPER: Saves a checkpoint when save_freq > 0 and (last step, step multiple of save_freq, or ESI expiration near
+        # based on max step duration), printing a notice for forced ESI saves.
         timing_raw = self.timing_raw
         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
         esi_close_to_expiration = should_save_ckpt_esi(
@@ -711,6 +838,10 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 # self.checkpoint_manager.update_weights()
 
     def _fit_stop_profile(self, should_profiler=None):
+        # [FUNCTION DOC]
+        # HELPER: Decides whether to stop profiling: when should_profiler is None computes next_step_profile from the
+        # configured steps and stops if the current step is profiled (and, with continuous profiling, the next is not);
+        # otherwise uses should_profiler. Then shifts profiling flags (prev <- curr, and curr <- next when not forced).
         timing_raw = self.timing_raw
         with marked_timer("stop_profile", timing_raw):
             if should_profiler is None:
@@ -732,6 +863,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 self.curr_step_profile = self.next_step_profile
 
     def _fit_collect_metrics(self, batch):
+        # [FUNCTION DOC]
+        # HELPER: Adds data, timing, throughput (using total GPUs) and variance-proxy metrics (using actor grad norm) to the step metrics.
         metrics = self.metrics
         timing_raw = self.timing_raw
 
@@ -746,6 +879,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
 
     def _fit_experimental(self, batch):
+        # [FUNCTION DOC]
+        # HELPER: Calls the train dataset's on_batch_end hook with the batch if it defines one.
         # this is experimental and may be changed/removed in the future
         # in favor of a general-purpose data buffer pool
         if hasattr(self.train_dataset, "on_batch_end"):
@@ -753,6 +888,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             self.train_dataset.on_batch_end(batch=batch)
 
     def _fit_postprocess_step(self):
+        # [FUNCTION DOC]
+        # HELPER: Tracks max step duration, logs metrics, advances the progress bar and global step; on the last step finalizes
+        # async calls (blocking), prints final validation metrics and closes the progress bar.
         metrics = self.metrics
         timing_raw = self.timing_raw
 
