@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Rollout skip implementations. Generated rollout batches are dumped under
+# <dump_dir>/<experiment>_<project>/GBS<gen batch size>_N<rollout n>_in<prompt len>_out<response len>/<step>/
+# and replayed on later runs instead of generating. RolloutSkip handles the decorator-based trainer
+# (DataProto dumps), RolloutTqSkip the TransferQueue-based V1 trainer (torch-saved TQ batches injected
+# back into TransferQueue), and AsyncRolloutSkip the fully-async rollouter, whose step is parsed from
+# sample uids.
 import json
 from pathlib import Path
 from typing import Callable
@@ -24,6 +31,9 @@ from verl.utils.skip.base_skip import BaseSkip, SkipAction, register_skip
 
 @register_skip("rollout")
 class RolloutSkip(BaseSkip):
+    # [CLASS DOC]
+    # Skip registered as "rollout" supporting CACHE and REPEAT. Class attributes: print_mark (log prefix),
+    # gen_batch_name (DataProto dump file name "gen_batch.dp"), meta_name ("meta.json").
     """RolloutSkip skips sequence generation during rollout by attempting to load previously dumped data."""
 
     support_actions = [SkipAction.CACHE, SkipAction.REPEAT]
@@ -32,6 +42,10 @@ class RolloutSkip(BaseSkip):
     meta_name = "meta.json"
 
     def __init__(self, local_config, global_config):
+        # [FUNCTION DOC]
+        # Initializes base fields and reads from global_config: experiment and project names (with defaults),
+        # rollout n (default 0), generation batch size (data.gen_batch_size, else data.train_batch_size,
+        # default 0), max response and prompt lengths (default 0). These form the dump sub-directory name.
         super().__init__(local_config, global_config)
         # prepare experiment info
         self.exp_name = global_config.trainer.get("experiment_name", "default_experiment_name")
@@ -45,6 +59,10 @@ class RolloutSkip(BaseSkip):
         self.prompt_length = OmegaConf.select(global_config, "data.max_prompt_length", default=0)
 
     def meet_precondition(self, step: int, func: Callable, *args, **kwargs) -> bool:
+        # [FUNCTION DOC]
+        # CACHE: True if a valid dump exists for exactly this step, else prints a notice and returns False.
+        # REPEAT: True if any usable dump step is found by _find_latest_step, else prints and returns False.
+        # Other actions: False. func/args unused.
         if self.action == SkipAction.CACHE:
             if not self._check_valid_step_path(self._get_step_dump_dir(step)):
                 print(
@@ -70,6 +88,11 @@ class RolloutSkip(BaseSkip):
         return False
 
     def warp_function(self, step: int, func: Callable, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Loads and returns the cached DataProto: for CACHE from this step, for REPEAT from the step chosen by
+        # _find_latest_step. Prints which step was loaded. func/args are unused.
+        # Exceptions: RuntimeError if REPEAT finds no dump; load errors if the file is missing.
+        # Side effects: disk reads, printing.
         """Load cached gen batch; ``*args``/``kwargs`` mirror the decorated call (e.g. ``self, prompts``)."""
         if self.action == SkipAction.CACHE:
             load_step = step
@@ -93,6 +116,9 @@ class RolloutSkip(BaseSkip):
         return result
 
     def prepare_data(self, step: int, result, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Dumps result (a DataProto) to <step dir>/gen_batch.dp and writes meta.json with global_steps,
+        # creating directories. Any failure is printed (not raised).
         step_dir = self._get_step_dump_dir(step)
         try:
             step_dir.mkdir(parents=True, exist_ok=True)
@@ -110,6 +136,9 @@ class RolloutSkip(BaseSkip):
             )
 
     def _get_project_dump_dir(self) -> Path:
+        # [FUNCTION DOC]
+        # HELPER: Returns the absolute project dump directory: expanded/resolved dump_dir joined with
+        # "<exp>_<project>/GBS<gbs>_N<n>_in<prompt_len>_out<response_len>".
         dumped_dir = Path(self.dump_dir).expanduser().resolve()
         sub_dir = (
             f"{self.exp_name}_{self.project_name}"
@@ -119,9 +148,13 @@ class RolloutSkip(BaseSkip):
         return dumped_dir
 
     def _get_step_dump_dir(self, step) -> Path:
+        # [FUNCTION DOC]
+        # HELPER: Returns the project dump directory joined with the step number.
         return self._get_project_dump_dir().joinpath(f"{step}").absolute()
 
     def _check_valid_step_path(self, path: Path) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if path is a directory containing both the gen batch file and meta.json as files.
         if not path.is_dir():
             return False
         gen_batch_path = path.joinpath(self.gen_batch_name)
@@ -129,6 +162,9 @@ class RolloutSkip(BaseSkip):
         return gen_batch_path.exists() and gen_batch_path.is_file() and meta_path.exists() and meta_path.is_file()
 
     def _get_available_steps(self) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Returns sorted integer names of child directories of the project dump dir that are valid
+        # step dumps; [] if the project dir does not exist.
         result: list[int] = []
         project_dir = self._get_project_dump_dir()
         if not project_dir.is_dir():
@@ -146,6 +182,9 @@ class RolloutSkip(BaseSkip):
         return sorted(result)
 
     def _find_latest_step(self, step: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Returns step if its dump is valid; else the largest available step below it; else the
+        # smallest above it; else -1.
         """Prefer exact ready step, else max step < current, else min step > current; -1 if none."""
         if self._check_valid_step_path(self._get_step_dump_dir(step)):
             return step
@@ -164,6 +203,11 @@ class RolloutSkip(BaseSkip):
 
 @register_skip("rollout_tq")
 class RolloutTqSkip(RolloutSkip):
+    # [CLASS DOC]
+    # Skip registered as "rollout_tq" for the V1 TransferQueue trainer, driven by explicit trainer calls
+    # (should_save/prepare_data in phase one, maybe_load_and_inject/load_dump_data in phase two). Each step
+    # directory holds parameter_sync_step inner sub-directories (one per sample call), each with
+    # tq_batch.pt and meta.json; a step is complete only when all inner dirs are valid.
     """Rollout skip for V1 TransferQueue-based trainer (``skip.rollout_tq``).
 
     Unlike V0's decorator pattern, V1's split architecture (submit prompts to TQ,
@@ -182,6 +226,9 @@ class RolloutTqSkip(RolloutSkip):
     tq_batch_name = "tq_batch.pt"
 
     def __init__(self, local_config, global_config):
+        # [FUNCTION DOC]
+        # Base init plus parameter_sync_step read from trainer.v1.<trainer_mode>.parameter_sync_step (default 1).
+        # Exceptions: config access errors if trainer.v1.trainer_mode is missing.
         super().__init__(local_config, global_config)
         self.parameter_sync_step = int(
             OmegaConf.select(
@@ -192,16 +239,22 @@ class RolloutTqSkip(RolloutSkip):
         )
 
     def _get_v1_inner_dir(self, step: int, inner_idx: int) -> Path:
+        # [FUNCTION DOC]
+        # HELPER: Returns <step dir>/<inner_idx>.
         """Return the dump directory for one mini-batch within a step."""
         return self._get_step_dump_dir(step) / str(inner_idx)
 
     def _check_valid_v1_step(self, step: int) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if all parameter_sync_step inner dirs for step are valid.
         """Check whether ALL inner dirs for *step* exist (complete cache)."""
         return all(
             self._check_valid_v1_step_path(self._get_v1_inner_dir(step, i)) for i in range(self.parameter_sync_step)
         )
 
     def _find_first_missing_inner(self, step: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Returns the first inner index without a valid dump, or -1 if all are present.
         """Return the first inner index whose dir does not yet exist."""
         for i in range(self.parameter_sync_step):
             if not self._check_valid_v1_step_path(self._get_v1_inner_dir(step, i)):
@@ -209,12 +262,16 @@ class RolloutTqSkip(RolloutSkip):
         return -1  # all present
 
     def _check_valid_v1_step_path(self, path: Path) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if path is a directory containing tq_batch.pt and meta.json files.
         """Check whether a V1-format cached batch (``tq_batch.pt``) exists at *path*."""
         if not path.is_dir():
             return False
         return (path / self.tq_batch_name).is_file() and (path / self.meta_name).is_file()
 
     def _get_available_steps_v1(self) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Sorted integer-named step directories whose V1 cache is complete.
         """Return sorted list of steps that have V1-format cached data."""
         result: list[int] = []
         project_dir = self._get_project_dump_dir()
@@ -233,6 +290,9 @@ class RolloutTqSkip(RolloutSkip):
         return sorted(result)
 
     def _resolve_load_step_v1(self, step: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Returns step if its V1 cache is complete; for REPEAT otherwise the closest available
+        # (largest smaller, else smallest larger); else -1 (CACHE requires exact match).
         """Return the actual step to load from for V1 path, or -1 if none available.
 
         - ``cache``: exact step match
@@ -253,6 +313,8 @@ class RolloutTqSkip(RolloutSkip):
         return -1
 
     def has_v1_cache(self, step: int) -> bool:
+        # [FUNCTION DOC]
+        # True if a loadable step exists for step (phase two), False otherwise (phase one).
         """V1 phase check: whether cached TQ batch data exists for *step*.
 
         Returns True -> phase two (load from disk).
@@ -261,14 +323,21 @@ class RolloutTqSkip(RolloutSkip):
         return self._resolve_load_step_v1(step) != -1
 
     def meet_precondition(self, step: int, *args, **kwargs) -> bool:
+        # [FUNCTION DOC]
+        # Same as has_v1_cache; extra args ignored.
         """Phase two: whether cached data exists and should be loaded/injected."""
         return self.has_v1_cache(step)
 
     def should_save(self, step: int, partition_id: str = "train") -> bool:
+        # [FUNCTION DOC]
+        # True only for the "train" partition when no V1 cache is available for step.
         """Phase one: whether the sampled batch should be saved to disk."""
         return partition_id == "train" and not self.has_v1_cache(step)
 
     def maybe_load_and_inject(self, step: int, new_prompt_uids: list[str], partition_id: str = "train") -> bool:
+        # [FUNCTION DOC]
+        # If no cache, prints a notice and returns False. Otherwise calls load_dump_data with n = rollout n
+        # and global_steps = step, and returns True (caller should skip real rollout).
         """Phase two: load cached data and inject into TransferQueue if cache exists.
 
         Convenience wrapper that combines ``meet_precondition`` + ``load_dump_data``.
@@ -297,6 +366,12 @@ class RolloutTqSkip(RolloutSkip):
         return True
 
     def prepare_data(self, step: int, batch, global_steps: int) -> None:
+        # [FUNCTION DOC]
+        # Saves the next missing inner mini-batch for step: returns silently if all inner dirs exist; else
+        # creates the dir, fetches the batch fields from TransferQueue by keys and partition, torch-saves a
+        # payload {tensordict, tags, keys, global_steps} as tq_batch.pt, writes meta.json with global_steps and
+        # trajectory count, and prints.
+        # Side effects: TransferQueue reads, disk writes. Exceptions propagate (unlike RolloutSkip).
         """Phase one: read batch from TransferQueue and save to disk.
 
         When ``parameter_sync_step > 1``, each ``sample`` call saves its mini-batch
@@ -344,6 +419,18 @@ class RolloutTqSkip(RolloutSkip):
         global_steps: int,
         partition_id: str = "train",
     ) -> None:
+        # [FUNCTION DOC]
+        # Loads the cache for the resolved step and injects it into TransferQueue under new prompt uids.
+        # Behavior: loads every inner payload (torch.load without weights-only restriction), concatenating
+        # tensordicts when more than one, and accumulates keys and tags. Groups trajectory indices by parent
+        # uid (key prefix before the first "_"). Prints a notice when cached group count differs from the
+        # number of prompts. For each new uid (cycling groups by modulo), creates n trajectories (cycling
+        # within the group if it has fewer) with keys "<uid>_<session>_0" and copied tags whose
+        # global_steps/min_global_steps/max_global_steps are set to global_steps and "is_prompt" removed.
+        # Selects the corresponding rows and puts them into TransferQueue, then puts prompt-level tags
+        # (is_prompt, status "finished", global_steps) for the new uids so the replay buffer can sample them.
+        # Exceptions: FileNotFoundError if no cache; RuntimeError if no groups found.
+        # Side effects: disk reads, TransferQueue writes, printing.
         """Phase two: load cached data from disk and inject into TransferQueue.
 
         Maps saved trajectories to new prompt uids in order, preserving the
@@ -464,6 +551,10 @@ class RolloutTqSkip(RolloutSkip):
 
 
 def parse_async_rollout_sample_step(sample_id: str) -> int:
+    # [FUNCTION DOC]
+    # Parses the trailing feed index from "uid_sample_<epoch>_<index>" or "sample_<epoch>_<index>".
+    # Outputs: int index. Exceptions: ValueError if the format (after removing an optional "uid_" prefix)
+    # is not exactly three underscore-separated parts starting with "sample", or the index is not an int.
     """Parse the prompt **feed index** embedded in ``uid_sample_{epoch}_{index}`` or ``sample_{epoch}_{index}``.
 
     The trailing integer is Rollouter ``global_steps`` at feed time: monotonic order in which
@@ -481,11 +572,18 @@ def parse_async_rollout_sample_step(sample_id: str) -> int:
 
 @register_skip("async_rollout")
 class AsyncRolloutSkip(RolloutSkip):
+    # [CLASS DOC]
+    # Skip registered as "async_rollout" for the fully-async policy; same caching as RolloutSkip but with
+    # support_online_step, deriving the step from the prompts' uids.
     """Rollout skip for fully async policy (``skip.async_rollout``)."""
 
     support_online_step = True
 
     def extract_step(self, *args, **kwargs) -> int:
+        # [FUNCTION DOC]
+        # Takes prompts from the second positional argument (after self) or the "prompts" keyword and parses
+        # the step from the first entry of prompts.non_tensor_batch["uid"].
+        # Exceptions: ValueError if prompts or uids are missing/empty, or the uid is malformed.
         # generate_sequences_single(self, prompts)
         # sample_id is embedded in prompts.non_tensor_batch["uid"]
         prompts = args[1] if len(args) > 1 else kwargs.get("prompts")
