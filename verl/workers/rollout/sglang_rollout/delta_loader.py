@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# SGLang custom weight loader that applies sparse/dense delta weight flushes from the
+# delta checkpoint engine in place inside each SGLang TP worker (see module docstring for
+# the wire contract). Module state: logger; CHUNK_BYTES (512 MiB cap per load_weights
+# call); LOADER_FQN (import path registered as custom_weight_loader and used as
+# load_format); _VERIFY_STATS (process-global accumulator for verify sweeps).
 """In-process sparse delta apply for SGLang, loaded via ``--custom-weight-loader``.
 
 SGLang's ``update_weights_from_tensor`` supports pluggable loaders: when the
@@ -59,6 +65,23 @@ LOADER_FQN = "verl.workers.rollout.sglang_rollout.delta_loader.apply_delta"
 
 
 def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
+    # [FUNCTION DOC]
+    # Entry point invoked by SGLang as loader(model, named_tensors) for one flush.
+    # Behavior: collects named tensors into a mapping; decodes the "__delta_spec__" uint8
+    # tensor as a UTF-8 JSON manifest; takes "__values__" and optional "__positions__" (empty
+    # uint8 tensor on the values' device when absent, e.g. the seed flush). Computes the
+    # checksum over positions and values with the delta_sync encoder's checksum and compares
+    # with the manifest. Encoding "dense": if spec "verify" is truthy runs the verification
+    # sweep (passing "is_last"), else a plain chunked dense load. Any other encoding: under the
+    # NaN-masked copy patch, densifies each param into a NaN-masked full tensor and feeds them
+    # to model.load_weights in chunks bounded by CHUNK_BYTES (a single oversize tensor still
+    # forms its own chunk).
+    # Inputs: model - SGLang model exposing load_weights; named_tensors - iterable of
+    # (name, tensor) pairs with the three reserved names.
+    # Outputs: None.
+    # Exceptions: KeyError if spec/values missing; RuntimeError on checksum mismatch;
+    # ValueError from decoding for unsupported encodings.
+    # Side effects: mutates model weights; temporarily patches torch.Tensor.copy_ globally.
     """Decode one sparse delta flush and masked-apply it onto ``model`` in place."""
     from verl.checkpoint_engine.delta_sync.encode import checksum as _checksum
 
@@ -100,6 +123,10 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
 
 
 def _apply_dense(model: torch.nn.Module, params: list[dict], values: torch.Tensor) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Load a dense flush: for each param dict, slice values[val_start:val_end], cast to
+    # the named torch dtype, reshape to shape, and load into the model in chunks of at most
+    # CHUNK_BYTES. Side effects: mutates model weights.
     """Apply a dense (full-coverage) flush: plain chunked load, no masking needed."""
     chunk: list[tuple[str, torch.Tensor]] = []
     chunk_bytes = 0
@@ -120,6 +147,22 @@ _VERIFY_STATS: dict = {"params": 0, "pieces": []}
 
 
 def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tensor, is_last: bool) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Verification sweep confirming that reloading the trainer's full weights is a
+    # no-op on the server (see docstring for rationale).
+    # Behavior: for each param, temporarily replaces torch.Tensor.copy_ with a wrapper that,
+    # the first time each destination (keyed by data pointer, numel, dtype) is written,
+    # snapshots a clone of it, then performs the real copy; runs the dense load for that one
+    # param; restores copy_. Counts differing elements between each destination and its
+    # snapshot (bit-level comparison via int16 view for 2-byte floats, so NaN/-0 differences
+    # count), records per-param offender counts and per-param totals in _VERIFY_STATS. When
+    # is_last, logs a warning summarizing params checked, mismatch total and top 12
+    # offenders, resets the stats, and raises if any mismatches occurred.
+    # Inputs: model; params - list of param dicts; values - value tensor; is_last - final
+    # flush of the sweep.
+    # Exceptions: RuntimeError on any mismatch at the end of the sweep.
+    # Side effects: mutates model (idempotent if in sync), mutates global _VERIFY_STATS,
+    # temporarily patches torch.Tensor.copy_, logs.
     """State-equivalence sweep, phrased as an IDEMPOTENCE check: replaying the
     trainer's FULL current weights onto an in-sync server must be a no-op. For
     each parameter we snapshot every ``copy_`` destination (the exact internal
@@ -138,6 +181,9 @@ def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tens
         touched: dict = {}
 
         def snap_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, _touched=touched, **kwargs) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Patched copy_ that snapshots the destination once per unique key into the
+            # bound _touched mapping before delegating to the original copy_. Returns its result.
             key = (self.data_ptr(), self.numel(), self.dtype)
             if key not in _touched:
                 _touched[key] = (self, self.detach().clone())
@@ -175,6 +221,16 @@ def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tens
 
 
 def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p: dict) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Densify one param's sparse delta into a full-shape tensor of the param's dtype
+    # filled with NaN except at changed positions.
+    # Behavior: returns all-NaN when the param has no values; otherwise slices the position
+    # bytes pos_start:pos_end, reinterprets them as int32 indices ("indices" encoding only),
+    # widens to int64 and scatters the cast values at those flat positions.
+    # Inputs: encoding name; positions uint8 blob; values tensor; p - param dict (shape, dtype,
+    # val_start/val_end, pos_start/pos_end).
+    # Outputs: tensor of shape p["shape"] on values' device.
+    # Exceptions: ValueError for any encoding other than "indices".
     """Densify one param's sparse delta into a full-shape NaN-masked tensor.
 
     ``indices`` positions are reinterpreted via an int32 view (8 B/element
@@ -201,6 +257,13 @@ def _decode_one(encoding: str, positions: torch.Tensor, values: torch.Tensor, p:
 
 @contextmanager
 def _masked_copy() -> Iterator[None]:
+    # [FUNCTION DOC]
+    # HELPER: Context manager that patches torch.Tensor.copy_ so that, when the source is a
+    # floating tensor of the same shape as the destination, positions where the source (cast
+    # to destination dtype) is NaN keep the destination's value; otherwise falls through to
+    # the original copy_. Restores the original on exit, even on error.
+    # Outputs: yields None. Side effects: global monkey-patch of torch.Tensor.copy_ for the
+    # duration (affects all threads in the process).
     """Temporarily make ``Tensor.copy_`` skip NaN positions in the source.
 
     SGLang's per-model ``load_weights`` ultimately lands on ``param.copy_(loaded)``
@@ -211,6 +274,10 @@ def _masked_copy() -> Iterator[None]:
     orig_copy = torch.Tensor.copy_
 
     def masked_copy_(self: torch.Tensor, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Masked copy_ replacement; uses an elementwise select (no host sync) to keep
+        # destination values where the casted source is NaN. Extra args are dropped on the masked
+        # path and forwarded on the fallback path.
         # Sync-free masked overwrite: boolean advanced indexing (and a
         # ``mask.all()`` early-out) would force a device->host sync per
         # parameter -- ruinous for MoE flushes carrying >10k per-expert

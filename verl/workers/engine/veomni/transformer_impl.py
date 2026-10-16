@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# VeOmni-backed training engine for verl. Subclasses the FSDP engine family but builds models,
+# parallelism (FSDP2 + Ulysses sequence parallel + expert parallel), optimizers and LR
+# schedulers through VeOmni; adds VeOmni-specific input transforms (vision-language masks,
+# SP sharding, varlen flash-attention kwargs), MoE router replay (record/replay of routing
+# decisions), weight export for rollout sync (full and sharded-delta), offload handling, and
+# registers language-model and value-model variants under backend "veomni" for cuda/npu.
+# Side effects at import: module logger; requires veomni installed; registry registration.
 
 
 import logging
@@ -63,6 +71,17 @@ logger = logging.getLogger(__file__)
 
 
 def _build_ops_implementation_config(engine_config: VeOmniEngineConfig) -> OpsImplementationConfig:
+    # [FUNCTION DOC]
+    # HELPER: Builds VeOmni's OpsImplementationConfig from the engine config.
+    # Behavior: collects every engine config dataclass field whose name ends in "_implementation".
+    # Fields known to the installed OpsImplementationConfig are forwarded; unknown fields still at
+    # their dataclass default are skipped (logged at info); unknown fields set to non-default
+    # values are collected as unsupported.
+    # Inputs: engine_config - VeOmniEngineConfig dataclass.
+    # Outputs: an OpsImplementationConfig constructed from forwarded fields.
+    # Exceptions: ValueError listing unsupported explicitly-set selectors.
+    # KNOWN ISSUE: fields whose default is supplied via default_factory have a sentinel default, so
+    # they always compare as non-default and would be reported unsupported if unknown.
     """Forward every ``*_implementation`` selector that the installed VeOmni accepts.
 
     ``VeOmniEngineConfig`` mirrors VeOmni's ``OpsImplementationConfig`` field by field, so a
@@ -97,9 +116,24 @@ def _build_ops_implementation_config(engine_config: VeOmniEngineConfig) -> OpsIm
 
 
 class VeOmniEngine(FSDPEngine):
+    # [CLASS DOC]
+    # Base VeOmni engine (FSDP2 only). Holds model/engine/optimizer/checkpoint configs, VeOmni
+    # parallel state, offload flags, router-replay controller, and entropy function. Class flag
+    # indicates VeOmni computes position-id-derived attention kwargs itself.
     _veomni_handles_position_ids = True
 
     def _apply_veomni_input_transforms(self, model_inputs: dict, micro_batch: TensorDict):
+        # [FUNCTION DOC]
+        # HELPER: Mutates model_inputs in place before the forward pass.
+        # Behavior: if the model type is a known vision-language type, adds boolean image and video
+        # masks (input ids equal to the type's image/video placeholder token index) and, when SP is
+        # enabled, runs the sequence shard collator over model_inputs (padding pixel features and
+        # slicing sequence features for this SP rank). Then if use_remove_padding (non-tensor flag,
+        # default true) and position ids are present, adds varlen flash-attention kwargs derived from
+        # the full position ids and, when SP is enabled, slices position ids along the last dim for
+        # this SP rank.
+        # Inputs: model_inputs - mapping prepared by the parent; micro_batch - TensorDict for flags.
+        # Outputs: none. Exceptions: ValueError from position-id layout validation.
         """Apply VeOmni-specific input transforms shared by LM and value heads.
 
         Handles vision-language model masks, sequence parallel sharding,
@@ -131,6 +165,20 @@ class VeOmniEngine(FSDPEngine):
         checkpoint_config: CheckpointConfig,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores configs, fixes data-parallel mode to fsdp2, records rank. Computes
+        # dp_size = world_size / ulysses size; if fsdp_size is negative or at least dp_size uses pure
+        # sharding (replicate 1, shard dp_size), else requires dp_size divisible by fsdp_size and uses
+        # hybrid sharding (replicate dp_size/fsdp_size, shard fsdp_size). Initializes VeOmni's global
+        # parallel state with these sizes plus expert-parallel and ulysses sizes. Optionally enables
+        # full determinism. Records remove-padding, param/optimizer offload, LoRA (rank > 0), and
+        # whether FSDP2 CPU offload policy is used. Records SP enabled/size and the SP process group.
+        # Chooses chunked or plain entropy-from-logits, optionally wrapped in torch.compile (dynamic).
+        # Records router replay mode/enabled flag (controller created later) and pad-to-length options.
+        # Inputs: model_config, engine_config, optimizer_config, checkpoint_config; kwargs ignored.
+        # Exceptions: ValueError when dp_size is not divisible by fsdp_size.
+        # Side effects: initializes global parallel state; may mutate env/RNG via determinism; logs.
+        # Note: does not call the parent constructor.
         """
         Initialize the VeOmniEngine.
 
@@ -218,6 +266,14 @@ class VeOmniEngine(FSDPEngine):
         self.pad_to_length_bucket: int = self.engine_config.pad_to_length_bucket
 
     def initialize(self):
+        # [FUNCTION DOC]
+        # Behavior: builds model/optimizer/scheduler; if router replay is enabled, requires
+        # use_remove_padding in engine config, creates the replay controller, and installs it on the
+        # module. Creates the FSDP checkpoint manager, then offloads model/optimizer/grads to CPU per
+        # offload flags and logs memory.
+        # Exceptions: RuntimeError if router replay enabled without remove padding; errors from replay
+        # install if VeOmni lacks support.
+        # Side effects: sets module, optimizer, lr_scheduler, checkpoint_manager, _router_replay.
         """
         Build the model, optimizer, and learning rate scheduler under VeOmni.
 
@@ -269,6 +325,11 @@ class VeOmniEngine(FSDPEngine):
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
     def _build_optimizer(self, module):
+        # [FUNCTION DOC]
+        # HELPER: Builds a VeOmni optimizer for the module from optimizer config (lr, betas, weight
+        # decay, type). If the module exposes a get_optimizer_pre_hook factory, registers the hook it
+        # returns (given module, its config and dp mode) as a step pre-hook.
+        # Outputs: the optimizer.
         optimizer = build_optimizer(
             module,
             lr=self.optimizer_config.lr,
@@ -284,6 +345,9 @@ class VeOmniEngine(FSDPEngine):
         return optimizer
 
     def _build_lr_scheduler(self, optimizer):
+        # [FUNCTION DOC]
+        # HELPER: Builds a VeOmni LR scheduler from optimizer config (total steps, lr, min lr, decay
+        # style, decay ratio, warmup ratio, start lr). Outputs: the scheduler.
         optim_config = self.optimizer_config
         lr_scheduler = build_lr_scheduler(
             optimizer,
@@ -299,6 +363,9 @@ class VeOmniEngine(FSDPEngine):
         return lr_scheduler
 
     def _get_model_config_path(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns what to pass as config_path to model building; base returns the local HF config
+        # path. Overridable hook.
         """Return the config path (or PretrainedConfig) for build_foundation_model.
 
         Subclasses can override to modify the HF config before model construction
@@ -307,6 +374,12 @@ class VeOmniEngine(FSDPEngine):
         return self.model_config.local_hf_config_path
 
     def _maybe_apply_async_activation_offload(self, module):
+        # [FUNCTION DOC]
+        # HELPER: If async activation offload is enabled, lazily imports VeOmni's offload API and applies
+        # it to the unparallelized module for the configured module names, with host cache limit
+        # converted from GB to bytes; logs memory. Otherwise no-op.
+        # Exceptions: ImportError if VeOmni lacks the feature (only when enabled).
+        # Side effects: wraps module layers' call behavior.
         """Attach VeOmni's stream-based activation offload to the decoder layers.
 
         Must run on the unparallelized module: the offload wraps each selected layer's
@@ -329,6 +402,15 @@ class VeOmniEngine(FSDPEngine):
         log_gpu_memory_usage("After apply async activation offload", logger=logger)
 
     def _build_model_optimizer(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds the ops implementation config and mixed-precision config; builds the foundation
+        # model (float32 weights when mixed precision is enabled, else bfloat16) with configured
+        # attention/ops implementation and init device; applies optional activation offload; then
+        # parallelizes via VeOmni (full shard, mixed precision, gradient checkpointing, FSDP offload,
+        # basic modules = union of model's no-split modules and configured ones, reentrant, forward
+        # prefetch, broadcast weights from rank 0, and the safetensors index mapping). Builds optimizer
+        # and scheduler unless forward_only, else both None.
+        # Side effects: sets module, optimizer, lr_scheduler; logs memory.
         # build_foundation_model runs apply_ops_config(ops_implementation)
         # before constructing the model, so per-model device_patch files see
         # the resolved kernel backends.
@@ -383,6 +465,12 @@ class VeOmniEngine(FSDPEngine):
         self.lr_scheduler = lr_scheduler
 
     def optimizer_step(self):
+        # [FUNCTION DOC]
+        # Behavior: clips gradients to clip_grad using the module's own clip method if present, else the
+        # torch utility; materializes a DTensor norm. If the norm is not finite, prints a warning and
+        # zeros grads without stepping; otherwise steps the optimizer.
+        # Outputs: grad norm as a Python float.
+        # Side effects: mutates params/optimizer state or grads; prints.
         """
         Perform an optimization step using the optimizer.
         """
@@ -403,6 +491,18 @@ class VeOmniEngine(FSDPEngine):
         return grad_norm.item()
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
+        # [FUNCTION DOC]
+        # Behavior: stores SP size in data; computes the global token count as the sum of loss_mask
+        # all-reduced over the DP group and stores it plus dp_size. Splits into micro-batches (same count
+        # across DP). If router replay is enabled and the batch flag enable_routing_replay is true, begins
+        # RECORD (mode R2 and forward_only) or REPLAY (otherwise). For each micro-batch runs forward_step
+        # under no-grad when forward_only, backpropagates the loss otherwise, and collects meta info;
+        # postprocesses into the aggregated output. Always clears the replay controller afterward when
+        # active.
+        # Inputs: data - TensorDict with loss_mask and batching metadata; loss_function - callable;
+        # forward_only - skip backward.
+        # Outputs: dict from postprocess_batch_func.
+        # Side effects: mutates data non-tensor fields; collectives; accumulates gradients.
         """
         Perform a forward pass and optionally a backward pass on a batch of data.
 
@@ -467,24 +567,37 @@ class VeOmniEngine(FSDPEngine):
                 self._router_replay.clear()
 
     def get_data_parallel_rank(self):
+        # [FUNCTION DOC]
+        # Behavior: returns this rank's local index in the "dp" mesh dimension.
         return parallel_state.get_parallel_state().device_mesh.get_local_rank("dp")
 
     def get_data_parallel_size(self):
+        # [FUNCTION DOC]
+        # Behavior: returns world size divided by ulysses size.
         return torch.distributed.get_world_size() // parallel_state.get_parallel_state().ulysses_size
 
     def get_data_parallel_group(self):
+        # [FUNCTION DOC]
+        # Behavior: returns the dp mesh dimension group when ulysses size > 1, else the WORLD group.
         if parallel_state.get_parallel_state().ulysses_size > 1:
             return parallel_state.get_parallel_state().device_mesh.get_group(mesh_dim="dp")
         else:
             return torch.distributed.group.WORLD
 
     def get_model_parallel_group(self):
+        # [FUNCTION DOC]
+        # Behavior: not supported. Exceptions: always NotImplementedError.
         raise NotImplementedError
 
     def get_context_parallel_group(self):
+        # [FUNCTION DOC]
+        # Behavior: not supported. Exceptions: always NotImplementedError.
         raise NotImplementedError
 
     def is_mp_src_rank_with_outputs(self):
+        # [FUNCTION DOC]
+        # Behavior: returns true when this rank is local rank 0 in the "ulysses" mesh dim (when ulysses
+        # size > 1), otherwise true.
         """
         Whether the current rank is the first rank in model parallel group that contains model outputs
         """
@@ -495,6 +608,8 @@ class VeOmniEngine(FSDPEngine):
         return is_collect
 
     def train_mode(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: returns a train-mode context bound to this engine; kwargs forwarded to the context.
         """
         Return a context manager that switches to training mode with VeOmni-specific handling.
 
@@ -503,6 +618,8 @@ class VeOmniEngine(FSDPEngine):
         return EngineTrainModeCtx(self, **kwargs)
 
     def eval_mode(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: returns an eval-mode context bound to this engine; kwargs forwarded.
         """
         Return a context manager that switches to evaluation mode with VeOmni-specific handling.
 
@@ -511,6 +628,14 @@ class VeOmniEngine(FSDPEngine):
         return EngineEvalModeCtx(self, **kwargs)
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+        # [FUNCTION DOC]
+        # Behavior: first calls the grandparent (BaseEngine, skipping FSDPEngine) device-move logic, then
+        # for the accelerator device loads model (if model) and optimizer state (if optimizer and one
+        # exists) via VeOmni helpers; for "cpu" offloads them.
+        # Inputs: device - accelerator name or "cpu"; model, optimizer, grad - which parts to move.
+        # Exceptions: AssertionError for any other device string.
+        # KNOWN ISSUE: the trailing ValueError branch is unreachable because of the preceding assert;
+        # grad flag is only forwarded to the parent, not handled here.
         """
         Move model parameters, optimizer states, or both to the specified device.
         Note that this function executes irrespective of offload config. It serves as manual control.
@@ -546,6 +671,12 @@ class VeOmniEngine(FSDPEngine):
         max_ckpt_to_keep: Optional[int] = None,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: if params are offloaded or the module currently lives on CPU, and FSDP2 CPU offload
+        # policy is not in use, loads the model to GPU. Saves via the checkpoint manager, barriers,
+        # then re-offloads the model if param offload is enabled.
+        # Inputs: local_path, optional hdfs_path, global_step, max_ckpt_to_keep; kwargs ignored.
+        # Side effects: writes checkpoint files; collective barrier; device moves.
         """
         Save VeOmni checkpoint, handling parameter offload as needed.
         """
@@ -566,6 +697,11 @@ class VeOmniEngine(FSDPEngine):
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: loads the model to GPU if param-offloaded (and not using CPU offload policy), loads the
+        # checkpoint, barriers, then re-offloads model and/or optimizer per offload flags.
+        # Inputs: local_path, optional hdfs_path, del_local_after_load; kwargs ignored.
+        # Side effects: mutates model/optimizer state; device moves; barrier.
         """
         Load VeOmni checkpoint, restoring parameters and optimizer state.
         """
@@ -584,6 +720,13 @@ class VeOmniEngine(FSDPEngine):
             offload_veomni_optimizer(self.optimizer)
 
     def get_per_tensor_param_shard(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: unless FSDP2 CPU offload policy is used, loads the model to GPU, then obtains the
+        # shard exporter generator and metadata from veomni_shard_export. Wraps the generator so that,
+        # after it is exhausted, the model is offloaded back to CPU if manual offload and param offload
+        # apply.
+        # Outputs: (generator of (name, local shard, spec), metadata).
+        # Side effects: device moves (deferred offload happens only when the generator is fully consumed).
         """Yield each rank's *local* shard ``(name, local_shard, ShardSpec)`` -- the
         DTensor export plus veomni's EP declarations. The mechanics live in
         :func:`verl.workers.engine.veomni.utils.veomni_shard_export`; this wrapper
@@ -599,6 +742,8 @@ class VeOmniEngine(FSDPEngine):
         gen, meta = veomni_shard_export(self.module)
 
         def _with_offload_back():
+            # [FUNCTION DOC]
+            # HELPER: Generator yielding all exporter items then performing the deferred offload.
             yield from gen
             if manual_offload and self._is_offload_param:
                 offload_veomni_model_to_cpu(self.module)
@@ -606,6 +751,13 @@ class VeOmniEngine(FSDPEngine):
         return _with_offload_back(), meta
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
+        # [FUNCTION DOC]
+        # HELPER: Per-param delta entry builder. If the spec has a to-HF chunk converter, a block
+        # placement and declared HF slots, delegates to the veomni converter entry builder; if it has a
+        # converter but no slots/block placement, raises; otherwise falls back to the FSDP identity
+        # builder.
+        # Inputs: name, spec, place, lidx, lval - as in the delta export contract.
+        # Outputs: delta entry tuple. Exceptions: NotImplementedError when converter lacks slots.
         """veomni's per-param entry builder: EP/converter specs (fused expert
         stacks) go through this backend's own converter machinery (see
         :mod:`verl.workers.engine.veomni.utils`); everything else falls back to
@@ -624,6 +776,20 @@ class VeOmniEngine(FSDPEngine):
     # get_per_tensor_param_shard and _hf_delta_entry overrides.
 
     def get_per_tensor_param(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: loads model to GPU unless CPU offload policy is used. If the model has a checkpoint
+        # tensor converter exposing export_weights, returns that export and None. Otherwise takes the
+        # state dict, converts keys to HF names, re-offloads params if param offload is on, and selects
+        # the MoE param handler for the model type. Returns a lazy generator: each param is materialized
+        # (DTensor moved to device and full_tensor; others unchanged). Expert projection params (name has
+        # "mlp.experts." and a down/gate/up/gate_up projection) under EP are broadcast from each EP rank in
+        # turn (using this rank's tensor or a same-shaped buffer) and passed to the handler with expert id
+        # base src_rank times local expert count; other expert params go through the handler with base 0;
+        # non-expert params are yielded directly.
+        # Outputs: (generator of (name, tensor), None).
+        # Side effects: device moves; collective broadcasts during iteration.
+        # KNOWN ISSUE: the model is offloaded before the generator runs, so non-DTensor params may be
+        # yielded from CPU; LoRA not supported.
         # FSDP2 CPUOffloadPolicy owns CPU<->accelerator placement; calling model.to(device)
         # here leaves the module half-moved and crashes state_dict() below (#5995). The
         # per-DTensor .to(device).full_tensor() in param_generator() below stages each
@@ -649,6 +815,8 @@ class VeOmniEngine(FSDPEngine):
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
 
         def param_generator():
+            # [FUNCTION DOC]
+            # HELPER: Lazy generator implementing the per-param materialization/broadcast described above.
             for name, param in params.items():
                 unsharded_tensor = (
                     param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param
@@ -676,10 +844,20 @@ class VeOmniEngine(FSDPEngine):
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
+    # [CLASS DOC]
+    # Eval-mode context for VeOmniEngine: swaps in the engine's Ulysses SP group on enter and restores
+    # the previous one on exit; reshards the root FSDP module on exit when shard size > 1.
     def __init__(self, engine: VeOmniEngine, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: initializes the base context with mode "eval"; kwargs forwarded.
         super().__init__(engine=engine, mode="eval", **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts the engine type, runs base enter, saves the current SP group, installs the
+        # engine's SP group, and puts the module in train mode.
+        # KNOWN ISSUE: eval context calls module.train() rather than eval(), so dropout etc. remain active
+        # (mirrors a TODO in the train context).
         assert isinstance(self.engine, VeOmniEngine)
         super().__enter__()
         self.prev_sp_group = get_ulysses_sequence_parallel_group()
@@ -687,6 +865,10 @@ class EngineEvalModeCtx(BaseEngineCtx):
         self.engine.module.train()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Behavior: restores the previous SP group; if dp shard size > 1 reshards the root FSDP module
+        # (FSDP1 handle reshard or FSDP2 reshard); then runs base exit.
+        # Inputs: standard exception triple. Outputs: none (exceptions propagate).
         assert isinstance(self.engine, VeOmniEngine)
         set_ulysses_sequence_parallel_group(self.prev_sp_group)
 
@@ -702,10 +884,17 @@ class EngineEvalModeCtx(BaseEngineCtx):
 
 
 class EngineTrainModeCtx(BaseEngineCtx):
+    # [CLASS DOC]
+    # Train-mode context for VeOmniEngine: SP group swap like eval, and zeroes grads on exit when
+    # configured or when an exception occurred.
     def __init__(self, engine: VeOmniEngine, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: initializes the base context with mode "train"; kwargs forwarded.
         super().__init__(engine=engine, mode="train", **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts engine type, base enter, saves and installs SP group, sets module train mode.
         assert isinstance(self.engine, VeOmniEngine)
         super().__enter__()
         self.prev_sp_group = get_ulysses_sequence_parallel_group()
@@ -715,6 +904,9 @@ class EngineTrainModeCtx(BaseEngineCtx):
         self.engine.module.train()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Behavior: restores SP group; zeroes optimizer grads if zero_grad_on_exit or an exception is
+        # propagating; then base exit.
         assert isinstance(self.engine, VeOmniEngine)
         set_ulysses_sequence_parallel_group(self.prev_sp_group)
         if self.zero_grad_on_exit or exc_type is not None:
@@ -724,6 +916,10 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @dataclass
 class OmniSequenceShardCollator:
+    # [CLASS DOC]
+    # Dataclass collator that pads and slices batch features along a sequence dimension for Ulysses
+    # SP. Fields: mapping of feature name to slice dim (input_ids/labels last dim, pixel values dim 0),
+    # mapping of feature to padding value, and mapping of feature to padding scale (pixel features 4).
     """
     Data collator to chunk inputs along the sequence length.
     """
@@ -755,10 +951,17 @@ class OmniSequenceShardCollator:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: reads SP size and rank from VeOmni parallel state into attributes.
         self.sp_size = parallel_state.get_parallel_state().sp_size
         self.sp_rank = parallel_state.get_parallel_state().sp_rank
 
     def sp_slice(self, feature: torch.Tensor, dim: int = -1) -> dict[str, "torch.Tensor"]:
+        # [FUNCTION DOC]
+        # Behavior: splits the dim into ceil(len/sp_size) chunks and returns this rank's chunk via narrow.
+        # Inputs: feature - tensor; dim - dimension. Outputs: a view tensor.
+        # KNOWN ISSUE: return annotation says dict but a tensor is returned; if length is not divisible
+        # the last rank's narrow can exceed bounds (callers must pre-pad).
         seq_length = feature.size(dim)
         sp_chunk_size = (seq_length + self.sp_size - 1) // self.sp_size
         return feature.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
@@ -766,6 +969,10 @@ class OmniSequenceShardCollator:
     def sp_padding(
         self, tensor: "torch.Tensor", dim: int = -1, pad_value: int = 0, pad_scale: int = 1
     ) -> "torch.Tensor":
+        # [FUNCTION DOC]
+        # Behavior: computes padding so the dim length is a multiple of sp_size*pad_scale and appends a
+        # tensor filled with pad_value (same dtype/device); returns input unchanged if no pad needed.
+        # Inputs: tensor; dim; pad_value; pad_scale. Outputs: padded tensor.
         """
         Pads a tensor with pad_length to aligns tensor with sp size.
         """
@@ -783,6 +990,11 @@ class OmniSequenceShardCollator:
         return torch.cat((tensor, pad), dim=dim)
 
     def __call__(self, batch: Sequence[dict[str, "torch.Tensor"]]) -> dict[str, "torch.Tensor"]:
+        # [FUNCTION DOC]
+        # Behavior: pads every padding feature present (using its slice dim, default last), then slices
+        # every slice feature present for this SP rank; mutates and returns the batch mapping.
+        # Inputs: batch - mapping of feature name to tensor. Outputs: same mapping.
+        # KNOWN ISSUE: annotated as a sequence of dicts but used as a single mapping.
         for key in batch.keys():
             if key in self.padding_features.keys():
                 batch[key] = self.sp_padding(
@@ -801,6 +1013,11 @@ class OmniSequenceShardCollator:
 
 
 def _prepare_veomni_flash_attention_kwargs(position_ids: torch.Tensor) -> dict[str, torch.Tensor | int]:
+    # [FUNCTION DOC]
+    # HELPER: Accepts 2-D (1, nnz) position ids as-is, or 3-D (rope_dim, 1, nnz) taking the first rope
+    # row; derives cumulative seqlens and max lengths via VeOmni.
+    # Outputs: mapping with cu_seq_lens_q/k and max_length_q/k.
+    # Exceptions: ValueError for 3-D with middle dim not 1 or other ranks.
     """Normalize packed position_ids layout and derive varlen FlashAttention kwargs.
 
     Supported formats for use_remove_padding=true:
@@ -835,7 +1052,18 @@ def _prepare_veomni_flash_attention_kwargs(position_ids: torch.Tensor) -> dict[s
 
 @EngineRegistry.register(model_type="language_model", backend=["veomni"], device=["cuda", "npu"])
 class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
+    # [CLASS DOC]
+    # Language-model VeOmni engine (registered as model_type language_model). Adds fused log-prob
+    # /top-K distillation inputs and router-replay preparation and output capture.
     def prepare_model_inputs(self, micro_batch: TensorDict):
+        # [FUNCTION DOC]
+        # Behavior: gets parent inputs, applies VeOmni transforms. When use_fused_kernels and
+        # use_remove_padding: sets labels to input ids, shift_labels to the rolled ids (unsqueezed), and
+        # return_log_probs true; additionally if distillation_use_topk and teacher_ids exist, requires
+        # teacher_logprobs, flattens both nested tensors to (1, nnz, K), SP-slices along dim 1 with padding
+        # when SP is used, and adds them as teacher top-K kwargs. Finally arms router replay.
+        # Outputs: (model_inputs, output_args).
+        # Exceptions: ValueError when teacher_ids present without teacher_logprobs.
         model_inputs, output_args = super().prepare_model_inputs(micro_batch)
         self._apply_veomni_input_transforms(model_inputs, micro_batch)
 
@@ -886,6 +1114,12 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
         return model_inputs, output_args
 
     def _prepare_router_replay_inputs(self, micro_batch: TensorDict, output_args: dict) -> None:
+        # [FUNCTION DOC]
+        # HELPER: No-op if no controller or disabled. In RECORD begins a micro-batch. In REPLAY requires
+        # routed_experts in the micro-batch, flattens it (nested values) to int64 [nnz, layers, topk],
+        # appends pad_size zero rows, SP-slices along dim 0 without padding, and begins the micro-batch
+        # with per-layer target tensors (unbound along dim 1).
+        # Exceptions: RuntimeError when routed_experts is missing in REPLAY.
         """Arm the router-replay controller for this micro-batch.
 
         RECORD only needs the controller reset. REPLAY additionally hands it
@@ -923,6 +1157,13 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
         rr.begin_microbatch(targets=list(targets.unbind(dim=1)))
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
+        # [FUNCTION DOC]
+        # Behavior: gets parent outputs. In RECORD mode takes recorded routing (reinterpreted as bytes),
+        # gathers SP shards and removes pad suffix, then stores it reinterpreted as int16 as a jagged
+        # nested tensor using input ids offsets under "routed_experts". In REPLAY verifies the number of
+        # routers fired equals number of target layers.
+        # Outputs: model output mapping.
+        # Exceptions: RuntimeError on fired/target count mismatch.
         """Attach this micro-batch's recorded MoE routing to the model output.
 
         Mirrors how ``super()`` post-processes ``log_probs``: gather the SP
@@ -955,6 +1196,9 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
 
 @EngineRegistry.register(model_type="value_model", backend=["veomni"], device=["cuda", "npu"])
 class VeOmniEngineWithValueHead(VeOmniEngine, FSDPEngineWithValueHead):
+    # [CLASS DOC]
+    # Value-model VeOmni engine (registered as model_type value_model) loading a token
+    # classification head with one label.
     """Value model engine using VeOmni's FSDP2 + sequence parallelism.
 
     Combines VeOmniEngine (model init, parallel state, activation offloading)
@@ -962,6 +1206,13 @@ class VeOmniEngineWithValueHead(VeOmniEngine, FSDPEngineWithValueHead):
     """
 
     def _get_model_config_path(self):
+        # [FUNCTION DOC]
+        # Behavior: builds the HF config via VeOmni, sets num_labels 1, disables dropouts, unties word
+        # embeddings, looks up the transformers token-classification class for the config type and sets
+        # architectures to it.
+        # Outputs: modified config object.
+        # Exceptions: ValueError if no token-classification class exists for the config type.
+        # KNOWN ISSUE: hidden_dropout is set to the string "0" rather than a number.
         """Return a modified HF config that loads ForTokenClassification(num_labels=1).
 
         Uses HF's AutoModelForTokenClassification model mapping to resolve the
@@ -984,6 +1235,8 @@ class VeOmniEngineWithValueHead(VeOmniEngine, FSDPEngineWithValueHead):
         return config
 
     def prepare_model_inputs(self, micro_batch: TensorDict):
+        # [FUNCTION DOC]
+        # Behavior: gets parent inputs and applies VeOmni input transforms. Outputs: (inputs, output_args).
         model_inputs, output_args = super().prepare_model_inputs(micro_batch)
         self._apply_veomni_input_transforms(model_inputs, micro_batch)
         return model_inputs, output_args

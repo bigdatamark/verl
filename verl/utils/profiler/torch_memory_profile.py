@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# torch_memory profiling backend: records allocator memory history and dumps CUDA/NPU memory snapshots
+# after a configurable number of profiled steps, plus an automatic snapshot on allocator OOM. Snapshot
+# writing and history control are delegated to verl.utils.memory_utils.
 import logging
 import traceback
 from datetime import datetime
@@ -27,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 
 class TorchMemoryProfiler:
+    # [CLASS DOC]
+    # Memory snapshot backend (see docstring). Class-level flags ensure memory history is enabled and the
+    # OOM observer is attached at most once per process. Tracks a window of profiled steps: the window's
+    # first/last step numbers name the snapshot sub-directory (step<N> or steps<A>-<B>).
     """Profiler that dumps CUDA/NPU memory snapshots at step boundaries.
 
     Behavior:
@@ -42,6 +50,13 @@ class TorchMemoryProfiler:
     def __init__(
         self, rank: int, config: Optional[ProfilerConfig], tool_config: Optional[TorchMemoryToolConfig] = None
     ):
+        # [FUNCTION DOC]
+        # Behavior: always enabled; defaults config to ProfilerConfig(ranks=[]); reads trace_alloc_max_entries,
+        # stack_depth and memory_snapshot_num_steps from tool_config (defaults 100000/32/1); enables memory
+        # history once per process (errors ignored, flag set anyway); attaches the OOM observer when this rank is
+        # selected.
+        # Inputs: rank; config; tool_config.
+        # Side effects: process-global allocator history recording; class flags; may attach OOM callback.
         # Always respond to explicit start/stop calls for torch_memory tool,
         # regardless of per-role enable flag, to align with global step control.
         self.enable = True
@@ -81,6 +96,12 @@ class TorchMemoryProfiler:
             self._attach_oom_observer()
 
     def _attach_oom_observer(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Attaches _on_out_of_memory as the allocator OOM observer once per process.
+        # Behavior: returns early if already attached; warns and returns for non-cuda/npu devices, unavailable
+        # accelerator, or a build without the private _<device>_attach_out_of_memory_observer hook (looked up on
+        # torch_npu._C for NPU, torch._C otherwise). On success sets the class flag and logs.
+        # Exceptions: all caught and logged as warnings. Side effects: registers a callback, logging.
         """Register one process-local callback that writes a snapshot at allocator OOM time."""
         if TorchMemoryProfiler._oom_observer_attached:
             return
@@ -114,6 +135,13 @@ class TorchMemoryProfiler:
             )
 
     def _on_out_of_memory(self, device: int, alloc: int, device_total: int, device_free: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: OOM callback.
+        # Behavior: logs the OOM details (device, requested bytes, total/limit, free), the Python stack, and
+        # allocator memory info; dumps a snapshot tagged "torch_memory_oom" into save_path (or
+        # "outputs/profile") under sub-dir oom_<timestamp> without device synchronization.
+        # Inputs: device, alloc, device_total, device_free - values passed by the allocator.
+        # Exceptions: failures caught and logged. Side effects: logging, writes snapshot files.
         """Best-effort snapshot callback invoked by the CUDA/NPU allocator."""
         out_dir = self.config.save_path or "outputs/profile"
         sub_dir = f"oom_{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
@@ -142,6 +170,10 @@ class TorchMemoryProfiler:
             logger.warning("[torch_memory] failed to dump %s OOM snapshot: %s", self._device_name.upper(), exc)
 
     def start(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: if enabled and this rank selected, reads profile_step (or global_step) from kwargs; records it
+        # as window start when the window is empty and always as window end; sets this_step.
+        # Side effects: mutates window state.
         if not self.enable:
             return
         if not self._should_profile_this_rank():
@@ -153,6 +185,12 @@ class TorchMemoryProfiler:
         self.this_step = True
 
     def stop(self):
+        # [FUNCTION DOC]
+        # Behavior: no-op unless a step is active; clears this_step; for selected ranks, increments the window
+        # step count and, once it reaches memory_snapshot_num_steps, dumps a snapshot tagged "torch_memory" into
+        # save_path (or "outputs/profile") under the window sub-dir (errors ignored), clears memory history (with
+        # the same parameters, restarting recording), and resets the window.
+        # Side effects: writes files, resets allocator history, mutates window state.
         if not self.enable or not self.this_step:
             return
         self.this_step = False
@@ -177,6 +215,9 @@ class TorchMemoryProfiler:
         self._window_end_step = None
 
     def _window_sub_dir(self) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Window sub-directory name: None if no start step; "step<N>" if start equals end; else
+        # "steps<start>-<end>".
         if self._window_start_step is None:
             return None
         if self._window_start_step == self._window_end_step:
@@ -184,6 +225,8 @@ class TorchMemoryProfiler:
         return f"steps{self._window_start_step}-{self._window_end_step}"
 
     def _should_profile_this_rank(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Rank selection: all_ranks -> True; non-empty ranks -> membership; else only rank 0.
         if self.config.all_ranks:
             return True
         if self.config.ranks:

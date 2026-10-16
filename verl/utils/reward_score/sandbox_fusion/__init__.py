@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Code-correctness reward using a remote Sandbox Fusion service (self-hosted or FaaS). Extracts code
+# from a completion, runs it against test cases through utils.check_correctness, and converts the
+# per-case results into a pass-rate score.
 import json
 import logging
 import traceback
@@ -28,6 +32,19 @@ logger = logging.getLogger(__name__)
 def compute_score(
     sandbox_fusion_url, concurrent_semaphore, memory_limit_mb, completion, test_cases, continuous=False, timeout=10
 ):
+    # [FUNCTION DOC]
+    # Behavior: extracts code from the last "```python" block, or the first generic ``` block (dropping a
+    # first line that is purely alphabetic, i.e. a language tag); without any fence returns
+    # (0.0, [error dict]). Parses test_cases JSON if needed (invalid -> 0.0 with error). If test_cases has
+    # a list "assert_case", fills default "inputs" (empty strings) and "outputs" (None) per case;
+    # otherwise requires "inputs" and "outputs". Runs check_correctness. Score: 0.0 with metadata if no
+    # results; continuous -> fraction of True among the first min(n, 10) results; else fraction of True
+    # over all results.
+    # Inputs: sandbox_fusion_url, concurrent_semaphore (limits concurrent requests), memory_limit_mb,
+    # completion, test_cases (dict or JSON string), continuous, timeout (per-case seconds).
+    # Outputs: tuple (float score, list of metadata dicts).
+    # Exceptions: all exceptions are caught and logged; score 0.0 with available metadata or an error dict.
+    # Side effects: network calls to the sandbox; logging; traceback printing.
     """
     Computes the code score using the remote sandbox API.
 

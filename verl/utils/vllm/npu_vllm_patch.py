@@ -15,6 +15,15 @@
 # limitations under the License.
 
 
+# [MODULE DOC]
+# Ascend NPU-specific monkey patches for vLLM / vllm-ascend. Unconditionally (on NPU) replaces the
+# rotary-embedding init to disable flash-attn rotary and wraps legacy FusedMoE weight loading to
+# transpose expert weights. When env var VERL_VLLM_ASCEND_GLM52_PATCH is truthy ("1", "true",
+# "yes"), also applies GLM-5.2 fixes: a CaMem sleep sync, RMSNorm residual handling, SFA kv_b_proj
+# preservation and indexer scaling, and a partial wake-up fix for vLLM engine core (propagated to
+# spawned engine-core processes). Patch targets are verified by matching whitespace-stripped source
+# code; patched callables carry a marker attribute for idempotence.
+
 import inspect
 import logging
 import os
@@ -32,10 +41,15 @@ _glm52_original_run_engine_core = None
 
 
 def _glm52_patch_enabled() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if the GLM-5.2 patch env var (trimmed, lowercased) is a truthy value.
     return os.getenv(_GLM52_PATCH_ENV, "").strip().lower() in _GLM52_PATCH_TRUTHY_VALUES
 
 
 def _normalized_source(fn) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the source code of fn with all whitespace removed, for robust substring matching.
+    # Exceptions: RuntimeError (chained) when source cannot be retrieved (OSError/TypeError).
     try:
         return "".join(inspect.getsource(fn).split())
     except (OSError, TypeError) as exc:
@@ -43,6 +57,14 @@ def _normalized_source(fn) -> str:
 
 
 def _patch_glm52_ascend_rms_norm(layernorm_module) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Patches AscendRMSNorm.forward_oot so that, with a residual, it computes residual via
+    # maybe_chunk_residual, adds x, then applies plain npu_rms_norm (instead of fused add-rms-norm),
+    # returning (normalized, residual); without residual it delegates to the original.
+    # Inputs: layernorm_module - vllm_ascend.ops.layernorm module.
+    # Outputs: True if patched; False if already marked or upstream source already contains the fix.
+    # Exceptions: RuntimeError if the source matches neither the fixed nor the expected npu_add_rms_norm form.
+    # Side effects: replaces the class method.
     ascend_rms_norm = layernorm_module.AscendRMSNorm
     original_forward = ascend_rms_norm.forward_oot
     if getattr(original_forward, _GLM52_PATCH_MARKER, False):
@@ -56,6 +78,9 @@ def _patch_glm52_ascend_rms_norm(layernorm_module) -> bool:
 
     @wraps(original_forward)
     def patched_forward(self, x, residual=None):
+        # [FUNCTION DOC]
+        # HELPER: Patched forward described above; imports torch_npu lazily.
+        # Inputs: self, x, residual (optional). Outputs: normalized tensor, or (tensor, residual) tuple.
         if residual is None:
             return original_forward(self, x, residual)
 
@@ -72,6 +97,14 @@ def _patch_glm52_ascend_rms_norm(layernorm_module) -> bool:
 
 
 def _patch_glm52_sfa_kv_b_proj_disposal(sfa_module) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Prevents AscendSFAImpl.process_weights_after_loading from disposing self.kv_b_proj.
+    # Replaces module-level dispose_layer with a version that skips the layer stored in a context
+    # variable, and wraps process_weights_after_loading to set that context variable to self.kv_b_proj
+    # for the duration of the call (reset in a finally block).
+    # Inputs: sfa_module - vllm_ascend.attention.sfa_v1.
+    # Outputs: True if patched; False if already marked or the source does not dispose kv_b_proj.
+    # Exceptions: RuntimeError from source inspection. Side effects: replaces module function and method.
     ascend_sfa_impl = sfa_module.AscendSFAImpl
     original_process_weights = ascend_sfa_impl.process_weights_after_loading
     if getattr(original_process_weights, _GLM52_PATCH_MARKER, False):
@@ -89,12 +122,17 @@ def _patch_glm52_sfa_kv_b_proj_disposal(sfa_module) -> bool:
 
     @wraps(original_dispose_layer)
     def selective_dispose_layer(layer):
+        # [FUNCTION DOC]
+        # HELPER: Skips disposal (returns None) when layer is the currently preserved layer, otherwise
+        # delegates to the original dispose_layer.
         if layer is preserved_layer.get():
             return None
         return original_dispose_layer(layer)
 
     @wraps(original_process_weights)
     def patched_process_weights(self, act_dtype):
+        # [FUNCTION DOC]
+        # HELPER: Runs the original weight post-processing with self.kv_b_proj marked as preserved.
         token = preserved_layer.set(self.kv_b_proj)
         try:
             return original_process_weights(self, act_dtype)
@@ -108,6 +146,14 @@ def _patch_glm52_sfa_kv_b_proj_disposal(sfa_module) -> bool:
 
 
 def _patch_glm52_sfa_indexer_scale(sfa_module) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Ensures indexer weights are scaled by n_head to the -0.5 and head_dim to the -0.5 power.
+    # Returns False if the scaling is already in AscendSFAImpl.indexer_select_post_process or the
+    # DeviceOperator method is already marked. Otherwise wraps DeviceOperator.indexer_select_post_process
+    # (as a staticmethod) to scale the weights argument before delegating.
+    # Exceptions: RuntimeError if the impl source or the operator's leading parameter names
+    # (sfa_impl, q_li, q_li_scale, q_li_shape_ori, weights) do not match expectations.
+    # Side effects: replaces the static method.
     indexer_post_process = sfa_module.AscendSFAImpl.indexer_select_post_process
     source = _normalized_source(indexer_post_process)
     scale_expression = "weights=weights*(self.n_head**-0.5)*(self.head_dim**-0.5)"
@@ -132,6 +178,8 @@ def _patch_glm52_sfa_indexer_scale(sfa_module) -> bool:
 
     @wraps(original_operator)
     def patched_operator(sfa_impl, q_li, q_li_scale, q_li_shape_ori, weights, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Scales weights by the sfa_impl head-count and head-dim factors, then calls the original.
         weights = weights * (sfa_impl.n_head**-0.5) * (sfa_impl.head_dim**-0.5)
         return original_operator(sfa_impl, q_li, q_li_scale, q_li_shape_ori, weights, *args, **kwargs)
 
@@ -141,6 +189,11 @@ def _patch_glm52_sfa_indexer_scale(sfa_module) -> bool:
 
 
 def patch_vllm_ascend_glm52() -> None:
+    # [FUNCTION DOC]
+    # Behavior: imports vllm-ascend sfa_v1 and layernorm modules and applies the three GLM-5.2 patches
+    # (rms norm, kv_b_proj disposal, indexer scale); logs whether any were applied or all already present.
+    # Exceptions: RuntimeError if the targets cannot be imported, or from individual patch checks.
+    # Side effects: monkey patches vllm-ascend; logs.
     """Apply the vllm-ascend GLM-5.2 fixes from commit ca0420391."""
     try:
         from vllm_ascend.attention import sfa_v1
@@ -158,6 +211,12 @@ def patch_vllm_ascend_glm52() -> None:
 
 
 def _glm52_run_engine_core(*args, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Module-level replacement for EngineCoreProc.run_engine_core used in spawned child
+    # processes: applies the partial wake-up patch in the child, then calls the saved original entrypoint.
+    # KNOWN ISSUE: relies on the module global original entrypoint, which in a freshly spawned child is
+    # only populated because the patch call inside rebinds it; if the child's entrypoint already is this
+    # function, the global stays None and the call fails.
     # Keep this callable at module scope, without @wraps: multiprocessing spawn
     # must import it by its verl name, then patch the fresh child's vLLM classes.
     patch_vllm_glm52_partial_wake_up()
@@ -165,6 +224,18 @@ def _glm52_run_engine_core(*args, **kwargs):
 
 
 def patch_vllm_glm52_partial_wake_up() -> None:
+    # [FUNCTION DOC]
+    # Behavior: patches vLLM v1 EngineCore.wake_up and DPEngineCoreProc.execute_dummy_batch so no
+    # forwards run during partial wake-up. Each target is first validated: considered already patched if
+    # marked or if the upstream fixed source is present; otherwise the source must match the expected
+    # pre-fix form or RuntimeError is raised (both checked before either is changed). New wake_up drops
+    # the "scheduling" tag, wakes the executor if tags is None or non-empty, and resumes the scheduler
+    # only if the executor is no longer sleeping. New execute_dummy_batch runs the original only when
+    # not sleeping. Also, unless the engine-core entrypoint is already the module wrapper, saves it
+    # globally and (if any patch was needed) replaces it with the wrapper so spawned processes patch too.
+    # Logs the status.
+    # Exceptions: RuntimeError on unsupported implementations. Side effects: monkey patches vLLM; mutates
+    # module global; logs.
     """Port vLLM 6f1ada0f91 + 11d60545e2: no forwards during partial wake-up."""
     global _glm52_original_run_engine_core
 
@@ -206,6 +277,8 @@ def patch_vllm_glm52_partial_wake_up() -> None:
 
         @wraps(original_wake_up)
         def patched_wake_up(self, tags=None):
+            # [FUNCTION DOC]
+            # HELPER: Patched wake_up described in the enclosing block. Inputs: self, tags (optional list).
             if tags is not None and "scheduling" in tags:
                 tags = [t for t in tags if t != "scheduling"]
             if tags is None or tags:
@@ -220,6 +293,8 @@ def patch_vllm_glm52_partial_wake_up() -> None:
 
         @wraps(original_dummy_batch)
         def patched_dummy_batch(self):
+            # [FUNCTION DOC]
+            # HELPER: Patched dummy batch: calls the original only if the executor is not sleeping, else None.
             # Leave the busy loop and its DP collectives intact. Its logging
             # context still runs, but no dummy forward touches sleeping memory.
             if not self.model_executor.is_sleeping:
@@ -239,8 +314,15 @@ def patch_vllm_glm52_partial_wake_up() -> None:
 
 
 def vllm_v013_weight_loader_method_wrapper(fn):
+    # [FUNCTION DOC]
+    # Behavior: decorator for vLLM 0.13 FusedMoE weight_loader methods on NPU. Before delegating, if
+    # shard is w1/w3 and param dim 1 equals hidden size, or shard is w2 and param dim 2 equals hidden
+    # size, replaces param.data with its dim-1/dim-2 transpose.
+    # Inputs: fn - original loader. Outputs: wrapped function.
     @wraps(fn)
     def wrapper(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success=False):
+        # [FUNCTION DOC]
+        # HELPER: The wrapper described above; mutates param.data then calls fn with all arguments.
         if (shard_id in ("w1", "w3") and param.shape[1] == self.hidden_size) or (
             shard_id == "w2" and param.shape[2] == self.hidden_size
         ):
@@ -251,6 +333,11 @@ def vllm_v013_weight_loader_method_wrapper(fn):
 
 
 def _patch_legacy_fused_moe_weight_loader(fused_moe) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: when fused_moe is a class with a callable weight_loader, wraps it with the transpose
+    # wrapper and marks it (returns True; True also if already marked). Returns False for non-class
+    # (factory) FusedMoE or missing loader.
+    # Side effects: replaces the class attribute.
     """Install the NPU transpose wrapper on vLLM's legacy FusedMoE class.
 
     Legacy vLLM releases expose ``FusedMoE`` as a class whose
@@ -273,6 +360,11 @@ def _patch_legacy_fused_moe_weight_loader(fused_moe) -> bool:
 
 
 def patch_vllm013_rotary_emb():
+    # [FUNCTION DOC]
+    # Behavior: replaces vLLM ApplyRotaryEmb.__init__ with a version that calls the grandparent init and
+    # sets is_neox_style, enable_fp32_compute and disables flash-attn rotary (attribute None);
+    # enforce_enable is accepted but ignored.
+    # Exceptions: ImportError if vLLM lacks the module. Side effects: monkey patches vLLM.
     from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
     def vllm013_npu_rotary_embedding_init_impl(
@@ -281,6 +373,8 @@ def patch_vllm013_rotary_emb():
         is_neox_style: bool = True,
         enable_fp32_compute: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Replacement initializer described above.
         super(ApplyRotaryEmb, self).__init__()
         self.is_neox_style = is_neox_style
         self.enable_fp32_compute = enable_fp32_compute
@@ -290,6 +384,11 @@ def patch_vllm013_rotary_emb():
 
 
 def patch_camem_sleep() -> None:
+    # [FUNCTION DOC]
+    # Behavior: wraps vllm-ascend CaMemAllocator.sleep to call torch.npu.synchronize before the original
+    # sleep. Silently returns if vllm-ascend (or its allocator module) is not installed; returns if
+    # already patched.
+    # Exceptions: re-raises ModuleNotFoundError for other missing modules. Side effects: monkey patch.
     """Synchronize pending NPU work before CaMem sleep unmaps tensor memory."""
     try:
         import vllm_ascend.device_allocator.camem as camem
@@ -304,6 +403,8 @@ def patch_camem_sleep() -> None:
 
     @wraps(original_sleep)
     def patched_sleep(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Synchronizes the NPU then delegates to the original sleep.
         # Graph replay and normal NPU launches are asynchronous. All users of
         # the virtual mappings must finish before sleep calls unmap_and_release;
         # synchronizing via empty_cache() after the unmap loop is too late.
@@ -315,6 +416,12 @@ def patch_camem_sleep() -> None:
 
 
 def apply_npu_vllm_patches() -> None:
+    # [FUNCTION DOC]
+    # Behavior: no-op unless an NPU torch backend is available. Applies the rotary patch and the legacy
+    # FusedMoE loader patch; if the GLM-5.2 env flag is set, imports vllm-ascend's routed-experts capture
+    # patch module (side-effect import) and applies the CaMem sleep, vllm-ascend GLM-5.2 and partial
+    # wake-up patches.
+    # Exceptions: propagates import and patch-validation errors. Side effects: monkey patches.
     """Apply NPU-specific vLLM patches for weight loading, rotary embedding, and sleep.
 
     Must be called before the vLLM engine is created.

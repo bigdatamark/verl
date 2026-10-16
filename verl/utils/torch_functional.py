@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Small torch utilities used across verl: log-probability and entropy computation from logits (with optional
+# flash-attn Triton or Ascend NPU fused cross-entropy backends, detected at import into module flags), masked
+# reductions and whitening, response masks, padding/truncation helpers, distributed dict gather/broadcast and
+# statistics, rmpad log-prob helpers, learning-rate schedules (cosine, constant, warmup-stable-decay), attention-mask
+# builders, nested-tensor expansion and context managers for device checks and un-patching torch.compile on NPU.
 """
 Contain small torch utilities
 """
@@ -48,6 +54,9 @@ except ImportError:
 
 
 def gather_from_labels(data: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Selects, along the last dimension of data, the element at each label index. Output has the label's shape.
+    # Exceptions: torch errors for out-of-range indices or shape mismatch.
     """Gather values from data tensor at positions specified by label indices.
 
     Selects elements from the last dimension of `data` based on indices in `label`.
@@ -71,6 +80,12 @@ def gather_from_labels(data: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
 
 
 def logprobs_from_logits(logits, labels, inplace_backward=True):
+    # [FUNCTION DOC]
+    # Computes log-probabilities of labels under logits, choosing a backend.
+    # Behavior: uses flash-attn cross entropy if available and env var VERL_DISABLE_FLASH_ATTN_CE is not "1" (flattens
+    # leading dims, computes, reshapes back); else the NPU fused loss if available; else the row-wise v2 implementation.
+    # Inputs: logits (..., vocab); labels matching leading dims; inplace_backward for flash-attn.
+    # Outputs: tensor with logits' leading shape. Side effects: reads environment.
     """
     Compute per-token log-probabilities for the given labels.
 
@@ -110,6 +125,9 @@ def logprobs_from_logits(logits, labels, inplace_backward=True):
 def logprobs_from_logits_flash_attn(
     logits: torch.Tensor, labels: torch.Tensor, inplace_backward: bool = True
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Returns the negated per-row loss from the flash-attn cross_entropy_loss on 2-D logits and 1-D labels.
+    # Exceptions: AssertionError if the kernel does not return a tuple (flash-attn older than 2.4.3).
     """Compute log-probabilities using Flash Attention's optimized cross-entropy.
 
     Uses the Flash Attention library's Triton-based cross-entropy implementation
@@ -134,6 +152,9 @@ def logprobs_from_logits_flash_attn(
 
 
 def logprobs_from_logits_torch_npu(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Flattens logits to 2-D, computes per-token cross entropy with no reduction using torch_npu, and returns its
+    # negation reshaped to the leading dims.
     """Compute log-probabilities using Ascend NPU's optimized cross-entropy.
 
     Uses torch_npu's native cross-entropy implementation for efficient
@@ -153,6 +174,8 @@ def logprobs_from_logits_torch_npu(logits: torch.Tensor, labels: torch.Tensor) -
 
 
 def logprobs_from_logits_naive(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Reference implementation: log-softmax over the last dim followed by gather at labels.
     """Compute log-probabilities using standard log-softmax approach.
 
     Simple implementation using PyTorch's log_softmax followed by gathering.
@@ -171,6 +194,10 @@ def logprobs_from_logits_naive(logits: torch.Tensor, labels: torch.Tensor) -> to
 
 
 def logprobs_from_logits_v2(logits: torch.FloatTensor, labels: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Memory-lean log-prob computation. For float32/float64: gathers label logits and subtracts a logsumexp computed one
+    # leading-dim row at a time. Other dtypes (e.g. bf16): per row, computes log-softmax and gathers labels, then stacks.
+    # Outputs: tensor shaped like labels. Exceptions: ValueError from strict zip if leading lengths differ.
     """Memory-efficient log-probability computation using row-wise processing.
 
     Computes log-probabilities by processing one row at a time to reduce peak
@@ -208,6 +235,8 @@ def logprobs_from_logits_v2(logits: torch.FloatTensor, labels: torch.Tensor) -> 
 
 
 def clip_by_value(x: torch.Tensor, tensor_min: torch.Tensor, tensor_max: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Element-wise clip of x between tensor bounds (minimum with max bound, then maximum with min bound).
     """Clip tensor values to a range defined by tensor bounds.
 
     Extension of torch.clamp that supports tensor-valued min/max bounds
@@ -229,6 +258,8 @@ def clip_by_value(x: torch.Tensor, tensor_min: torch.Tensor, tensor_max: torch.T
 
 
 def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Entropy of the softmax distribution per row: logsumexp(logits) minus the probability-weighted sum of logits.
     """Calculate Shannon entropy from unnormalized logits.
 
     Computes H(p) = -sum(p * log(p)) using the numerically stable formula:
@@ -246,6 +277,9 @@ def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
 
 
 def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Chunked entropy for 2-D logits: processes chunk_size rows at a time in float32 and writes into a float32 zero
+    # tensor on the logits' device. Outputs: 1-D tensor (batch,).
     """Memory-efficient entropy calculation using chunked processing.
 
     Computes entropy by processing the batch in chunks to reduce peak memory
@@ -271,6 +305,9 @@ def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 20
 
 
 def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, ...] | None = None) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Sum of values where mask is nonzero: values outside the mask are replaced by 0 (so NaNs there do not propagate),
+    # multiplied by mask (so numeric masks weight values), and summed over axis (all when None).
     """Compute sum of tensor values where mask is True.
 
     NaN values outside the mask are replaced with zeros to prevent
@@ -292,6 +329,8 @@ def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, 
 
 
 def masked_mean(values, mask, axis=None):
+    # [FUNCTION DOC]
+    # Masked mean: masked sum divided by mask sum over axis plus 1e-8.
     """
     Compute the mean of `values` over elements selected by `mask`.
 
@@ -309,6 +348,10 @@ def masked_mean(values, mask, axis=None):
 
 
 def masked_var(values, mask, unbiased=True):
+    # [FUNCTION DOC]
+    # Masked variance around the global masked mean (over all elements). If unbiased, applies Bessel correction using the
+    # total mask count.
+    # Exceptions: ValueError when the mask sum is 0 or 1 (only when unbiased).
     """Compute variance of tensor with masked values."""
     mean = masked_mean(values, mask)
     centered_values = values - mean
@@ -327,6 +370,10 @@ def masked_var(values, mask, unbiased=True):
 
 
 def masked_whiten(values, mask, shift_mean=True):
+    # [FUNCTION DOC]
+    # Normalizes values to zero mean and unit variance using masked statistics (unbiased variance, epsilon 1e-8); if
+    # shift_mean is False the mean is added back. Statistics are global over all elements, applied to all positions.
+    # Exceptions: ValueError from masked_var.
     """
     Whiten `values` by normalizing with mean and variance computed over `mask`.
 
@@ -347,6 +394,10 @@ def masked_whiten(values, mask, shift_mean=True):
 
 
 def get_response_mask(response_id: torch.Tensor, eos_token: int | list[int] = 2, dtype=torch.int64):
+    # [FUNCTION DOC]
+    # Builds a mask that is 1 up to and including the first EOS token per row and 0 afterwards.
+    # Behavior: marks positions whose id is in eos_token (int or list), computes the running count minus the current mark,
+    # and keeps positions where that is zero. Inputs: 2-D id tensor; eos_token (default 2); output dtype (default int64).
     """
     end of sentence token can be int or list: 1 or [1, 2]
     e.g.
@@ -370,6 +421,9 @@ def get_response_mask(response_id: torch.Tensor, eos_token: int | list[int] = 2,
 
 
 def compute_grad_norm(model: nn.Module) -> float:
+    # [FUNCTION DOC]
+    # Sums the squared gradient entries of all parameters with a gradient. Outputs: Python float (squared norm, not the
+    # norm). Side effects: device-to-host sync per parameter.
     """Compute the squared L2 norm of all gradients in a model.
 
     Sums the squared values of all gradient tensors across all parameters.
@@ -393,6 +447,10 @@ def compute_grad_norm(model: nn.Module) -> float:
 
 
 def broadcast_dict_tensor(tensors: dict[str, torch.Tensor] | TensorDict, src: int, group) -> None:
+    # [FUNCTION DOC]
+    # Broadcasts each tensor of the mapping from rank src over group, in place, one tensor at a time.
+    # Side effects: collective communication; mutates tensors on non-source ranks.
+    # KNOWN ISSUE: iterates a sorted_keys attribute, which plain dicts lack (AttributeError), despite the type hint allowing a dict.
     """Broadcast all tensors in a dictionary from source rank to all ranks.
 
     Iterates over all tensors in the dictionary and broadcasts each one
@@ -414,6 +472,10 @@ def broadcast_dict_tensor(tensors: dict[str, torch.Tensor] | TensorDict, src: in
 def allgather_dict_tensors(
     tensors: dict[str, torch.Tensor] | TensorDict, size: int, group, dim: int = 0
 ) -> dict[str, torch.Tensor] | TensorDict:
+    # [FUNCTION DOC]
+    # All-gathers each tensor (in sorted key order) from size ranks and concatenates along dim. A TensorDict input is
+    # converted to a dict first and rewrapped with batch size multiplied by size.
+    # Outputs: dict or TensorDict. Side effects: collective communication.
     """Gather tensors from all ranks and concatenate them.
 
     Performs all_gather on each tensor in the dictionary and concatenates
@@ -455,6 +517,10 @@ def allgather_dict_tensors(
 
 
 def allgather_dict_into_dict(data: dict, group=None) -> dict:
+    # [FUNCTION DOC]
+    # All-gathers an arbitrary picklable dict from every rank in group and returns a dict mapping each key to the list of
+    # values from the ranks that had it (rank order).
+    # Exceptions: AssertionError if data is not a dict. Side effects: collective communication.
     """allgather a dict into a dict of list
 
     Args:
@@ -481,6 +547,9 @@ def allgather_dict_into_dict(data: dict, group=None) -> dict:
 
 
 def split_dict_tensor_into_batches(tensors: TensorDict, batch_size) -> list[TensorDict]:
+    # [FUNCTION DOC]
+    # Splits a TensorDict along its batch dim into chunks of batch_size.
+    # Exceptions: AssertionError if the batch size is not divisible.
     assert tensors.batch_size[0] % batch_size == 0, (
         f"input data batch size: {tensors.batch_size[0]}, split batch size: {batch_size}"
     )
@@ -488,6 +557,9 @@ def split_dict_tensor_into_batches(tensors: TensorDict, batch_size) -> list[Tens
 
 
 def pad_2d_list_to_length(response, pad_token_id, max_length=None):
+    # [FUNCTION DOC]
+    # Right-pads each inner list with pad_token_id to the longest inner length (or max_length if larger) and returns a 2-D
+    # tensor. Exceptions: ValueError for an empty outer list.
     """
     pad a 2D list (e.g. responses, logprobs) to a 2D tensor.
     """
@@ -499,6 +571,9 @@ def pad_2d_list_to_length(response, pad_token_id, max_length=None):
 
 
 def pad_sequence_to_length(tensors, max_seq_len, pad_token_id, left_pad=False):
+    # [FUNCTION DOC]
+    # Pads the last dim of a tensor with pad_token_id up to max_seq_len, on the left if left_pad else on the right;
+    # returns the input unchanged if already at least that long.
     """
     pad a 2D tensors (e.g. responses, logprobs) in the last dim to max_seq_length.
     input shape: [bs, seq_length]
@@ -519,6 +594,11 @@ def postprocess_data(
     left_pad=True,
     truncation="error",
 ):
+    # [FUNCTION DOC]
+    # Pads or truncates 2-D input_ids and attention_mask to max_length.
+    # Behavior: shorter -> pad ids with pad_token_id and mask with 0 on the chosen side; longer -> truncate per strategy:
+    # left keeps the last max_length, right keeps the first, middle keeps the first half and last remaining half; error raises.
+    # Exceptions: AssertionError for invalid truncation or non-2-D ids; NotImplementedError for "error" truncation.
     """Process tokenizer outputs to consistent shapes via padding/truncation.
 
     Args:
@@ -567,6 +647,9 @@ def postprocess_data(
 def tokenize_and_postprocess_data(
     prompt: str, tokenizer: PreTrainedTokenizer, max_length: int, pad_token_id: int, left_pad=True, truncation="error"
 ):
+    # [FUNCTION DOC]
+    # Tokenizes prompt (tensors, no special tokens) and applies postprocess_data with the given settings.
+    # Outputs: (input_ids, attention_mask) of shape (1, max_length).
     """Tokenize text and process outputs to consistent tensor shapes.
 
     Args:
@@ -588,6 +671,9 @@ def tokenize_and_postprocess_data(
 
 
 def remove_pad_token(input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    # [FUNCTION DOC]
+    # For each row returns the last mask-sum ids as a Python list (assumes left padding).
+    # KNOWN ISSUE: the docstring implies generic pad removal, but this only works for left-padded rows with contiguous valid tokens.
     """Remove the pad token.
 
     Args:
@@ -603,6 +689,9 @@ def remove_pad_token(input_ids: torch.Tensor, attention_mask: torch.Tensor):
 
 
 def log_probs_from_logits_response(input_ids, logits, response_length):
+    # [FUNCTION DOC]
+    # Takes logits at positions immediately preceding the last response_length tokens and computes log-probs of those
+    # response tokens. Outputs: (batch, response_length).
     """Compute the response log_probs from full logits. Note that logits = model(input_ids)
 
     Args:
@@ -619,6 +708,10 @@ def log_probs_from_logits_response(input_ids, logits, response_length):
 
 
 def log_probs_from_logits_response_rmpad(input_ids, attention_mask, logits_rmpad, response_length):
+    # [FUNCTION DOC]
+    # Computes response log-probs from unpadded logits: unpads input_ids with the attention mask (flash-attn), rolls ids by
+    # one so each position's label is the next token, computes log-probs, re-pads to (batch, seqlen) and slices the
+    # response window shifted by one. Requires flash_attn.
     """Compute the log_probs from logits with rmpad logits and pad input. Note that
     logits_rmpad = model(input_ids_rmpad). For each sentences, there is a shift between
     logits and input_ids.
@@ -646,6 +739,10 @@ def log_probs_from_logits_response_rmpad(input_ids, attention_mask, logits_rmpad
 
 
 def log_probs_from_logits_all_rmpad(input_ids_rmpad, logits_rmpad, indices, batch_size, seqlen, response_length):
+    # [FUNCTION DOC]
+    # Like the previous function but takes already-unpadded ids of shape (1, nnz) and the unpad indices; chooses pad_input
+    # from flash-attn on CUDA or verl's attention utils on NPU.
+    # KNOWN ISSUE: on any other device name pad_input is never imported and a NameError is raised.
     """Compute the log_probs from logits with rmpad input_ids and logits. Note that
     logits_rmpad = model(input_ids_rmpad). For each sentences, there is a shift between
     logits and input_ids.
@@ -677,6 +774,9 @@ def log_probs_from_logits_all_rmpad(input_ids_rmpad, logits_rmpad, indices, batc
 
 
 def post_process_logits(input_ids, logits, temperature, top_k, top_p):
+    # [FUNCTION DOC]
+    # Divides logits in place by temperature when it is not 1.0 and returns them; top_k/top_p are currently ignored.
+    # Side effects: mutates logits.
     if temperature != 1.0:
         logits = logits.div_(temperature)  # inplace operation to avoid OOM
     # TODO: add them back
@@ -688,6 +788,8 @@ def post_process_logits(input_ids, logits, temperature, top_k, top_p):
 
 
 def calculate_sum_pi_squared_from_logits(logits: torch.Tensor):
+    # [FUNCTION DOC]
+    # Returns the sum of squared softmax probabilities per row, computed in log space as exp(logsumexp(2x) - 2 logsumexp(x)).
     """
     Compute exact sum of squared probabilities from logits.
     Formula: Σπ² = exp(logsumexp(2*logits) - 2*logsumexp(logits))
@@ -719,6 +821,12 @@ def get_cosine_schedule_with_warmup(
     init_lr_ratio: float = None,
     zero_indexed_step: bool = True,
 ):
+    # [FUNCTION DOC]
+    # Builds a LambdaLR cosine schedule with linear warmup.
+    # Behavior: min_lr_ratio None -> 0; requires 0<=min_lr_ratio<=1 and 0<=init_lr_ratio<=1 (None -> 0). The multiplier
+    # during warmup rises linearly from init_lr_ratio to 1; afterwards it is cosine(pi * num_cycles * 2 * progress) scaled
+    # to [min_lr_ratio, 1] and floored at min_lr_ratio. When zero_indexed_step is False, steps are shifted by one.
+    # Exceptions: AssertionError for out-of-range ratios. Outputs: LambdaLR.
     """
     Create a schedule with a learning rate that decreases following the values of the cosine function between the
     initial lr set in the optimizer to 0, after a warmup period during which it increases linearly between 0 and the
@@ -754,6 +862,8 @@ def get_cosine_schedule_with_warmup(
     assert init_lr_ratio >= 0 and init_lr_ratio <= 1.0
 
     def lr_lambda(current_step):
+        # [FUNCTION DOC]
+        # HELPER: Computes the cosine-with-warmup multiplier for a step (closure over the schedule parameters).
         if not zero_indexed_step:
             current_step += 1
         if current_step < num_warmup_steps:
@@ -770,6 +880,8 @@ def get_constant_schedule_with_warmup(
     num_warmup_steps: int,
     last_epoch: int = -1,
 ):
+    # [FUNCTION DOC]
+    # Builds a LambdaLR whose multiplier rises linearly from 0 to 1 over num_warmup_steps and then stays 1.
     """
     Create a constant LR schedule with a linear warmup phase.
 
@@ -783,6 +895,8 @@ def get_constant_schedule_with_warmup(
     """
 
     def lr_lambda(current_step):
+        # [FUNCTION DOC]
+        # HELPER: Linear warmup multiplier, then constant 1.
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1.0, num_warmup_steps))
         return 1.0
@@ -791,6 +905,9 @@ def get_constant_schedule_with_warmup(
 
 
 def prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds):
+    # [FUNCTION DOC]
+    # Builds an additive 4-D attention mask (batch, 1, tgt, src): a causal mask when the sequence length exceeds 1, plus
+    # the expanded padding mask when attention_mask is given (sum of both when both exist). Returns None if neither applies.
     # create causal mask
     # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
     combined_attention_mask = None
@@ -815,6 +932,10 @@ def prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds):
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device):
+    # [FUNCTION DOC]
+    # HELPER: Creates an additive causal mask of shape (bsz, 1, tgt, tgt) with 0 on/below the diagonal and the dtype's
+    # minimum above.
+    # KNOWN ISSUE: the docstring says bi-directional, but the mask is causal.
     """
     Make causal mask used for bi-directional self-attention.
     """
@@ -828,6 +949,9 @@ def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, device: t
 
 # Copied from transformers.models.bart.modeling_bart._expand_mask
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+    # [FUNCTION DOC]
+    # HELPER: Expands a (bsz, src) 0/1 mask to (bsz, 1, tgt, src) additive form: masked-out positions get the dtype minimum,
+    # attended positions 0.
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
@@ -842,6 +966,9 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
 
 def get_unpad_data(attention_mask):
+    # [FUNCTION DOC]
+    # Returns unpadding metadata from a 2-D attention mask: flat indices of nonzero positions, cumulative sequence lengths
+    # (int32, with leading 0) and the max sequence length as Python int.
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
     max_seqlen_in_batch = seqlens_in_batch.max().item()
@@ -862,6 +989,10 @@ def get_wsd_schedule_with_warmup(
     last_epoch: int = -1,
     stable_ratio: float = 0.9,
 ):
+    # [FUNCTION DOC]
+    # Builds a LambdaLR warmup-stable-decay schedule: linear warmup to 1, constant 1 for stable_ratio of the remaining
+    # steps, cosine decay from 1 to min_lr_ratio over the rest, then min_lr_ratio after num_training_steps.
+    # KNOWN ISSUE: the docstring says stable_ratio defaults to 0.0 but the signature default is 0.9.
     """
     Create a Warmup-Stable-Decay learning rate scheduler.
 
@@ -895,6 +1026,8 @@ def get_wsd_schedule_with_warmup(
     num_decay_steps = remaining_steps - num_stable_steps
 
     def lr_lambda(current_step):
+        # [FUNCTION DOC]
+        # HELPER: Warmup-stable-decay multiplier for a step (closure).
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
         if current_step < num_warmup_steps + num_stable_steps:
@@ -910,6 +1043,8 @@ def get_wsd_schedule_with_warmup(
 
 @contextmanager
 def check_device_is_available():
+    # [FUNCTION DOC]
+    # Context manager that raises RuntimeError naming the device type if the accelerator is not available, otherwise yields.
     """
     Some modules must be imported after CUDA is initialized. Such as sglang's sharding manager.
 
@@ -922,6 +1057,11 @@ def check_device_is_available():
 
 
 def distributed_mean_max_min_std(local_tensor, compute_max=True, compute_min=True, compute_std=True):
+    # [FUNCTION DOC]
+    # Computes global mean and optionally max, min and std of a tensor across all ranks via all-reduce. Std uses the
+    # global mean and the (N-1) sample correction. Disabled statistics are None.
+    # Outputs: tuple (mean, max, min, std). Side effects: collective communication; all-reduces modify the local
+    # max/min scalars in place.
     """Compute distributed statistics across all processes.
 
     Args:
@@ -965,6 +1105,9 @@ def distributed_mean_max_min_std(local_tensor, compute_max=True, compute_min=Tru
 
 
 def distributed_masked_mean(local_tensor, local_mask):
+    # [FUNCTION DOC]
+    # Global masked mean across ranks: all-reduces the sum of masked values and the mask count and divides.
+    # Side effects: collective communication. Division by zero yields NaN when no element is valid.
     """Compute global mean of non-masked elements across distributed processes.
 
     Args:
@@ -987,6 +1130,10 @@ def distributed_masked_mean(local_tensor, local_mask):
 
 
 def expand_as_nested(tensor: torch.Tensor, nested_tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Repeats each scalar of a 1-D tensor by the corresponding row length of a 2-D jagged nested tensor and returns a jagged
+    # nested tensor with the same offsets.
+    # Exceptions: AssertionError if inputs are not nested / batch sizes differ / dims are not 1 and 2.
     """
 
     Args:
@@ -1013,6 +1160,10 @@ def expand_as_nested(tensor: torch.Tensor, nested_tensor: torch.Tensor) -> torch
 
 @contextmanager
 def use_original_torch_compile():
+    # [FUNCTION DOC]
+    # Context manager that temporarily removes MindSpeed's patch of torch.compile (if applied), yields, then re-applies it;
+    # yields directly when no patch exists or MindSpeed is unavailable.
+    # KNOWN ISSUE: the broad exception handler also catches exceptions raised by the caller's block after the first yield and tries to yield again (the context manager then raises RuntimeError), and the patch is not restored on error.
     """torch.compile might be replaced by mindspeed on NPU, this contextmanager
     can revert torch.compile temporarily.
     """

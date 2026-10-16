@@ -13,6 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Converts QAT-trained bf16 Megatron weights, streamed under HuggingFace names, into NVFP4
+# quantized tensors plus scales (weight_scale per block in FP8, weight_scale_2 global, optional
+# input_scale) for vLLM. Quantization metadata (format, block size, amax values) is collected from
+# ModelOpt quantizers on local Megatron modules and synchronized across PP and EP ranks.
+# _NVFP4_AMAX_DENOMINATOR = FP4 max (6) * FP8 max (448) used to turn amax into global scales.
+
 """QAT weight exporter for Megatron-to-vLLM NVFP4 quantized weight sync."""
 
 import re
@@ -37,6 +44,10 @@ _NVFP4_AMAX_DENOMINATOR = 6.0 * 448.0
 
 @dataclass
 class _QuantMeta:
+    # [CLASS DOC]
+    # HELPER: Dataclass of per-parameter quantization metadata: qformat, block_size, weight_amax (CPU
+    # tensor or None), input_amax (CPU tensor or None), input_quantizer (live object or None; None for
+    # metadata received from other ranks).
     """Quantization metadata for a single parameter."""
 
     qformat: str
@@ -47,6 +58,9 @@ class _QuantMeta:
 
 
 class QATWeightExporter:
+    # [CLASS DOC]
+    # Wraps the HF-named weight stream for one actor model and emits quantized weights for parameters
+    # with QAT metadata.
     """Export QAT-trained bf16 weights as quantized weights (e.g. NVFP4)."""
 
     def __init__(
@@ -55,6 +69,14 @@ class QATWeightExporter:
         bridge: Any,
         qat_mode: str = "w4a16",
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores mode and modules; obtains the bridge's mapping registry; reads PP and EP world
+        # size/rank/group (groups only when size > 1); model config from the first chunk; counts local
+        # experts; collects metadata from local modules; then all-gathers metadata across the PP group and
+        # the EP group when those are > 1.
+        # Inputs: actor_module - list of (possibly wrapped) Megatron chunks; bridge - Megatron Bridge with
+        # _model_bridge.mapping_registry(); qat_mode - stored but not otherwise used.
+        # Side effects: collectives (all_gather_object) over PP/EP groups.
         self.qat_mode = qat_mode
         self._actor_module = actor_module
 
@@ -85,6 +107,11 @@ class QATWeightExporter:
         self,
         per_tensor_param: Iterator[tuple[str, torch.Tensor]],
     ) -> Iterator[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Behavior: generator; skips names containing "_quantizer."; for names with resolved metadata
+        # yields the NVFP4 tensors, otherwise yields the input pair unchanged.
+        # Inputs: per_tensor_param - iterator of (hf_name, weight). Outputs: iterator of (name, tensor).
+        # Exceptions: AssertionError if the resolved format is not NVFP4.
         """Wrap a weight iterator to apply quantization.
 
         For each ``(hf_name, bf16_weight)`` from the iterator, yields the
@@ -103,15 +130,21 @@ class QATWeightExporter:
 
     @staticmethod
     def _get_mapping_registry(bridge):
+        # [FUNCTION DOC]
+        # HELPER: Returns bridge._model_bridge.mapping_registry().
         return bridge._model_bridge.mapping_registry()
 
     @staticmethod
     def _get_model_config(actor_module):
+        # [FUNCTION DOC]
+        # HELPER: Returns the unwrapped first chunk's config attribute or None.
         model = unwrap_model(actor_module[0])
         return getattr(model, "config", None)
 
     @staticmethod
     def _count_local_experts(actor_module) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Scans module names in all chunks for "local_experts.<n>" and returns max n + 1 (0 if none).
         indices: set[int] = set()
         for module in actor_module:
             model = unwrap_model(module)
@@ -122,6 +155,12 @@ class QATWeightExporter:
         return max(indices) + 1 if indices else 0
 
     def _collect_metadata(self, actor_module: list) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For each chunk (with its VPP index) and each submodule with a ModelOpt quantization
+        # format other than none and nonzero weight block size, captures CPU clones of weight/input
+        # quantizer amax values (if present), builds a _QuantMeta, and registers it for each direct
+        # parameter of the submodule under its global Megatron name.
+        # Side effects: populates self._metadata.
         for vpp_idx, module in enumerate(actor_module):
             model = unwrap_model(module)
             for name, submodule in model.named_modules():
@@ -151,6 +190,10 @@ class QATWeightExporter:
                     self._metadata[global_name] = meta
 
     def _local_to_global_param_name(self, name: str, vpp_idx: int) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Without model config returns the name unchanged; otherwise converts a local parameter
+        # name (PP/VPP/EP-local layer and expert indices) to its global name using Megatron Bridge's
+        # _megatron_local_name_to_global.
         if self._config is None:
             return name
 
@@ -159,6 +202,10 @@ class QATWeightExporter:
         return _megatron_local_name_to_global(self._actor_module, self._config, name, vpp_idx)
 
     def _sync_metadata(self, group) -> None:
+        # [FUNCTION DOC]
+        # HELPER: All-gathers a picklable summary (qformat, block_size, amaxes) of local metadata across the
+        # group and adds entries for names not already known locally (with input_quantizer None).
+        # Inputs: group - process group. Side effects: collective; mutates self._metadata.
         world_size = torch.distributed.get_world_size(group=group)
 
         local_info = {
@@ -189,6 +236,10 @@ class QATWeightExporter:
                 )
 
     def _resolve_quant_metadata(self, hf_name: str) -> Optional[_QuantMeta]:
+        # [FUNCTION DOC]
+        # HELPER: Returns None for names not ending in ".weight" or containing "norm"; otherwise iterates
+        # registry mappings matching the HF name and returns the first metadata found for the mapped
+        # Megatron parameter name, else None.
         if not hf_name.endswith(".weight") or "norm" in hf_name:
             return None
 
@@ -205,6 +256,13 @@ class QATWeightExporter:
         weight: torch.Tensor,
         meta: _QuantMeta,
     ) -> Iterator[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Generator. Global scale weight_scale_2 = weight_amax / (6 * 448); per-block scale from
+        # NVFP4QTensor.get_weights_scaling_factor with that global scale; packs weight with
+        # to_quantized_weight. Yields (name, packed uint8 weight), (weight_scale name, per-block scale),
+        # (weight_scale_2 name, global scale), and (input_scale name, scale) when computable.
+        # Inputs: name; weight - bf16 tensor; meta.
+        # Exceptions: AttributeError if meta.weight_amax is None.
         """NVFP4 two-level quantization.
 
         Produces up to four tensors:
@@ -234,6 +292,12 @@ class QATWeightExporter:
 
 
 def _iter_hf_to_megatron_matches(registry, hf_name: str):
+    # [FUNCTION DOC]
+    # HELPER: Generator over registry._reverse_patterns. For single-name mappings: exact equality when
+    # the pattern is None, else regex match then resolve with captured groups. For dict-valued HF
+    # params (several HF names per Megatron param): checks each key's pattern similarly (exact match
+    # resolves with no groups). Yields resolved mapping objects with a megatron_param attribute.
+    # Relies on Megatron Bridge private registry internals.
     """Yield all resolved mappings whose HF pattern matches *hf_name*."""
     for pattern_info, mapping in registry._reverse_patterns:
         if isinstance(mapping.hf_param, str):
@@ -258,11 +322,19 @@ def _iter_hf_to_megatron_matches(registry, hf_name: str):
 
 
 def _derive_scale_name(weight_name: str, suffix: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Replaces ".weight" with ".<suffix>" in the name; if nothing changed, appends "_<suffix>".
+    # KNOWN ISSUE: replaces every ".weight" occurrence, not only the trailing one (e.g. names with
+    # ".weight" earlier in the path would be altered too).
     result = weight_name.replace(".weight", f".{suffix}")
     return result if result != weight_name else f"{weight_name}_{suffix}"
 
 
 def _compute_input_scale(meta: _QuantMeta) -> Optional[torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: With a live input quantizer: use NVFP4QTensor.get_activation_scaling_factor if it exists,
+    # else quantizer amax / (6 * 448) if available. Otherwise fall back to stored input_amax / (6*448);
+    # else None.
     if meta.input_quantizer is not None:
         if hasattr(NVFP4QTensor, "get_activation_scaling_factor"):
             return NVFP4QTensor.get_activation_scaling_factor(meta.input_quantizer)

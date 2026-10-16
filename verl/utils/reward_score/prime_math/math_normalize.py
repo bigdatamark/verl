@@ -31,6 +31,10 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+# [MODULE DOC]
+# Hendrycks MATH / PRM800K string normalization of answers ("mathd" normalization), used as the
+# lenient first check in prime_math.grade_answer. Helpers are identical in behavior to those in
+# reward_score/math_reward.py.
 """
 This logic is largely copied from the Hendrycks' MATH release (math_equivalence).
 
@@ -42,6 +46,9 @@ from typing import Optional
 
 
 def normalize_answer(answer: Optional[str]) -> Optional[str]:
+    # [FUNCTION DOC]
+    # Returns None for None; otherwise strips whitespace, unwraps a whole-string \text{...}, and returns
+    # _strip_string of the result. If normalization raises, returns the stripped/unwrapped answer.
     if answer is None:
         return None
     answer = answer.strip()
@@ -56,6 +63,10 @@ def normalize_answer(answer: Optional[str]) -> Optional[str]:
 
 
 def _fix_fracs(string):
+    # [FUNCTION DOC]
+    # HELPER: Adds braces to shorthand \frac arguments ({a}{b}, or {a}b when the second char is "{");
+    # returns the original string if a segment after "\frac" is a single character.
+    # KNOWN ISSUE: an empty segment (string ending in "\frac") raises IndexError (caught by normalize_answer).
     substrs = string.split("\\frac")
     new_str = substrs[0]
     if len(substrs) > 1:
@@ -88,6 +99,8 @@ def _fix_fracs(string):
 
 
 def _fix_a_slash_b(string):
+    # [FUNCTION DOC]
+    # HELPER: Converts canonical "int/int" to "\frac{a}{b}"; otherwise returns input unchanged.
     if len(string.split("/")) != 2:
         return string
     a = string.split("/")[0]
@@ -103,6 +116,8 @@ def _fix_a_slash_b(string):
 
 
 def _remove_right_units(string):
+    # [FUNCTION DOC]
+    # HELPER: Returns the text before "\text{ " (assumed units). AssertionError if it occurs more than once.
     # "\\text{ " only ever occurs (at least in the val set) when describing units
     if "\\text{ " in string:
         splits = string.split("\\text{ ")
@@ -113,6 +128,9 @@ def _remove_right_units(string):
 
 
 def _fix_sqrt(string):
+    # [FUNCTION DOC]
+    # HELPER: Braces a single character after "\sqrt" when not already braced.
+    # KNOWN ISSUE: trailing "\sqrt" leaves an empty segment and raises IndexError.
     if "\\sqrt" not in string:
         return string
     splits = string.split("\\sqrt")
@@ -128,6 +146,11 @@ def _fix_sqrt(string):
 
 
 def _strip_string(string):
+    # [FUNCTION DOC]
+    # HELPER: Normalization pipeline: remove newlines and "\!"; collapse double backslashes;
+    # tfrac/dfrac -> frac; drop \left/\right, degree marks, escaped dollars; remove right units and
+    # percent signs; add leading zeros to bare decimals; return early if empty; drop a short "x =" prefix;
+    # fix sqrt; remove spaces; fix fracs; "0.5" -> "\frac{1}{2}"; fix a/b. Exceptions propagate from helpers.
     # linebreaks
     string = string.replace("\n", "")
 

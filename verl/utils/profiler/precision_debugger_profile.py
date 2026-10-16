@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Integration with Huawei msprobe's PrecisionDebugger for dumping model tensors per training stage.
+# Maps stage names (actor_update, actor_compute_log_prob, ref_compute_log_prob, compute_values,
+# critic_update, compute_rm_score) to roles and, per role, to candidate dotted attribute paths on a
+# worker where the model can be found. "rollout_generate" is always skipped. Dumps land under
+# <save_path>/step_<n>/<stage>.
 import functools
 import logging
 import os
@@ -66,9 +72,20 @@ _SKIP_STAGES = {"rollout_generate"}
 
 
 class PrecisionDebuggerProfiler:
+    # [CLASS DOC]
+    # Wraps a single lazily-created msprobe PrecisionDebugger. Provides start/stop around a stage and an
+    # annotate decorator for worker methods that resolves the model and global step from the worker
+    # instance/arguments. Non-strict mode swallows failures (returns False); strict mode raises.
     """Minimal msprobe PrecisionDebugger integration."""
 
     def __init__(self, precision_cfg, rank: Optional[int] = None, save_path: Optional[str] = None):
+        # [FUNCTION DOC]
+        # Behavior: normalizes precision_cfg into a PrecisionDebuggerToolConfig, records msprobe availability,
+        # normalizes the stage filter, sets dump root (save_path or "outputs/profile"), and warns if the
+        # deprecated steps field is set.
+        # Inputs: precision_cfg - None, config dataclass, DictConfig, dict, or other dataclass; rank; save_path.
+        # Exceptions: ValueError from stage normalization in strict mode with unknown stages.
+        # Side effects: may log a warning.
         self.rank = rank
         self.precision_cfg = self._normalize_config(precision_cfg)
         self._available = is_msprobe_available()
@@ -84,6 +101,11 @@ class PrecisionDebuggerProfiler:
 
     @staticmethod
     def _normalize_config(precision_cfg) -> PrecisionDebuggerToolConfig:
+        # [FUNCTION DOC]
+        # HELPER: Converts input to PrecisionDebuggerToolConfig: None -> defaults; same type returned as-is;
+        # objects with to_container (OmegaConf) resolved to a container first; dicts expanded as kwargs; else
+        # treated as a dataclass via asdict.
+        # Exceptions: TypeError for unexpected keys or non-dataclass input.
         if precision_cfg is None:
             return PrecisionDebuggerToolConfig()
         if isinstance(precision_cfg, PrecisionDebuggerToolConfig):
@@ -96,9 +118,16 @@ class PrecisionDebuggerProfiler:
 
     @staticmethod
     def _normalize_stage(stage: Optional[str]) -> Optional[str]:
+        # [FUNCTION DOC]
+        # HELPER: Identity hook for stage-name normalization; returns stage unchanged.
         return stage
 
     def _normalize_stages(self, stages: Optional[list[str]]) -> Optional[set[str]]:
+        # [FUNCTION DOC]
+        # HELPER: Builds the stage filter set.
+        # Behavior: None -> None (all stages). Otherwise normalizes, warns and drops skipped stages, warns about
+        # (or raises on, if strict) unknown stages, and returns the intersection with known stages.
+        # Exceptions: ValueError for unknown stages when strict. Side effects: logging.
         if stages is None:
             return None
         normalized = {self._normalize_stage(stage) for stage in stages}
@@ -115,6 +144,9 @@ class PrecisionDebuggerProfiler:
 
     @staticmethod
     def _resolve_attr(obj, attr_path: str):
+        # [FUNCTION DOC]
+        # HELPER: Follows a dotted attribute path from obj, returning None as soon as any segment is missing
+        # or None.
         current = obj
         for part in attr_path.split("."):
             current = getattr(current, part, None)
@@ -124,15 +156,25 @@ class PrecisionDebuggerProfiler:
 
     @staticmethod
     def _is_valid_model(model) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True when model is not None and has a callable forward attribute.
         return model is not None and callable(getattr(model, "forward", None))
 
     def _get_candidate_attrs(self, stage: str) -> tuple[str, ...]:
+        # [FUNCTION DOC]
+        # HELPER: Returns the candidate model attribute paths for the stage's role, or empty tuple if unknown.
         role = _STAGE_TO_ROLE.get(stage)
         if role is None:
             return ()
         return _MODEL_ATTRS_BY_ROLE.get(role, ())
 
     def _resolve_model(self, self_instance, stage: str):
+        # [FUNCTION DOC]
+        # HELPER: Locates the model for a stage on a worker instance.
+        # Behavior: for each candidate path, returns the resolved value if it is a valid model; if it is a
+        # list/tuple (e.g. Megatron chunks) returns the first valid element, warning when several exist. Falls
+        # back to self_instance.module if valid, else None.
+        # Side effects: may log a warning.
         for attr in self._get_candidate_attrs(stage):
             value = self._resolve_attr(self_instance, attr)
             if self._is_valid_model(value):
@@ -155,6 +197,12 @@ class PrecisionDebuggerProfiler:
         return fallback if self._is_valid_model(fallback) else None
 
     def _resolve_global_step(self, self_instance, args, kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Determines the global step for a call.
+        # Behavior: scans positional then keyword argument values: an object whose meta_info dict has
+        # "global_steps", or a dict with "global_steps", wins. Then checks instance attributes global_step and
+        # _global_step. Falls back to the last step recorded via start().
+        # Outputs: step value or None.
         for val in list(args) + list(kwargs.values()):
             if hasattr(val, "meta_info"):
                 meta = val.meta_info
@@ -168,6 +216,11 @@ class PrecisionDebuggerProfiler:
         return self._current_global_step
 
     def _should_collect(self, stage: str, global_step: Optional[int]) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Decides whether a stage should be collected (global_step currently unused).
+        # Behavior: False for skipped stages; unknown stages warn (or raise if strict) and return False; False if
+        # a stage filter exists and excludes the stage; else True.
+        # Exceptions: ValueError for unknown stage in strict mode.
         if stage in _SKIP_STAGES:
             return False
         if stage not in _STAGE_TO_ROLE:
@@ -181,6 +234,16 @@ class PrecisionDebuggerProfiler:
         return True
 
     def start(self, stage: Optional[str] = None, global_step: Optional[int] = None, model=None, **kwargs) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: records global_step/profile_step kwargs as the current step; returns False if stage is None,
+        # not collectable, msprobe unavailable (ImportError if strict), config_path or dump root missing, or the
+        # model invalid (ValueError if strict, else warning). Otherwise creates dump_path
+        # <root>/step_<n or unknown>/<stage>, lazily creates the debugger with config_path and dump_path,
+        # updates the debugger service's dump_path for subsequent stages, and starts it on the model.
+        # Outputs: True if collection started, else False.
+        # Exceptions: in strict mode the above errors and any exception during setup propagate; otherwise
+        # exceptions are swallowed and False returned.
+        # Side effects: directory creation, debugger state, logging.
         profile_step = kwargs.get("global_step", kwargs.get("profile_step"))
         if profile_step is not None:
             self._current_global_step = profile_step
@@ -227,6 +290,9 @@ class PrecisionDebuggerProfiler:
             return False
 
     def stop(self, started: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Behavior: if started, msprobe available, and a debugger exists, stops it and resets its service status.
+        # Inputs: started - value returned by start. Side effects: debugger state.
         if not started:
             return
         if not self._available:
@@ -244,14 +310,23 @@ class PrecisionDebuggerProfiler:
         category: Optional[str] = None,
         **kwargs_outer,
     ):
+        # [FUNCTION DOC]
+        # Behavior: message/color/domain/category are ignored. Stage is taken from the "role" kwarg; if absent,
+        # returns an identity decorator. Otherwise returns a decorator whose wrapper (for worker methods)
+        # resolves the global step and model, starts collection, calls the function, and always stops in finally.
+        # Outputs: decorator.
         _ = (message, color, domain, category)
         stage = self._normalize_stage(kwargs_outer.get("role"))
         if stage is None:
             return lambda func: func
 
         def decorator(func):
+            # [FUNCTION DOC]
+            # HELPER: Builds the functools.wraps wrapper around func.
             @functools.wraps(func)
             def wrapper(self_instance, *args, **kwargs_inner):
+                # [FUNCTION DOC]
+                # HELPER: Worker-method wrapper; start before, stop after (finally); returns func's result.
                 global_step = self._resolve_global_step(self_instance, args, kwargs_inner)
                 model = self._resolve_model(self_instance, stage)
                 started = self.start(stage=stage, global_step=global_step, model=model)
@@ -265,6 +340,9 @@ class PrecisionDebuggerProfiler:
         return decorator
 
     def _reset_debugger_status(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls the debugger service's reset_status, or else _reset_status, when present and callable;
+        # no-op if there is no service.
         service = getattr(self._debugger, "service", None)
         if service is None:
             return

@@ -13,6 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Refit support for vLLM block-FP8 linear and MoE quant methods (see module docstring): preserves
+# vLLM Parameter-subclass metadata across post-load parameter rebuilds, records each layer's
+# checkpoint (pristine) FP8 layout at first post-processing, stages checkpoint-layout buffers before
+# a reload, and folds re-derived kernel layouts back into the live (CUDA-graph-captured) storage.
+# Provides version-specific replacement post-load hooks and builders for the mock patchers that
+# install them. Layer attribute names used for stashing: pristine layout and live params.
+
 """Refit support for vLLM's ``Fp8LinearMethod`` and ``Fp8MoEMethod``.
 
 Two problems have to be solved for an RL weight refit to land correctly on a
@@ -42,6 +50,10 @@ logger = logging.getLogger(__name__)
 
 
 def _iter_transferable_param_attrs(src_param):
+    # [FUNCTION DOC]
+    # HELPER: Generator over (name, value) attributes of src_param worth copying: skips names present on
+    # the base Parameter class, dunder names, attributes whose access raises AttributeError, and methods
+    # bound to any tensor.
     """Yield the attributes worth moving onto a rebuilt parameter.
 
     Methods bound to a tensor are excluded, and that exclusion is the whole
@@ -71,6 +83,11 @@ def _iter_transferable_param_attrs(src_param):
 
 
 def _copy_param_subclass_attrs(dst_param, src_param):
+    # [FUNCTION DOC]
+    # HELPER: No-op if src_param is None. Copies transferable attributes onto dst_param (ignoring
+    # AttributeError on set) and records subclass_type (the source's stored subclass_type, else its
+    # type) on dst_param when that is not plain Parameter.
+    # Side effects: mutates dst_param.
     """Carry vLLM's parameter metadata across a parameter rebuild.
 
     vLLM stores loader dispatch information (``output_dim``, ``weight_loader``,
@@ -112,6 +129,11 @@ _FP8_REFIT_PARAM_NAMES = (*_FP8_LINEAR_PARAM_NAMES, *_FP8_MOE_PARAM_NAMES)
 
 
 def _fold_into_live_param(layer, param_name, param, new_data):
+    # [FUNCTION DOC]
+    # HELPER: Unwraps a Parameter to its data, requires shape and dtype equal to the live param, copies
+    # the data into the live storage unless it already is the same memory, and sets the live param back
+    # on the layer.
+    # Exceptions: RuntimeError on shape/dtype mismatch. Side effects: in-place copy; layer attribute set.
     """Move post-processing output into the storage the CUDA graph captured."""
     if isinstance(new_data, torch.nn.Parameter):
         new_data = new_data.data
@@ -130,6 +152,13 @@ def _fold_into_live_param(layer, param_name, param, new_data):
 def replace_parameter_preserve_subclass(
     layer: torch.nn.Module, param_name: str, new_data: torch.Tensor | None, prefer_copy: bool = False
 ):
+    # [FUNCTION DOC]
+    # Behavior: if the layer has a stashed live param for param_name and new_data is not None, folds the
+    # data into it and removes it from the stash. Else if new_data is None, sets the attribute to None.
+    # Otherwise wraps new_data (unwrapped if a Parameter) in a fresh non-trainable Parameter, copies
+    # metadata from the previous attribute, and sets it.
+    # Inputs: layer; param_name; new_data - tensor, Parameter or None; prefer_copy - ignored.
+    # Outputs: None. Exceptions: RuntimeError from folding. Side effects: mutates layer.
     """Stand-in for vLLM's ``replace_parameter`` inside the fp8 quant module.
 
     During a refit of a staged layer this folds the result into the live
@@ -161,6 +190,9 @@ def replace_parameter_preserve_subclass(
 
 
 def _restore_layer_param_subclass_attrs(layer: torch.nn.Module, old_params: dict[str, torch.nn.Parameter]):
+    # [FUNCTION DOC]
+    # HELPER: For each name in old_params whose current attribute on the layer is a Parameter, copies
+    # the old param's metadata onto it.
     for name, old_param in old_params.items():
         new_param = getattr(layer, name, None)
         if isinstance(new_param, torch.nn.Parameter):
@@ -168,6 +200,10 @@ def _restore_layer_param_subclass_attrs(layer: torch.nn.Module, old_params: dict
 
 
 def _record_pristine_fp8_layout(layer, params):
+    # [FUNCTION DOC]
+    # HELPER: If the layer has no pristine record yet, records (shape, dtype) for each known FP8 refit
+    # param name found as a Parameter in params, and stores the mapping on the layer if non-empty.
+    # Side effects: sets a layer attribute.
     """Remember the checkpoint layout of a layer's FP8 weights and scales.
 
     Kernel post-processing rewrites these into inference layouts that the
@@ -196,6 +232,9 @@ def _record_pristine_fp8_layout(layer, params):
 
 
 def _layer_needs_fp8_staging(layer, pristine) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if any recorded param that is still a Parameter has a different shape or dtype than
+    # recorded, or is flagged is_shuffled (ROCm AITER); else False.
     for name, (shape, dtype) in pristine.items():
         param = getattr(layer, name, None)
         if not isinstance(param, torch.nn.Parameter):
@@ -213,6 +252,10 @@ def _layer_needs_fp8_staging(layer, pristine) -> bool:
 
 
 def _fp8_staging_data(param, shape, dtype):
+    # [FUNCTION DOC]
+    # HELPER: If dtype matches and element counts match, returns a reshape of the live data (shared
+    # storage); otherwise allocates a new buffer filled with all-ones bytes (NaN sentinel).
+    # Inputs: param; shape; dtype. Outputs: tensor.
     """Checkpoint-layout tensor that ``load_weights`` can write into.
 
     Reuses the live storage whenever the kernel transform only reshaped it, so
@@ -234,6 +277,11 @@ def _fp8_staging_data(param, shape, dtype):
 
 
 def stage_fp8_params_for_loading(model):
+    # [FUNCTION DOC]
+    # Behavior: for each module with a pristine record that needs staging, replaces each recorded param
+    # with a non-trainable staging Parameter in checkpoint layout (metadata copied), stashing the live
+    # params on the layer. Logs the number of staged layers.
+    # Inputs: model. Outputs: list of staged layers. Side effects: mutates layers; logs.
     """Expose checkpoint-layout buffers so ``load_weights`` can write into them.
 
     Covers both quant methods: ``Fp8LinearMethod`` layers keyed on ``weight`` /
@@ -272,6 +320,12 @@ def stage_fp8_params_for_loading(model):
 
 
 def process_fp8_weights_after_loading(layers):
+    # [FUNCTION DOC]
+    # Behavior: for each staged layer, calls its quant_method.process_weights_after_loading if present
+    # (which, under the patches, folds params via the subclass-preserving replace), then folds any
+    # remaining stashed live params from the layer's current attribute, and deletes the stash.
+    # Inputs: layers. Outputs: None. Exceptions: RuntimeError from folding (e.g. shape mismatch, or
+    # attribute is None). Side effects: in-place parameter updates.
     """Re-derive the inference layout in place and reinstate the live params."""
     for layer in layers:
         live = getattr(layer, _FP8_LIVE_ATTR, None) or {}
@@ -293,7 +347,14 @@ def process_fp8_weights_after_loading(layers):
 
 
 def _make_process_weights_after_loading_for_vllm20(original_fn):
+    # [FUNCTION DOC]
+    # HELPER: Builds a wrapper for vLLM 0.20+ post-load hooks.
+    # Inputs: original_fn - original unbound process_weights_after_loading. Outputs: wrapped method.
     def _patched_process_weights_after_loading(self, layer) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Snapshots the layer's direct parameters, records the pristine layout, runs the original
+        # hook with the fp8 module's replace_parameter patched to the subclass-preserving version, then
+        # restores metadata onto rebuilt params. Side effects: mutates layer.
         old_params = dict(layer.named_parameters(recurse=False))
         _record_pristine_fp8_layout(layer, old_params)
         with patch(
@@ -306,6 +367,17 @@ def _make_process_weights_after_loading_for_vllm20(original_fn):
 
 
 def process_weights_after_loading_for_vllm14(self, layer) -> None:
+    # [FUNCTION DOC]
+    # Behavior: replacement Fp8LinearMethod post-load hook for older vLLM. Requires block quant with an
+    # FP8-serialized checkpoint and dynamic activation. Runs vLLM's block-strategy processing on weight
+    # and inverse scale, then rebuilds weight as a ModelWeightParameter and weight_scale_inv as a
+    # BlockQuantScaleParameter (output dim 0, input dim 1, original weight loaders), each converted to a
+    # plain Parameter with subclass metadata copied. Ensures input_scale exists (None) and runs vLLM's
+    # optional block post-processing.
+    # Inputs: self - quant method; layer. Outputs: None.
+    # Exceptions: AssertionError on unsupported configs. Side effects: mutates layer.
+    # KNOWN ISSUE: docstring says vLLM v0.18-v0.19 while the name says v14; it is used for every vLLM
+    # below 0.20.
     """This function is used to process the weights after loading for a Linear layer, it is used for vllm v0.18-v0.19.
 
     Compared to the original process_weights_after_loading in vllm, we just avoid creation of
@@ -325,6 +397,8 @@ def process_weights_after_loading_for_vllm14(self, layer) -> None:
     assert self.quant_config.activation_scheme == "dynamic"
 
     def _create_param_from_subclass_attributes(custom_param):
+        # [FUNCTION DOC]
+        # HELPER: Wraps the custom parameter's data in a non-trainable Parameter carrying its metadata.
         param = Parameter(custom_param.data, requires_grad=False)
         _copy_param_subclass_attrs(param, custom_param)
         return param
@@ -358,6 +432,18 @@ def process_weights_after_loading_for_vllm14(self, layer) -> None:
 
 
 def process_weights_after_loading_moe_for_vllm14(self, layer) -> None:
+    # [FUNCTION DOC]
+    # Behavior: replacement Fp8MoEMethod post-load hook for vLLM below 0.20 (without the reentrancy
+    # guard so it can run on every refit). Converts w13/w2 weights and scales (scale name from
+    # weight_scale_name) to kernel format, then rebuilds w13_weight, w2_weight, w13_weight_scale_inv and
+    # w2_weight_scale_inv as plain Parameters with transferable attributes copied. Rebuilds the MoE quant
+    # config and, if set, the MoE kernel, using the newer factory signature (with routing tables and
+    # shared experts) when available, else the older one returning (kernel, use_inplace).
+    # Inputs: self - quant method; layer. Outputs: None.
+    # Exceptions: AssertionError if experts_cls is None when a quant config exists.
+    # Side effects: mutates layer and quant method.
+    # KNOWN ISSUE: scales are always written to the *_weight_scale_inv names and read from them as the
+    # copy source, so a non-block layer (weight_scale_name "weight_scale") would fail on attribute lookup.
     # removed the reentrancy guard here for refit
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
         convert_to_fp8_moe_kernel_format,
@@ -386,6 +472,9 @@ def process_weights_after_loading_moe_for_vllm14(self, layer) -> None:
     from torch.nn import Parameter
 
     def _create_param_from_subclass_attributes(custom_data, custom_weight):
+        # [FUNCTION DOC]
+        # HELPER: Non-trainable Parameter from custom_data with transferable attributes of custom_weight set
+        # on it (without AttributeError protection).
         param = Parameter(custom_data, requires_grad=False)
         for attr, value in _iter_transferable_param_attrs(custom_weight):
             setattr(param, attr, value)
@@ -426,6 +515,11 @@ def process_weights_after_loading_moe_for_vllm14(self, layer) -> None:
 
 
 def build_fp8_method_patchers(vllm_version):
+    # [FUNCTION DOC]
+    # Behavior: returns unstarted mock patchers for Fp8LinearMethod and Fp8MoEMethod
+    # process_weights_after_loading: on vLLM 0.20 or newer, wrappers around the original methods;
+    # otherwise the replacement functions in this module.
+    # Inputs: vllm_version - parsed packaging Version. Outputs: list of two patchers.
     """Patchers that make the FP8 quant methods survive a refit, not yet started.
 
     The caller owns starting and tracking them so all patch lifetime lives in

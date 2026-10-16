@@ -12,6 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Utilities for the SGLang rollout: LoRA config helpers, DeepSeek-V4 fused-parameter
+# grouping, a pickle-based object broadcast, and size-bounded bucketing of named tensors
+# for weight sync. Constants: SGLANG_LORA_NAME (adapter name used in SGLang),
+# DEEPSEEK_V4_FUSION_GROUPS (tuples of name suffixes, under "self_attn" and "attn", that
+# must be loaded together in one bucket).
 
 import pickle
 from typing import Any, Iterator, Optional
@@ -40,6 +46,10 @@ DEEPSEEK_V4_FUSION_GROUPS = tuple(
 
 
 def _fusion_key(name: str, groups: tuple[tuple[str, ...], ...]):
+    # [FUNCTION DOC]
+    # HELPER: Find which fusion group a parameter name belongs to by suffix match.
+    # Outputs: None if no match; else (name prefix without suffix, group index, group size).
+    # Exceptions: ValueError if the name matches more than one suffix/group.
     matches = [
         (index, suffix, len(group)) for index, group in enumerate(groups) for suffix in group if name.endswith(suffix)
     ]
@@ -52,6 +62,10 @@ def _fusion_key(name: str, groups: tuple[tuple[str, ...], ...]):
 
 
 def normalize_peft_config_for_sglang(peft_config: dict) -> dict:
+    # [FUNCTION DOC]
+    # Copy a PEFT adapter config dict, converting enum values of "task_type"/"peft_type" to
+    # their .value, and making target_modules a list unless it is a single string.
+    # Exceptions: ValueError if "peft_type" is missing; KeyError if "target_modules" is missing.
     """Normalize an engine's adapter config (enums to strings) for SGLang's adapter loader."""
     normalized = dict(peft_config)
     for key in ("task_type", "peft_type"):
@@ -69,12 +83,18 @@ def normalize_peft_config_for_sglang(peft_config: dict) -> dict:
 
 
 def lora_rank_of(model_config) -> int:
+    # [FUNCTION DOC]
+    # Return the LoRA rank as the max of the flat lora_rank attribute and lora["rank"]
+    # (treating missing/None as 0).
     """The LoRA rank, from whichever block carries it: megatron sets ``model.lora.rank``, fsdp
     the flat ``model.lora_rank``."""
     return max(int(getattr(model_config, "lora_rank", 0) or 0), int(model_config.lora.get("rank", 0) or 0))
 
 
 def lora_served_as_adapter(model_config) -> bool:
+    # [FUNCTION DOC]
+    # True when LoRA is enabled (rank > 0) and lora["merge"] is not true, i.e. SGLang must
+    # serve the adapter separately.
     """Whether SGLang should serve LoRA as a hot-swappable adapter.
 
     ``HFModelConfig`` carries two LoRA config blocks that are never synced: megatron
@@ -91,6 +111,10 @@ def lora_served_as_adapter(model_config) -> bool:
 
 
 def sglang_lora_target_modules(target_modules: Any) -> list[str]:
+    # [FUNCTION DOC]
+    # Map verl target_modules to SGLang lora_target_modules: "all-linear" becomes ["all"];
+    # other strings (regex) are rejected; iterables are listed.
+    # Exceptions: ValueError for non-"all-linear" strings.
     """Render verl's ``model.target_modules`` as SGLang's ``lora_target_modules``."""
     if target_modules == "all-linear":
         return ["all"]
@@ -109,6 +133,16 @@ def broadcast_pyobj(
     src: int = 0,
     force_cpu_device: bool = False,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Broadcast a list of picklable objects from src via torch.distributed. Source
+    # sends the byte length (0 for empty) then the pickled bytes as uint8 tensors on the
+    # accelerator (or CPU if forced) and returns data unchanged; receivers read the length,
+    # return an empty list for 0, else receive and unpickle the bytes.
+    # Inputs: data (used only on src), rank, dist_group, src, force_cpu_device.
+    # Outputs: the broadcast list. Side effects: collective communication.
+    # KNOWN ISSUE: src is passed to dist.broadcast as a global rank while also compared to the
+    # caller-supplied rank; receivers with a non-default group must pass the global src.
+    # Unpickling received data is unsafe with untrusted peers.
     """from https://github.com/sgl-project/sglang/blob/844e2f227ab0cce6ef818a719170ce37b9eb1e1b/python/sglang/srt/utils.py#L905
 
     Broadcast inputs from src rank to all other ranks with torch.dist backend.
@@ -148,6 +182,9 @@ def broadcast_pyobj(
 
 
 def _compact_for_bucket(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Clone a tensor only if it is a view of another tensor's storage, so buckets do
+    # not pin larger backing buffers; tensors owning their storage are returned as-is.
     """Return a tensor safe to retain in a weight-sync bucket without pinning extra memory.
 
     ``get_named_tensor_buckets`` keeps every tensor alive until its bucket is flushed. A tensor
@@ -168,6 +205,21 @@ async def get_named_tensor_buckets(
     bucket_bytes: int,
     fusion_groups: tuple[tuple[str, ...], ...] = (),
 ) -> Iterator[list[tuple[str, torch.Tensor]]]:
+    # [FUNCTION DOC]
+    # Async generator that groups (name, tensor) pairs into lists whose total byte size stays
+    # at or under bucket_bytes where possible.
+    # Behavior: accepts sync or async iterables. Each tensor is compacted. Tensors matching a
+    # fusion group are staged until all members with the same prefix arrive, then placed
+    # together. Placement of an indivisible run: if the current bucket is non-empty and adding
+    # the run would exceed bucket_bytes, the current bucket is yielded first; the run is then
+    # appended (a single run larger than the limit forms an oversize bucket). The final
+    # partial bucket is yielded at the end.
+    # Inputs: iterable; bucket_bytes (> 0); fusion_groups - tuples of suffixes.
+    # Outputs: yields lists of (name, tensor).
+    # Exceptions: ValueError if bucket_bytes <= 0 or some fused group never completed.
+    # KNOWN ISSUE: the docstring says size is in megabytes and its example uses a
+    # nonexistent bucket_size_mb argument with synchronous iteration; the function takes bytes
+    # and is an async generator.
     """
     Group tensors into buckets based on a specified size in megabytes.
 
@@ -199,6 +251,11 @@ async def get_named_tensor_buckets(
     staged: dict = {}
 
     def _place(entries):
+        # [FUNCTION DOC]
+        # HELPER: Decide whether the current bucket must be cut before a run of entries: if the
+        # bucket is non-empty and the run's total size would overflow, returns (old bucket,
+        # entries) after resetting the enclosing bucket state; otherwise (None, entries).
+        # Side effects: rebinds the enclosing current_bucket/current_size.
         """Put an indivisible run of entries in a bucket, cutting before it if
         it would not fit rather than partway through."""
         nonlocal current_bucket, current_size

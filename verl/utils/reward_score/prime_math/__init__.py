@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# PRIME math reward: extracts a final answer from free-form model output and grades it against the
+# ground truth using (1) PRM800K-style string normalization plus sympy difference simplification
+# and (2) a fallback numeric/symbolic comparison from grader.math_equal. Constants BAD_SUBSTRINGS
+# and BAD_REGEXES block sympy evaluation of expressions likely to hang (large exponents), and
+# TUPLE_CHARS lists bracket characters that delimit tuples/intervals.
 """
 Answer checker API that uses sympy to simplify expressions and check for equality.
 
@@ -42,6 +48,9 @@ TUPLE_CHARS = "()[]"
 
 
 def _sympy_parse(expr: str):
+    # [FUNCTION DOC]
+    # HELPER: Replaces "^" with "**" and parses with sympy using standard transformations plus implicit
+    # multiplication/application. Outputs: sympy expression. Exceptions: sympy parse errors propagate.
     """Parses an expression with sympy."""
     py_expr = expr.replace("^", "**")
     return sympy_parser.parse_expr(
@@ -51,6 +60,10 @@ def _sympy_parse(expr: str):
 
 
 def _parse_latex(expr: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Converts LaTeX to plain text sympy can read: tfrac/dfrac -> frac, space before \frac
+    # (for mixed numbers), pylatexenc latex-to-text, then replaces the unicode symbols for sqrt, pi,
+    # infinity, union ("U") and multiplication dots/crosses ("*"). Returns stripped text.
     """Attempts to parse latex to an expression sympy can read."""
     expr = expr.replace("\\tfrac", "\\frac")
     expr = expr.replace("\\dfrac", "\\frac")
@@ -69,6 +82,8 @@ def _parse_latex(expr: str) -> str:
 
 
 def _is_float(num: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if the string parses as a float (ValueError -> False).
     try:
         float(num)
         return True
@@ -77,6 +92,8 @@ def _is_float(num: str) -> bool:
 
 
 def _is_int(x: float) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if x is within 1e-7 of its rounded integer; False on any error.
     try:
         return abs(x - int(round(x))) <= 1e-7
     except Exception:
@@ -84,10 +101,15 @@ def _is_int(x: float) -> bool:
 
 
 def _is_frac(expr: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if expr looks like an optional-minus integer, optional one char, "/", a non-zero
+    # denominator (leading zeros allowed), optional one char.
     return bool(re.search(r"^-?[0-9]+.?/0*[1-9][0-9]*.?$", expr))
 
 
 def _str_is_int(x: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Removes thousands-separator commas, parses as float and checks near-integer; False on error.
     try:
         x = _strip_properly_formatted_commas(x)
         x = float(x)
@@ -97,12 +119,18 @@ def _str_is_int(x: str) -> bool:
 
 
 def _str_to_int(x: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Removes all commas, parses as float and truncates to int.
+    # KNOWN ISSUE: annotated as returning bool but returns an int. Raises ValueError for non-numeric input.
     x = x.replace(",", "")
     x = float(x)
     return int(x)
 
 
 def _inject_implicit_mixed_number(step: str):
+    # [FUNCTION DOC]
+    # HELPER: Replaces "digit spaces digit" with "digit+digit" so mixed numbers like "7 3/4" evaluate
+    # as a sum.
     """
     Automatically make a mixed number evalable
     e.g. 7 3/4 => 7+3/4
@@ -113,6 +141,9 @@ def _inject_implicit_mixed_number(step: str):
 
 
 def _strip_properly_formatted_commas(expr: str):
+    # [FUNCTION DOC]
+    # HELPER: Repeatedly removes commas that sit between a digit and exactly three digits followed by
+    # end or a non-digit (thousands separators), leaving tuple commas alone. Returns the result.
     # We want to be careful because we don't want to strip tuple commas
     p1 = re.compile(r"(\d)(,)(\d\d\d)($|\D)")
     while True:
@@ -124,6 +155,13 @@ def _strip_properly_formatted_commas(expr: str):
 
 
 def _normalize(expr: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: PRM800K answer normalization. Returns None for None. Unwraps a whole-string \text{...};
+    # removes percent/dollar signs; " or "/" and " -> " , "; million/billion/trillion -> "*10^k";
+    # removes listed unit words (with optional plural and exponent) and degree markers; strips one pair
+    # of outer braces; removes ",\!" thin-space separators; integer-valued floats -> integer string;
+    # if a backslash remains, tries LaTeX-to-text (errors suppressed); collapses "- " to "-"; injects
+    # mixed-number plus; lowercases; integer-like strings -> canonical int string.
     """Normalize answer expressions."""
     if expr is None:
         return None
@@ -191,6 +229,8 @@ def _normalize(expr: str) -> str:
 
 
 def count_unknown_letters_in_expr(expr: str):
+    # [FUNCTION DOC]
+    # HELPER: Counts distinct alphabetic characters after removing "sqrt" and "frac".
     expr = expr.replace("sqrt", "")
     expr = expr.replace("frac", "")
     letters_in_expr = set([x for x in expr if x.isalpha()])
@@ -198,6 +238,9 @@ def count_unknown_letters_in_expr(expr: str):
 
 
 def should_allow_eval(expr: str):
+    # [FUNCTION DOC]
+    # HELPER: False if more than 2 distinct letters, any BAD_SUBSTRINGS, or any BAD_REGEXES match;
+    # otherwise True.
     # we don't want to try parsing unknown text or functions of more than two variables
     if count_unknown_letters_in_expr(expr) > 2:
         return False
@@ -211,6 +254,10 @@ def should_allow_eval(expr: str):
 
 @timeout_limit(seconds=10)
 def are_equal_under_sympy(ground_truth_normalized: str, given_normalized: str):
+    # [FUNCTION DOC]
+    # Returns True if sympy simplifies "(gt) - (given)" to 0 and the expression passes
+    # should_allow_eval; any exception -> False. Wrapped in a 10 second timeout_limit decorator,
+    # which raises on timeout (callers catch it).
     are_equal = False
     try:
         expr = f"({ground_truth_normalized})-({given_normalized})"
@@ -225,6 +272,9 @@ def are_equal_under_sympy(ground_truth_normalized: str, given_normalized: str):
 
 
 def split_tuple(expr: str):
+    # [FUNCTION DOC]
+    # Removes thousands commas; returns [] for empty; if longer than 2, starts and ends with a bracket
+    # char and has no bracket chars inside, returns comma-split stripped elements; else [expr].
     """
     Split the elements in a tuple/interval, while handling well-formatted commas in large numbers
     """
@@ -244,6 +294,14 @@ def split_tuple(expr: str):
 
 
 def grade_answer(given_answer: str, ground_truth: str) -> bool:
+    # [FUNCTION DOC]
+    # Returns True if the answers match under math_normalize.normalize_answer, or under _normalize, or
+    # element-wise for tuples/intervals. Element-wise check requires same element count and, for
+    # multi-element answers, the same opening and closing brackets; per element: two fractions must
+    # match exactly (unreduced fractions not accepted); integer-vs-non-integer mismatch fails;
+    # otherwise sympy equality (exceptions printed and treated as False). Stops at the first failure.
+    # Outputs: bool. Returns False if given_answer is None, gt normalizes to None, or given is empty.
+    # Side effects: prints sympy errors.
     """
     The answer will be considered correct if:
     (a) it normalizes to the same string as the ground truth answer
@@ -305,6 +363,8 @@ def grade_answer(given_answer: str, ground_truth: str) -> bool:
 
 
 def remove_boxed(s):
+    # [FUNCTION DOC]
+    # HELPER: Strips "\boxed{" and the trailing "}"; returns None if the format does not match.
     left = "\\boxed{"
     try:
         assert s[: len(left)] == left
@@ -315,6 +375,10 @@ def remove_boxed(s):
 
 
 def _last_boxed_only_string(string):
+    # [FUNCTION DOC]
+    # HELPER: Finds the last "\boxed" (or "\fbox"), then brace-matches from there and returns the
+    # stripped content between the first opening brace and its matching closing brace; None if no
+    # marker or unbalanced. Note: unlike similarly named helpers it returns only the inner content.
     idx = string.rfind("\\boxed")
     if idx < 0:
         idx = string.rfind("\\fbox")
@@ -345,6 +409,16 @@ def _last_boxed_only_string(string):
 
 
 def match_answer(response):
+    # [FUNCTION DOC]
+    # Heuristically extracts the final answer text from a response.
+    # Behavior: for markers "answer:", "answer is", "answers are" (case-insensitive, last occurrence),
+    # keep text after the marker; for "is answer", "is the answer", "are answers", "are the answers",
+    # keep text before; if a boxed expression exists, use its content; cut at the last ". "; then for
+    # markers like "be ", "is ", "are ", "=", ": ", "get " (and newline variants) keep text after the
+    # last occurrence. Each marker found sets matched. Matched is forced False if the result has no digit.
+    # Outputs: tuple (matched bool, extracted string).
+    # KNOWN ISSUE: the "ends with newline, drop last 2 chars" checks run after strip so never trigger,
+    # and would drop two characters instead of one.
     is_matched = False
     for ans_marker in ["answer:", "answer is", "answers are"]:
         ans_idx = response.lower().rfind(ans_marker)
@@ -387,6 +461,13 @@ def match_answer(response):
 
 
 def compute_score(model_output: str, ground_truth: str) -> bool:
+    # [FUNCTION DOC]
+    # Extracts the answer with match_answer; format_correctness is True if output contains "Step 2:"
+    # and "\box". If grade_answer succeeds returns (True, True, extracted). Otherwise uses math_equal
+    # with timeout (trying pi = math.pi and 3.14 if "\pi" appears in either) and returns
+    # (is_correct, format_correctness, extracted); exceptions -> is_correct False.
+    # KNOWN ISSUE: annotated as returning bool but returns a 3-tuple; the early-success path reports
+    # format correctness True regardless of format.
     model_output = str(model_output)
     ground_truth = str(ground_truth)
 

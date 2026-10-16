@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Glue between the RouterReplay state (router_replay_patch) and Megatron pipeline/sequence/context
+# parallel layouts. Provides: per-stage layer/MoE-layer counting, gathering recorded top-k routes
+# from local routers into (batch, seq, layers, topk) int16 maps (R2 record), building replay masks
+# and aligning rollout-captured routes (R3), scattering routes back to local routers for replay,
+# VPP reordering, PP gathering, and helpers to query replay actions. Route indices are carried as
+# int16 and bit-reinterpreted as uint8 for collectives. Module-level device_name is the current
+# accelerator name.
+
 """
 Router Replay Utilities
 Utilities for handling router replay functionality in Megatron models.
@@ -48,6 +57,10 @@ device_name = get_device_name()
 
 
 def _context_parallel_layout(tf_config) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns "contiguous" when tf_config.experimental_attention_variant is "dsv4_hybrid",
+    # else "zigzag".
+    # KNOWN ISSUE: this definition is shadowed by an identical, documented redefinition later in the module.
     if getattr(tf_config, "experimental_attention_variant", None) == "dsv4_hybrid":
         return "contiguous"
     return "zigzag"
@@ -55,6 +68,18 @@ def _context_parallel_layout(tf_config) -> str:
 
 # from megatron.core.transformer.transformer_block import get_num_layers_to_build
 def get_num_layers_to_build(config: TransformerConfig, vp_stage: int | None = None, pp_rank: int | None = None) -> int:
+    # [FUNCTION DOC]
+    # Behavior: local copy of Megatron's get_num_layers_to_build. If a custom pipeline layout exists,
+    # delegate to it for decoder layers at vp_stage. Otherwise (pp_rank defaults to current PP rank):
+    # with uneven first/last stage sizes (incompatible with embedding/loss accounting), distribute
+    # remaining layers evenly over middle stages and use the explicit counts on first/last stages;
+    # otherwise count embedding/loss as extra layers when configured and split evenly. With VPP and
+    # PP > 1, divide the per-rank count by vp_size. Subtract one on the first (last) virtual+pipeline
+    # stage when the embedding (loss) is counted in the split.
+    # Inputs: config - TransformerConfig; vp_stage; pp_rank.
+    # Outputs: int number of transformer layers for that stage.
+    # Exceptions: AssertionError on non-divisible splits or negative results; NameError if
+    # is_vp_first_stage/is_vp_last_stage failed to import and embedding/loss accounting is on.
     """
     Determine the number of transformer layers to build for the current pipeline stage.
     Args:
@@ -178,6 +203,11 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: int | None = No
 
 
 def is_moe_layer(tf_config, layer_idx):
+    # [FUNCTION DOC]
+    # Behavior: with integer moe_layer_freq, layer is MoE when layer_idx % freq == 0; with a list,
+    # when the entry at layer_idx equals 1.
+    # Inputs: tf_config; layer_idx (0-based global). Outputs: bool.
+    # Exceptions: ValueError for other/missing freq types; IndexError for out-of-range list access.
     moe_layer_freq = getattr(tf_config, "moe_layer_freq", None)
 
     if isinstance(moe_layer_freq, int):
@@ -191,6 +221,13 @@ def is_moe_layer(tf_config, layer_idx):
 def get_moe_num_layers_to_build(
     config: TransformerConfig, vp_stage: int | None = None, pp_rank: int | None = None
 ) -> int:
+    # [FUNCTION DOC]
+    # Behavior: computes the stage's layer count and global layer offset (calling
+    # get_transformer_layer_offset with whichever of vp_stage/pp_rank its signature supports), then
+    # counts MoE layers in that global index range.
+    # Inputs: config; vp_stage; pp_rank. Outputs: int.
+    # KNOWN ISSUE: when get_transformer_layer_offset lacks pp_rank, an explicit pp_rank is ignored for
+    # the offset (current rank is used) while the layer count still uses it.
     """Count the number of MoE layers assigned to the current rank.
     When ``moe_layer_freq`` is 1 or unset, every transformer layer is an MoE
     layer, so the count equals the total layer count. Otherwise only layers
@@ -221,6 +258,9 @@ def get_moe_num_layers_to_build(
 
 
 def _context_parallel_layout(tf_config) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the CP row layout ("contiguous" for dsv4_hybrid attention, else "zigzag") used
+    # for THD packing; must match the engine's layout so routes align with token rows.
     """Return the CP row layout used for THD packing, matching MegatronEngine.
 
     Router-replay tensors must be sharded exactly like the model's own token rows; otherwise the
@@ -242,6 +282,26 @@ def merge_router_topk_indices(
     local_cp_size=None,
     model=None,
 ):
+    # [FUNCTION DOC]
+    # Behavior (no grad): requires attention_mask for non-nested inputs. Selects routers either from
+    # the given model (sorted by layer number; duplicates are an error) or from the global registry
+    # slice for (tf_config, vp_rank; None -> 0). If none are found: error if the stage should contain
+    # MoE layers, else append an empty int16 route map with zero layers (jagged per-sequence for
+    # nested input_ids, else (batch, seq, 0, topk) on CPU) using a positive moe_router_topk. Otherwise
+    # every router must have recorded indices; stacks them to (tokens, layers, topk) int16 on device,
+    # views as uint8, all-gathers across the sequence-parallel (TP) region and adds a leading dim.
+    # Then unpacks to the original layout: for nested inputs via preprocess/postprocess_thd_engine
+    # (with fp8 padding for e4m3/hybrid, CP layout, csa_window_size min rows for dsv4_hybrid,
+    # local_cp_size) and re-views values as int16 in a jagged tensor; for padded inputs via
+    # preprocess/postprocess_packed_seqs to (batch, seq, layers, topk) then int16 view. Appends the
+    # CPU result to mini_layer_topk_idx_list.
+    # Inputs: attention_mask (batch, seq) or None for nested; input_ids (batch, seq) or jagged nested;
+    # mini_layer_topk_idx_list - output list; tf_config; vp_rank; local_cp_size; model.
+    # Outputs: none.
+    # Exceptions: RuntimeError for missing mask, duplicate layers, missing expected routers, bad
+    # topk, or routers without recorded indices.
+    # Side effects: appends to the list; TP collective.
+    # KNOWN ISSUE: docstring says vp_rank None means the current VP rank, but the code uses 0.
     """
     Merge recorded router top-k indices across sequence-parallel ranks for all router instances,
     then pack/unpack them to align with the original (batch, seq_len) layout and append the result.
@@ -378,6 +438,12 @@ def merge_router_topk_indices(
 
 
 def build_r3_replay_mask(input_ids: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: for each jagged sequence of total length L with a non-empty response, mark the first
+    # L-1 rows True and the last row False; sequences without response tokens get all False. Returns a
+    # jagged bool tensor with the same offsets as input_ids.
+    # Inputs: input_ids - jagged nested tensor; response_mask (batch, resp_len).
+    # Outputs: jagged bool mask.
     """Build a full-sequence replay mask for rollout-captured routes.
 
     Response logprobs are read from shifted model rows, but those rows attend to
@@ -397,6 +463,13 @@ def build_r3_replay_mask(input_ids: torch.Tensor, response_mask: torch.Tensor) -
 
 
 def align_r3_router_replay_data(layers_topk_idx: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: per sequence, keeps routes whose length equals the input length, or appends a single
+    # zero placeholder row when routes are exactly one shorter; returns a jagged tensor.
+    # Inputs: layers_topk_idx - jagged (seq_i, layers, topk); input_ids - jagged.
+    # Outputs: aligned jagged route tensor.
+    # Exceptions: TypeError if either is not nested; RuntimeError on sequence-count mismatch or any
+    # other length difference.
     """Align rollout routes with full training inputs one sequence at a time.
 
     Autoregressive rollout records the routes used to predict each generated
@@ -440,6 +513,22 @@ def set_router_replay_data(
     local_cp_size=None,
     model=None,
 ):
+    # [FUNCTION DOC]
+    # Behavior (no grad): errors if layers_topk_idx is None. Packs routes (and optional replay mask)
+    # to rmpad layout: nested via preprocess_thd_engine (same fp8/CP/min-rows options as merge),
+    # padded via preprocess_packed_seqs (requires attention_mask; mask is ignored in this path). Moves
+    # to device and scatters along tokens to the local sequence-parallel shard; reshapes to
+    # (layers, local_tokens, topk). If the layer dim equals num_layers index by absolute layer,
+    # otherwise by MoE ordinal. With model: for each (layer_number, router) of the model, set int64
+    # target indices (+ mask) for its index; error listing layers out of range. Without model: walk the
+    # local layer range from get_current_rank_layer_info, assigning to registry routers in order for
+    # each MoE layer.
+    # Inputs: layers_topk_idx (batch, seq, layers, topk) or jagged; attention_mask; tf_config;
+    # vp_rank (None -> 0); replay_mask - optional per-token mask; local_cp_size; model.
+    # Outputs: none.
+    # Exceptions: RuntimeError on missing data/mask/routers/coverage; IndexError if registry is short.
+    # Side effects: mutates RouterReplay instances (targets and backward queues); collectives.
+    # KNOWN ISSUE: replay_mask is silently ignored for non-nested (padded) inputs.
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
     RouterReplay instance with target indices for replay mode.
@@ -568,6 +657,11 @@ def set_router_replay_data(
 
 
 def iter_model_routers(model):
+    # [FUNCTION DOC]
+    # Behavior: generator over model chunks (list/tuple or single module); for each module in the
+    # chunk's decoder (or the chunk itself), yields (layer_number, router_replay) for TopKRouter
+    # modules having a non-None router_replay and layer_number. MTP layers are excluded by scoping.
+    # Inputs: model. Outputs: iterator of (int, RouterReplay).
     """Yield ``(layer_number, RouterReplay)`` for every replay-enabled router owned by ``model``.
 
     ``model`` is a single module or the list of virtual-pipeline chunks. The process-global
@@ -586,6 +680,9 @@ def iter_model_routers(model):
 
 
 def set_model_router_replay_action(model, router_replay_action):
+    # [FUNCTION DOC]
+    # Behavior: sets the given action on every router yielded by iter_model_routers(model).
+    # Side effects: mutates router state.
     """Set the router replay action on the forwarded model's own routers.
 
     Mirrors the module walk in ``set_router_replay_data``. Toggling through the positional slice can
@@ -603,6 +700,17 @@ def reorder_and_merge_vpp_layers(
     vpp_size: int,
     microbatch_group_size_per_vp_stage: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: builds Megatron's VPP schedule table (virtual microbatch -> (microbatch, chunk)),
+    # requires one captured tensor per schedule entry, groups captured tensors by chunk id in schedule
+    # order, concatenates each chunk's tensors along the batch dim (or merges jagged maps), then
+    # concatenates chunks along the layer dim (dim 2).
+    # Inputs: micro_batch_tensor_list - list of route maps in capture order; num_microbatches;
+    # vpp_size; microbatch_group_size_per_vp_stage.
+    # Outputs: (batch, seq, layers, topk) tensor (or jagged equivalent).
+    # Exceptions: RuntimeError when list length != schedule length.
+    # KNOWN ISSUE: the docstring describes a single input tensor and reshape; the code takes a list and
+    # concatenates, and does not raise ValueError as documented.
     """
     Reorder and merge per-VPP layer blocks into a contiguous layer dimension.
 
@@ -653,12 +761,21 @@ def reorder_and_merge_vpp_layers(
 
 
 def merge_nested_router_maps(router_maps) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Unbinds each jagged route map into per-sequence tensors, casts to int16 and rebuilds a
+    # single jagged tensor (sequence order preserved).
     """Flatten recorded micro-batch routes into one int16 jagged tensor."""
     tensors = [tensor.to(torch.int16) for router_map in router_maps for tensor in router_map.unbind()]
     return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
 
 
 def get_current_rank_layer_info(tf_config, vp_rank=None):
+    # [FUNCTION DOC]
+    # Behavior: vp_rank None -> 0; computes the layer count for this stage and the global layer offset
+    # (passing vp_stage if supported). Returns a dict with "start", "end" (exclusive) and "count".
+    # Inputs: tf_config; vp_rank. Outputs: dict.
+    # KNOWN ISSUE: docstring says it returns a tuple (local, all_assignments) and uses the current VP
+    # rank when None; the code returns only the local dict and defaults to 0.
     # When vp_rank is None, default to the current VP rank (or 0 if VP is disabled).
     """Return the local layer range/count for the current process and the full assignment table.
 
@@ -689,6 +806,18 @@ def get_current_rank_layer_info(tf_config, vp_rank=None):
 
 
 def pp_gather(local_layers_router_map, tf_config):
+    # [FUNCTION DOC]
+    # Behavior: returns the input when PP size <= 1. Otherwise checks PP group size; for jagged maps,
+    # moves to CPU and all_gather_object; for dense maps, views as uint8, all-gathers per-rank layer
+    # counts, pads the layer dim to the max count, all-gathers payloads and trims/reinterprets each as
+    # int16 (if every count is 0, uses the local map for all ranks). With VPP, reassembles layers in
+    # global order: for each vp stage then each pp stage, slices that rank's MoE layers for the chunk
+    # (offsets from get_moe_num_layers_to_build) and concatenates along layer dim; without VPP
+    # concatenates PP ranks in order. Result moved to CPU.
+    # Inputs: local_layers_router_map (batch, seq, local_layers, topk) int16 or jagged; tf_config.
+    # Outputs: global router map (batch, seq, moe_layers, topk) on CPU.
+    # Exceptions: RuntimeError on PP group size mismatch. Side effects: PP collectives.
+    # KNOWN ISSUE: the pp_size <= 1 early return does not move the map to CPU, unlike the docstring.
     """
     Gather local router maps from all PP ranks into a global router map.
 
@@ -776,10 +905,20 @@ def pp_gather(local_layers_router_map, tf_config):
 
 
 class RouterReplayHelper:
+    # [CLASS DOC]
+    # Static helpers locating local RouterReplay instances and querying their current action.
     """Helper class to query router replay state and locate local RouterReplay instances."""
 
     @staticmethod
     def get_micro_batch_router_list(tf_config, vp_rank=None):
+        # [FUNCTION DOC]
+        # Behavior: empty list if no registry. Validates vp_rank (None -> 0) against VPP size; computes
+        # MoE-layer counts per local VPP stage and the global MoE-layer count. If the registry size equals
+        # the local total, offset = sum of counts of earlier local stages; if it equals the global total,
+        # offset = number of MoE layers before this stage's start layer; else error. Returns the registry
+        # slice of length local_counts[vp_rank] at that offset.
+        # Inputs: tf_config; vp_rank. Outputs: list of RouterReplay.
+        # Exceptions: ValueError for out-of-range vp_rank; RuntimeError for unrecognized registry size.
         """
         Return the list of RouterReplay instances corresponding to the current micro-batch and local
         (pp_rank, vp_stage) layer range.
@@ -822,12 +961,16 @@ class RouterReplayHelper:
 
     @staticmethod
     def _get_action_router_list(tf_config, vp_rank=None, model=None):
+        # [FUNCTION DOC]
+        # HELPER: Routers of the given model if provided, else get_micro_batch_router_list.
         if model is not None:
             return [router for _, router in iter_model_routers(model)]
         return RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
 
     @staticmethod
     def is_r2_record_action(tf_config, vp_rank=None, model=None) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if routers exist and the first one's action is RECORD.
         """Return True if the current router_replay_action is RECORD (R2) for the local router instances.
 
         This inspects the first local RouterReplay instance's router_replay_action and compares it to
@@ -840,6 +983,8 @@ class RouterReplayHelper:
 
     @staticmethod
     def is_replay_forward_action(tf_config, vp_rank=None, model=None) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if routers exist and the first one's action is REPLAY_FORWARD.
         """Return True if the current router_replay_action is REPLAY_FORWARD for the local router instances.
 
         This inspects the first local RouterReplay instance's router_replay_action and compares it to
@@ -853,6 +998,8 @@ class RouterReplayHelper:
 
     @staticmethod
     def is_replay_backward_action(tf_config, vp_rank=None, model=None) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: True if routers exist and the first one's action is REPLAY_BACKWARD.
         """Return True if the current router_replay_action is REPLAY_BACKWARD for the local router instances.
 
         This inspects the first local RouterReplay instance's router_replay_action and compares it to

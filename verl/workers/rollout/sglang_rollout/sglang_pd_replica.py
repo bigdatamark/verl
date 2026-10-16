@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Prefill/decode (PD) disaggregated SGLang replica: one prefill server plus N decode
+# servers per replica, all on a single node, with possibly different TP sizes for
+# prefill and decode. Module state: logger (INFO).
 """SGLang PD-disaggregated replica: 1 prefill + N decode servers per replica,
 asymmetric TP supported. MVP: prefill_replicas=1, whole replica on one node."""
 
@@ -37,6 +41,10 @@ logger.setLevel(logging.INFO)
 
 
 class SGLangPDReplica(SGLangReplica):
+    # [CLASS DOC]
+    # SGLangReplica subclass that launches one prefill SGLangHttpServer and
+    # disaggregation.decode_replicas decode servers, wires the prefill server to its decode
+    # peers, and exposes the prefill server as the replica's entry address.
     """Replica that runs SGLang in prefill-decode disaggregated mode."""
 
     def __init__(
@@ -48,6 +56,16 @@ class SGLangPDReplica(SGLangReplica):
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Behavior: initializes the base replica, then validates and records PD topology:
+        # requires disaggregation.enabled, exactly one prefill replica, data_parallel_size 1,
+        # and prefill_tp + n_decode * decode_tp <= gpus_per_node (decode_tp defaults to the
+        # rollout TP). Overrides world_size to that PD total and recomputes
+        # gpus_per_replica_node and nnodes; initializes empty server lists/addresses.
+        # Inputs: replica_rank, config, model_config, gpus_per_node, reward/teacher flags.
+        # Exceptions: AssertionError if disaggregation is disabled; NotImplementedError for
+        # unsupported topologies.
+        # KNOWN ISSUE: unlike SGLangReplica, does not accept or forward name_suffix.
         super().__init__(
             replica_rank,
             config,
@@ -93,6 +111,20 @@ class SGLangPDReplica(SGLangReplica):
         self._bootstrap_port: Optional[int] = None
 
     async def launch_servers(self):
+        # [FUNCTION DOC]
+        # Launch the prefill server and then each decode server sequentially, then link them.
+        # Behavior: collects (node id, visible devices) from every worker; uses the configured
+        # bootstrap port or reserves a free one on this node's IP. The first prefill_tp workers
+        # form the prefill server; consecutive decode_tp-sized slices form each decode server.
+        # Each server is launched via _launch_one with its role and the shared bootstrap port.
+        # Records formatted "host:port" addresses (IPv6 bracketed), sets the prefill server as
+        # _server_handle/_server_address, sets servers to prefill + decode handles, calls
+        # set_pd_peer on the prefill server with the decode handles and prefill host, and logs.
+        # Exceptions: AssertionError if worker count mismatches world_size or on NPU.
+        # Side effects: creates named Ray actors, binds/closes a socket.
+        # KNOWN ISSUE: the code comment says the reserved bootstrap socket is held open until the
+        # prefill server binds it, but it is closed before the prefill server is launched, so the
+        # port-race window still exists.
         assert len(self.workers) == self.world_size
         assert not is_torch_npu_available(check_device=False), "PD on NPU not validated"
 
@@ -140,6 +172,8 @@ class SGLangPDReplica(SGLangReplica):
         prefill_address, prefill_port = await prefill_server.get_server_address.remote()
 
         def _fmt(addr, port):
+            # [FUNCTION DOC]
+            # HELPER: Format address and port as "host:port", bracketing IPv6 hosts.
             return f"[{addr}]:{port}" if is_valid_ipv6_address(addr) else f"{addr}:{port}"
 
         self._prefill_server_address = _fmt(prefill_address, prefill_port)
@@ -182,6 +216,9 @@ class SGLangPDReplica(SGLangReplica):
 
     @staticmethod
     def _collect_cuda_devices(worker_infos) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Union the comma-separated device ids of the given (node id, devices) pairs,
+        # dropping blanks, and return them sorted and comma-joined.
         devs = set()
         for _, dev_str in worker_infos:
             for d in dev_str.split(","):
@@ -199,6 +236,17 @@ class SGLangPDReplica(SGLangReplica):
         tp: int,
         actor_name: str,
     ) -> list[ActorHandle]:
+        # [FUNCTION DOC]
+        # HELPER: Create and launch one single-node SGLangHttpServer actor for a PD role.
+        # Behavior: base_gpu_id is 0 unless Ray's NOSET visible-devices env var is set, in which
+        # case (replica_rank * world_size) mod gpus_per_node. Copies the rollout config with
+        # tensor_model_parallel_size set to tp, creates the actor with hard node affinity, the
+        # NOSET env var set to "1", the given name and max_concurrency, passing the role and
+        # bootstrap port, and awaits launch_server.
+        # Outputs: single-element list with the actor handle.
+        # KNOWN ISSUE: with the NOSET env var set, every server of the replica (prefill and each
+        # decode) gets the same base_gpu_id, which does not account for the slice offset of each
+        # role's GPUs.
         base_gpu_id = 0
         if os.environ.get(f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}", None):
             base_gpu_id = (0 + self.replica_rank * self.world_size) % self.gpus_per_node

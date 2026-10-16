@@ -13,6 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# NVIDIA ModelOpt integration package for NVFP4 quantization-aware training (QAT) with Megatron
+# and quantized weight sync to vLLM. Re-exports build_quantize_config/apply_qat (quantize),
+# QATWeightExporter, the vLLM ModelOpt NVFP4 patch helpers, apply_qat_to_modules and
+# export_qat_weights. Importing it requires modelopt, Megatron and the vLLM patch module.
+
 """ModelOpt integration for NVFP4 quantization with Megatron QAT training and vLLM inference."""
 
 from verl.utils.modelopt.qat_utils import apply_qat_to_modules, export_qat_weights

@@ -30,6 +30,13 @@
 # - Extended functionality for distributed weight updates
 # - Improved logging and monitoring capabilities
 # - Additional configuration options and optimizations
+# [MODULE DOC]
+# HTTP client adapters that drive an SGLang HTTP server (launched as a child process or
+# already running) through its REST endpoints instead of in-process engine calls, with
+# retry/backoff and router registration. Module state: logger (level from
+# VERL_LOGGING_LEVEL, default WARN); defaults DEFAULT_TIMEOUT 60s, DEFAULT_MAX_ATTEMPTS 3,
+# DEFAULT_RETRY_DELAY 2s, DEFAULT_MAX_CONNECTIONS 2000, DEFAULT_MAX_WAIT_TIME 300s;
+# _ERROR_BODY_CHARS 2000 (log truncation for error bodies).
 
 """HTTP Server Engine Adapter for SGLang.
 
@@ -75,6 +82,9 @@ _ERROR_BODY_CHARS = 2000
 
 
 def _read_response(response: requests.Response):
+    # [FUNCTION DOC]
+    # HELPER: Decode a requests response: empty dict for 204 or empty body; parsed JSON when
+    # possible; otherwise a dict with "content_type" header and raw "text".
     if response.status_code == 204 or not response.content:
         return {}
     try:
@@ -87,11 +97,18 @@ def _read_response(response: requests.Response):
 
 
 def _log_error_body(endpoint: str, status: int, body: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Log an error line with endpoint, status and the body truncated to
+    # _ERROR_BODY_CHARS. Side effects: logging only.
     """Log a failed response's body; the raised error carries only the status line."""
     logger.error(f"HTTP error for {endpoint}: {status}, body={body[:_ERROR_BODY_CHARS]}")
 
 
 async def _read_async_response(resp: aiohttp.ClientResponse) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Async counterpart of _read_response for aiohttp: empty dict on 204 or zero
+    # content length; JSON (any content type) when parseable; else {"content_type", "text"};
+    # empty dict if even the text cannot be read. Never raises.
     if resp.status == 204 or (resp.content_length == 0):
         return {}
 
@@ -114,6 +131,22 @@ def launch_server_process(
     max_wait_time=DEFAULT_MAX_WAIT_TIME,
     first_rank_in_node=False,
 ) -> multiprocessing.Process:
+    # [FUNCTION DOC]
+    # Start an SGLang launch_server child process and, on the first rank of node 0, block
+    # until it is healthy.
+    # Behavior: creates the process; if node_rank != 0 or not first_rank_in_node, returns it
+    # WITHOUT starting it. Otherwise starts it and polls (every 2 s, until max_wait_time from
+    # start) "/health" (embedding models) or "/health_generate" with a bearer API key header
+    # until HTTP 200, then polls "/flush_cache" until 200 within the same overall deadline.
+    # Inputs: server_args; timeout - per-request timeout; max_wait_time - overall deadline;
+    # first_rank_in_node - whether this caller owns the server.
+    # Outputs: the multiprocessing.Process.
+    # Exceptions: RuntimeError if the process dies during either phase; TimeoutError (after
+    # terminating the process) if a phase does not succeed in time.
+    # Side effects: spawns a process, network calls, logging.
+    # KNOWN ISSUE: the early-return log call passes flush=True to logger.info, which the
+    # logging API rejects with TypeError when INFO is enabled; it also logs p.pid before the
+    # process is started (None). Docstring does not mention first_rank_in_node.
     """Launch an SGLang HTTP server process and wait for it to be ready.
 
     This function starts a new process running an SGLang HTTP server, then waits
@@ -197,6 +230,11 @@ def launch_server_process(
 
 
 class HttpServerAdapter(EngineBase):
+    # [CLASS DOC]
+    # Synchronous SGLang engine adapter over HTTP (implements EngineBase). Constructs
+    # ServerArgs from kwargs, optionally launches the server process, optionally registers
+    # with a router. Requests go to http://host:port/<endpoint>; control endpoints are
+    # issued only from node rank 0.
     """HTTP-based adapter for SGLang engines.
 
     This adapter allows interaction with SGLang engines through HTTP requests
@@ -230,6 +268,14 @@ class HttpServerAdapter(EngineBase):
         launch_server: bool = True,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC]
+        # Store retry/timeout settings, build ServerArgs from kwargs, record node_rank, launch
+        # the server process if launch_server (sets self.process), and register with the router
+        # when on node rank 0 and both router_ip and router_port are set.
+        # Inputs: router_ip/router_port; timeout; max_attempts; retry_delay; first_rank_in_node;
+        # max_start_wait_time; launch_server; kwargs - ServerArgs fields.
+        # Exceptions: propagates ServerArgs validation errors and launch_server_process errors.
+        # Side effects: may spawn a process and make HTTP calls; logs.
         """Initialize the HTTP server engine adapter.
 
         Args:
@@ -273,6 +319,9 @@ class HttpServerAdapter(EngineBase):
             self._register_with_router()
 
     def _register_with_router(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POST to the router's /add_worker with this server's URL as a query param;
+        # logs success or any error without raising.
         """Register worker with router with error handling.
 
         This method attempts to register the current worker with a router service.
@@ -300,6 +349,15 @@ class HttpServerAdapter(EngineBase):
         timeout: float = DEFAULT_TIMEOUT,
         only_master: bool = True,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Send a GET (no body) or POST (JSON body, default {}) to the endpoint with retries.
+        # Returns {} immediately when only_master and node_rank != 0. On timeout or connection
+        # error logs a warning and retries with exponential backoff (retry_delay * 2^attempt);
+        # on HTTP error logs the body and re-raises; other exceptions are logged and re-raised on
+        # the last attempt. Returns the decoded response.
+        # Exceptions: requests.HTTPError; RuntimeError after exhausting attempts; other
+        # exceptions on final attempt.
+        # KNOWN ISSUE: the timeout parameter is ignored; self.timeout is always used.
         """Make a HTTP request with retry logic and consistent error handling.
 
         Args:
@@ -353,6 +411,12 @@ class HttpServerAdapter(EngineBase):
         raise RuntimeError(f"Failed to complete request to {endpoint} after {self.max_attempts} attempts")
 
     def update_weights_from_tensor(self, req: UpdateWeightsFromTensorReqInput) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Push weight-update metadata: base64-encodes each serialized tensor bytes blob in req and
+        # POSTs them with load_format and flush_cache to "update_weights_from_tensor" (master
+        # only). Outputs: server response dict.
+        # KNOWN ISSUE: docstring documents individual arguments, but the method takes a single
+        # UpdateWeightsFromTensorReqInput.
         """Update model weights from tensor data.
 
         The HTTP server will only post meta data, and the real weights will be
@@ -395,6 +459,9 @@ class HttpServerAdapter(EngineBase):
         )
 
     def shutdown(self) -> None:
+        # [FUNCTION DOC]
+        # Unregister from the router (POST /remove_worker, 5 s timeout) when configured, then kill
+        # the server process tree if a process exists. All errors are logged, never raised.
         """Shutdown the HTTP server and clean up resources.
 
         This method performs the following cleanup operations:
@@ -439,6 +506,9 @@ class HttpServerAdapter(EngineBase):
         lora_path: Optional[str] = None,
         custom_logit_processor: Optional[Callable] = None,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Build a /generate payload from the given fields, drop None values, and POST it from any
+        # node rank (only_master False). Outputs: the server's response dict.
         """Generate text using the SGLang server.
 
         Args:
@@ -492,6 +562,10 @@ class HttpServerAdapter(EngineBase):
         image_data: Optional[Any] = None,
         lora_path: Optional[str] = None,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # POST a /classify request (text, input_ids, image_data, lora_path, None values dropped)
+        # from any rank and return the response.
+        # Exceptions: AssertionError unless the server is an embedding model.
         assert self.server_args.is_embedding, "Score is only supported for embedding models"
         payload = {
             "text": prompt,
@@ -505,6 +579,10 @@ class HttpServerAdapter(EngineBase):
         return self._make_request("classify", payload, only_master=False)
 
     def flush_cache(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Flush the server cache on node rank 0 (other ranks return {}). Tries GET /flush_cache up
+        # to max_attempts*2 times, sleeping retry_delay between failures; returns the decoded
+        # response on HTTP 200, else logs an error and returns {}. Exceptions are swallowed.
         """Flush the cache of the server.
 
         This method repeatedly attempts to flush the server cache until successful.
@@ -538,6 +616,8 @@ class HttpServerAdapter(EngineBase):
         return {}
 
     def release_memory_occupation(self, tags: Optional[list[str]] = None) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # POST release_memory_occupation with the given tags (None means all); master only.
         """Release GPU memory occupation temporarily.
 
         Args:
@@ -550,6 +630,8 @@ class HttpServerAdapter(EngineBase):
         return self._make_request("release_memory_occupation", {"tags": tags})
 
     def resume_memory_occupation(self, tags: Optional[list[str]] = None) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # POST resume_memory_occupation with the given tags (None means all); master only.
         """Resume GPU memory occupation.
 
         Args:
@@ -562,6 +644,8 @@ class HttpServerAdapter(EngineBase):
         return self._make_request("resume_memory_occupation", {"tags": tags})
 
     def abort_request(self, rid: str = "", abort_all: bool = False) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # POST abort_request with rid and abort_all flag; master only.
         """Abort a request.
 
         Args:
@@ -575,6 +659,9 @@ class HttpServerAdapter(EngineBase):
 
 
 class AsyncHttpServerAdapter(HttpServerAdapter):
+    # [CLASS DOC]
+    # Async variant of HttpServerAdapter using aiohttp, with a fresh pooled session per
+    # request. Overrides control and generation methods as coroutines.
     """Asynchronous HTTP-based adapter for SGLang engines.
 
     This class inherits from HttpServerAdapter and adds async capabilities
@@ -601,6 +688,9 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         launch_server: bool = True,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC]
+        # Delegate to HttpServerAdapter.__init__ (same semantics) and store max_connections for
+        # the per-request connector.
         """Initialize the async HTTP server engine adapter.
 
         Args:
@@ -634,6 +724,10 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
 
     @asynccontextmanager
     async def _get_session(self) -> aiohttp.ClientSession:
+        # [FUNCTION DOC]
+        # HELPER: Async context manager yielding a new aiohttp ClientSession with a TCP connector
+        # (limit max_connections, per-host limit max_connections // 4, 300 s DNS cache) and total
+        # timeout self.timeout; closes it on exit.
         """Context manager for safe session access with proper connection pooling.
 
         Yields:
@@ -668,6 +762,13 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         timeout: float = DEFAULT_TIMEOUT,
         only_master: bool = True,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Async request with retries; same contract as _make_request. GET or POST (JSON,
+        # default {}) using the timeout argument per request. For status >= 400 logs the body and
+        # raises ClientResponseError (re-raised immediately). Timeouts and connector errors are
+        # warned and retried with exponential backoff via async sleep; other errors re-raised on
+        # the final attempt. Exceptions: aiohttp.ClientResponseError; RuntimeError after
+        # exhausting attempts.
         """Make an async HTTP request with retry logic and consistent error handling.
 
         Args:
@@ -729,6 +830,8 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         raise RuntimeError(f"Failed to complete async request to {endpoint} after {self.max_attempts} attempts")
 
     async def release_memory_occupation(self, tags: Optional[list[str]] = None) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Async POST release_memory_occupation with tags; master only.
         """Release GPU memory occupation temporarily (async version).
 
         Args:
@@ -741,6 +844,10 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         return await self._make_async_request("release_memory_occupation", {"tags": tags})
 
     async def resume_memory_occupation(self, tags: Optional[list[str]] = None) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Async POST resume_memory_occupation with tags; master only.
+        # KNOWN ISSUE: docstring claims first-time weight reloading via release_memory_occupation,
+        # but the method only forwards the resume request.
         """Resume GPU memory occupation (async version).
 
         Similar to AsyncEngine, this method handles first-time weight reloading
@@ -759,6 +866,11 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         self,
         req: UpdateWeightsFromTensorReqInput,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Async version of update_weights_from_tensor: base64-encodes req.serialized_named_tensors
+        # and POSTs them with load_format and flush_cache (master only).
+        # Exceptions: TypeError if serialized_named_tensors is None (unlike the sync version, which
+        # treats empty/None as an empty list).
         """Update model weights from tensor data asynchronously.
 
         Args:
@@ -788,6 +900,9 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         )
 
     async def load_lora_adapter_from_tensor(self, req):
+        # [FUNCTION DOC]
+        # POST "load_lora_adapter_from_tensors" with req.lora_name, req.config_dict and the
+        # base64-encoded req.serialized_named_tensors (master only). Returns the response dict.
         import base64
 
         # Base64 like update_weights_from_tensor above: the field is List[bytes], JSON has none.
@@ -802,6 +917,8 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         )
 
     async def unload_lora_adapter(self, lora_name: str):
+        # [FUNCTION DOC]
+        # POST "unload_lora_adapter" for lora_name (master only). Returns the response dict.
         return await self._make_async_request(
             "unload_lora_adapter",
             {
@@ -810,9 +927,15 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         )
 
     async def available_models(self):
+        # [FUNCTION DOC]
+        # GET "v1/models" (master only) and return the response dict.
         return await self._make_async_request(endpoint="v1/models", method="GET")
 
     async def flush_cache(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Async flush_cache on node rank 0: up to max_attempts*4 GET /flush_cache tries with
+        # retry_delay sleeps; returns the decoded body on 200, else logs and returns {}.
+        # Exceptions swallowed. Other ranks return {}.
         """Flush the cache of the server asynchronously.
 
         Similar to the sync version, this method retries until the cache
@@ -858,6 +981,9 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         lora_path: Optional[str] = None,
         custom_logit_processor: Optional[Callable] = None,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Async /generate: builds the payload (None values dropped), logs start, POSTs from any
+        # rank with self.timeout, and returns the response dict.
         """Generate text using the SGLang server asynchronously."""
         logger.info("generate() started")
 
@@ -895,6 +1021,8 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         lora_path: Optional[str] = None,
         custom_logit_processor: Optional[Callable] = None,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Alias of generate kept for AsyncEngine interface compatibility; forwards all args.
         """Async generate method that mirrors AsyncEngine.async_generate interface.
 
         This method provides compatibility with AsyncEngine's async_generate method
@@ -948,6 +1076,9 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         image_data: Optional[Any] = None,
         lora_path: Optional[str] = None,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Async /classify from any rank with None values dropped; logs start; returns response.
+        # KNOWN ISSUE: unlike the sync version it does not assert the server is an embedding model.
         logger.info("reward_score() started")
         payload = {
             "text": prompt,
@@ -970,6 +1101,8 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         image_data: Optional[Any] = None,
         lora_path: Optional[str] = None,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Alias of reward_score; forwards all args.
         return await self.reward_score(
             prompt=prompt,
             input_ids=input_ids,
@@ -978,6 +1111,8 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         )
 
     async def abort_request(self, rid: str = "", abort_all: bool = False) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Async POST abort_request with rid and abort_all; master only.
         """Abort a request asynchronously.
 
         Args:

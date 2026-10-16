@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# ROCm repair utility for vLLM expert-parallel routing buffers zeroed by dummy-weight init. Logger
+# level is taken from VERL_LOGGING_LEVEL (default WARN).
+
 import logging
 import os
 
@@ -20,6 +24,16 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def restore_moe_expert_maps(model):
+    # [FUNCTION DOC]
+    # Behavior: iterates all modules; for each vLLM RoutedExperts with an expert_map_manager and EP
+    # enabled, recomputes the expert map (and mask when ROCm aiter is enabled) from the manager's EP size,
+    # rank, global expert count, placement strategy and fused-shared-expert count. For each of the
+    # _expert_map and expert_mask buffers that exist both live and rebuilt, copies the rebuilt values in
+    # place (moved to the live device) and counts it. Logs the count if non-zero.
+    # Inputs: model - vLLM model. Outputs: int number of buffers repaired.
+    # Exceptions: RuntimeError if a rebuilt buffer's shape differs from the live one; ImportError if vLLM
+    # lacks the referenced modules.
+    # Side effects: in-place writes to module buffers; logs.
     """Rebuild the EP expert maps of every ``RoutedExperts`` layer, in place.
 
     A rollout engine comes up on dummy weights, whose init zeroes the int32

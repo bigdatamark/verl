@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Metric aggregation utilities package; re-exports reduce_metrics, AggregationType and Metric from
+# the utils submodule.
+
 from .utils import AggregationType, Metric, reduce_metrics
 
 __all__ = ["reduce_metrics", "AggregationType", "Metric"]

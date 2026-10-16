@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# APPS-style test harness that executes generated Python code in-process (intended to run in a
+# dedicated child process) against input/output cases. Supports two modes: call-based (a named
+# function or Solution method called with JSON-decoded arguments) and standard-input (the program
+# is wrapped into a function and fed stdin via mocks while stdout is captured). Timeouts use
+# SIGALRM; destructive OS functions are disabled beforehand by reliability_guard.
 
 import ast
 import faulthandler
@@ -37,6 +43,10 @@ import numpy as np
 
 
 def module_from_string(name: str, code: str) -> ModuleType:
+    # [FUNCTION DOC]
+    # HELPER: Compiles code with filename "<string>", executes it in a fresh module namespace, registers
+    # the module in the global module registry under name, and returns it.
+    # Exceptions: propagates compile/runtime errors from the code. Side effects: executes arbitrary code.
     """Compile ``code`` into a new in-memory module registered under ``name``.
 
     Replaces ``pyext.RuntimeModule.from_string``, since ``pyext`` is unmaintained and cannot be
@@ -50,6 +60,9 @@ def module_from_string(name: str, code: str) -> ModuleType:
 
 
 def truncatefn(s, length=300):
+    # [FUNCTION DOC]
+    # HELPER: Returns s unchanged if at most length chars; otherwise the first length/2 chars, the marker
+    # "...(truncated) ..." and the last length/2 chars. Exceptions: AssertionError if s is not a str.
     assert isinstance(s, str)
     if len(s) <= length:
         return s
@@ -58,6 +71,8 @@ def truncatefn(s, length=300):
 
 
 class CODE_TYPE(Enum):
+    # [CLASS DOC]
+    # Enumeration of test modes: call_based (0) and standard_input (1).
     call_based = 0
     standard_input = 1
 
@@ -66,7 +81,13 @@ class CODE_TYPE(Enum):
 # from https://stackoverflow.com/a/16571630/6416660
 # alternative use redirect_stdout() from contextlib
 class Capturing(list):
+    # [CLASS DOC]
+    # HELPER: Context manager that is also a list; captures everything written to stdout while active and
+    # appends the captured text as one string element on exit.
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Saves the current stdout, replaces it with an in-memory text buffer whose close is made a no-op,
+        # and returns self.
         self._stdout = sys.stdout
         sys.stdout = self._stringio = StringIO()
         # Make closing the StringIO a no-op
@@ -74,24 +95,36 @@ class Capturing(list):
         return self
 
     def __exit__(self, *args):
+        # [FUNCTION DOC]
+        # Appends the buffer contents to self, deletes the buffer and restores the saved stdout.
         self.append(self._stringio.getvalue())
         del self._stringio  # free up some memory
         sys.stdout = self._stdout
 
 
 def only_int_check(val):
+    # [FUNCTION DOC]
+    # HELPER: True if val is an int.
     return isinstance(val, int)
 
 
 def string_int_check(val):
+    # [FUNCTION DOC]
+    # HELPER: True if val is a str consisting only of digits.
     return isinstance(val, str) and val.isdigit()
 
 
 def combined_int_check(val):
+    # [FUNCTION DOC]
+    # HELPER: True if val is an int or a digit-only string.
     return only_int_check(val) or string_int_check(val)
 
 
 def clean_traceback(error_traceback):
+    # [FUNCTION DOC]
+    # HELPER: Trims a formatted traceback to start at the first 'File "<string>"' frame (generated code),
+    # prefixed with a standard "Traceback (most recent call last):" header. If not found, the find index
+    # is -1 and only the last character is kept after the header.
     file_start = error_traceback.find('File "<string>"')
     # print(file_start)
     error_traceback = "Traceback (most recent call last):\n  " + error_traceback[file_start:]
@@ -99,6 +132,39 @@ def clean_traceback(error_traceback):
 
 
 def run_test(in_outs, test=None, debug=False, timeout=15):
+    # [FUNCTION DOC]
+    # Executes generated code against all test cases and returns per-case results plus metadata of the
+    # first failure.
+    # Behavior:
+    # - Calls reliability_guard first (irreversibly disables destructive functions in this process).
+    # - Mode: standard_input if in_outs has no "fn_name", else call_based using that name.
+    # - Prepends a fixed header of wildcard/standard imports and a raised recursion limit.
+    # - Call-based: appends code, compiles under a timeout alarm; target is the module, or an instance of
+    #   Solution when the code contains "class Solution". Standard-input: if the code ends with an
+    #   if-name-equals-main block it is unwrapped; non-import lines are indented and wrapped into a
+    #   function "code" (preceded by stdin/stdout aliases); compiled under alarm.
+    # - Compile failures return ([-2], {error, traceback}); failure to find the method also returns -2.
+    # - For each case: call-based decodes each input line as JSON and the expected output as JSON;
+    #   string-keyed dicts are converted to int keys. The method is called with unpacked args; result
+    #   (tuples turned into lists) is compared to expected, or expected[0], or tuple elements as lists.
+    #   A mismatch returns immediately with {output, expected, inputs, error_message "Wrong Answer"};
+    #   an exception/timeout appends -1 and returns {error, traceback}.
+    # - Standard-input: joins list inputs/outputs with newlines, runs via call_method inside Capturing
+    #   under alarm (exception -> -1 and return), splits captured stdout into lines and tries a cascade
+    #   of comparisons: joined-string compare, line-list equality, stripped lines, re-splitting expected
+    #   output into stripped non-empty lines, float closeness when not all integers, and finally
+    #   whitespace-split set equality. A final mismatch returns "Wrong Answer" metadata.
+    # Inputs: in_outs - dict with "inputs", "outputs", optional "fn_name" (mutated in place);
+    # test - generated code string; debug - verbose prints; timeout - seconds per alarm.
+    # Outputs: tuple (list of per-case results True/False/-1/-2, metadata dict; {} if all pass).
+    # Exceptions: AssertionError if test is None.
+    # Side effects: executes untrusted code, sets alarms, mutates in_outs, patches globals, prints.
+    # KNOWN ISSUE: no SIGALRM handler is installed, so an expired alarm uses the default action and
+    # terminates the whole process rather than raising; the outer process-level timeout handles it.
+    # KNOWN ISSUE: if in_outs is falsy, which_type is never assigned and a NameError occurs.
+    # KNOWN ISSUE: debug messages for call-based and standard-input runtime errors are swapped.
+    # KNOWN ISSUE: the final set-based comparison converts output into sets but never re-compares, so
+    # that last conversion has no effect on tmp_result.
     """
     if test(generated_code) is not None it'll try to run the code.
     otherwise it'll just return an input and output pair.
@@ -567,6 +633,9 @@ def run_test(in_outs, test=None, debug=False, timeout=15):
 
 
 def custom_compare_(output, ground_truth):
+    # [FUNCTION DOC]
+    # HELPER: When output is a list of lines, returns True if joining them with newlines (raw, or with
+    # each line stripped) equals ground_truth after stripping both ends; otherwise False.
     if isinstance(output, list):
         output_1 = "\n".join(output)
         if stripped_string_compare(output_1, ground_truth):
@@ -582,12 +651,19 @@ def custom_compare_(output, ground_truth):
 
 
 def stripped_string_compare(s1, s2):
+    # [FUNCTION DOC]
+    # HELPER: Equality of two strings after stripping leading/trailing whitespace.
     s1 = s1.lstrip().rstrip()
     s2 = s2.lstrip().rstrip()
     return s1 == s2
 
 
 def call_method(method, inputs):
+    # [FUNCTION DOC]
+    # HELPER: Invokes a no-argument program function with stdin simulated from inputs (list joined by
+    # newlines). Patches builtins.open (returns inputs), sys.stdin and its readline (successive lines),
+    # readlines and read during the call; SystemExit is swallowed.
+    # Outputs: the function's return value, or None on SystemExit.
     if isinstance(inputs, list):
         inputs = "\n".join(inputs)
 
@@ -603,6 +679,8 @@ def call_method(method, inputs):
     @patch("sys.stdin.read", lambda *args: inputs)
     # @patch('sys.stdout.write', print)
     def _inner_call_method(_method):
+        # [FUNCTION DOC]
+        # HELPER: Calls _method under the patches, returning its result or None if it raises SystemExit.
         try:
             return _method()
         except SystemExit:
@@ -614,6 +692,14 @@ def call_method(method, inputs):
 
 
 def reliability_guard(maximum_memory_bytes=None):
+    # [FUNCTION DOC]
+    # Disables destructive functionality in the current process so generated code can't easily harm
+    # the host (not a security sandbox). Optionally sets address-space, data (and on non-macOS, stack)
+    # resource limits to maximum_memory_bytes. Disables faulthandler; sets OMP_NUM_THREADS=1; sets
+    # exit/quit, many os functions (kill, system, remove, fork, chdir, getcwd, ...), shutil
+    # rmtree/move/chown, subprocess.Popen and help to None; blocks importing ipdb, joblib, resource,
+    # psutil, tkinter, subprocess and ctypes by setting their module registry entries to None.
+    # Side effects: irreversible global mutation of the process.
     """
     This disables various destructive functions and prevents the generated code
     from interfering with the test (e.g. fork bomb, killing other processes,

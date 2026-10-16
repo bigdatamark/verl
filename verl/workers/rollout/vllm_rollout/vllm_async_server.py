@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# vLLM rollout server side. Defines vLLMHttpServer, a Ray actor (one per replica node) that builds
+# vLLM "serve" CLI arguments from verl config, starts an AsyncLLM engine plus OpenAI-compatible
+# HTTP app (master node) or a headless engine (other nodes), and exposes token-in-token-out
+# generation, sleep/wake, weight-update RPC, request pause/abort/drain, profiling, and
+# prefill/decode disaggregated routing. Also defines vLLMReplica, the RolloutReplica that creates
+# and launches these server actors. At import, optionally preloads the GPT-OSS harmony encoding
+# when VERL_USE_GPT_OSS is "1"; records the installed vLLM version for feature gating.
 import argparse
 import asyncio
 import inspect
@@ -85,6 +93,12 @@ logger.setLevel(logging.INFO)
 
 
 class vLLMHttpServer:
+    # [CLASS DOC]
+    # Server actor for one node of one rollout replica. Key state: config/model_config (converted to
+    # dataclasses), workers (the trainer-side worker actors whose GPUs it uses), replica/node rank,
+    # engine (AsyncLLM, set after launch on master node), global_steps (weights version), submission
+    # gating state (paused flag, admitting counter, resume event, rejecting flag), HTTP address/port,
+    # profiler controller, master/DP ports reserved on node 0, and PD peer routing state.
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
     vllm serve --tensor-parallel-size=8 ...
@@ -105,6 +119,19 @@ class vLLMHttpServer:
         disaggregation_role: str = "null",
         disaggregation_kv_transfer_config: Optional[dict] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: validates disaggregation_role is null/prefill/decode and that PD roles have a KV
+        # transfer config (ValueError otherwise). Initializes PD peer state. Sets environment: the
+        # platform's visible devices variable, VERL_REPLICA_RANK, VERL_RAY_JOB_ID. Converts and validates
+        # configs; when full_determinism, enables deterministic mode with seed replica_rank + config seed
+        # and sets VERL_FULL_DETERMINISM, VERL_SEED, VLLM_BATCH_INVARIANT. Initializes gating state (resume
+        # event set), node IP as server address, profiler (only torch/npu tools are supported; others warn
+        # and disable), replica world size (tp*dp*pp) and global ranks to keep. On node 0 reserves free
+        # ports for master, DP RPC and DP master (keeping sockets alive); others get None. Finally calls
+        # the subclass hook _post_init.
+        # Inputs: see docstring; workers - worker actor handles on this node.
+        # Exceptions: ValueError for invalid PD arguments; config validation errors.
+        # Side effects: mutates process environment, binds sockets, may enable deterministic algorithms.
         """
         Args:
             config (RolloutConfig): full config.
@@ -220,6 +247,8 @@ class vLLMHttpServer:
         self._post_init(cuda_visible_devices)
 
     def get_master_address(self):
+        # [FUNCTION DOC]
+        # Returns (master address, master port, DP RPC port); values are None on non-master nodes.
         """Get master address and port for data parallel.
         Returns:
             tuple: (master_address, master_port, dp_rpc_port)
@@ -227,11 +256,15 @@ class vLLMHttpServer:
         return self._master_address, self._master_port, self._dp_rpc_port
 
     def get_server_address(self):
+        # [FUNCTION DOC]
+        # Returns (HTTP server address, port). Exceptions: AssertionError before the server is launched.
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
 
     def get_rollout_config(self):
+        # [FUNCTION DOC]
+        # Returns the server's RolloutConfig dataclass. Side effects: none.
         """Get the RolloutConfig (e.g. max_num_seqs, max_model_len).
 
         Lets external routers fetch server-side config (vLLM doesn't expose
@@ -242,6 +275,9 @@ class vLLMHttpServer:
 
     @property
     def lora_as_adapter(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: true when LoRA rank (lora_rank or lora rank entry) is positive and merge is not set,
+        # i.e. LoRA is served as a separate adapter rather than merged into base weights.
         return (
             self.model_config.lora_rank > 0 or self.model_config.lora.get("rank", 0) > 0
         ) and not self.model_config.lora.get("merge", False)
@@ -253,6 +289,12 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: forwards a collective RPC (method name or callable, timeout, args, kwargs) to all
+        # engine workers and awaits completion.
+        # Outputs: None.
+        # KNOWN ISSUE: the RPC result is discarded, so callers (ServerAdapter._execute_method, which
+        # documents returning the result) always receive None.
         await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
@@ -266,6 +308,9 @@ class vLLMHttpServer:
         prefill_side_channel_port: int,
         prefill_engine_id: str,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: registers decode peer servers, the prefill side-channel port and prefill engine id
+        # for PD routing. Exceptions: AssertionError if not the prefill role or peers empty / not a list.
         assert self._disaggregation_role == "prefill", (
             f"set_pd_peer must be called on the prefill server (got role={self._disaggregation_role!r})"
         )
@@ -275,6 +320,26 @@ class vLLMHttpServer:
         self._pd_prefill_engine_id = prefill_engine_id
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+        # [FUNCTION DOC]
+        # Behavior: on non-master nodes, requires and stores the master address/ports. Builds engine
+        # kwargs from config engine_kwargs for this engine key (dropping None values, adding image limit),
+        # applies the subclass preprocess hook, computes override generation config, enables expandable
+        # CUDA segments when sleep mode is off, applies quantization overrides. Builds compilation config
+        # (parsed from JSON string if needed; cudagraph_mode default FULL_AND_PIECEWISE, downgraded to
+        # PIECEWISE with a warning when decode context parallel > 1; optional capture sizes), then the
+        # argument map (dtype, load format, mp executor, worker extension class, lengths, batching, prefix
+        # caching, sleep mode, logprobs mode, eager, memory utilization, TP size, seed replica_rank+seed,
+        # quantization, scheduling policy, plus engine kwargs). Adds profiler CLI args only when this
+        # replica is profiled and vLLM is at least 0.13; served model name (basename of a path) when
+        # prometheus is enabled; MTP speculative config; data-parallel args (asserting gpus_per_node
+        # divisible by TP and worker count equals local DP times TP); expert parallel flag; multi-node
+        # torch distributed args; LoRA args (rank from lora config or lora_rank, zero when merged; max one
+        # LoRA, rounded max rank, optional fully sharded); routed experts return for routing replay
+        # (RuntimeError if vLLM older than 0.22.0); KV transfer config JSON for PD roles. Converts to a
+        # CLI list, prints it on replica 0, parses with vLLM's subcommand parser from the CLI modules hook,
+        # sets model from model_tag, validates, then runs the full server on node 0 or headless elsewhere.
+        # Exceptions: AssertionError on missing master info or DP layout mismatch; RuntimeError above.
+        # Side effects: launches the engine, sets environment/CUDA allocator settings, prints.
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
                 "non-master node should provide master_address, master_port and dp_rpc_port"
@@ -479,6 +544,14 @@ class vLLMHttpServer:
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
+        # [FUNCTION DOC]
+        # Behavior: creates engine config from CLI args, sets the DP master port to the reserved port,
+        # builds AsyncLLM passing logging/stat flags only if supported by its signature. Resets the
+        # multimodal cache, calls monkey_patch_model on workers to ban vision placeholder tokens (using
+        # tokenizer vocab size). Builds the OpenAI app and initializes its state using whichever signature
+        # this vLLM version provides (supported_tasks, model_config, vllm_config variants). Logs config on
+        # replica 0, stores the engine, and starts uvicorn, storing port and server task.
+        # Side effects: allocates GPU resources, opens HTTP port.
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
@@ -533,14 +606,24 @@ class vLLMHttpServer:
         self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
 
     async def run_headless(self, args: argparse.Namespace):
+        # [FUNCTION DOC]
+        # Behavior: sets API server count to 0 and runs vLLM's blocking headless entrypoint in a worker
+        # thread as an asyncio task; a done-callback logs the outcome and terminates the process with exit
+        # code 1, since headless mode should never finish.
+        # Side effects: spawns thread; process exits when the headless engine ends.
         """Run headless server in a separate thread."""
         args.api_server_count = 0
 
         def run_headless_wrapper():
+            # [FUNCTION DOC]
+            # HELPER: runs the headless engine with signal handler installation suppressed (not main thread).
             with SuppressSignalInThread():
                 run_headless(args)
 
         def on_run_headless_done(future: asyncio.Future):
+            # [FUNCTION DOC]
+            # HELPER: logs the exception (or an unexpected-completion warning) from the finished future, then
+            # always hard-exits the process with status 1.
             try:
                 exc = future.exception()
                 if exc:
@@ -567,6 +650,27 @@ class vLLMHttpServer:
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
     ) -> TokenOutput:
+        # [FUNCTION DOC]
+        # Behavior: on the prefill server with peers and no KV transfer params, delegates to PD dispatch.
+        # Otherwise normalizes prompt ids; computes headroom (max_model_len minus prompt length, ValueError
+        # if under 1). Takes max_tokens from sampling params "max_tokens" or "max_new_tokens" (popped),
+        # else the minimum of response_length and prompt_length+response_length-prompt length; clamps to
+        # [1, headroom]. Converts the logprobs flag to 0 (return sampled-token logprob) or None; defaults
+        # repetition_penalty, ignore_eos, and seed under full determinism. Adds KV transfer params into
+        # extra_args. Builds SamplingParams, deduplicates Qwen2.5-VL image tokens, assembles multimodal data
+        # and prompt (falls back to a plain mapping if the prompt type rejects fields). Adds the LoRA
+        # request if served as adapter and loaded. Waits for admission via the submission gate (returning
+        # an aborted result if rejected), then streams engine.generate under a trace span, decrementing the
+        # admitting counter exactly once on first output or on exit. If outputs are empty returns an
+        # aborted TokenOutput. Otherwise collects cached-token count, prompt logprobs, token ids, per-token
+        # logprobs, routed experts (when replay), stop reason (abort -> aborted, stop/length -> completed,
+        # else raw), preemption count, response KV transfer params, and MTP spec-decode stats (warning once
+        # if missing).
+        # Inputs: prompt ids, sampling params mapping (mutated), request id, optional image/video/audio
+        # data, processor kwargs, priority, KV transfer params.
+        # Outputs: TokenOutput with extra_fields including global_steps.
+        # Exceptions: ValueError on no headroom; AssertionError if no output was produced.
+        # Side effects: mutates sampling_params argument; gate counters.
         """Generate sequence with token-in-token-out.
 
         Args:
@@ -758,6 +862,8 @@ class vLLMHttpServer:
         )
 
     def _select_decode_peer(self) -> ActorHandle:
+        # [FUNCTION DOC]
+        # HELPER: returns the next decode peer in round-robin order and advances the index.
         """Round-robin across decode peers."""
         peer = self._pd_decode_peers[self._pd_peer_idx % len(self._pd_decode_peers)]
         self._pd_peer_idx += 1
@@ -774,6 +880,16 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
     ) -> TokenOutput:
+        # [FUNCTION DOC]
+        # HELPER: PD routing. Picks a decode peer round-robin and detects Mooncake from the KV connector
+        # name. Runs a prefill leg locally via generate with request id suffixed "_P", max_tokens forced to
+        # 1 (output discarded) and KV params requesting remote decode with a fresh transfer id. Builds
+        # decode KV params: for Mooncake, remote-prefill params naming the prefill engine id, a localhost
+        # bootstrap URL on the prefill side-channel port, and the transfer id; otherwise the KV transfer
+        # params returned by the prefill leg. Then calls the decode peer's generate remotely with a copy of
+        # the original sampling params, request id suffixed "_D", and those KV params.
+        # Outputs: the decode peer's TokenOutput.
+        # Exceptions: RuntimeError if a non-Mooncake prefill leg returns no KV transfer params.
         """Run prefill locally, then decode on a selected peer."""
         decode_peer = self._select_decode_peer()
         connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
@@ -830,6 +946,11 @@ class vLLMHttpServer:
         )
 
     async def wake_up(self, tags: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Behavior: master node only. HYBRID mode: wake engine with given tags (or default wake tags),
+        # then reset prefix cache including external connector. COLOCATED: wake with default tags (ignores
+        # the tags argument) and reset prefix cache. STANDALONE: log and skip.
+        # Side effects: reallocates GPU memory for weights/KV cache.
         if self.node_rank != 0:
             return
 
@@ -851,6 +972,9 @@ class vLLMHttpServer:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
+        # [FUNCTION DOC]
+        # Behavior: master node only and only when free_cache_engine: HYBRID delegates to the sleep hook,
+        # COLOCATED sleeps at level 1, STANDALONE logs and skips.
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
@@ -862,6 +986,9 @@ class vLLMHttpServer:
             logger.info("skip sleep in standalone mode")
 
     async def clear_kv_cache(self):
+        # [FUNCTION DOC]
+        # Behavior: master node only; resets prefix cache (including external KV connector store),
+        # multimodal cache and encoder cache, e.g. after weights change.
         if self.node_rank == 0:
             # reset_connector=True drops any attached external KV store
             # (e.g. MooncakeStoreConnector) whose entries were computed
@@ -873,6 +1000,9 @@ class vLLMHttpServer:
             await self.engine.reset_encoder_cache()
 
     async def release_kv_cache(self):
+        # [FUNCTION DOC]
+        # Behavior: master node, free_cache_engine set, and not COLOCATED: sleeps at the resolved level
+        # then wakes only the weights, leaving the KV cache freed. Otherwise no-op.
         """Free the kv_cache pool for the duration of a weight sync."""
         # TODO: use the real release_kv_cache() method after vllm supports it (vllm#44890/46438)
         if self.node_rank != 0 or not self.config.free_cache_engine:
@@ -883,6 +1013,8 @@ class vLLMHttpServer:
         await self.engine.wake_up(tags=["weights"])
 
     async def resume_kv_cache(self):
+        # [FUNCTION DOC]
+        # Behavior: same guards as release_kv_cache; wakes the KV cache and resets prefix cache.
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
@@ -892,6 +1024,8 @@ class vLLMHttpServer:
         await self.engine.reset_prefix_cache(reset_connector=True)
 
     def _should_profile(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: true when profiling is enabled, this replica is selected, and discrete mode is used.
         """Whether this replica drives the engine profiler."""
         return (
             self.profiler_controller.check_enable()
@@ -900,12 +1034,18 @@ class vLLMHttpServer:
         )
 
     async def start_profile(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: master node only; starts the engine profiler with kwargs if this replica profiles.
         if self.node_rank != 0:
             return
         if self._should_profile():
             await self.engine.start_profile(**kwargs)
 
     async def stop_profile(self):
+        # [FUNCTION DOC]
+        # Behavior: master node only; if profiling, stops the engine profiler and relocates its traces into
+        # the configured save path, keeping only the selected global ranks.
+        # Side effects: filesystem moves of trace files.
         if self.node_rank != 0:
             return
         if self._should_profile():
@@ -922,13 +1062,29 @@ class vLLMHttpServer:
             )
 
     async def set_global_steps(self, global_steps: int):
+        # [FUNCTION DOC]
+        # Stores the weights version tag reported in each generation's extra fields.
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
     async def wait_for_requests_to_drain(self):
+        # [FUNCTION DOC]
+        # Awaits until the engine has no in-flight requests. Exceptions: AttributeError on non-master nodes
+        # (no engine).
         await self.engine.wait_for_requests_to_drain()
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True, reject_request: bool = False) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: non-master nodes return zero aborted. Otherwise closes the submission gate (paused,
+        # rejecting flag as given, resume event cleared), waits up to 60 seconds (polling every 10 ms) for
+        # in-flight admissions to reach the engine (warns on timeout), snapshots the engine's current
+        # request ids, and pauses the engine without waiting for in-flight requests (aborting them and
+        # clearing caches when reset_prefix_cache). Logs and returns the counts.
+        # Outputs: mapping with aborted_count and request_ids.
+        # Exceptions: any engine error is logged and re-raised.
+        # Side effects: engine remains paused and gate closed until resume_generation.
+        # KNOWN ISSUE: the docstring describes a manual per-request abort path for vLLM < 0.12.0, but the
+        # code always uses pause_generation with no version check.
         """Abort all ongoing generation requests.
 
         On vLLM >= 0.12.0, uses AsyncLLM.pause_generation() to abort in-flight
@@ -1004,22 +1160,32 @@ class vLLMHttpServer:
             raise
 
     async def resume_engine_generation(self):
+        # [FUNCTION DOC]
+        # Master node only: resumes the engine's scheduling; the submission gate stays closed.
         """Resume the DP engines while request admission remains closed."""
         if self.node_rank == 0:
             await self.engine.resume_generation()
 
     async def open_submission_gate(self):
+        # [FUNCTION DOC]
+        # Clears the rejecting and paused flags and sets the resume event, waking parked requests.
         """Admit requests after the replica has finished resuming its engines."""
         self._rejecting = False
         self._submission_paused = False
         self._resume_event.set()
 
     async def resume_generation(self):
+        # [FUNCTION DOC]
+        # Resumes the engine and then opens the submission gate.
         """Resume generation after abort_all_requests (pause_generation)."""
         await self.resume_engine_generation()
         await self.open_submission_gate()
 
     async def _park_until_admitted(self, request_id: str) -> Optional[TokenOutput]:
+        # [FUNCTION DOC]
+        # HELPER: loops while the gate is paused: if rejecting, returns an aborted empty TokenOutput with
+        # global_steps; otherwise waits on the resume event. Once open, increments the admitting counter
+        # (with no intervening await) and returns None. Caller must decrement the counter later.
         """Wait out a closed gate, or fail the request when the gate rejects late arrivals.
 
         Returns None once the request is admitted, or an aborted TokenOutput that tells the
@@ -1044,6 +1210,13 @@ class vLLMHttpServer:
         return None
 
     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: non-master nodes return not aborted. Looks up the request state; if absent returns an
+        # error mapping. Otherwise pushes an ABORT-finished output into the request's queue (unblocking the
+        # consumer), aborts it in the output processor and engine core, optionally clears KV/mm caches,
+        # and logs.
+        # Outputs: mapping with aborted flag, request_id, and error message on failure.
+        # Exceptions: none propagate; errors are logged and returned in the mapping.
         """Abort a specific generation request.
 
         Args:
@@ -1091,14 +1264,23 @@ class vLLMHttpServer:
     # -----------------------------------------------------------------------
 
     def _init_config(self, config):
+        # [FUNCTION DOC]
+        # HELPER (hook): converts the rollout config to its dataclass.
         """Initialise config. Override when a specific dataclass_type is needed."""
         return omega_conf_to_dataclass(config)
 
     def _init_model_config(self, model_config):
+        # [FUNCTION DOC]
+        # HELPER (hook): converts the model config to HFModelConfig.
         """Initialise model_config. Override when a specific dataclass_type is needed."""
         return omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
 
     def _validate_configs(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER (hook): defaults max_model_len to the model's max position embeddings, or raises ValueError
+        # if it exceeds them. When chunked prefill is disabled and max_num_batched_tokens is below
+        # max_model_len, warns and raises max_num_batched_tokens to max_model_len.
+        # Side effects: mutates self.config.
         """Validate config/model_config after initialisation."""
         max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
         if self.config.max_model_len is None:
@@ -1119,6 +1301,8 @@ class vLLMHttpServer:
             self.config.max_num_batched_tokens = self.config.max_model_len
 
     def _post_init(self, cuda_visible_devices: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER (hook): logs class name, ranks, visible devices and reserved ports.
         """Called at the end of __init__. Default logs server metadata."""
         logger.info(
             f"{self.__class__.__name__}, replica_rank: {self.replica_rank}, node_rank: {self.node_rank}, "
@@ -1128,10 +1312,21 @@ class vLLMHttpServer:
         )
 
     def _get_engine_kwargs_key(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER (hook): returns "vllm".
         """Return the key under config.engine_kwargs for this engine (e.g. 'vllm')."""
         return "vllm"
 
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
+        # [FUNCTION DOC]
+        # HELPER (hook): mutates engine kwargs in place. For vLLM older than 0.22.0, defaults the
+        # multimodal processor cache size to 0. When the checkpoint engine backend is delta_sharded:
+        # checks vLLM delta support, then rejects (NotImplementedError) verify_every > 0, data parallel > 1
+        # (config or engine kwargs), PD disaggregation, pipeline parallel > 1 in engine kwargs, and an
+        # engine TP size differing from rollout TP. For MoE models, requires moe_backend unset/auto/triton,
+        # forces triton, and rejects EPLB. Requires weight_transfer_config to be absent or a mapping
+        # (TypeError otherwise) whose backend is absent or the verl delta backend (ValueError otherwise),
+        # then sets it to the verl delta backend.
         """Mutate engine_kwargs in-place before the CLI args dict is built."""
         if _VLLM_VERSION < version.parse("0.22.0"):
             # Work around multimodal processor cache desync across pause/resume.
@@ -1195,6 +1390,9 @@ class vLLMHttpServer:
             engine_kwargs["weight_transfer_config"] = {"backend": VERL_DELTA_WEIGHT_TRANSFER_BACKEND}
 
     def _get_override_generation_config(self) -> dict:
+        # [FUNCTION DOC]
+        # HELPER (hook): returns default generation overrides: configured temperature, top_k, top_p,
+        # repetition_penalty 1.0 and max_new_tokens equal to response_length.
         """Return the override_generation_config dict."""
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
@@ -1207,6 +1405,17 @@ class vLLMHttpServer:
         )
 
     def _apply_quantization(self) -> tuple[Optional[str], dict]:
+        # [FUNCTION DOC]
+        # HELPER (hook): determines the vLLM quantization name and HF config overrides. If QAT is enabled,
+        # loads the quantization config and, by its quant_method, applies modelopt NVFP4 patches
+        # ("modelopt") or QAT patches ("compressed-tensors"), else ValueError; injects the config as an HF
+        # override. Else if a quantization is configured it must be fp8, torchao or ascend (ValueError
+        # otherwise); for fp8, builds a block-wise dynamic e4m3 128x128 config ignoring every layer's MoE
+        # router gate, applies vLLM quant patches and sets VERL_VLLM_FP8_QUANT_ENABLED. If no quantization
+        # is set but the model checkpoint is already fp8, applies the patches and sets the env var too.
+        # Adds the quantization config file override when quantization is set and a file is configured.
+        # Outputs: (quantization name or None, HF overrides mapping).
+        # Side effects: monkey patches, sets environment variable.
         """Process quantization config. Returns (quantization_str, hf_overrides)."""
         quantization = self.config.quantization
         hf_overrides = {}
@@ -1271,22 +1480,33 @@ class vLLMHttpServer:
         return quantization, hf_overrides
 
     def _get_worker_extension_cls(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER (hook): returns the dotted path of the colocate worker extension class.
         """Return the fully-qualified colocate worker extension class name."""
         return "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension"
 
     def _get_cli_modules(self) -> list:
+        # [FUNCTION DOC]
+        # HELPER (hook): returns the list of CLI modules (vLLM serve) used to build the parser.
         """Return the list of CLI command modules used for argument parsing."""
         return [vllm.entrypoints.cli.serve]
 
     def _get_cli_description(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER (hook): returns the parser description "vLLM CLI".
         """Return the description string for the CLI argument parser."""
         return "vLLM CLI"
 
     def _get_wake_up_tags(self) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER (hook): returns default wake-up tags kv_cache and weights.
         """Return the tags passed to engine.wake_up(). Default includes kv_cache."""
         return ["kv_cache", "weights"]
 
     def _resolve_sleep_level(self) -> int:
+        # [FUNCTION DOC]
+        # HELPER (hook): returns sleep level 1 if MTP rollout is enabled, LoRA is served as adapter, or
+        # running on NPU; otherwise 2 (discard weights too).
         """Deepest sleep level whose discarded state a subsequent weight sync can restore.
 
         MTP drafter-only weights are initialized by vLLM and are not guaranteed
@@ -1305,6 +1525,8 @@ class vLLMHttpServer:
         return 2
 
     async def _sleep_hybrid(self):
+        # [FUNCTION DOC]
+        # HELPER (hook): sleeps the engine (all DP shards) at the resolved level and resets encoder cache.
         """HYBRID sleep: adapters and MTP need level=1; full weights need level=2.
 
         Uses engine.sleep() instead of engine.collective_rpc("sleep") to ensure
@@ -1318,6 +1540,9 @@ class vLLMHttpServer:
 
 
 class vLLMReplica(RolloutReplica):
+    # [CLASS DOC]
+    # RolloutReplica implementation for vLLM: one vLLMHttpServer actor per node of the replica, the
+    # node-0 server being the HTTP endpoint and owning the engine. Fans control calls out to servers.
     def __init__(
         self,
         replica_rank: int,
@@ -1328,12 +1553,23 @@ class vLLMReplica(RolloutReplica):
         is_teacher_model: bool = False,
         name_suffix: str = "",
     ):
+        # [FUNCTION DOC]
+        # Behavior: calls the parent constructor and sets the server class to vLLMHttpServer as a Ray
+        # remote class.
         super().__init__(
             replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
         )
         self.server_class = ray.remote(vLLMHttpServer)
 
     async def launch_servers(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts worker count equals world size; queries each worker's node id and accelerator
+        # id. For each node, takes the contiguous slice of gpus_per_replica_node workers, their device list
+        # and the first worker's node id; names the actor "<prefix>server[_reward|_teacher]_<replica>_<node>
+        # <suffix>"; sets platform env vars; creates the actor with hard node affinity and max concurrency.
+        # Fetches master address/ports from server 0, launches all servers concurrently, then records the
+        # first server as handle and its address (IPv6 bracketed).
+        # Exceptions: AssertionError on worker count mismatch. Side effects: creates Ray actors.
         """Launch http server in each node."""
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
@@ -1416,12 +1652,17 @@ class vLLMReplica(RolloutReplica):
         )
 
     async def sleep(self):
+        # [FUNCTION DOC]
+        # Behavior: waits for server 0's requests to drain, then sleeps all servers concurrently.
         """Sleep each rollout server."""
         # Drain DP engines for safe sleep.
         await self.servers[0].wait_for_requests_to_drain.remote()
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
     async def abort_all_requests(self, reject_request: bool = False) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: calls abort_all_requests on all servers concurrently and combines counts and request
+        # ids; also includes the raw per-server results.
         """Abort all ongoing generation requests across all servers.
 
         Args:
@@ -1447,6 +1688,8 @@ class vLLMReplica(RolloutReplica):
         }
 
     async def resume_generation(self):
+        # [FUNCTION DOC]
+        # Behavior: resumes engine generation via server 0, then opens every server's submission gate.
         """Resume the DP engines before admitting requests on any server."""
         # KV-cache wake-up may already have resumed scheduling. Keep admission
         # closed during this resume too: new requests could otherwise start a
@@ -1455,6 +1698,9 @@ class vLLMReplica(RolloutReplica):
         await asyncio.gather(*[server.open_submission_gate.remote() for server in self.servers])
 
     async def abort_request(self, request_id: str) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: aborts the request on all servers concurrently and returns the first successful result,
+        # or a not-found mapping.
         """Abort a specific request. Tries all servers since we don't know which one has it.
 
         Args:
@@ -1473,6 +1719,8 @@ class vLLMReplica(RolloutReplica):
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
 
     async def release_kv_cache(self):
+        # [FUNCTION DOC]
+        # Behavior: waits for server 0 to drain, then calls release_kv_cache on all servers concurrently.
         # Drain all in-flight requests so that vLLM worker threads go idle
         # before we touch engine.release_kv_cache()
         await self.servers[0].wait_for_requests_to_drain.remote()
@@ -1483,5 +1731,7 @@ class vLLMReplica(RolloutReplica):
     # -----------------------------------------------------------------------
 
     def _get_server_name_prefix(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER (hook): returns the actor name prefix "vllm_".
         """Return the Ray actor name prefix (e.g. 'vllm_')."""
         return "vllm_"

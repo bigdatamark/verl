@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# VeOmni-specific engine helpers: vision-language placeholder token indices per model type,
+# safetensors index loading, model/optimizer CPU offload and reload for FSDP2 VeOmni models,
+# MoE expert parameter handlers that turn fused expert stacks into per-expert HF-named tensors,
+# and the EP-aware sharded-delta export machinery (slot table enumeration, NaN-probe row
+# conversion, converter entry builder, and the per-rank shard exporter).
+# Module state: a process-lifetime cache of enumerated slot tables.
 import json
 import os
 
@@ -44,6 +51,12 @@ VL_TYPE2INDEX = {
 
 
 def load_safetensors_index(model_path: str) -> dict[str, int]:
+    # [FUNCTION DOC]
+    # Behavior: reads "model.safetensors.index.json" under model_path and maps each parameter fqn to
+    # the integer shard number parsed from the second dash-separated token of its filename
+    # (e.g. "model-00002-of-00004..." gives 2). Returns an empty mapping when the file is absent.
+    # Inputs: model_path - directory. Outputs: mapping fqn to shard index.
+    # Exceptions: JSON/KeyError/ValueError for malformed index files.
     path = os.path.join(model_path, "model.safetensors.index.json")
     if not os.path.exists(path):
         return {}
@@ -55,6 +68,12 @@ def load_safetensors_index(model_path: str) -> dict[str, int]:
 
 @torch.no_grad()
 def offload_veomni_model_to_cpu(model, empty_cache: bool = True):
+    # [FUNCTION DOC]
+    # Behavior: (no-grad) for every submodule that has FSDP2 state with a param group, forces the
+    # group's training state to IDLE (so reshard is allowed), then reshards the root, moves the model
+    # to CPU, and optionally empties the device cache.
+    # Inputs: model - FSDP2 root module; empty_cache - whether to free device cache.
+    # Side effects: mutates private FSDP state; moves parameters; frees cache.
     from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
     from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
 
@@ -77,12 +96,19 @@ def offload_veomni_model_to_cpu(model, empty_cache: bool = True):
 
 @torch.no_grad()
 def load_veomni_model_to_gpu(model):
+    # [FUNCTION DOC]
+    # Behavior: (no-grad) moves the model to the current device id. Side effects: device move.
     device = get_device_id()
     model.to(device)
 
 
 @torch.no_grad()
 def offload_veomni_optimizer(optimizer):
+    # [FUNCTION DOC]
+    # Behavior: (no-grad) collects the inner optimizers when given a VeOmni multi-optimizer (flag
+    # _is_multi_optimizer, children in optimizers_dict), else the single optimizer. For each with
+    # non-empty state, moves every tensor state value of every param to CPU non-blocking.
+    # Side effects: replaces optimizer state tensors in place.
     optimizers = []
     # Check if this is a MultiOptimizer (for ep and non-ep parameters when ep+fsdp2 is enabled)
     if hasattr(optimizer, "_is_multi_optimizer") and optimizer._is_multi_optimizer:
@@ -103,6 +129,9 @@ def offload_veomni_optimizer(optimizer):
 
 @torch.no_grad()
 def load_veomni_optimizer(optimizer, device_id):
+    # [FUNCTION DOC]
+    # Behavior: same traversal as the CPU offload, but moves tensor state values to device_id
+    # non-blocking. Inputs: optimizer; device_id - target device. Side effects: mutates state.
     optimizers = []
     # Check if this is a MultiOptimizer (for ep and non-ep parameters when ep+fsdp2 is enabled)
     if hasattr(optimizer, "_is_multi_optimizer") and optimizer._is_multi_optimizer:
@@ -122,6 +151,10 @@ def load_veomni_optimizer(optimizer, device_id):
 
 
 def _map_moe_params_common(name, tensor, expert_id_base):
+    # [FUNCTION DOC]
+    # HELPER: For each row i of the stacked expert tensor, yields a key with "mlp.experts." replaced by
+    # "mlp.experts.<base+i>." plus a ".weight" suffix, and the row moved to the current device.
+    # Outputs: generator of (name, tensor).
     for i in range(tensor.size(0)):
         idx = expert_id_base + i
         new_key = name.replace("mlp.experts.", f"mlp.experts.{idx}.") + ".weight"
@@ -129,6 +162,11 @@ def _map_moe_params_common(name, tensor, expert_id_base):
 
 
 def default_moe_param_handler(name, tensor, expert_id_base):
+    # [FUNCTION DOC]
+    # Behavior: if the name contains "gate_up_proj", splits the tensor into two halves along dim 1
+    # named with gate_proj and up_proj respectively; otherwise keeps it as one. Each is expanded
+    # into per-expert entries via the common mapper starting at expert_id_base.
+    # Outputs: generator of (per-expert HF name, tensor on device).
     """Project a stacked expert tensor ``[k, ...]`` (dim 0 = a contiguous run of
     experts) onto per-expert HF-named tensors. ``expert_id_base`` is the global
     expert id of slice 0: an ep rank's local stack passes
@@ -147,12 +185,17 @@ def default_moe_param_handler(name, tensor, expert_id_base):
 
 
 def passthrough_moe_param_handler(name, tensor, expert_id_base):
+    # [FUNCTION DOC]
+    # Behavior: discards expert_id_base and yields the (name, tensor) unchanged.
     """Keep a fused MoE checkpoint tensor unchanged."""
     del expert_id_base
     yield name, tensor
 
 
 def streamed_gpt_oss_moe_param_handler(name, tensor, expert_id_base):
+    # [FUNCTION DOC]
+    # Behavior: for each row, yields the name with the first "mlp.experts." replaced by
+    # "mlp.experts.<global id>." (no ".weight" suffix) and the row moved to device.
     """Export GPT-OSS fused projections one global expert at a time.
 
     The vLLM GPT-OSS loader consumes the original checkpoint orientation and
@@ -172,6 +215,10 @@ MOE_PARAM_HANDERS = {"gpt_oss": passthrough_moe_param_handler}
 
 
 def get_moe_param_handler(model_type, ep_enabled):
+    # [FUNCTION DOC]
+    # Behavior: returns the streamed GPT-OSS handler for gpt_oss with EP enabled; otherwise the
+    # per-model override from the handler table (passthrough for gpt_oss) or the default handler.
+    # Inputs: model_type - string; ep_enabled - bool. Outputs: handler callable.
     """Resolve the checkpoint export handler for the current MoE layout."""
     if model_type == "gpt_oss" and ep_enabled:
         return streamed_gpt_oss_moe_param_handler
@@ -194,6 +241,14 @@ _SLOT_TABLES: dict = {}
 
 
 def enumerate_hf_slots(process_func, fqn, full_shape, dtype, device=None) -> list:
+    # [FUNCTION DOC]
+    # Behavior: caches by (handler, fqn, full shape, dtype). On miss, builds a zero row of shape
+    # (1, row dims) on device and, for each expert id, runs the handler with that id as base and
+    # records each output's (name, shape) in order; caches and returns the list.
+    # Inputs: process_func - handler; fqn - param name; full_shape - (experts, ...); dtype; device.
+    # Outputs: list of (hf name, hf shape) slots.
+    # Side effects: populates the module cache.
+    # KNOWN ISSUE: device is not part of the cache key (harmless since only names/shapes are stored).
     """Let the handler itself reveal its slot table: run it once per expert row
     on a zero dummy row and record the ``(hf_name, hf_shape)`` sequence in the
     handler's own output order. Same philosophy as the mcore probe -- the
@@ -224,6 +279,17 @@ def enumerate_hf_slots(process_func, fqn, full_shape, dtype, device=None) -> lis
 
 
 def convert_row_to_hf(name, spec, expert_id: int, pos_in_row, vals, like):
+    # [FUNCTION DOC]
+    # Behavior: builds a NaN-filled flat row buffer (dtype/device of like) sized to the row element
+    # count (at least 1), scatters vals at pos_in_row, runs the spec's to_hf_chunk for that expert id
+    # on the buffer reshaped to (1, row dims), and asserts the output count equals slots per row
+    # (total slots divided by expert count). For each output, flattens it (moving to like's device if
+    # needed) and records the non-NaN positions (int32) and values, skipping slots without survivors.
+    # Inputs: name - for messages; spec - with full_shape, hf_slots, to_hf_chunk; expert_id; pos_in_row
+    # - within-row flat positions; vals - values; like - reference tensor.
+    # Outputs: list of (slot index within row, int32 indices, values).
+    # Exceptions: AssertionError on output count mismatch.
+    # KNOWN ISSUE (documented): deltas whose new value is NaN are dropped.
     """NaN-probe one dim-0 row through the spec's converter: scatter the row's
     (within-row position, value) pairs into a NaN-filled row buffer, run
     ``to_hf_chunk`` on it, and extract each output slot's surviving positions and
@@ -262,6 +328,14 @@ def convert_row_to_hf(name, spec, expert_id: int, pos_in_row, vals, like):
 
 
 def hf_entry_converter(name, spec, place, lidx, lval):
+    # [FUNCTION DOC]
+    # Behavior: allocates int64 zero counts per slot. If there are local indices, translates them to
+    # full-tensor flat indices, sorts indices and values together, groups consecutive indices by row
+    # (expert id = index floor-divided by row size), and for each touched row runs the NaN probe with
+    # within-row positions, setting the count of each produced slot (expert_id*slots_per_row + slot)
+    # and collecting indices/values. Concatenates pieces or uses empty tensors.
+    # Inputs: name, spec, place (block placement), lidx, lval.
+    # Outputs: (spec.hf_slots, dtype string, counts, concatenated int32 indices, concatenated values).
     """Turn one converter param's shard-local delta into its final HF-coordinate
     entry ``(slots, dtype_str, counts, idx_concat, val_concat)``: only the touched
     dim-0 rows go through the NaN probe; every rank enumerates the same slot list
@@ -302,6 +376,22 @@ def hf_entry_converter(name, spec, place, lidx, lval):
 
 
 def veomni_shard_export(module):
+    # [FUNCTION DOC]
+    # Behavior: takes the module state dict with HF-converted keys, picks the MoE handler (always the
+    # streamed GPT-OSS handler for gpt_oss, otherwise per get_moe_param_handler), and finds the
+    # fqn-to-spec-info table on the module or its wrapped module. Returns a lazy generator: every
+    # floating param not already bf16 is cast to bf16. Non-expert params yield (name, flattened local
+    # shard, spec derived from the param). Expert params compute the DTensor local shape and global
+    # offset (or full shape/zero offset for plain tensors); with DTensor, only ranks at coordinate 0
+    # on all replicate mesh dims contribute. Builds a virtual full shape with dim 0 multiplied by
+    # ep_size, offset dim 0 by ep_rank times local expert count, a block placement, asserts ep_size
+    # times mesh size equals world size, and yields a spec with the block placement, WORLD gather
+    # group, contributes flag, a to_hf_chunk closure calling the handler with the start expert id,
+    # and the enumerated bf16 slot table.
+    # Inputs: module - VeOmni FSDP2 model.
+    # Outputs: (generator of (name, flat local tensor, ShardSpec), None).
+    # Exceptions: AssertionError when expert blocks do not cover the world.
+    # Side effects: state_dict materialization; casting allocates new tensors.
     """Build the per-rank shard export ``(gen, None)`` for
     :meth:`VeOmniEngine.get_per_tensor_param_shard`.
 
@@ -353,6 +443,10 @@ def veomni_shard_export(module):
     )
 
     def _is_ep_param(name, param):
+        # [FUNCTION DOC]
+        # HELPER: Returns whether a param is an EP-sharded expert param: uses the spec-info placement
+        # (Shard means expert) when available for the name; otherwise falls back to name matching
+        # ("mlp.experts." plus a projection name). Inputs: name, param (unused).
         if fqn2si is not None:
             si = fqn2si.get(name)
             if si is not None:
@@ -363,6 +457,8 @@ def veomni_shard_export(module):
         return "mlp.experts." in name and any(p in name for p in ["down_proj", "gate_proj", "up_proj", "gate_up_proj"])
 
     def _gen():
+        # [FUNCTION DOC]
+        # HELPER: Lazy generator implementing the per-param export described in the enclosing function.
         for name, param in params.items():
             # NOT gated on ep_enabled: the fused expert stack exists (and needs
             # the per-expert HF renaming, like the seed path does) even with

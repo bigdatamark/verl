@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Trainer-side client for vLLM rollout servers in the hybrid (colocated) engine. Each trainer
+# rank holds a ServerAdapter that maps it to its colocated vLLM server Ray actor, and drives
+# wake-up/sleep and weight synchronization: weights are streamed over a per-rank ZMQ IPC socket
+# (CUDA IPC, or shared memory fallback) while the server's workers receive them via collective RPC.
 """
 The vllm_rollout that can be applied in different backend
 When working with FSDP:
@@ -51,6 +56,10 @@ class ServerAdapter(BaseRollout):
     vLLM server adapter used in native async mode, serve as a client to request vLLM server
     to resume/release/update weights and kv_cache.
     """
+    # [CLASS DOC]
+    # Rollout implementation that does no generation itself; it is a control-plane client. Only one
+    # rank per server ("has_server" rank) talks to the server actor; all ranks send their weights on
+    # their own ZMQ socket. Supports colocated layout and prefill/decode (PD) disaggregated layout.
 
     def __init__(
         self,
@@ -59,6 +68,21 @@ class ServerAdapter(BaseRollout):
         device_mesh: DeviceMesh,
         replica_rank: int = -1,
     ):
+        # [FUNCTION DOC]
+        # Behavior: initializes the base rollout, reads RANK and RAY_LOCAL_WORLD_SIZE env vars, and
+        # computes the rollout world size per replica: prefill TP for plain layout, or prefill_tp times
+        # prefill_replicas plus decode_tp (defaults to prefill_tp) times decode_replicas when
+        # disaggregation is enabled; multiplied by data and pipeline parallel sizes. Derives
+        # replica_rank (rank divided by that size, unless given), rollout_rank (rank modulo), node_rank.
+        # In PD mode, maps the local offset within the footprint (prefill_tp + decode_replicas*decode_tp)
+        # to role prefill (server index 0) or decode (server index and TP-local rank from the offset) and
+        # marks has_server for TP-local rank 0; logs the mapping. Otherwise has_server for rollout_rank 0.
+        # Sets sleep_level 1 when layered_summon (with a warning) else the global vLLM sleep level. Builds
+        # the ZMQ IPC path from Ray job id, replica rank, and node-local rank under /tmp. Uses shared
+        # memory when device IPC is unsupported (warns).
+        # Inputs: config - RolloutConfig; model_config - HFModelConfig; device_mesh; replica_rank - -1 to infer.
+        # Exceptions: KeyError if env vars missing.
+        # Side effects: reads env, queries Ray runtime context, logs.
         super().__init__(config, model_config, device_mesh)
         self.server_handle: ray.actor.ActorHandle = None
 
@@ -151,6 +175,11 @@ class ServerAdapter(BaseRollout):
             )
 
     def _ensure_server_handle(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: returns False if this rank does not own the server; otherwise lazily resolves the Ray
+        # named actor ("<prefix>server_<replica>_0" for prefill, "<prefix>server_decode_<replica>_<idx>"
+        # for decode, "<prefix>server_<replica>_<node_rank>" otherwise) and returns True.
+        # Exceptions: ValueError from Ray if the actor does not exist. Side effects: caches server_handle.
         """Lazy-init server handle. Returns False if this rank should not proceed."""
         if not self._has_server:
             return False
@@ -174,6 +203,10 @@ class ServerAdapter(BaseRollout):
         args: tuple = (),
         kwargs: Optional[dict] = None,
     ) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: if this rank owns a server, calls collective_rpc on the server actor with method,
+        # timeout, args, kwargs; returns the Ray object ref if non_block else awaits and returns its
+        # result. Returns None on non-owner ranks.
         """Execute method on inference engine via ray.
 
         Args:
@@ -193,6 +226,10 @@ class ServerAdapter(BaseRollout):
         return future if non_block else await future
 
     async def resume(self, tags: list[str]):
+        # [FUNCTION DOC]
+        # Behavior: when free_cache_engine is enabled and this rank owns the server, awaits wake_up with
+        # the given tags (e.g. weights, kv_cache); otherwise does nothing.
+        # Side effects: remote call to the server.
         """Resume rollout weights or kv cache in GPU memory.
 
         Args:
@@ -202,6 +239,9 @@ class ServerAdapter(BaseRollout):
             await self.server_handle.wake_up.remote(tags=tags)
 
     async def release(self):
+        # [FUNCTION DOC]
+        # Behavior: when free_cache_engine is enabled and this rank owns the server, awaits server sleep.
+        # Side effects: frees server GPU memory remotely.
         """Release weights and kv cache in GPU memory."""
         if self.config.free_cache_engine and self._ensure_server_handle():
             await self.server_handle.sleep.remote()
@@ -214,6 +254,17 @@ class ServerAdapter(BaseRollout):
         wire_format: str = "named_tensors",
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: dispatches to the delta path for wire_format "delta_flush". Otherwise asserts
+        # "named_tensors", starts update_weights_from_ipc on the server non-blocking (owner rank only,
+        # extra kwargs plus use_shm), streams all weights in buckets of the configured size through a
+        # BucketedWeightSender on this rank's ZMQ socket, awaits the server call, then on owner rank
+        # clears the KV cache and sets global_steps if given; logs elapsed time on global rank 0.
+        # Inputs: weights - iterator of (name, tensor); global_steps - optional step tag; wire_format;
+        # kwargs - forwarded to the server method.
+        # Outputs: None (or the delta path's result).
+        # Exceptions: AssertionError on unsupported wire_format.
+        # Side effects: GPU memory/IPC transfers, remote calls, logging. Runs under no-grad decorator.
         """Update rollout weights from full tensors or DeltaFlush payloads.
 
         Full-tensor updates may fall back to shared memory; delta updates
@@ -258,6 +309,15 @@ class ServerAdapter(BaseRollout):
         *,
         global_steps: int | None,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: delta weight sync. Raises NotImplementedError when using shared memory. Wraps weights as
+        # an async iterator of (named tensors, is_last) flushes. If empty, only sets global_steps on the
+        # server (weights unchanged) and returns. Otherwise lazily initializes the server's weight transfer
+        # engine once, calls start_weight_update, sends each flush (server update_verl_delta_weights
+        # started non-blocking, tensors sent via a bucketed sender, then awaited), and validates the
+        # stream: ValueError if data follows an is_last flush or if the stream ends without is_last.
+        # Then calls finish_weight_update, and on owner rank clears KV cache and sets global_steps.
+        # Side effects: remote calls, IPC transfer, sets the transfer-engine-initialized flag.
         """Send one delta weight update as a stream of DeltaFlush payloads."""
 
         from verl.workers.rollout.utils import ensure_async_iterator
@@ -287,6 +347,9 @@ class ServerAdapter(BaseRollout):
         await self._execute_method("start_weight_update")
 
         async def send_flush(flush_tensors: list[tuple[str, torch.Tensor]]) -> None:
+            # [FUNCTION DOC]
+            # HELPER: send one flush: start the receiver RPC non-blocking, send the tensors through a new
+            # bucketed CUDA-IPC sender, await the receiver if this rank owns the server.
             receiver_future = await self._execute_method(
                 "update_verl_delta_weights",
                 non_block=True,
@@ -319,10 +382,14 @@ class ServerAdapter(BaseRollout):
                 await self.server_handle.set_global_steps.remote(global_steps)
 
     def _get_server_name_prefix(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER: returns the configured rollout name (default "vllm") followed by an underscore.
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""
         return f"{self.config.get('name', 'vllm')}_"
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
+        # [FUNCTION DOC]
+        # Behavior: unsupported; always raises NotImplementedError pointing to the async server interface.
         """Batch generate sequences in sync mode.
 
         Note: ServerAdapter uses async server mode and does not support synchronous

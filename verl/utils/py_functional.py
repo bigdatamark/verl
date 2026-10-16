@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Grab-bag of small Python utilities: a function-timeout decorator (multiprocessing- or signal-based),
+# dict merging/renaming/appending helpers for metrics, a recursive SimpleNamespace, a runtime-extensible
+# enum (DynamicEnum) with pickling support, a temporary environment-variable context manager, and
+# converters from OmegaConf/numpy containers to plain Python types.
 """
 Contain small python utility functions
 """
@@ -33,6 +38,11 @@ from verl.utils.metric import Metric
 # --- Top-level helper for multiprocessing timeout ---
 # This function MUST be defined at the top level to be pickleable
 def _mp_target_wrapper(target_func: Callable, mp_queue: multiprocessing.Queue, args: tuple, kwargs: dict[str, Any]):
+    # [FUNCTION DOC]
+    # HELPER: Child-process entry for timeout_limit's multiprocessing mode.
+    # Behavior: calls target_func with args/kwargs and puts (True, result) on the queue; on Exception puts
+    # (False, exception) if it pickles, else (False, RuntimeError describing the original).
+    # Side effects: writes one item to mp_queue. Exceptions: none escape for Exception subclasses.
     """
     Internal wrapper function executed in the child process.
     Calls the original target function and puts the result or exception into the queue.
@@ -54,6 +64,20 @@ def _mp_target_wrapper(target_func: Callable, mp_queue: multiprocessing.Queue, a
 
 # Renamed the function from timeout to timeout_limit
 def timeout_limit(seconds: float, use_signals: bool = False):
+    # [FUNCTION DOC]
+    # Behavior: returns a decorator factory. Signal mode (deprecated): requires POSIX, prints a deprecation
+    # warning at decoration time, and wraps func so that a SIGALRM real-time interval timer of `seconds`
+    # raises TimeoutError in the handler; the timer and previous handler are restored in finally.
+    # Multiprocessing mode (default): each call spawns a Process running _mp_target_wrapper with a size-1
+    # queue, joins with timeout; if still alive it is terminated (warning printed if it survives 0.5s) and
+    # TimeoutError raised. Otherwise reads the result with a 0.1s timeout: success returns the value, failure
+    # re-raises the child's exception; an empty queue raises RuntimeError for non-zero exit code else
+    # TimeoutError. The queue is closed and its feeder thread joined in finally.
+    # Inputs: seconds - float timeout; use_signals - mode flag.
+    # Outputs: decorator. Exceptions: see docstring; NotImplementedError raised at decoration time on non-POSIX.
+    # KNOWN ISSUE: in multiprocessing mode func, args and results must be picklable (depending on start method),
+    # and the child's return value is lost if it is large enough to block the queue before join completes.
+    # Side effects: spawns processes or installs signal handlers; prints.
     """
     Decorator to add a timeout to a function.
 
@@ -73,6 +97,8 @@ def timeout_limit(seconds: float, use_signals: bool = False):
     """
 
     def decorator(func):
+        # [FUNCTION DOC]
+        # HELPER: Builds the signal- or multiprocessing-based wrapper for func as described in timeout_limit.
         if use_signals:
             if os.name != "posix":
                 raise NotImplementedError(f"Unsupported OS: {os.name}")
@@ -85,7 +111,11 @@ def timeout_limit(seconds: float, use_signals: bool = False):
 
             @wraps(func)
             def wrapper_signal(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Signal-mode wrapper; runs func under a SIGALRM timer and returns its result.
                 def handler(signum, frame):
+                    # [FUNCTION DOC]
+                    # HELPER: SIGALRM handler raising TimeoutError naming func and seconds.
                     # Update function name in error message if needed (optional but good practice)
                     raise TimeoutError(f"Function {func.__name__} timed out after {seconds} seconds (signal)!")
 
@@ -107,6 +137,8 @@ def timeout_limit(seconds: float, use_signals: bool = False):
             # --- Multiprocessing based timeout (existing logic) ---
             @wraps(func)
             def wrapper_mp(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Multiprocessing-mode wrapper; runs func in a child process with the timeout logic above.
                 q = multiprocessing.Queue(maxsize=1)
                 process = multiprocessing.Process(target=_mp_target_wrapper, args=(func, q, args, kwargs))
                 process.start()
@@ -149,6 +181,11 @@ def timeout_limit(seconds: float, use_signals: bool = False):
 
 
 def union_two_dict(dict1: dict, dict2: dict):
+    # [FUNCTION DOC]
+    # Behavior: for each key in dict2, asserts equality with dict1's value when present, then sets it in dict1.
+    # Inputs: dict1 (mutated), dict2. Outputs: dict1.
+    # KNOWN ISSUE: docstring/message say "same object" but the check uses equality, not identity.
+    # Exceptions: AssertionError on conflicting values. Side effects: mutates dict1.
     """Union two dict. Will throw an error if there is an item not the same object with the same key.
 
     Args:
@@ -167,6 +204,9 @@ def union_two_dict(dict1: dict, dict2: dict):
 
 
 def rename_dict(data: dict, prefix: str = "") -> dict:
+    # [FUNCTION DOC]
+    # Behavior: returns a new dict whose keys are prefixed with prefix unless they already start with it.
+    # Inputs: data - dict with str keys; prefix. Outputs: new dict. Side effects: none.
     """Add a prefix to all the keys in the data dict if it's name is not started with prefix
 
     Args:
@@ -185,6 +225,11 @@ def rename_dict(data: dict, prefix: str = "") -> dict:
 
 
 def append_to_dict(data: dict, new_data: dict, prefix: str = ""):
+    # [FUNCTION DOC]
+    # Behavior: for each item in new_data, computes the prefixed key (as rename_dict); creates a container
+    # if missing (val.init_list() for Metric values, else an empty list); extends with list values, otherwise
+    # appends the value.
+    # Inputs: data (mutated); new_data; prefix. Outputs: None. Side effects: mutates data.
     """Append values from new_data to lists in data.
 
     For each key in new_data, this function appends the corresponding value to a list
@@ -208,6 +253,8 @@ def append_to_dict(data: dict, new_data: dict, prefix: str = ""):
 
 
 class NestedNamespace(SimpleNamespace):
+    # [CLASS DOC]
+    # SimpleNamespace that recursively converts nested dict values into NestedNamespace instances.
     """A nested version of SimpleNamespace that recursively converts dictionaries to namespaces.
 
     This class allows for dot notation access to nested dictionary structures by recursively
@@ -224,6 +271,10 @@ class NestedNamespace(SimpleNamespace):
     """
 
     def __init__(self, dictionary, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: initializes base with kwargs, then sets each dictionary entry as an attribute, recursing for
+        # dict values (lists of dicts are not converted).
+        # Inputs: dictionary - mapping; kwargs - extra attributes. Side effects: sets attributes.
         super().__init__(**kwargs)
         for key, value in dictionary.items():
             if isinstance(value, dict):
@@ -233,41 +284,70 @@ class NestedNamespace(SimpleNamespace):
 
 
 class DynamicEnumMeta(type):
+    # [CLASS DOC]
+    # Metaclass giving DynamicEnum classes enum-like class-level behavior backed by cls._registry
+    # (name -> member): iteration over members, membership by name or member, indexing by name, pickling of the
+    # class by module lookup, and names()/values() listings.
     def __iter__(cls) -> Iterator[Any]:
+        # [FUNCTION DOC]
+        # Outputs: iterator over registered members (insertion order).
         return iter(cls._registry.values())
 
     def __contains__(cls, item: Any) -> bool:
+        # [FUNCTION DOC]
+        # Behavior: str items are checked against registered names (case-sensitive, upper-case keys); others
+        # against members. Outputs: bool.
         # allow `name in EnumClass` or `member in EnumClass`
         if isinstance(item, str):
             return item in cls._registry
         return item in cls._registry.values()
 
     def __getitem__(cls, name: str) -> Any:
+        # [FUNCTION DOC]
+        # Outputs: member registered under name. Exceptions: KeyError if absent.
         return cls._registry[name]
 
     def __reduce_ex__(cls, protocol):
+        # [FUNCTION DOC]
+        # Behavior: pickles the class as a lookup of its name on its imported module. Outputs: reduce tuple.
         # Always load the existing module and grab the class
         return getattr, (importlib.import_module(cls.__module__), cls.__name__)
 
     def names(cls):
+        # [FUNCTION DOC]
+        # Outputs: list of registered names.
         return list(cls._registry.keys())
 
     def values(cls):
+        # [FUNCTION DOC]
+        # Outputs: list of registered members.
         return list(cls._registry.values())
 
 
 class DynamicEnum(metaclass=DynamicEnumMeta):
+    # [CLASS DOC]
+    # Runtime-extensible enum. Members are instances with name (upper-case) and an auto-incremented integer
+    # value, stored in the class registry and set as class attributes.
+    # KNOWN ISSUE: _registry and _next_value are defined on the base; subclasses that do not redefine
+    # _registry share one registry (though _next_value becomes per-class once incremented via cls).
     _registry: dict[str, "DynamicEnum"] = {}
     _next_value: int = 0
 
     def __init__(self, name: str, value: int):
+        # [FUNCTION DOC]
+        # Behavior: stores name and value. Side effects: none.
         self.name = name
         self.value = value
 
     def __repr__(self):
+        # [FUNCTION DOC]
+        # Outputs: "<ClassName.NAME: value>".
         return f"<{self.__class__.__name__}.{self.name}: {self.value}>"
 
     def __reduce_ex__(self, protocol):
+        # [FUNCTION DOC]
+        # Behavior: pickles a member as attribute lookup of its name on the class re-imported from its module,
+        # so unpickling returns the existing member. Outputs: reduce tuple.
         """
         Unpickle via: getattr(import_module(module).Dispatch, 'ONE_TO_ALL')
         so the existing class is reused instead of re-executed.
@@ -278,6 +358,10 @@ class DynamicEnum(metaclass=DynamicEnumMeta):
 
     @classmethod
     def register(cls, name: str) -> "DynamicEnum":
+        # [FUNCTION DOC]
+        # Behavior: upper-cases name, rejects duplicates, creates a member with the next value, registers it,
+        # sets it as a class attribute and increments the counter.
+        # Outputs: new member. Exceptions: ValueError if already registered. Side effects: mutates class state.
         key = name.upper()
         if key in cls._registry:
             raise ValueError(f"{key} already registered")
@@ -289,6 +373,9 @@ class DynamicEnum(metaclass=DynamicEnumMeta):
 
     @classmethod
     def remove(cls, name: str):
+        # [FUNCTION DOC]
+        # Behavior: removes the upper-cased name from the registry and class attributes.
+        # Outputs: removed member. Exceptions: KeyError if not registered. Side effects: mutates class state.
         key = name.upper()
         member = cls._registry.pop(key)
         delattr(cls, key)
@@ -296,11 +383,17 @@ class DynamicEnum(metaclass=DynamicEnumMeta):
 
     @classmethod
     def from_name(cls, name: str) -> Optional["DynamicEnum"]:
+        # [FUNCTION DOC]
+        # Outputs: member for the upper-cased name, or None.
         return cls._registry.get(name.upper())
 
 
 @contextmanager
 def temp_env_var(key: str, value: str):
+    # [FUNCTION DOC]
+    # Behavior: saves the original value, sets the variable, yields, and in finally restores the original or
+    # removes the variable if it was unset.
+    # Inputs: key, value - strings. Side effects: temporarily mutates os.environ.
     """Context manager for temporarily setting an environment variable.
 
     This context manager ensures that environment variables are properly set and restored,
@@ -331,6 +424,12 @@ def temp_env_var(key: str, value: str):
 
 
 def convert_to_regular_types(obj):
+    # [FUNCTION DOC]
+    # Behavior: DictConfig -> dict with recursively converted values; ListConfig -> plain list (elements NOT
+    # recursively converted); list/tuple -> list of converted elements; dict -> dict of converted values;
+    # anything else returned as-is.
+    # KNOWN ISSUE: ListConfig elements that are nested configs remain OmegaConf objects.
+    # Outputs: converted object. Side effects: none.
     """Convert Hydra configs and other special types to regular Python types."""
     from omegaconf import DictConfig, ListConfig
 
@@ -344,6 +443,10 @@ def convert_to_regular_types(obj):
 
 
 def convert_nested_value_to_list_recursive(data_item):
+    # [FUNCTION DOC]
+    # Behavior: recursively converts dicts and lists element-wise, and numpy arrays via tolist (then
+    # recursed); other values returned as-is (tuples are not traversed).
+    # Outputs: converted structure. Side effects: none.
     if isinstance(data_item, dict):
         return {k: convert_nested_value_to_list_recursive(v) for k, v in data_item.items()}
     elif isinstance(data_item, list):
@@ -357,6 +460,12 @@ def convert_nested_value_to_list_recursive(data_item):
 
 
 def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
+    # [FUNCTION DOC]
+    # Behavior: returns {} for empty input; uses the first dict's keys to initialize lists, then appends each
+    # dict's values under their keys.
+    # Outputs: dict key -> list of values.
+    # Exceptions: AssertionError if a later dict has a key absent in the first. Missing keys in later dicts
+    # silently produce shorter lists. Side effects: none.
     if len(list_of_dict) == 0:
         return {}
     keys = list_of_dict[0].keys()

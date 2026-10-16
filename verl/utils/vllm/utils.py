@@ -13,6 +13,13 @@
 # limitations under the License.
 
 
+# [MODULE DOC]
+# vLLM LoRA and weight-sync helpers: a LoRA request type that carries in-memory adapter tensors, a
+# hijack that lets vLLM's LRU LoRA worker manager load adapters from those tensors, a package version
+# check, and resolution of weight-sync names against the live vLLM parameter namespace (handling
+# LoRA base_layer segments, packed modules and routed experts). At import, detects whether vLLM's
+# LoRA base layer defines its own load_weights, which changes the base_layer naming rule.
+
 from msgspec import field
 from packaging import version as vs
 
@@ -29,14 +36,33 @@ from verl.third_party.vllm import get_version
 
 
 class TensorLoRARequest(LoRARequest):
+    # [CLASS DOC]
+    # LoRARequest subclass with two extra optional fields: peft_config (PEFT config mapping) and
+    # lora_tensors (mapping of adapter parameter name to tensor), both defaulting to None.
     peft_config: dict = field(default=None)
     lora_tensors: dict = field(default=None)
 
 
 class VLLMHijack:
+    # [CLASS DOC]
+    # Namespace for installing the in-memory LoRA loading monkey patch into vLLM.
     @staticmethod
     def hijack():
+        # [FUNCTION DOC]
+        # Behavior: replaces LRUCacheWorkerLoRAManager._load_adapter with the nested tensor-aware loader.
+        # Inputs: none. Outputs: None. Side effects: global monkey patch of a vLLM class.
         def hijack__load_adapter(self, lora_request: TensorLoRARequest) -> LoRAModel:
+            # [FUNCTION DOC]
+            # HELPER: Replacement adapter loader (see docstring). Builds the expected LoRA module list by
+            # expanding packed modules from the adapter manager and de-duplicating. For TensorLoRARequest,
+            # builds a PEFT helper from the request's config dict; otherwise resolves the adapter path and reads
+            # the PEFT config from disk. Validates against the LoRA config. Uses the model's hf_to_vllm_mapper if
+            # present (its unstacked form on vLLM 0.25.0 or newer). Builds loader kwargs (helper, id, cpu device,
+            # lora dtype, mapper, plus either embedding modules / padding modules or model vocab size, and target
+            # embedding padding if lora_extra_vocab_size exists), then constructs the LoRA model from tensors or
+            # from the local checkpoint.
+            # Inputs: self - worker LoRA manager; lora_request. Outputs: the LoRA model.
+            # Exceptions: re-raises any loading error; ValueError if the adapter's extra vocab exceeds the config.
             """
             based on vllm.lora.worker_manager.WorkerLoRAManager._load_adapter, support load adapter with lora tensors
 
@@ -120,12 +146,17 @@ class VLLMHijack:
             return lora
 
         def do_hijack(target_cls, target_method_name, hooking_method):
+            # [FUNCTION DOC]
+            # HELPER: Sets attribute target_method_name on target_cls to hooking_method.
             setattr(target_cls, target_method_name, hooking_method)
 
         do_hijack(LRUCacheWorkerLoRAManager, "_load_adapter", hijack__load_adapter)
 
 
 def is_version_ge(pkg: str = "vllm", minver: str = "0.7.3"):
+    # [FUNCTION DOC]
+    # Behavior: compares the installed version of pkg (via the third-party get_version helper) to minver.
+    # Inputs: pkg - package name; minver - version string. Outputs: True if installed version is at least minver.
     """check if the package version is greater than or equal to the minimum version"""
     return vs.parse(get_version(pkg)) >= vs.parse(minver)
 
@@ -146,6 +177,21 @@ except ImportError:
 
 
 def resolve_weight_name(model, name: str, model_weight_names: set[str]) -> str:
+    # [FUNCTION DOC]
+    # Behavior (in order, returning the first applicable result):
+    # 1. If the name contains ".base_layer.", checks whether the parent prefix really has a base_layer
+    # child (by existence of parent.base_layer.weight or any live name with that prefix). If not, or if
+    # vLLM's LoRA layer has its own load_weights, returns the name with the first ".base_layer." removed.
+    # 2. If the name exists (see the nested existence check), returns it unchanged.
+    # 3. For non-leaf names under ".mlp.experts." whose tail has no base_layer, if the model has any
+    # "mlp.experts.base_layer." parameter, inserts "base_layer." after the experts marker.
+    # 4. For non-leaf names already under ".mlp.experts.base_layer.", returns the stripped form if it exists.
+    # 5. For leaf names (weight/bias or ending with _weight/_bias) on vLLM without LoRA load_weights,
+    # inserts ".base_layer." before the leaf if that alternative exists.
+    # 6. Otherwise returns the name unchanged.
+    # Inputs: model - vLLM model; name - incoming weight name; model_weight_names - set of live names.
+    # Outputs: the reconciled (unmapped) name.
+    # Exceptions: none expected. Side effects: none.
     """Reconcile an incoming weight-sync name with the live vLLM namespace.
 
     Toggles one ``.base_layer`` segment (strip it for non-LoRA-wrapped modules
@@ -165,6 +211,13 @@ def resolve_weight_name(model, name: str, model_weight_names: set[str]) -> str:
     is_leaf = leaf in {"weight", "bias"} or leaf.endswith(("_weight", "_bias"))
 
     def _exists(candidate: str) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Existence check for a candidate name: true if present in live names; or if the mapper
+        # rewrites it to a different live name; or, using the inverted packed-modules mapping (unpacked to
+        # owner) at the module segment (third-from-last if the second-to-last segment is base_layer, else
+        # second-to-last), if replacing that segment with its owner gives a live name directly or after mapping.
+        # KNOWN ISSUE: the mapped-packed check compares against the original candidate instead of the
+        # joined owner name; harmless in practice but inconsistent with the earlier mapper check.
         if candidate in model_weight_names:
             return True
         if mapper is not None:

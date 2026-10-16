@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Dataclass configs for the policy (actor) worker: MoE router replay, policy loss, the
+# strategy-agnostic ActorConfig with batch-size / loss validation, and strategy-specific subclasses
+# (Megatron, FSDP, VeOmni, TorchTitan) whose post-init binds the generic engine field to their
+# backend engine config. All derive from BaseConfig (DictConfig-like, frozen except mutable fields).
+
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -46,6 +52,9 @@ __all__ = [
 
 @dataclass
 class RouterReplayConfig(BaseConfig):
+    # [CLASS DOC]
+    # Router replay settings: mode ("disabled", "R2", "R3"), optional record and replay file paths.
+    # KNOWN ISSUE: the docstring refers to 'record'/'replay' modes, which validation rejects.
     """Configuration for router replay in MoE models.
 
     This configuration controls the routing behavior for Mixture of Experts (MoE) models,
@@ -67,6 +76,8 @@ class RouterReplayConfig(BaseConfig):
     replay_file: Optional[str] = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: raises ValueError if mode is not one of disabled / R2 / R3. Outputs: None.
         """Validate router replay configuration."""
         valid_modes = ["disabled", "R2", "R3"]
         if self.mode not in valid_modes:
@@ -75,6 +86,9 @@ class RouterReplayConfig(BaseConfig):
 
 @dataclass
 class PolicyLossConfig(BaseConfig):
+    # [CLASS DOC]
+    # Policy loss settings: loss_mode name (default "vanilla"), clip-cov and kl-cov ratios and bounds,
+    # PPO KL coefficient, optional DRO beta, and a nested rollout-correction config. No validation.
     """Configuration for policy loss computation.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -103,6 +117,12 @@ class PolicyLossConfig(BaseConfig):
 
 @dataclass
 class ActorConfig(BaseConfig):
+    # [CLASS DOC]
+    # Base actor config with PPO batch sizing, clipping, loss aggregation, entropy/KL options,
+    # checkpoint/optimizer/profiler/QAT sub-configs, a generic engine slot and model config, and a mutable
+    # global_batch_info dict. Mutable fields add the micro/mini batch sizes, engine and model_config.
+    # strategy and rollout_n are required (MISSING by default).
+    # KNOWN ISSUE: model_config is annotated as HFModelConfig but defaults to a plain BaseConfig.
     """Configuration for actor model training.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -193,6 +213,12 @@ class ActorConfig(BaseConfig):
     qat: QATConfig = field(default_factory=QATConfig)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts strategy and rollout_n were set. Without dynamic batch size, raises ValueError if
+        # both micro batch size and per-GPU micro batch size are set, and asserts at least one is set.
+        # Raises ValueError if loss_agg_mode is not one of token-mean, token-sum, seq-mean-token-sum,
+        # seq-mean-token-mean, seq-mean-token-sum-norm.
+        # Exceptions: AssertionError, ValueError.
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING
         assert self.rollout_n != MISSING
@@ -220,6 +246,11 @@ class ActorConfig(BaseConfig):
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
+        # [FUNCTION DOC]
+        # Behavior: only without dynamic batch size: requires train_batch_size at least the mini batch size;
+        # if the deprecated global micro batch size is set, requires it to divide the mini batch size and,
+        # multiplied by the Ulysses SP size attribute (default 1), to be at least n_gpus.
+        # Inputs: n_gpus; train_batch_size; model_config - unused here. Outputs: None. Exceptions: ValueError.
         """Validate actor configuration with runtime parameters."""
         if not self.use_dynamic_bsz:
             if train_batch_size < self.ppo_mini_batch_size:
@@ -243,6 +274,8 @@ class ActorConfig(BaseConfig):
 
     @staticmethod
     def _check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
+        # [FUNCTION DOC]
+        # HELPER: Raises ValueError if neither or both of mbs and mbs_per_gpu are set; name prefixes messages.
         """Validate mutually exclusive micro batch size configuration options."""
         param = "ppo_micro_batch_size"
         param_per_gpu = f"{param}_per_gpu"
@@ -259,6 +292,9 @@ class ActorConfig(BaseConfig):
 
 @dataclass
 class McoreActorConfig(ActorConfig):
+    # [CLASS DOC]
+    # Megatron actor: strategy "megatron", entropy chunking options, a Megatron engine config, a profile
+    # dict, use_rollout_log_probs, and a Megatron checkpoint config.
     """Configuration for Megatron actor models.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -280,6 +316,9 @@ class McoreActorConfig(ActorConfig):
     checkpoint: McoreCheckpointConfig = field(default_factory=McoreCheckpointConfig)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base validation then binds engine to the megatron config.
+        # KNOWN ISSUE: docstring says FSDP but this is the Megatron config.
         """Validate FSDP actor configuration parameters."""
         super().__post_init__()
         self.engine = self.megatron
@@ -287,6 +326,9 @@ class McoreActorConfig(ActorConfig):
 
 @dataclass
 class FSDPActorConfig(ActorConfig):
+    # [CLASS DOC]
+    # FSDP actor: strategy "fsdp", gradient clip, deprecated top-level Ulysses SP size, entropy
+    # chunking/checkpointing, pad_to_length, an FSDP engine config, remove-padding and rollout log-prob flags.
     """Configuration for FSDP actor models.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -316,6 +358,12 @@ class FSDPActorConfig(ActorConfig):
     use_rollout_log_probs: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base validation, binds engine to fsdp_config, force-writes strategy onto the engine
+        # config (bypassing its freeze), and if the deprecated SP size is greater than 1 copies it to the
+        # FSDP config.
+        # Side effects: mutates the nested engine config.
+        # KNOWN ISSUE: pad_to_length is documented as forwarded to fsdp_config but no forwarding happens here.
         """Validate FSDP actor configuration parameters."""
         super().__post_init__()
         self.engine = self.fsdp_config
@@ -329,6 +377,9 @@ class FSDPActorConfig(ActorConfig):
             self.fsdp_config.ulysses_sequence_parallel_size = self.ulysses_sequence_parallel_size
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
+        # [FUNCTION DOC]
+        # Behavior: runs base validation; additionally raises ValueError if SP size is greater than 1 and a
+        # model_config mapping is given without use_remove_padding enabled.
         """Validate FSDP actor configuration with runtime parameters."""
         super().validate(n_gpus, train_batch_size, model_config)
         if (
@@ -343,6 +394,9 @@ class FSDPActorConfig(ActorConfig):
 
 @dataclass
 class VeOmniActorConfig(ActorConfig):
+    # [CLASS DOC]
+    # VeOmni actor: strategy "veomni", a VeOmni engine config, pad_to_length, remove-padding and rollout
+    # log-prob flags.
     """Configuration for VeOmni actor models.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -362,6 +416,10 @@ class VeOmniActorConfig(ActorConfig):
     use_rollout_log_probs: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base validation, binds engine to the veomni config, and raises RuntimeError if
+        # router replay is enabled while use_remove_padding is False.
+        # KNOWN ISSUE: pad_to_length is documented as forwarded but is not forwarded here.
         """Validate VeOmni actor configuration parameters."""
         super().__post_init__()
         self.engine = self.veomni
@@ -377,6 +435,9 @@ class VeOmniActorConfig(ActorConfig):
 
 @dataclass
 class TorchTitanActorConfig(ActorConfig):
+    # [CLASS DOC]
+    # TorchTitan actor: strategy "torchtitan", a TorchTitan engine config, remove-padding and rollout
+    # log-prob flags.
     """Configuration for TorchTitan actor models.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
@@ -394,6 +455,8 @@ class TorchTitanActorConfig(ActorConfig):
     use_rollout_log_probs: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs base validation then binds engine to the torchtitan config.
         """Validate TorchTitan actor configuration parameters."""
         super().__post_init__()
         self.engine = self.torchtitan

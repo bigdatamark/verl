@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Continuous Token (CT) builders: keep a multi-turn rollout's runtime token stream consistent with what the chat
+# template would render for the full conversation, by rendering only appended messages as token-level suffix diffs
+# against synthetic prefixes and patching the junction between model-generated tokens and appended context
+# (inserting/removing boundary tokens). Contains the base text builder, model-specific text builders (GPT-OSS, Qwen,
+# MiniMax, GLM, Gemma4, DeepSeek), a VL base and VL builders, plus helpers for tool-name resolution and token lookup.
+# Module constants: allowed append roles (tool/user/system/assistant), synthetic system/user messages used as render
+# prefixes, a placeholder assistant reasoning string and a dummy tool name.
 """Continuous Token builder implementations."""
 
 from __future__ import annotations
@@ -36,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class MergeResult:
+    # [CLASS DOC]
+    # Immutable record of one merge: token_ids (new runtime stream), appended_token_count (appended model/context tokens,
+    # excluding inserted boundary tokens), kind ("assistant" or "context", default "context"), inserted_token_ids
+    # (CT-inserted boundary tokens, default empty) and removed_prefix_token_count (stale prefix tokens dropped, default 0).
     """Merged runtime tokens plus the edits callers need to align metadata.
 
     ``token_ids`` is the updated runtime token stream. The other fields describe
@@ -55,6 +67,10 @@ class MergeResult:
 
 
 class ContinuousTokenBuilder:
+    # [CLASS DOC]
+    # Base text-only CT builder. Holds the tokenizer, chat template kwargs and allowed append roles. Provides the runtime
+    # API (initial render, context merge, assistant merge, metadata alignment) and overridable hooks for per-template
+    # grouping, rendering and junction handling. Text builders do not support multimodal rendering.
     """Build and update continuous-token runtime prompts for multi-turn rollouts.
 
     This class exposes two API layers:
@@ -84,6 +100,11 @@ class ContinuousTokenBuilder:
         chat_template_kwargs: dict[str, Any] | None = None,
         allowed_append_roles: list[str] | tuple[str, ...] | set[str] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores tokenizer and chat_template_kwargs (default empty mapping). If allowed_append_roles is given, converts to a
+        # frozen set and validates it is a subset of the supported roles, storing it on the instance (otherwise the class
+        # default is used).
+        # Exceptions: ValueError listing unknown roles.
         # Text-only base: no processor / mm_processor_kwargs. All multimodal state
         # (processor, mm_processor_kwargs, sampling-rate defaults) lives in the VL
         # layer so a text builder never carries multimodal parameters it cannot use.
@@ -106,6 +127,9 @@ class ContinuousTokenBuilder:
         audios: list[Any] | None = None,
         mm_inputs_out: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Renders the full initial prompt token ids with a generation prompt and optional tools via the chat template.
+        # Multimodal arguments are ignored by the text base. Outputs: list of int.
         # Text-only builders ignore multimodal inputs; VL builders override this.
         del mm_inputs_out
         return self._render_tokens(messages, add_generation_prompt=True, tools=tools)
@@ -117,6 +141,15 @@ class ContinuousTokenBuilder:
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Tokenizes messages appended after previous_messages so the result equals what the template adds.
+        # Behavior: validates append-only; returns [] if nothing appended. Splits appended messages into groups (runs of tool
+        # messages form one group, everything else one per group). Asks whether to fuse the generation prompt into the last
+        # group. For each group: tool groups use the tool-group hook with the messages processed so far; user/system/assistant
+        # groups must contain one message, an assistant cannot be the last group, and use the single-message hook; any other
+        # role raises. Each group's ids are merged into the incremental list via the merge-group hook, then the group is added
+        # to the processed messages. If not fused, appends the generation-prompt delta computed from the full updated list.
+        # Outputs: list of int. Exceptions: ValueError for append violations, bad groups, trailing assistant, unknown roles.
         self._assert_append_only(previous_messages, updated_messages)
         appended_messages = updated_messages[len(previous_messages) :]
         if not appended_messages:
@@ -174,6 +207,8 @@ class ContinuousTokenBuilder:
         processed_messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Hook: appends a group's token ids to the incremental list. Side effects: mutates incremental_ids.
         """Merge one encoded context group into the incremental token stream."""
         incremental_ids.extend(group_token_ids)
 
@@ -185,6 +220,9 @@ class ContinuousTokenBuilder:
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> MergeResult:
+        # [FUNCTION DOC]
+        # Computes appended context token ids and merges them with the runtime stream via the junction hook, passing
+        # previous_messages and appended_messages as keyword context. Outputs: MergeResult of kind "context".
         appended_messages = updated_messages[len(previous_messages) :]
         appended_ids = self.tokenize_context_incremental_messages(previous_messages, updated_messages, tools=tools)
         return self._merge_context_token_ids(
@@ -195,6 +233,9 @@ class ContinuousTokenBuilder:
         )
 
     def merge_assistant_tokens(self, runtime_token_ids: list[int], assistant_token_ids: list[int]) -> MergeResult:
+        # [FUNCTION DOC]
+        # Concatenates runtime ids with model-generated assistant ids; returns a MergeResult of kind "assistant" whose
+        # appended count is the assistant token count. No boundary edits.
         """Merge model-generated assistant tokens into the runtime token stream."""
         merged_token_ids = list(runtime_token_ids) + list(assistant_token_ids)
         return MergeResult(
@@ -209,6 +250,8 @@ class ContinuousTokenBuilder:
         appended_token_ids: list[int],
         **kwargs: Any,
     ) -> MergeResult:
+        # [FUNCTION DOC]
+        # Hook: plain concatenation of runtime and appended context ids, ignoring extra kwargs; returns a "context" MergeResult.
         """Merge runtime prefix tokens and appended context tokens.
 
         Model-specific builders usually override this hook for boundary handling,
@@ -230,6 +273,9 @@ class ContinuousTokenBuilder:
         add_generation_prompt: bool,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Renders messages through the module's apply_chat_template wrapper with tokenization, the given generation
+        # prompt flag, tools and the stored chat template kwargs, and normalizes to a list of ints.
         tokenized = apply_chat_template(
             self.tokenizer,
             messages,
@@ -248,6 +294,11 @@ class ContinuousTokenBuilder:
         add_generation_prompt: bool = False,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Renders prefix_messages alone (no generation prompt) and prefix plus appended (with the given generation flag) and
+        # returns the token suffix of the full render beyond the prefix render.
+        # Exceptions: ValueError naming the appended roles (or "generation_prompt" if none) when the full render does not start
+        # with the prefix render.
         """Render prefix/full prompts as token IDs and return the token-level suffix."""
         prefix_token_ids = self._render_tokens(prefix_messages, add_generation_prompt=False, tools=tools)
         full_token_ids = self._render_tokens(
@@ -268,6 +319,9 @@ class ContinuousTokenBuilder:
         tools: list[dict[str, Any]] | None = None,
         add_generation_prompt: bool = False,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Hook: tokenizes a run of tool messages as the delta after a synthetic system, synthetic user and a synthetic
+        # assistant whose tool calls match the tool messages.
         synthetic_assistant = self._synthetic_assistant_for_tools(tool_messages)
         return self.render_delta_token_id(
             [_SYNTHETIC_SYSTEM_MESSAGE, _SYNTHETIC_USER_MESSAGE, synthetic_assistant],
@@ -283,6 +337,8 @@ class ContinuousTokenBuilder:
         tools: list[dict[str, Any]] | None = None,
         add_generation_prompt: bool = False,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Hook: tokenizes one non-tool message as the delta after the synthetic system and user messages.
         return self.render_delta_token_id(
             [_SYNTHETIC_SYSTEM_MESSAGE, _SYNTHETIC_USER_MESSAGE],
             [message],
@@ -291,6 +347,8 @@ class ContinuousTokenBuilder:
         )
 
     def _should_fuse_generation_prompt_with_last_group(self) -> bool:
+        # [FUNCTION DOC]
+        # Hook: returns True, meaning the generation prompt is rendered together with the last appended group.
         """Whether the last append-group render should also add the generation prompt.
 
         Builders whose chat template derives the generation scaffold from more than
@@ -305,10 +363,16 @@ class ContinuousTokenBuilder:
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Hook: returns the tokens added only by the generation prompt for the full updated conversation (delta with no
+        # appended messages).
         """Tokenize the tokens added only by ``add_generation_prompt=True``."""
         return self.render_delta_token_id(updated_messages, [], add_generation_prompt=True, tools=tools)
 
     def _iter_append_groups(self, appended_messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        # [FUNCTION DOC]
+        # HELPER: Groups appended messages: consecutive tool messages become one group; each other message is its own group.
+        # Outputs: list of message lists preserving order.
         groups: list[list[dict[str, Any]]] = []
         index = 0
         while index < len(appended_messages):
@@ -329,6 +393,9 @@ class ContinuousTokenBuilder:
         previous_messages: list[dict[str, Any]],
         updated_messages: list[dict[str, Any]],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Validates updated_messages is previous_messages plus appended messages whose roles are allowed.
+        # Exceptions: ValueError if shorter, if the prefix differs, or if an appended role is not allowed.
         if len(updated_messages) < len(previous_messages):
             raise ValueError("Continuous Token messages must be append-only; updated_messages is shorter")
         if updated_messages[: len(previous_messages)] != previous_messages:
@@ -344,6 +411,10 @@ class ContinuousTokenBuilder:
         self,
         tool_messages: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Builds a synthetic assistant message with empty content, placeholder reasoning_content and one function tool
+        # call per tool message (id from the message's tool_call_id or a dummy based on index, name from the message or the
+        # dummy tool name, empty arguments).
         tool_calls = []
         for index, tool_message in enumerate(tool_messages):
             tool_call = {
@@ -370,6 +441,14 @@ class ContinuousTokenBuilder:
         *,
         assistant_logprobs: list[float] | None = None,
     ) -> tuple[list[int], list[float] | None]:
+        # [FUNCTION DOC]
+        # Applies a MergeResult's edits to response-side metadata.
+        # Behavior: copies mask and logprobs; if logprobs are absent but assistant_logprobs given, raises. Trims the last
+        # removed_prefix_token_count entries from both. Appends 0 / 0.0 for each inserted boundary token. For kind assistant,
+        # appends mask 1 per appended token and, when logprobs are tracked, the assistant logprobs (which are required when
+        # tokens were appended and must match the appended count; treated as empty when nothing was appended). For kind
+        # context, appends 0 / 0.0 per appended token. Other kinds raise.
+        # Outputs: tuple (mask list, logprob list or None). Exceptions: ValueError as described.
         """Align response masks and logprobs after a Continuous Token merge.
 
         ``MergeResult`` records token edits at the runtime-prefix boundary. This
@@ -422,6 +501,8 @@ class ContinuousTokenBuilder:
 
     @classmethod
     def supports_multimodal(cls) -> bool:
+        # [FUNCTION DOC]
+        # Class-level flag: returns False for text builders (VL subclasses return True).
         """Whether this builder handles vision inputs.
 
         VL subclasses override this to return True. Used by the wiring layer
@@ -439,6 +520,9 @@ class ContinuousTokenBuilder:
         add_generation_prompt: bool = True,
         mm_inputs_out: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Multimodal rendering hook; not implemented in the text base.
+        # Exceptions: always raises NotImplementedError.
         """Render messages with images through the processor.
 
         Unlike ``_render_tokens`` which uses only the tokenizer, this method
@@ -464,6 +548,9 @@ class ContinuousTokenBuilder:
 
 
 class GptOssContinuousTokenBuilder(ContinuousTokenBuilder):
+    # [CLASS DOC]
+    # GPT-OSS (harmony format) builder: encodes tool responses and plain historical assistant turns directly as harmony
+    # text instead of template suffix diffs, and computes the generation prompt as a separate delta.
     """GPT-OSS tool-response formatting."""
 
     def _tokenize_single_non_tool(
@@ -473,6 +560,9 @@ class GptOssContinuousTokenBuilder(ContinuousTokenBuilder):
         add_generation_prompt: bool = False,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # For a plain assistant message without tool calls, directly encodes the harmony text for its analysis (if any) and
+        # final channels without special tokens; otherwise delegates to the base hook.
         if message.get("role") == "assistant" and not message.get("tool_calls"):
             del add_generation_prompt, tools
             # Context incremental messages currently reject a final assistant turn,
@@ -488,6 +578,8 @@ class GptOssContinuousTokenBuilder(ContinuousTokenBuilder):
         )
 
     def _should_fuse_generation_prompt_with_last_group(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns False so the generation prompt is derived separately.
         # Tool responses are encoded directly rather than through a chat-template
         # suffix diff, so keep generation-prompt derivation as a separate step.
         return False
@@ -500,6 +592,10 @@ class GptOssContinuousTokenBuilder(ContinuousTokenBuilder):
         tools: list[dict[str, Any]] | None = None,
         add_generation_prompt: bool = False,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Encodes each tool message as a harmony tool response (tool name resolved from the message, its call id, or the
+        # matching preceding assistant tool call; required) and tokenizes the concatenated text without special tokens.
+        # Exceptions: ValueError from tool-name resolution when no name can be determined.
         del tools, add_generation_prompt
         response_text = "".join(
             self._format_tool_response(
@@ -517,12 +613,19 @@ class GptOssContinuousTokenBuilder(ContinuousTokenBuilder):
 
     @staticmethod
     def _format_tool_response(tool_message: dict[str, Any], tool_name: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Formats a tool response: stringifies content, JSON-encodes it compactly (non-ASCII kept) and wraps it in a
+        # harmony message from functions.<tool_name> to the assistant on the commentary channel ending with the end token.
         content = _stringify_tool_content(tool_message.get("content", ""))
         json_content = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
         return f"<|start|>functions.{tool_name} to=assistant<|channel|>commentary<|message|>{json_content}<|end|>"
 
     @staticmethod
     def _format_plain_assistant_context(message: dict[str, Any]) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Formats a plain historical assistant turn: picks thinking from "thinking", then "reasoning_content", then
+        # "reasoning"; if non-empty emits an analysis-channel message, then always a final-channel message with the
+        # stringified content, each closed with the end token (not the return token).
         thinking = message.get("thinking")
         if thinking is None:
             thinking = message.get("reasoning_content")
@@ -538,6 +641,9 @@ class GptOssContinuousTokenBuilder(ContinuousTokenBuilder):
 
 
 class QwenContinuousTokenBuilder(ContinuousTokenBuilder):
+    # [CLASS DOC]
+    # Qwen ChatML builder: if the runtime stream ends with the im_end token, inserts the newline token the template
+    # renders after it before appending context.
     """Qwen ChatML boundary handling.
 
     Qwen2, Qwen2.5, Qwen3, and Qwen3.5 templates render ``<|im_end|>\n`` after a turn,
@@ -552,6 +658,8 @@ class QwenContinuousTokenBuilder(ContinuousTokenBuilder):
     """
 
     def __init__(self, tokenizer: Any, **kwargs: Any):
+        # [FUNCTION DOC]
+        # Initializes the base, verifies "\n" encodes to exactly one token (ValueError otherwise) and resolves the im_end id.
         super().__init__(tokenizer, **kwargs)
         newline_ids = tokenizer.encode("\n", add_special_tokens=False)
         if len(newline_ids) != 1:
@@ -565,6 +673,9 @@ class QwenContinuousTokenBuilder(ContinuousTokenBuilder):
         appended_token_ids: list[int],
         **kwargs: Any,
     ) -> MergeResult:
+        # [FUNCTION DOC]
+        # Junction hook: copies runtime ids, appends the newline (recorded as inserted) when the last runtime token is im_end,
+        # then appends context ids; returns a "context" MergeResult.
         prefix = list(runtime_token_ids)
         inserted_token_ids: list[int] = []
         if prefix and prefix[-1] == self._im_end_id:
@@ -579,6 +690,8 @@ class QwenContinuousTokenBuilder(ContinuousTokenBuilder):
 
 
 class MiniMaxContinuousTokenBuilder(ContinuousTokenBuilder):
+    # [CLASS DOC]
+    # MiniMax builder: same newline-insertion rule as Qwen but keyed on the MiniMax end-of-turn token "[e~[".
     """MiniMax boundary handling.
 
     MiniMax templates render ``[e~[\n`` after a turn, while generation may stop
@@ -587,6 +700,8 @@ class MiniMaxContinuousTokenBuilder(ContinuousTokenBuilder):
     """
 
     def __init__(self, tokenizer: Any, **kwargs: Any):
+        # [FUNCTION DOC]
+        # Initializes the base, verifies "\n" encodes to exactly one token (ValueError otherwise) and resolves the "[e~[" id.
         super().__init__(tokenizer, **kwargs)
         newline_ids = tokenizer.encode("\n", add_special_tokens=False)
         if len(newline_ids) != 1:
@@ -600,6 +715,9 @@ class MiniMaxContinuousTokenBuilder(ContinuousTokenBuilder):
         appended_token_ids: list[int],
         **kwargs: Any,
     ) -> MergeResult:
+        # [FUNCTION DOC]
+        # Junction hook: inserts the newline token when the runtime stream ends with the MiniMax end token, then appends the
+        # context ids; returns a "context" MergeResult.
         prefix = list(runtime_token_ids)
         inserted_token_ids: list[int] = []
         if prefix and prefix[-1] == self._eos_id:
@@ -614,6 +732,9 @@ class MiniMaxContinuousTokenBuilder(ContinuousTokenBuilder):
 
 
 class GLMContinuousTokenBuilder(ContinuousTokenBuilder):
+    # [CLASS DOC]
+    # GLM builder: observation/user tokens act both as stop tokens and as the next message's start token, so a trailing one
+    # in the runtime stream is removed before appending context (which re-renders it).
     """GLM observation/user boundary handling.
 
     ``<|observation|>`` and ``<|user|>`` can be both assistant stop tokens and
@@ -622,6 +743,8 @@ class GLMContinuousTokenBuilder(ContinuousTokenBuilder):
     """
 
     def __init__(self, tokenizer: Any, **kwargs: Any):
+        # [FUNCTION DOC]
+        # Initializes the base and resolves the observation and user token ids into a set of ambiguous boundary ids.
         super().__init__(tokenizer, **kwargs)
         self._observation_id = require_token_id(tokenizer, "<|observation|>")
         self._user_id = require_token_id(tokenizer, "<|user|>")
@@ -633,6 +756,9 @@ class GLMContinuousTokenBuilder(ContinuousTokenBuilder):
         appended_token_ids: list[int],
         **kwargs: Any,
     ) -> MergeResult:
+        # [FUNCTION DOC]
+        # Junction hook: if the last runtime token is an ambiguous boundary id, drops it and records one removed prefix token;
+        # returns a "context" MergeResult with the concatenation.
         prefix = list(runtime_token_ids)
         removed_prefix_token_count = 0
         if prefix and prefix[-1] in self._ambiguous_boundary_ids:
@@ -647,9 +773,15 @@ class GLMContinuousTokenBuilder(ContinuousTokenBuilder):
 
 
 class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
+    # [CLASS DOC]
+    # Gemma4 builder: inserts turn separators before appended user turns when needed, renders tool responses as
+    # continuations of the model turn and derives the generation scaffold separately based on the preceding message type.
     """Gemma4 turn-continuation and tool-response boundary handling."""
 
     def __init__(self, tokenizer: Any, **kwargs: Any):
+        # [FUNCTION DOC]
+        # Initializes the base, resolves the tool_response token id and tokenizes the "<turn|>\n" separator and the
+        # "<|turn>model\n" header (each must be non-empty, else ValueError).
         super().__init__(tokenizer, **kwargs)
         self._tool_response_id = require_token_id(tokenizer, "<|tool_response>")
         turn_separator_ids = normalize_token_ids(tokenizer.encode("<turn|>\n", add_special_tokens=False))
@@ -670,6 +802,9 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
         processed_messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Merge-group hook: before a user group, appends the turn separator ids when the context so far does not already end
+        # with them, then delegates to the base merge (append group ids).
         if group[0].get("role") == "user" and self._needs_user_turn_separator(
             incremental_ids,
             processed_messages=processed_messages,
@@ -691,6 +826,9 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
         processed_messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Returns False when there is no incremental output and no processed history; otherwise True iff the context
+        # prefix does not end with the turn separator.
         if not incremental_ids and not processed_messages:
             return False
         return not self._context_prefix_ends_with_turn_separator(
@@ -706,6 +844,9 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
         processed_messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Checks whether the context rendered so far ends with the turn separator: if there are incremental ids, checks
+        # their tail; else if there is processed history, renders it (no generation prompt) and checks the tail; else False.
         separator_ids = self._turn_separator_ids
         if incremental_ids:
             return incremental_ids[-len(separator_ids) :] == separator_ids
@@ -715,6 +856,8 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
         return rendered_ids[-len(separator_ids) :] == separator_ids
 
     def _should_fuse_generation_prompt_with_last_group(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns False: Gemma4's generation scaffold is computed separately from the preceding message type.
         # Gemma4's generation scaffold depends on the preceding message type and
         # is handled by the model-specific hook below.
         return False
@@ -727,6 +870,11 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
         tools: list[dict[str, Any]] | None = None,
         add_generation_prompt: bool = False,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Tokenizes a run of tool messages as the delta after synthetic system/user plus a synthetic assistant whose tool
+        # calls carry each message's call id (or a dummy) and its required resolved tool name. Each tool message is copied with
+        # tool_call_id set to that id and name filled in when missing. Generation prompt is never added here.
+        # Exceptions: ValueError when a tool name cannot be resolved or the suffix diff fails.
         del add_generation_prompt
         tool_calls = []
         rendered_tool_messages = []
@@ -771,6 +919,9 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Returns [] unless the last updated message is user or system; otherwise the generation-prompt delta rendered after
+        # synthetic system/user followed by that last message.
         last_message = updated_messages[-1]
         if last_message.get("role") not in {"user", "system"}:
             return []
@@ -787,6 +938,14 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
         appended_token_ids: list[int],
         **kwargs: Any,
     ) -> MergeResult:
+        # [FUNCTION DOC]
+        # Junction hook for Gemma4.
+        # Behavior: when the first appended message is assistant and the last non-tool previous message is assistant (the
+        # assistant continues the same model turn), removes a trailing turn separator from the runtime prefix (recorded as
+        # removed prefix tokens) and drops a leading model-turn header from the appended ids. When the first appended message
+        # is a tool message and neither the prefix end nor the appended start is already the tool_response token, inserts that
+        # token (recorded as inserted). Returns a "context" MergeResult; appended count reflects the possibly trimmed appended ids.
+        # Inputs: kwargs previous_messages and appended_messages (default empty).
         previous_messages = kwargs.get("previous_messages", [])
         appended_messages = kwargs.get("appended_messages", [])
         prefix = list(runtime_token_ids)
@@ -836,6 +995,8 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
 
     @staticmethod
     def _last_non_tool_role(messages: list[dict[str, Any]]) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns the role of the last message whose role is not "tool", or None.
         for message in reversed(messages):
             role = message.get("role")
             if role != "tool":
@@ -844,6 +1005,11 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
 
 
 def require_token_id(tokenizer: Any, token: str) -> int:
+    # [FUNCTION DOC]
+    # Resolves a required special token to a single non-negative int id via convert_tokens_to_ids, unwrapping a
+    # one-element list.
+    # Exceptions: ValueError when the id is None, a list of other length, or not a non-negative int.
+    # KNOWN ISSUE: many tokenizers return the unk id rather than None for unknown tokens, which this check accepts.
     token_id = tokenizer.convert_tokens_to_ids(token)
     if token_id is None:
         raise ValueError(f"Tokenizer does not define required token {token!r}")
@@ -857,6 +1023,9 @@ def require_token_id(tokenizer: Any, token: str) -> int:
 
 
 def _stringify_tool_content(content: Any) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns "" for None, strings unchanged, concatenated text of dict parts of type "text" for lists, else the
+    # string conversion.
     if content is None:
         return ""
     if isinstance(content, str):
@@ -869,12 +1038,16 @@ def _stringify_tool_content(content: Any) -> str:
 
 
 def _tool_message_name_or_dummy(tool_message: dict[str, Any]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the tool message's name as string if truthy, else the dummy tool name.
     if tool_message.get("name"):
         return str(tool_message["name"])
     return _DUMMY_TOOL_NAME
 
 
 def _tool_call_id_or_dummy(tool_message: dict[str, Any], index: int) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Returns the message's tool_call_id when not None, else "continuous_token_call_<index>".
     if tool_message.get("tool_call_id") is not None:
         return tool_message["tool_call_id"]
     return f"continuous_token_call_{index}"
@@ -883,6 +1056,11 @@ def _tool_call_id_or_dummy(tool_message: dict[str, Any], index: int) -> Any:
 def _latest_assistant_tool_call_names(
     messages: list[dict[str, Any]],
 ) -> tuple[dict[str, str], list[str | None]]:
+    # [FUNCTION DOC]
+    # HELPER: Finds the most recent assistant message and extracts its tool call names.
+    # Outputs: (mapping from tool call id string to function name for calls having both, list of names by position with None
+    # for non-dict calls or nameless calls). Returns (empty mapping, empty list) if no assistant exists or its tool_calls is
+    # not a list.
     tool_names_by_id: dict[str, str] = {}
     for message in reversed(messages):
         if message.get("role") != "assistant":
@@ -910,6 +1088,11 @@ def _resolve_required_tool_name(
     tool_messages: list[dict[str, Any]],
     previous_messages: list[dict[str, Any]],
 ) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Determines a tool response's function name: the message's own name if set; else the name of the latest
+    # assistant tool call with matching id; else positional matching, which requires the tool group size to equal the
+    # latest assistant's tool call count and a name at this index, and logs a warning.
+    # Exceptions: ValueError when positional matching is impossible.
     if tool_message.get("name"):
         return str(tool_message["name"])
 
@@ -942,6 +1125,8 @@ def _resolve_required_tool_name(
 
 
 def _tool_call_function_name(tool_call: dict[str, Any]) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns the tool call's function name as string when present in a dict "function" entry, else None.
     function = tool_call.get("function")
     if isinstance(function, dict) and function.get("name") is not None:
         return str(function["name"])
@@ -949,6 +1134,10 @@ def _tool_call_function_name(tool_call: dict[str, Any]) -> str | None:
 
 
 class DeepSeekContinuousTokenBuilder(ContinuousTokenBuilder):
+    # [CLASS DOC]
+    # DeepSeek V2/V3/R1 builder. Resolves EOS (required) and optional BOS/User/Assistant ids, tokenizes the
+    # tool-outputs-end marker, uses string-encoded synthetic tool arguments, and removes a trailing tool-outputs-end marker
+    # before a user turn is appended (both inside incremental output and at the runtime junction).
     """DeepSeek V3/R1 boundary handling.
 
     DeepSeek uses direct concatenation at boundaries (no separator between
@@ -965,6 +1154,10 @@ class DeepSeekContinuousTokenBuilder(ContinuousTokenBuilder):
     _TOOL_OUTPUTS_END_TOKEN = "<\uff5ctool\u2581outputs\u2581end\uff5c>"
 
     def __init__(self, tokenizer: Any, **kwargs: Any):
+        # [FUNCTION DOC]
+        # Initializes the base, resolves required EOS id, optional BOS/User/Assistant ids (None when missing/unk) and tokenizes
+        # the tool-outputs-end marker without special tokens. Exceptions: ValueError if EOS is missing or the marker tokenizes
+        # to nothing.
         super().__init__(tokenizer, **kwargs)
         # EOS is the only token guaranteed across V2/V3/R1
         self._eos_id = require_token_id(tokenizer, self._EOS_TOKEN)
@@ -980,6 +1173,8 @@ class DeepSeekContinuousTokenBuilder(ContinuousTokenBuilder):
 
     @staticmethod
     def _optional_token_id(tokenizer: Any, token: str) -> int | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns the token id as int, or None when the tokenizer returns None or the unk id.
         token_id = tokenizer.convert_tokens_to_ids(token)
         unk = getattr(tokenizer, "unk_token_id", None)
         if token_id is None or token_id == unk:
@@ -990,6 +1185,9 @@ class DeepSeekContinuousTokenBuilder(ContinuousTokenBuilder):
         self,
         tool_messages: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Builds the base synthetic assistant but replaces each tool call's arguments with the JSON string "{}" because these
+        # templates concatenate arguments as strings.
         # The R1 / V3.1 / V3.2 templates splice ``tool['function']['arguments']`` into
         # the prompt by string concatenation, so a mapping raises TypeError there. The
         # synthetic tool call only exists to be diffed away; carry its arguments as the
@@ -1008,6 +1206,9 @@ class DeepSeekContinuousTokenBuilder(ContinuousTokenBuilder):
         processed_messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Merge-group hook: before a user group, strips a trailing tool-outputs-end marker from the incremental ids, then
+        # appends the group ids.
         if group[0].get("role") == "user":
             self._strip_trailing_tool_outputs_end(incremental_ids)
         super()._merge_context_group(
@@ -1024,6 +1225,9 @@ class DeepSeekContinuousTokenBuilder(ContinuousTokenBuilder):
         appended_token_ids: list[int],
         **kwargs: Any,
     ) -> MergeResult:
+        # [FUNCTION DOC]
+        # Junction hook: if the first appended message is user, strips a trailing tool-outputs-end marker from the runtime
+        # prefix and records the removed count; returns a "context" MergeResult with the concatenation.
         appended_messages = kwargs.get("appended_messages", [])
         prefix = list(runtime_token_ids)
         removed_prefix_token_count = 0
@@ -1038,6 +1242,9 @@ class DeepSeekContinuousTokenBuilder(ContinuousTokenBuilder):
         )
 
     def _strip_trailing_tool_outputs_end(self, token_ids: list[int]) -> int:
+        # [FUNCTION DOC]
+        # HELPER: If token_ids ends with the tool-outputs-end marker ids, deletes them in place and returns their count;
+        # otherwise returns 0. Side effects: mutates token_ids.
         suffix = self._tool_outputs_end_ids
         if token_ids[-len(suffix) :] != suffix:
             return 0
@@ -1051,6 +1258,10 @@ class DeepSeekContinuousTokenBuilder(ContinuousTokenBuilder):
 
 
 class VLContinuousTokenMixin:
+    # [CLASS DOC]
+    # Mixin adding processor-backed multimodal rendering to a text builder (placed first in the MRO so text-family junction
+    # handling still applies). Stores the processor and constant mm_processor_kwargs, extracts media references from
+    # OpenAI-style content blocks and routes all renders through the processor's chat template and call.
     """Shared processor-backed logic for vision-language continuous token builders.
 
     Provides the multimodal workflow (image extraction, processor rendering,
@@ -1068,6 +1279,9 @@ class VLContinuousTokenMixin:
         mm_processor_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ):
+        # [FUNCTION DOC]
+        # Initializes the next class in the MRO with tokenizer and kwargs, stores processor and mm_processor_kwargs (default
+        # empty), and when no sampling_rate is set adds the processor feature extractor's sampling rate (as int) if available.
         super().__init__(tokenizer, **kwargs)
         self.processor = processor
         # Processor kwargs (e.g. max_pixels, do_pan_and_scan) that control how media
@@ -1084,9 +1298,14 @@ class VLContinuousTokenMixin:
 
     @classmethod
     def supports_multimodal(cls) -> bool:
+        # [FUNCTION DOC]
+        # Returns True: VL builders support multimodal inputs.
         return True
 
     def _extract_images_from_messages(self, messages: list[dict[str, Any]]) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Collects image references from list-valued message contents: for blocks of type image/image_url, uses the
+        # "image" field, or falls back to image_url (dict url or string). Outputs: list of references in order.
         """Extract image references from OpenAI-style content blocks."""
         images: list[Any] = []
         for msg in messages:
@@ -1106,6 +1325,8 @@ class VLContinuousTokenMixin:
         return images
 
     def _extract_videos_from_messages(self, messages: list[dict[str, Any]]) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Collects non-None "video" fields from content blocks of type video. Outputs: list.
         """Extract video references from OpenAI-style content blocks."""
         videos: list[Any] = []
         for msg in messages:
@@ -1119,6 +1340,8 @@ class VLContinuousTokenMixin:
         return videos
 
     def _extract_audios_from_messages(self, messages: list[dict[str, Any]]) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Collects "audio" (or fallback "audio_url") fields from content blocks of type audio. Outputs: list.
         """Extract audio references from OpenAI-style content blocks."""
         audios: list[Any] = []
         for msg in messages:
@@ -1144,6 +1367,13 @@ class VLContinuousTokenMixin:
         tools: list[dict[str, Any]] | None = None,
         mm_inputs_out: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Renders messages to token ids through the processor.
+        # Behavior: copies chat template kwargs, adds tools when given, renders text (untokenized) with the processor chat
+        # template via the module's apply_chat_template wrapper, then runs the processor on the single text with the given media
+        # (empty lists become None) and the stored processor kwargs. If mm_inputs_out is given, updates it with all processor
+        # outputs except input_ids. Returns normalized input_ids.
+        # Side effects: mutates mm_inputs_out.
         """Render messages through the processor (full render with all media).
 
         ``mm_inputs_out``, when given, receives the processor features other than ``input_ids``
@@ -1188,6 +1418,9 @@ class VLContinuousTokenMixin:
         add_generation_prompt: bool,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Overrides the base text render to go through render_tokens_with_mm, extracting images, videos and audios from the
+        # messages themselves.
         """Render messages to token IDs through the processor (VL override).
 
         Routes the base text renderer through the processor chat template +
@@ -1214,6 +1447,9 @@ class VLContinuousTokenMixin:
         audios: list[Any] | None = None,
         mm_inputs_out: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Renders the initial prompt through the processor with the provided media, generation prompt and tools, optionally
+        # filling mm_inputs_out.
         return self.render_tokens_with_mm(
             messages,
             images,
@@ -1226,6 +1462,8 @@ class VLContinuousTokenMixin:
 
 
 class VLContinuousTokenBuilder(VLContinuousTokenMixin, ContinuousTokenBuilder):
+    # [CLASS DOC]
+    # Default VL builder: mixin rendering plus the base plain-concatenation junction handling.
     """Generic vision-language builder used as the default for VL models that
     have no model-specific builder.
 
@@ -1235,6 +1473,8 @@ class VLContinuousTokenBuilder(VLContinuousTokenMixin, ContinuousTokenBuilder):
 
 
 class QwenVLContinuousTokenBuilder(VLContinuousTokenMixin, QwenContinuousTokenBuilder):
+    # [CLASS DOC]
+    # Qwen VL builder (Qwen2-VL, 2.5-VL, 3-VL, 3-VL-MoE): mixin rendering plus Qwen newline insertion after im_end.
     """Qwen Vision-Language: Qwen ChatML newline patch + VL processor logic.
 
     Handles Qwen2-VL, Qwen2.5-VL, Qwen3-VL, and Qwen3-VL-MoE.
@@ -1242,6 +1482,9 @@ class QwenVLContinuousTokenBuilder(VLContinuousTokenMixin, QwenContinuousTokenBu
 
 
 class MiniMaxVLContinuousTokenBuilder(VLContinuousTokenMixin, MiniMaxContinuousTokenBuilder):
+    # [CLASS DOC]
+    # MiniMax-VL builder: mixin rendering plus MiniMax newline insertion, keyed on the end_of_sentence terminator, and
+    # stripping of the assistant scaffold the processor template always appends when no generation prompt is requested.
     """MiniMax-VL (e.g. MiniMax-VL-01): MiniMax ``[e~[`` newline patch + VL processor logic.
 
     MiniMax-VL-01's *processor* chat template ignores ``add_generation_prompt`` and
@@ -1254,6 +1497,9 @@ class MiniMaxVLContinuousTokenBuilder(VLContinuousTokenMixin, MiniMaxContinuousT
     """
 
     def __init__(self, tokenizer: Any, processor: Any, **kwargs: Any):
+        # [FUNCTION DOC]
+        # Initializes the mixin/MiniMax chain, repoints the EOS id to "<end_of_sentence>" and precomputes the scaffold ids.
+        # Exceptions: ValueError when tokens are missing or scaffold detection fails.
         super().__init__(tokenizer, processor, **kwargs)
         # MiniMax-VL-01 uses ``<end_of_sentence>`` as its turn terminator, not the
         # MiniMax-Text-01 ``[e~[`` token the base builder resolves. Repoint the EOS
@@ -1263,6 +1509,10 @@ class MiniMaxVLContinuousTokenBuilder(VLContinuousTokenMixin, MiniMaxContinuousT
         self._vl_scaffold_ids = self._compute_generation_scaffold_ids()
 
     def _compute_generation_scaffold_ids(self) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Renders synthetic system+user through the processor template (no generation prompt) and processor call
+        # without images, and returns the ids from the last beginning_of_sentence token to the end.
+        # Exceptions: ValueError when no such token exists or the result is empty.
         """Extract the unconditional trailing assistant scaffold token ids.
 
         Rendered via the processor chat template (bypassing this class's override),
@@ -1299,6 +1549,8 @@ class MiniMaxVLContinuousTokenBuilder(VLContinuousTokenMixin, MiniMaxContinuousT
         tools: list[dict[str, Any]] | None = None,
         mm_inputs_out: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Calls the mixin render, then removes the trailing scaffold ids when present and no generation prompt was requested.
         # The processor template always appends the scaffold; strip it unless a
         # generation prompt was requested, restoring append-only rendering.
         token_ids = super().render_tokens_with_mm(
@@ -1317,6 +1569,8 @@ class MiniMaxVLContinuousTokenBuilder(VLContinuousTokenMixin, MiniMaxContinuousT
 
 
 class Gemma4VLContinuousTokenBuilder(VLContinuousTokenMixin, Gemma4ContinuousTokenBuilder):
+    # [CLASS DOC]
+    # Gemma4 VL builder: mixin processor rendering combined with Gemma4 turn/tool-response boundary handling.
     """Gemma4 (unified) vision-language: Gemma4 ``<|tool_response>`` boundary handling
     + VL processor rendering.
 
@@ -1328,14 +1582,21 @@ class Gemma4VLContinuousTokenBuilder(VLContinuousTokenMixin, Gemma4ContinuousTok
 
 
 class GLM46VContinuousTokenBuilder(VLContinuousTokenMixin, GLMContinuousTokenBuilder):
+    # [CLASS DOC]
+    # GLM-4.6V builder: mixin processor rendering combined with GLM observation/user trimming.
     """GLM-4.6V: GLM observation/user trim + VL processor logic."""
 
 
 class KimiVLContinuousTokenBuilder(VLContinuousTokenMixin, ContinuousTokenBuilder):
+    # [CLASS DOC]
+    # Kimi-VL builder: mixin processor rendering with plain concatenation at junctions.
     """Kimi-VL (MoonViT): direct concatenation + VL processor logic."""
 
 
 class DeepSeekVL2ContinuousTokenBuilder(DeepSeekContinuousTokenBuilder):
+    # [CLASS DOC]
+    # DeepSeek-VL2 builder. Not using the mixin: renders via the DeepseekVLV2Processor conversation API (no chat template)
+    # and computes context merges by full re-render plus prefix diff; inherits DeepSeek junction handling.
     """DeepSeek-VL2 continuous token builder.
 
     VL2 uses its own DeepseekVLV2Processor that handles both conversation
@@ -1355,6 +1616,8 @@ class DeepSeekVL2ContinuousTokenBuilder(DeepSeekContinuousTokenBuilder):
         mm_processor_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ):
+        # [FUNCTION DOC]
+        # Initializes the DeepSeek text builder and stores the processor and mm_processor_kwargs (unused, kept for symmetry).
         super().__init__(tokenizer, **kwargs)
         self.processor = processor
         # VL2 renders through DeepseekVLV2Processor directly and does not consume
@@ -1363,9 +1626,13 @@ class DeepSeekVL2ContinuousTokenBuilder(DeepSeekContinuousTokenBuilder):
 
     @classmethod
     def supports_multimodal(cls) -> bool:
+        # [FUNCTION DOC]
+        # Returns True.
         return True
 
     def _extract_images_from_messages(self, messages: list[dict[str, Any]]) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Same image-reference extraction as the VL mixin (image field or image_url dict/string).
         """Extract image references from content blocks."""
         images: list[Any] = []
         for msg in messages:
@@ -1390,6 +1657,13 @@ class DeepSeekVL2ContinuousTokenBuilder(DeepSeekContinuousTokenBuilder):
         images: list[Any],
         add_generation_prompt: bool = True,
     ) -> tuple[list[dict[str, Any]], list[Any]]:
+        # [FUNCTION DOC]
+        # HELPER: Converts OpenAI-style messages to VL2 conversation dicts: list contents are flattened to text with an
+        # "<image>" placeholder per image block (consuming images in order while available) and the message's images collected;
+        # user and system map to the User role (system with no images), assistant to the Assistant role; when a generation prompt
+        # is requested, appends an empty Assistant entry unless the last entry already is an empty Assistant.
+        # Outputs: (conversation list, the original images list).
+        # KNOWN ISSUE: messages with other roles (e.g. tool) are silently dropped.
         """Convert OpenAI-style messages to VL2 conversation format."""
         conv: list[dict[str, Any]] = []
         img_idx = 0
@@ -1430,6 +1704,9 @@ class DeepSeekVL2ContinuousTokenBuilder(DeepSeekContinuousTokenBuilder):
         images: list[Any],
         add_generation_prompt: bool = True,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Converts messages to a VL2 conversation and calls the processor with force_batchify, returning the first
+        # row of input_ids as a list of ints.
         """Render messages through DeepseekVLV2Processor."""
         conv, all_images = self._to_vl2_conversation(messages, images, add_generation_prompt)
         out = self.processor.__call__(conversations=conv, images=all_images, force_batchify=True)
@@ -1445,6 +1722,9 @@ class DeepSeekVL2ContinuousTokenBuilder(DeepSeekContinuousTokenBuilder):
         audios: list[Any] | None = None,
         mm_inputs_out: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC]
+        # Initial prompt: uses the given images or extracts them from messages; with no images falls back to the text template
+        # render, otherwise renders through the processor. Video/audio inputs are ignored.
         # DeepSeek-VL2 renders through its own processor and has no video path here.
         del mm_inputs_out
         if images is None:
@@ -1461,6 +1741,12 @@ class DeepSeekVL2ContinuousTokenBuilder(DeepSeekContinuousTokenBuilder):
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> MergeResult:
+        # [FUNCTION DOC]
+        # Validates append-only, re-renders the full updated conversation through the processor (with all extracted images
+        # and a generation prompt) and takes everything past the runtime stream length as appended ids, then applies the
+        # DeepSeek junction hook.
+        # KNOWN ISSUE: the prefix is assumed to equal the runtime stream by length only (no equality check), tools are ignored,
+        # and appended_messages is not passed to the junction hook so the tool-outputs-end stripping never triggers.
         """Merge tokens: always use processor + prefix diff for VL2.
 
         VL2 tokenizer has no chat_template, so all rendering goes through

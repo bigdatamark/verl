@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Core profiler dispatch: DistProfiler selects a backend implementation by config.tool (nsys, npu,
+# torch, torch_memory, precision_debugger, or a no-op), gates it by enable/rank/step, provides a
+# method-annotation decorator, and runs the optional post-profiling finish hook (artifact relocation and
+# a user shell command). Also provides no-op range markers, a rollout-replica profiler builder that maps
+# global GPU ranks to replica indices, and DistProfilerExtension exposing start/stop/step as
+# single-controller ONE_TO_ALL worker methods.
 import copy
 import dataclasses
 import functools
@@ -27,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 
 def _hook_print(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints "[Profiler][finish_hook] <msg>" to stdout with flush. Side effects: stdout.
     """Report finish-hook activity on stdout.
 
     Worker processes do not necessarily inherit the ``verl`` logger configuration, so hook
@@ -41,6 +50,8 @@ def mark_start_range(
     domain: Optional[str] = None,
     category: Optional[str] = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # No-op range start. Inputs ignored. Outputs: None.
     """Start a profiling range marker (no-op implementation).
 
     Args:
@@ -53,6 +64,8 @@ def mark_start_range(
 
 
 def mark_end_range(range_id: str) -> None:
+    # [FUNCTION DOC]
+    # No-op range end. Inputs ignored. Outputs: None.
     """End a profiling range marker (no-op implementation).
 
     Args:
@@ -67,6 +80,8 @@ def mark_annotate(
     domain: Optional[str] = None,
     category: Optional[str] = None,
 ) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: returns an identity decorator. Outputs: decorator.
     """Decorator to annotate a function with profiling markers (no-op implementation).
 
     Args:
@@ -80,12 +95,19 @@ def mark_annotate(
     """
 
     def decorator(func):
+        # [FUNCTION DOC]
+        # HELPER: Identity decorator returning func.
         return func
 
     return decorator
 
 
 class DistProfiler:
+    # [CLASS DOC]
+    # Per-worker profiler facade. Holds config, tool_config, rank, an optional role prefix for file names,
+    # the backend _impl, and flags: _enable (config.enable), _this_rank (rank selection), _this_step (set
+    # between start and stop), _discrete (tool_config.discrete), and finish-hook settings. Backend calls are
+    # made through getattr with no-op fallbacks.
     """A dispatcher that delegates to specific profilers based on config.tool.
 
     Supported tools:
@@ -104,6 +126,19 @@ class DistProfiler:
         save_file_prefix: Optional[str] = None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: defaults config to a disabled ProfilerConfig; tool_config defaults to config.tool_config.
+        # Rank selection: all_ranks -> True; non-empty ranks -> membership; else rank 0 when enabled. For
+        # precision_debugger with enable, rank gate is forced open (msprobe filters ranks). Finish-hook rank:
+        # finish_hook_all_ranks -> True; finish_hook_ranks non-empty -> membership; else same as profiled rank.
+        # Discrete flag read from tool_config. Lazily imports and instantiates the backend matching config.tool
+        # (nsys -> NsightSystemsProfiler, npu -> NPUProfiler, torch -> torch_profile.Profiler with
+        # save_file_prefix, torch_memory -> TorchMemoryProfiler, precision_debugger -> PrecisionDebuggerProfiler
+        # with save_path), else _NoOpProfiler.
+        # Inputs: rank - global rank; config; tool_config; save_file_prefix - role label; kwargs forwarded to
+        # nsys/npu backends only.
+        # Exceptions: backend constructor / import errors propagate (e.g. missing nvtx or torch_npu).
+        # Side effects: imports backend modules.
         # Default config
         if config is None:
             config = ProfilerConfig(ranks=[], enable=False, tool_config=None)
@@ -178,22 +213,34 @@ class DistProfiler:
             self._impl = _NoOpProfiler()
 
     def check_enable(self):
+        # [FUNCTION DOC]
+        # Outputs: the enable flag.
         """Return whether profiling is enabled by configuration."""
         return self._enable
 
     def check_this_rank(self):
+        # [FUNCTION DOC]
+        # Outputs: whether this rank is selected.
         """Return whether current rank should perform profiling."""
         return self._this_rank
 
     def check_this_step(self):
+        # [FUNCTION DOC]
+        # Outputs: whether start() was called without a subsequent stop().
         """Return whether current global step is marked for profiling."""
         return self._this_step
 
     def is_discrete_mode(self):
+        # [FUNCTION DOC]
+        # Outputs: the discrete flag.
         """Return whether profiler backend runs in discrete mode."""
         return self._discrete
 
     def start(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: when enabled and rank selected, sets _this_step True and calls the backend start with kwargs
+        # (e.g. role, profile_step); otherwise does nothing.
+        # Outputs: backend start's return value or None. Side effects: starts backend profiling.
         """Profiler switch for the Ray main flow; sets `this_step=True`.
 
         Args:
@@ -204,6 +251,11 @@ class DistProfiler:
             return getattr(self._impl, "start", lambda **_: None)(**kwargs)
 
     def stop(self, run_command: bool = True):
+        # [FUNCTION DOC]
+        # Behavior: when enabled and rank selected, clears _this_step and calls backend stop. Then, whenever
+        # enabled (regardless of rank), runs _run_finish_hook with run_command.
+        # Inputs: run_command - True on the final profiled step. Outputs: backend stop's return value or None.
+        # Side effects: stops profiling, may relocate files and run a shell command.
         """Profiler switch for the Ray main flow; sets `this_step=False`.
 
         Stops the backend profiler and relocates its artifacts into ``save_path`` on every profiled
@@ -222,6 +274,8 @@ class DistProfiler:
         return result
 
     def run_finish_hook(self, run_command: bool = True) -> None:
+        # [FUNCTION DOC]
+        # Behavior: if enabled, runs _run_finish_hook. Inputs: run_command. Side effects: as _run_finish_hook.
         """Relocate backend artifacts and, when ``run_command`` is True, run the user's command.
 
         Kept for external drivers that stop their own backend and then want verl to relocate
@@ -233,6 +287,13 @@ class DistProfiler:
             self._run_finish_hook(run_command=run_command)
 
     def _run_finish_hook(self, run_command: bool = True) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Finish-hook logic.
+        # Behavior: (1) if relocate_results is set and this rank is profiled, calls backend relocate_results
+        # (when present) with save_path, rank and save_file_prefix, printing any exception. (2) if run_command,
+        # prints a summary; returns if no command or this rank is not selected for the hook (printing a skip
+        # note); else runs the command via _run_finish_command.
+        # Exceptions: none propagated from relocation. Side effects: stdout prints, filesystem moves, subprocess.
         """Relocate backend artifacts every step; run the user's finish command once, at the end.
 
         Relocation (currently nsys) runs on every ``stop()`` on the ranks that profiled, so a step's
@@ -269,6 +330,14 @@ class DistProfiler:
         self._run_finish_command(self._finish_hook_cmd, save_path)
 
     def _run_finish_command(self, cmd: str, save_path: Optional[str]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Runs the finish command.
+        # Behavior: copies the environment and sets VERL_PROFILE_SAVE_PATH, _TOOL, _RANK, _PID, _ROLE (if a
+        # prefix), and _RAY_NSIGHT_DIR (nsys only). Launches the command via /bin/sh -c with merged
+        # stdout/stderr in line-buffered text mode, streams each output line through _hook_print, waits for exit
+        # and prints the return code; non-zero exit logs a warning.
+        # Exceptions: launch failures are caught, printed and logged; nothing propagates.
+        # Side effects: spawns a subprocess (blocks until it exits), prints, logs.
         """Execute the user finish command in a shell once profiling is done.
 
         The command is meant to ship the accumulated traces off the node, e.g.
@@ -315,6 +384,9 @@ class DistProfiler:
             logger.warning("profiler finish hook: command exited with %s on rank %s: %s", returncode, self.rank, cmd)
 
     def step(self):
+        # [FUNCTION DOC]
+        # Behavior: when enabled and rank selected, calls backend step (no-op default). Outputs: backend result or None.
+        # Side effects: may advance the torch profiler schedule.
         """Mark the end of one training step in the trace, i.e. one whole RL cycle.
 
         Delegates to backends that label step boundaries (currently the torch profiler, which
@@ -339,6 +411,15 @@ class DistProfiler:
         category: Optional[str] = None,
         **kwargs_outer,
     ) -> Callable:
+        # [FUNCTION DOC]
+        # Behavior: class-level decorator factory for worker instance methods. The wrapper looks up
+        # self_instance.profiler; if missing calls func directly. Otherwise, inside an RLInsightLogger trace
+        # state named by the "role" kwarg (or func qualname) on lane rank_<profiler.rank>, it calls func directly
+        # unless profiling is enabled, the step is active and the rank is selected; in that case it asks the
+        # backend's annotate (with message/color/domain/category and kwargs_outer) to wrap func and calls the
+        # wrapped version, falling back to the plain func only if building the backend wrapper raises.
+        # Inputs: message, color, domain, category, kwargs_outer (e.g. role). Outputs: decorator.
+        # Exceptions: func's exceptions propagate. Side effects: profiling and tracing state.
         """Decorate instance methods with backend profiler annotations.
 
         The wrapped function is executed directly if profiling is disabled,
@@ -346,8 +427,12 @@ class DistProfiler:
         """
 
         def decorator(func):
+            # [FUNCTION DOC]
+            # HELPER: Builds the functools.wraps wrapper for func.
             @functools.wraps(func)
             def wrapper(self_instance, *args, **kwargs_inner):
+                # [FUNCTION DOC]
+                # HELPER: Per-call dispatch described in annotate; returns func's result.
                 profiler = getattr(self_instance, "profiler", None)
                 if profiler is None:
                     return func(self_instance, *args, **kwargs_inner)
@@ -385,6 +470,13 @@ def build_rollout_dist_profiler(
     config: Optional[ProfilerConfig] = None,
     tool_config: Optional[object] = None,
 ) -> "DistProfiler":
+    # [FUNCTION DOC]
+    # Behavior: unless config is None or all_ranks is set, converts non-empty config.ranks (global GPU
+    # ranks) into the sorted unique set of replica indices (rank integer-divided by replica_world_size),
+    # producing a modified copy of the config (dataclasses.replace for dataclass instances, deep copy plus
+    # attribute assignment otherwise). Builds a DistProfiler with rank=replica_rank.
+    # Inputs: replica_rank; replica_world_size - GPUs per replica; config; tool_config.
+    # Outputs: DistProfiler. Exceptions: ValueError for non-int ranks. Side effects: none on the input config.
     """Build a :class:`DistProfiler` for a rollout replica, treating ``config.ranks`` as global GPU ranks.
 
     Training workers key their ``DistProfiler`` on the worker's own global GPU rank, so ``ranks``
@@ -415,17 +507,28 @@ def build_rollout_dist_profiler(
 
 
 class _NoOpProfiler:
+    # [CLASS DOC]
+    # HELPER: Backend used for unknown/unset tools; start, stop and step do nothing.
     def start(self, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: No-op.
         return
 
     def stop(self):
+        # [FUNCTION DOC]
+        # HELPER: No-op.
         return
 
     def step(self):
+        # [FUNCTION DOC]
+        # HELPER: No-op.
         return
 
 
 class DistProfilerExtension:
+    # [CLASS DOC]
+    # Mixin for single-controller workers holding a DistProfiler; exposes registered ONE_TO_ALL methods so the
+    # driver can start/stop/step profiling on all ranks. Imports Dispatch/register in the class body.
     """An extension class for DistProfiler that provides distributed profiling capabilities.
 
     It is intended for workers in verl that single controller invokes.
@@ -438,17 +541,23 @@ class DistProfilerExtension:
     """
 
     def __init__(self, profiler: DistProfiler):
+        # [FUNCTION DOC]
+        # Behavior: stores the profiler. Side effects: sets self.profiler.
         self.profiler = profiler
 
     from verl.single_controller.base.decorator import Dispatch, register
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Behavior: forwards kwargs to profiler.start.
         """Start profiling for the current rank in the current training step."""
         self.profiler.start(**kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def stop_profile(self, run_command: bool = True) -> None:
+        # [FUNCTION DOC]
+        # Behavior: forwards to profiler.stop(run_command).
         """Stop profiling for the current rank in the current training step.
 
         ``run_command`` is True only on the last profiled step, so the finish command (e.g. the
@@ -459,5 +568,7 @@ class DistProfilerExtension:
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def step_profile(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: forwards to profiler.step.
         """Mark the end of one training step in the trace."""
         self.profiler.step()

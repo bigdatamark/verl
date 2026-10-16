@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# NeMo Automodel engine for verl: Automodel builds, parallelizes (FSDP2 / MegatronFSDP / DDP with TP/CP/EP meshes), shards the optimizer, schedules LR, clips gradients and checkpoints, while verl drives micro-batching, the loss and log-prob/entropy computation. Provides AutomodelEngine, its train/eval contexts, and the registered AutomodelEngineWithLMHead (language_model, backend "automodel", cuda).
+
 """Automodel (nemo_automodel) engine for verl SFT training.
 
 This engine delegates model building, parallelization, optimizer sharding,
@@ -68,6 +71,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class AutomodelEngine(BaseEngine):
+    # [CLASS DOC]
+    # Base Automodel engine. Attributes: model/engine/optimizer/checkpoint configs, mode, rank, distributed_config, device_mesh, moe_mesh, offload flags, compute_entropy_from_logits; after initialize also module, optimizer, lr_scheduler, checkpointer. Subclasses must implement forward_step.
     """Engine implementation using Automodel for distributed training."""
 
     def __init__(
@@ -78,6 +83,10 @@ class AutomodelEngine(BaseEngine):
         checkpoint_config: CheckpointConfig,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Stores configs, applies Automodel cache and Transformer Engine compatibility patches, builds distributed config and meshes for the global world size, optionally enables full determinism with the configured seed, records offload flags, and selects (chunked or plain) entropy function, optionally torch.compiled with dynamic shapes.
+        # Inputs: model_config, engine_config, optimizer_config, checkpoint_config; extra kwargs ignored.
+        # Side effects: global monkey patches; process group/mesh creation; requires initialized torch.distributed.
         super().__init__()
 
         self.model_config = model_config
@@ -119,13 +128,20 @@ class AutomodelEngine(BaseEngine):
 
     @property
     def is_param_offload_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns the param_offload flag.
         return self._is_offload_param
 
     @property
     def is_optimizer_offload_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns the optimizer_offload flag.
         return self._is_offload_optimizer
 
     def initialize(self):
+        # [FUNCTION DOC]
+        # Builds model, optimizer (sharded for MegatronFSDP) and LR scheduler (both None when forward_only), builds the checkpointer, then offloads model/grad/optimizer to CPU per offload flags and empties the CUDA cache.
+        # Side effects: GPU allocation, logging of memory usage.
         """Build the model, optimizer, LR scheduler, and checkpointer using Automodel infrastructure."""
         self.module = build_automodel_model(
             self.model_config, self.engine_config, self.distributed_config, self.device_mesh, self.moe_mesh
@@ -153,6 +169,12 @@ class AutomodelEngine(BaseEngine):
         torch.cuda.empty_cache()
 
     def _build_optimizer(self, module):
+        # [FUNCTION DOC]
+        # HELPER: Builds the optimizer through Automodel's build_optimizer.
+        # Behavior: makes a config mapping with _target_ "<optimizer_impl>.<optimizer>", lr, weight_decay, eps, betas; adds master_weights and store_param_remainders when truthy; maps short dtype names (bf16/fp32/fp16) for exp_avg_dtype, exp_avg_sq_dtype, master_weight_dtype to torch dtype strings; merges override_optimizer_config last.
+        # Inputs: module - model.
+        # Outputs: the single optimizer.
+        # Exceptions: AssertionError if Automodel returns not exactly one optimizer.
         """Build optimizer via Automodel's build_optimizer."""
         from nemo_automodel.components.config.loader import ConfigNode
         from nemo_automodel.recipes.llm.train_ft import build_optimizer as automodel_build_optimizer
@@ -187,6 +209,10 @@ class AutomodelEngine(BaseEngine):
         return optimizers[0]
 
     def _build_lr_scheduler(self, optimizer):
+        # [FUNCTION DOC]
+        # HELPER: Builds Automodel's OptimizerParamScheduler.
+        # Behavior: warmup steps = lr_warmup_steps, or lr_warmup_steps_ratio times total steps when non-positive; init/min LR = lr times init_lr_ratio (default 0.1) / min_lr_ratio (default 0.01); decay over total_training_steps with lr_scheduler_type; constant weight decay (wd_incr_style default "constant").
+        # Outputs: scheduler. Side effects: prints the schedule on rank 0.
         cfg = self.optimizer_config
         total_steps = cfg.total_training_steps
         num_warmup_steps = cfg.lr_warmup_steps
@@ -221,6 +247,12 @@ class AutomodelEngine(BaseEngine):
         return scheduler
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
+        # [FUNCTION DOC]
+        # Runs forward (and backward) over micro-batches.
+        # Behavior: all-reduces the number of loss-mask tokens across the DP group and stores it plus dp_size as non-tensor data on the batch; splits into micro-batches with the same count across DP ranks; when training, prepares grad accumulation and, with EP above 1, sets the MoE aux-loss backward scale to the DP(with CP) group size; signals final backward before the last micro-batch; for each micro-batch calls forward_step (under no-grad if forward_only) and backpropagates the loss when training; finally post-processes collected outputs back into original order.
+        # Inputs: data - TensorDict with loss_mask; loss_function; forward_only.
+        # Outputs: dict from postprocess_batch_func.
+        # Side effects: collective all-reduce; gradient accumulation; mutates data.
         batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
         torch.distributed.all_reduce(
             batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
@@ -261,12 +293,19 @@ class AutomodelEngine(BaseEngine):
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        # [FUNCTION DOC]
+        # Abstract per-micro-batch forward; raises NotImplementedError.
         raise NotImplementedError("forward_step must be implemented in subclass")
 
     def optimizer_zero_grad(self):
+        # [FUNCTION DOC]
+        # Zeroes optimizer gradients.
+        # KNOWN ISSUE: fails with AttributeError when the engine is forward_only (optimizer is None), e.g. if a train-mode context exits.
         self.optimizer.zero_grad()
 
     def optimizer_step(self):
+        # [FUNCTION DOC]
+        # Scales and clips gradients via Automodel (L2 norm, foreach, EP axis "ep" when the MoE mesh has it, DP group size including CP), converts the norm to float; if not finite prints a warning and zeroes grads, else steps the optimizer and updates MoE gate bias when the model supports it. Returns the grad norm as float.
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=self.optimizer_config.clip_grad,
             model_parts=[self.module],
@@ -298,39 +337,57 @@ class AutomodelEngine(BaseEngine):
         return grad_norm_val
 
     def lr_scheduler_step(self):
+        # [FUNCTION DOC]
+        # Steps the LR scheduler by one and returns the first param group's LR.
         """Step Automodel's OptimizerParamScheduler and return current LR."""
         self.lr_scheduler.step(increment=1)
         lr = self.optimizer.param_groups[0]["lr"]
         return lr
 
     def get_data_parallel_rank(self):
+        # [FUNCTION DOC]
+        # Returns the "dp" local rank of the device mesh, or the global rank without a mesh.
         if self.device_mesh is not None:
             return self.device_mesh.get_local_rank("dp")
         return torch.distributed.get_rank()
 
     def get_data_parallel_size(self):
+        # [FUNCTION DOC]
+        # Returns the "dp" mesh dim size, or the world size without a mesh.
         if self.device_mesh is not None:
             return self.device_mesh["dp"].size()
         return torch.distributed.get_world_size()
 
     def get_data_parallel_group(self):
+        # [FUNCTION DOC]
+        # Returns the "dp" mesh dim process group, or WORLD without a mesh.
         if self.device_mesh is not None:
             return self.device_mesh.get_group(mesh_dim="dp")
         return torch.distributed.group.WORLD
 
     def is_mp_src_rank_with_outputs(self):
+        # [FUNCTION DOC]
+        # Returns true only for TP rank 0 when a tp dim larger than 1 exists; true otherwise.
         if self.device_mesh is not None and "tp" in self.device_mesh.mesh_dim_names:
             if self.device_mesh["tp"].size() > 1:
                 return self.device_mesh.get_local_rank("tp") == 0
         return True
 
     def train_mode(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns an AutomodelTrainModeCtx for this engine (kwargs forwarded).
         return AutomodelTrainModeCtx(self, **kwargs)
 
     def eval_mode(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns an AutomodelEvalModeCtx for this engine (kwargs forwarded).
         return AutomodelEvalModeCtx(self, **kwargs)
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+        # [FUNCTION DOC]
+        # Moves model/optimizer between CPU and the accelerator.
+        # Behavior: validates arguments via the base; no-op for forward_only engines; for the accelerator device loads model and/or optimizer state; for "cpu" offloads model (reshard) and/or optimizer state. The grad flag is otherwise unused.
+        # Exceptions: AssertionError for devices other than the accelerator name or "cpu" (the ValueError branch is unreachable).
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
 
         if self.engine_config.forward_only:
@@ -353,6 +410,8 @@ class AutomodelEngine(BaseEngine):
             raise ValueError(f"Invalid device type: {device}")
 
     def _build_checkpointer(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates Automodel's Checkpointer with safetensors consolidated model saving, HF hub cache, model path as repo id, no PEFT, and DP(with CP)/TP/PP ranks plus MoE mesh.
         ckpt_config = CheckpointingConfig(
             enabled=True,
             checkpoint_dir="checkpoints/",
@@ -378,6 +437,10 @@ class AutomodelEngine(BaseEngine):
         max_ckpt_to_keep: Optional[int] = None,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC]
+        # Saves model and (if present) optimizer plus LR scheduler with the Checkpointer to local_path.
+        # Behavior: loads the model to GPU first when param offload is on or params are on CPU; barriers; re-offloads when param offload is on.
+        # KNOWN ISSUE: hdfs_path, global_step and max_ckpt_to_keep are ignored (no upload or checkpoint rotation).
         """Save model, optimizer, and LR scheduler using Automodel's Checkpointer."""
         origin_module_device = next(self.module.parameters()).device.type
         if self._is_offload_param or origin_module_device == "cpu":
@@ -398,6 +461,9 @@ class AutomodelEngine(BaseEngine):
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
     ) -> None:
+        # [FUNCTION DOC]
+        # Loads model weights (from local_path/model if that directory exists, else local_path) and optimizer/scheduler state via the Checkpointer, then barriers and re-offloads model and optimizer per offload flags.
+        # KNOWN ISSUE: hdfs_path and del_local_after_load are ignored; del_local_after_load is annotated int but defaults to True.
         """Load model, optimizer, and LR scheduler using Automodel's Checkpointer."""
         if self._is_offload_param:
             load_automodel_model_to_gpu(self.module)
@@ -419,6 +485,10 @@ class AutomodelEngine(BaseEngine):
             offload_automodel_optimizer(self.optimizer)
 
     def get_per_tensor_param(self, **kwargs):
+        # [FUNCTION DOC]
+        # Exports full weights for rollout sync.
+        # Behavior: loads model to GPU, takes the state dict and converts keys to HF naming, re-offloads if param offload is on, then returns a generator yielding (name, full tensor) with DTensors gathered lazily, and None as PEFT config.
+        # Side effects: the lazy full_tensor gathers are collectives, so all ranks must consume the generator in lockstep.
         load_automodel_model_to_gpu(self.module)
 
         params = self.module.state_dict()
@@ -428,6 +498,8 @@ class AutomodelEngine(BaseEngine):
             offload_automodel_model_to_cpu(self.module)
 
         def param_generator():
+            # [FUNCTION DOC]
+            # HELPER: Yields (name, tensor) for each state-dict entry, materializing DTensors with full_tensor.
             for name, param in params.items():
                 unsharded_tensor = param.full_tensor() if isinstance(param, DTensor) else param
                 yield name, unsharded_tensor
@@ -436,15 +508,23 @@ class AutomodelEngine(BaseEngine):
 
 
 class AutomodelEvalModeCtx(BaseEngineCtx):
+    # [CLASS DOC]
+    # Eval-mode context for Automodel: sets module.eval() on entry and reshards the root FSDP module on exit.
     def __init__(self, engine: AutomodelEngine, **kwargs):
+        # [FUNCTION DOC]
+        # Creates the context in "eval" mode; kwargs forwarded to BaseEngineCtx.
         super().__init__(engine=engine, mode="eval", **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Asserts the engine type, runs base entry (load per offload), then switches the module to eval mode.
         assert isinstance(self.engine, AutomodelEngine)
         super().__enter__()
         self.engine.module.eval()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Reshards the root module if it supports reshard, then runs base exit (offload, clear mode).
         assert isinstance(self.engine, AutomodelEngine)
         # Reshard the root FSDP module
         if hasattr(self.engine.module, "reshard"):
@@ -453,15 +533,23 @@ class AutomodelEvalModeCtx(BaseEngineCtx):
 
 
 class AutomodelTrainModeCtx(BaseEngineCtx):
+    # [CLASS DOC]
+    # Train-mode context for Automodel: sets module.train() on entry and zeroes grads on exit.
     def __init__(self, engine: AutomodelEngine, **kwargs):
+        # [FUNCTION DOC]
+        # Creates the context in "train" mode; kwargs forwarded to BaseEngineCtx.
         super().__init__(engine=engine, mode="train", **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Asserts the engine type, runs base entry, then switches module to train mode.
         assert isinstance(self.engine, AutomodelEngine)
         super().__enter__()
         self.engine.module.train()
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Zeroes gradients if zero_grad_on_exit is set or an exception occurred, then runs base exit.
         assert isinstance(self.engine, AutomodelEngine)
         if self.zero_grad_on_exit or exc_type is not None:
             self.engine.optimizer_zero_grad()
@@ -470,9 +558,17 @@ class AutomodelTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend=["automodel"], device=["cuda"])
 class AutomodelEngineWithLMHead(AutomodelEngine):
+    # [CLASS DOC]
+    # Causal-LM Automodel engine computing per-token log-probs (and optional entropy) of next tokens from nested (jagged) input batches.
     """Automodel engine for language model with LM head training."""
 
     def prepare_model_inputs(self, micro_batch: TensorDict):
+        # [FUNCTION DOC]
+        # Builds model inputs from a micro-batch of nested tensors.
+        # Behavior: reads non-tensor flags use_remove_padding (default true), pad_mode (default NO_PADDING), use_fused_kernels; requires pad_mode NO_PADDING. Broadcasts a scalar temperature to a per-sample float32 tensor. Remove-padding path: packs input ids into shape (1, total_tokens) and position ids into (1, total) or (3or4, 1, total) for 3D; records labels as input ids rolled left by one and per-token temperatures; inputs have no attention mask; for TE attention adds thd format, int32 cu_seqlens (with leading batch dim) and max_seqlen. Padded path: right-pads input ids (pad_token_id) and position ids (0; 3D variant to shape (4, batch, len) after transpose) to the max length, builds an attention mask of ones over valid tokens, records rolled packed labels and per-sample temperature. Fused kernels add the scalar temperature and return_dict. Multi-modal inputs are merged in.
+        # Inputs: micro_batch - TensorDict.
+        # Outputs: (model_inputs mapping, output_args mapping).
+        # Exceptions: AssertionError for per-sample temperature with fused kernels, non-NO_PADDING pad mode or batch-size mismatch.
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
@@ -584,6 +680,13 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
         return model_inputs, output_args
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict):
+        # [FUNCTION DOC]
+        # Converts raw model output into log_probs (and entropy) nested tensors aligned with input ids.
+        # Behavior: wraps bare tensor output as an object with logits. Remove-padding: fused kernels supply log_probs/entropy directly; otherwise gathers DTensor logits, divides by clamped temperature, computes log-probs of the rolled labels (in-place backward unless entropy is needed) and entropy (chunked, plain, or activation-checkpointed); then re-nests by input offsets. Padded: fused kernels slice the last response_length positions; otherwise scales logits by temperature, optionally computes entropy, narrows each row to its valid length, concatenates, computes log-probs and re-nests both.
+        # Inputs: output - model output; output_args - from prepare_model_inputs; micro_batch.
+        # Outputs: mapping with "log_probs" and optionally "entropy".
+        # Exceptions: NotImplementedError for unsupported pad modes.
+        # KNOWN ISSUE: in the padded path with fused kernels, outputs are dense tensors sliced by max_response_length rather than nested per-sequence tensors, inconsistent with the other paths.
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
@@ -685,6 +788,11 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
         return model_output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        # [FUNCTION DOC]
+        # Runs one micro-batch forward under bf16 autocast and computes loss.
+        # Behavior: moves the micro-batch to device, prepares inputs, calls the module with use_cache false, prepares outputs; calls loss_function with model output, data and DP group, or, when it is None (forward-only only), uses a dummy loss of 1.0 and empty metrics.
+        # Outputs: (loss tensor, mapping with detached "model_output", float "loss", and "metrics").
+        # Exceptions: AssertionError if loss_function is None and not forward_only.
         """Run forward pass, compute loss, and return outputs."""
         device_name = get_device_name()
         micro_batch = micro_batch.to(get_device_id())

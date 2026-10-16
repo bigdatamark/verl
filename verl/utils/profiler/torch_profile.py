@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# PyTorch torch.profiler backend: builds profilers that export gzipped chrome traces with descriptive
+# per-process filenames (role, step, rank, parallel ranks, pid, timestamp) directly into save_path,
+# optionally driven by a torch.profiler.schedule over update mini-batches, and the Profiler DistProfiler
+# backend supporting continuous (one trace per step) and discrete (one trace per annotated stage) modes.
 import functools
 import os
 import re
@@ -25,6 +30,11 @@ from .profile import DistProfiler
 
 
 def get_dist_topology() -> dict:
+    # [FUNCTION DOC]
+    # Behavior: collects rank/world_size from torch.distributed when initialized, and tp/pp/dp (and cp when
+    # available) ranks from Megatron parallel_state when model parallel is initialized. Every lookup is
+    # wrapped so failures (including missing Megatron) just omit keys.
+    # Outputs: dict possibly containing rank, world_size, tp, pp, dp, cp. Exceptions: none. Side effects: none.
     """Best-effort snapshot of the current process's distributed topology.
 
     Used to make per-process profiler trace files self-describing. The returned dict
@@ -61,6 +71,9 @@ def get_dist_topology() -> dict:
 
 
 def _sanitize_name_part(text: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Converts to str, replaces each run of characters outside [0-9A-Za-z.=+-] with "-", strips
+    # leading/trailing "-".
     """Make an arbitrary label safe to embed in a filename."""
     return re.sub(r"[^0-9A-Za-z.=+-]+", "-", str(text)).strip("-")
 
@@ -72,6 +85,12 @@ def build_trace_basename(
     topology: Optional[dict] = None,
     profile_step: Optional[int] = None,
 ) -> str:
+    # [FUNCTION DOC]
+    # Behavior: uses the given topology or queries get_dist_topology. Joins with "_" the parts: sanitized
+    # save_file_prefix, sanitized role, "step<N>" (if profile_step given), "rank<R>" (topology rank or given
+    # rank) with "-of-<world_size>" when known, a "-"-joined "tp<x>-pp<y>-dp<z>-cp<w>" segment for present
+    # dims, "pid<pid>", and a local-time timestamp YYYYmmddHHMMSS plus milliseconds.
+    # Outputs: filename stem string. Exceptions: none. Side effects: none.
     """Build a descriptive, per-process trace filename stem.
 
     Encodes -- when available -- the worker role (``save_file_prefix``, e.g. ``actor``),
@@ -119,6 +138,17 @@ def get_torch_profiler(
     schedule: Optional[dict] = None,
     name_mini_batch_window: bool = False,
 ):
+    # [FUNCTION DOC]
+    # Behavior: creates save_path; computes base file name via build_trace_basename; defines a trace handler
+    # with an invocation counter that writes <base><suffix>.json.gz via export_chrome_trace, where suffix is
+    # "_mb<a>" / "_mb<a>-<b>" (mini-batch window, when scheduled and name_mini_batch_window and step_num is an
+    # int), else "_part<idx>" for scheduled windows lacking step_num or for any call after the first.
+    # Activities: always CPU, plus CUDA when contents empty or contains "cuda"; with_stack/record_shapes/
+    # profile_memory from contents. Adds torch.profiler.schedule(**schedule) when given and then disables
+    # ProfilerStep row recording.
+    # Inputs: see docstring. Outputs: unstarted torch.profiler.profile.
+    # Exceptions: OSError from makedirs; TypeError for bad schedule keys.
+    # Side effects: creates directory; handler prints and writes trace files.
     """Build a ``torch.profiler.profile`` instance.
 
     Args:
@@ -155,6 +185,11 @@ def get_torch_profiler(
     handler_state = {"count": 0}
 
     def _scheduled_mini_batch_range(step_num: int) -> tuple[int, int]:
+        # [FUNCTION DOC]
+        # HELPER: Computes (first, last) mini-batch indices of the window flushed at step_num: last = step_num-1
+        # (min 0); cycle length = wait+warmup+active (active at least 1); cycle index = (last - skip_first,
+        # floored at 0) divided by cycle length; first = skip_first + cycle*cycle_len + wait + warmup, capped at last.
+        # Inputs: step_num - profiler step count. Uses enclosing schedule dict.
         """Mini-batches held by the window being flushed at ``step_num``.
 
         step() is advanced once per mini-batch, so the last mini-batch in the window is the one
@@ -175,6 +210,9 @@ def get_torch_profiler(
         return min(first_mb, last_mb), last_mb
 
     def _trace_handler(prof):
+        # [FUNCTION DOC]
+        # HELPER: on_trace_ready callback; increments counter, chooses suffix as described above, prints and
+        # exports the chrome trace. Side effects: file write, stdout.
         idx = handler_state["count"]
         handler_state["count"] += 1
         suffix = ""
@@ -227,6 +265,9 @@ def get_torch_profiler(
 
 
 class Profiler(DistProfiler):
+    # [CLASS DOC]
+    # torch.profiler backend. Class-level _define_count ensures one continuous profiler per process and
+    # _active_prof holds the process-global running profiler so step() from any instance advances it.
     """A PyTorch profiler wrapper class for collecting performance metrics.
 
     This profiler provides a convenient interface for profiling PyTorch operations,
@@ -256,6 +297,13 @@ class Profiler(DistProfiler):
         tool_config: Optional[TorchProfilerToolConfig] = None,
         save_file_prefix=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: defaults config to a disabled ProfilerConfig; asserts tool_config when enabled; stores rank,
+        # config, tool_config, contents, save_path, discrete flag, and initializes schedule kwargs and profile
+        # step to None.
+        # Exceptions: AssertionError when enabled without tool_config.
+        # KNOWN ISSUE: with tool_config None (disabled), reading tool_config.contents raises AttributeError.
+        # Side effects: sets attributes.
         # note : if we do not set use_profile, it will be set as None, so that all function will be skip
         config = config or ProfilerConfig(ranks=[], enable=False)
         self.save_file_prefix = save_file_prefix
@@ -278,9 +326,14 @@ class Profiler(DistProfiler):
         self._profile_step = None
 
     def check(self):
+        # [FUNCTION DOC]
+        # Outputs: True if a continuous profiler instance has been created on this object.
         return self.prof is not None
 
     def _resolve_schedule_kwargs(self) -> Optional[dict]:
+        # [FUNCTION DOC]
+        # HELPER: Returns schedule kwargs (skip_first, wait, warmup, active, repeat as ints, None/0 treated as 0)
+        # from tool_config.schedule, or None when schedule is absent or active <= 0.
         """Build the full torch.profiler.schedule kwargs from tool_config, or None to disable.
 
         This is the schedule as configured, used verbatim for the discrete update-stage trace
@@ -301,6 +354,8 @@ class Profiler(DistProfiler):
         }
 
     def _resolve_continuous_schedule_kwargs(self) -> Optional[dict]:
+        # [FUNCTION DOC]
+        # HELPER: Same as _resolve_schedule_kwargs but repeat 0 becomes 1 (single window per step); None passes through.
         """Schedule for the single continuous trace, or None to record the whole step.
 
         The schedule picks which update mini-batches land in the trace. ``skip_first``/``wait``/
@@ -330,6 +385,12 @@ class Profiler(DistProfiler):
         }
 
     def start(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: records profile_step (from profile_step or global_step kwarg) for later filenames. In
+        # continuous mode and if no profiler is active process-wide, resolves continuous schedule, builds a
+        # profiler (role from kwargs), prints a start message describing the capture scope, starts it, sets it as
+        # the active process-global profiler and increments the counter.
+        # Inputs: kwargs - role, profile_step/global_step. Side effects: starts profiling, class state, stdout.
         role = kwargs.get("role", None)
         # Recorded outside the discrete gate: discrete mode opens its profilers later, from
         # annotate(), and still needs to know which RL step it is collecting.
@@ -364,6 +425,9 @@ class Profiler(DistProfiler):
             Profiler._define_count += 1
 
     def step(self):
+        # [FUNCTION DOC]
+        # Behavior: calls step() on the process-global active profiler if any. Side effects: advances schedule,
+        # may flush a trace window.
         """Advance the process-global active profiler by one update mini-batch.
 
         The actor/critic update loop calls this once per mini-batch. When a
@@ -380,6 +444,10 @@ class Profiler(DistProfiler):
 
     @staticmethod
     def _flush_partial_window(prof) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If the profiler's current action is RECORD (and the enum has RECORD/RECORD_AND_SAVE), sets it to
+        # RECORD_AND_SAVE so stopping writes the partially collected window. Relies on a private torch attribute.
+        # Side effects: mutates profiler state.
         """Make torch write a collection window that the update loop ended in the middle of.
 
         torch only calls ``on_trace_ready`` once a window reaches its last (``RECORD_AND_SAVE``)
@@ -395,6 +463,13 @@ class Profiler(DistProfiler):
             prof.current_action = record_and_save
 
     def stop(self):
+        # [FUNCTION DOC]
+        # Behavior: in continuous mode when the counter is 1: flushes a partial window if scheduled, else steps
+        # once; prints, stops the profiler (triggering trace export), clears the active profiler and schedule,
+        # decrements the counter.
+        # KNOWN ISSUE: the counter is class-wide but self.prof is per instance; if a different instance than the
+        # one that started calls stop, self.prof may be None.
+        # Side effects: trace files written, class state.
         if not self.discrete and Profiler._define_count == 1:
             if self._schedule_kwargs:
                 # Stepping is driven per mini-batch; flush a window the step ended mid-way.
@@ -409,6 +484,14 @@ class Profiler(DistProfiler):
             Profiler._define_count -= 1
 
     def annotate(self, message: Optional[str] = None, role: Optional[str] = None, **kwargs_outer) -> Callable:
+        # [FUNCTION DOC]
+        # Behavior: returns a decorator. "scheduled" kwarg marks update stages. Continuous mode: runs func inside
+        # a record_function range named message, role, or func name. Discrete mode: builds a new profiler for the
+        # stage (role or profile name; schedule only if scheduled, with mini-batch window naming), starts it, sets
+        # it as active profiler when scheduled, runs func inside record_function, and in finally flushes a
+        # partial window/clears the active profiler (if scheduled) and stops the profiler.
+        # Inputs: message, role, kwargs_outer (scheduled). Outputs: decorator.
+        # Exceptions: func's exceptions propagate after cleanup. Side effects: trace files.
         """Decorate a Worker member function to profile the current rank in the current training step.
 
         Requires the target function to be a member function of a Worker,
@@ -427,8 +510,12 @@ class Profiler(DistProfiler):
         scheduled = bool(kwargs_outer.get("scheduled", False))
 
         def decorator(func):
+            # [FUNCTION DOC]
+            # HELPER: Builds the functools.wraps wrapper for func.
             @functools.wraps(func)
             def wrapper(*args, **kwargs_inner):
+                # [FUNCTION DOC]
+                # HELPER: Per-call profiling logic described in annotate; returns func's result.
                 # Prefer the stage label (`role`, e.g. "actor_compute_log_prob"), which names both
                 # the role and the function it ran: in a colocated worker the method name alone
                 # cannot say whether a log-prob forward belongs to the actor or the reference

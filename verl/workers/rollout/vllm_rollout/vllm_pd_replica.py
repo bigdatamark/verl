@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Prefill/decode (PD) disaggregated vLLM replica. One replica consists of one prefill vLLM HTTP
+# server (KV producer) and N decode servers (KV consumers), each with its own TP size, connected by
+# a KV transfer connector (NIXL or Mooncake). Current limits: one prefill server, single node,
+# no data/pipeline parallelism.
 """vLLM PD-disaggregated replica: 1 prefill + N decode servers per replica,
 asymmetric TP supported. MVP: prefill_replicas=1, single-node only."""
 
@@ -35,6 +40,11 @@ logger.setLevel(logging.INFO)
 
 class vLLMPDReplica(vLLMReplica):
     """Replica that runs vLLM in prefill-decode disaggregated mode."""
+    # [CLASS DOC]
+    # Subclass of vLLMReplica whose world_size is prefill_tp + decode_replicas*decode_tp. Worker
+    # ordering: the first prefill_tp workers belong to the prefill server, followed by consecutive
+    # decode_tp-sized groups for each decode server. The prefill server is the replica's public
+    # endpoint; it forwards to decode peers.
 
     def __init__(
         self,
@@ -46,6 +56,15 @@ class vLLMPDReplica(vLLMReplica):
         is_teacher_model: bool = False,
         name_suffix: str = "",
     ):
+        # [FUNCTION DOC]
+        # Behavior: calls the parent constructor, then validates the disaggregation config: enabled
+        # (assert), transfer_backend nixl or mooncake, prefill_replicas == 1, PD world size fits in
+        # gpus_per_node, data and pipeline parallel sizes equal 1. Stores prefill/decode counts and TP sizes
+        # (decode TP defaults to prefill TP), overrides world_size, gpus_per_replica_node and nnodes, and
+        # initializes empty prefill/decode server lists.
+        # Inputs: same as vLLMReplica.
+        # Exceptions: AssertionError if disaggregation disabled; NotImplementedError for unsupported setups.
+        # Side effects: none beyond attribute setup.
         super().__init__(
             replica_rank,
             config,
@@ -102,6 +121,23 @@ class vLLMPDReplica(vLLMReplica):
         self._decode_servers: list[ActorHandle] = []
 
     async def launch_servers(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts worker count equals PD world size and that NPU is not in use. Queries every
+        # worker for (node id, accelerator id, node IP). Uses the first worker's IP as the side-channel host
+        # and a random prefill engine id. Reserves a free side-channel port (keeping the socket open) for
+        # the prefill server and spawns it on the first prefill_tp workers (pinned to their node with
+        # their device list, trainer ZMQ base rank 0). For each decode server, reserves another port, builds
+        # a consumer KV config with a fresh engine id, and spawns it on its worker slice (Mooncake bootstrap
+        # port is the prefill port; ZMQ base rank is the slice start). Launches all servers concurrently,
+        # then closes all reserved sockets (always, via finally). Registers the decode servers as peers of
+        # the prefill server, sets servers to prefill followed by decodes, and records the prefill server as
+        # the handle and its address (IPv6 bracketed) as the replica address; logs a summary.
+        # Outputs: None.
+        # Exceptions: AssertionError on precondition failures; remote errors propagate.
+        # Side effects: creates named Ray actors, binds ports, logs.
+        # KNOWN ISSUE: actor names are hard-coded with the "vllm_" prefix, while ServerAdapter resolves
+        # them using the configured rollout name prefix and without name_suffix; a non-default name or a
+        # non-empty name_suffix would make the trainer-side lookup fail.
         assert len(self.workers) == self.world_size, (
             f"worker count {len(self.workers)} != PD world size {self.world_size}"
         )
@@ -224,6 +260,9 @@ class vLLMPDReplica(vLLMReplica):
 
     @staticmethod
     def _collect_cuda_devices(worker_infos) -> str:
+        # [FUNCTION DOC]
+        # HELPER: joins the accelerator id (second element) of each worker info with commas, for
+        # CUDA_VISIBLE_DEVICES.
         return ",".join(worker_info[1] for worker_info in worker_infos)
 
     @staticmethod
@@ -233,6 +272,12 @@ class vLLMPDReplica(vLLMReplica):
         transfer_backend: str,
         mooncake_protocol: Optional[str] = None,
     ) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: builds the kv-transfer-config mapping: connector class name for the backend (NixlConnector
+        # or MooncakeConnector), kv_role kv_producer for prefill or kv_consumer for decode, engine id, and
+        # the current device name as buffer device; for mooncake with a protocol, adds an extra config
+        # entry with mooncake_protocol.
+        # Exceptions: KeyError for unknown backend or role.
         """Assemble vLLM's ``--kv-transfer-config`` payload."""
         role_to_kv_role = {
             "prefill": "kv_producer",
@@ -266,6 +311,14 @@ class vLLMPDReplica(vLLMReplica):
         actor_name: str,
         zmq_base_trainer_rank: int = 0,
     ) -> ActorHandle:
+        # [FUNCTION DOC]
+        # HELPER: creates one server actor: copies config with the role's TP size, sets env vars (do not
+        # let Ray set visible devices, disable NCCL cuMem, NIXL side-channel host/port, Mooncake bootstrap
+        # port, Mooncake connection pooling default on, ZMQ base trainer rank, Ray job id), and launches the
+        # server class with hard node affinity, the given actor name and max concurrency, node_rank 0,
+        # nnodes 1, the device list and disaggregation role/KV config.
+        # Outputs: the actor handle (server not yet launched).
+        # Side effects: creates a Ray actor.
         """Construct one PD ``vLLMHttpServer`` actor."""
         per_role_config = _dc_replace(self.config, tensor_model_parallel_size=tp)
 

@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# ToolRL-style ("RLLA") reward for tool-calling responses: a format reward checking the
+# <think>/<tool_call>/<response> tag layout expected by the ground truth, plus a tool-call
+# correctness reward comparing predicted JSON tool calls (names, parameter keys and values) to the
+# ground truth. Combined by compute_score.
 
 import json
 import random
@@ -19,6 +24,9 @@ from collections import Counter
 
 
 def match_score(list1, list2):
+    # [FUNCTION DOC]
+    # HELPER: Multiset Jaccard-like similarity: 1.0 if lists are equal; 0.0 if either is empty;
+    # otherwise (multiset intersection size) / (len1 + len2 - intersection). Order is ignored.
     """Compute a similarity score considering element frequency, ignoring order.
 
     Reference: Liu S Y, Dong X, Lu X, et al. "Gdpo: Group reward-decoupled normalization policy
@@ -44,6 +52,15 @@ def match_score(list1, list2):
 def customize_format_reward_func(
     completions, answer, step, max_possible_reward, min_possible_reward, do_print, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Format reward per completion. The required pattern depends on which tags the ground truth contains:
+    # response only -> "<think>...</think>\n<response>...</response>" with exactly one response tag pair;
+    # tool_call only -> "<think>...</think>\n<tool_call>\n...\n</tool_call>" with exactly one tool_call
+    # pair; both -> think, tool_call block, then response, each pair exactly once; neither -> only a
+    # think block. Whole-string anchored, dot matches newlines.
+    # Inputs: completions - list of message lists (content of first message is used); answer - list of
+    # ground-truth strings; step (unused); max/min_possible_reward; do_print; extra kwargs ignored.
+    # Outputs: list of rewards (max on match, else min). Side effects: prints when do_print.
     rewards = []
     responses = [completion[0]["content"] for completion in completions]
 
@@ -98,6 +115,14 @@ def customize_format_reward_func(
 
 
 def compute_tool_call_reward(gt_tools, pd_tools, max_possible_reward, min_possible_reward, do_print):
+    # [FUNCTION DOC]
+    # Scores predicted tool calls against ground-truth ones (each a dict with "name" and "parameters").
+    # Exact list equality -> max_possible_reward. Otherwise score = match_score of name lists, plus for
+    # each gt tool (greedy, in order) the best unused predicted tool with the same name, scored as
+    # match_score of parameter keys + count of exactly matching parameter values. The normalizer is
+    # 1 + sum over gt tools of (1 + number of gt parameters). Result is linearly mapped to
+    # [min_possible_reward, max_possible_reward].
+    # Outputs: float. Exceptions: KeyError if tools lack "name"/"parameters". Side effects: prints when do_print.
     if gt_tools == pd_tools:
         if do_print:
             print("Max possible score:", "Exact Match!")
@@ -155,6 +180,13 @@ def compute_tool_call_reward(gt_tools, pd_tools, max_possible_reward, min_possib
 def customize_correctness_reward_tool(
     completions, answer, step, max_possible_reward, min_possible_reward, do_print, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Tool-call correctness reward per completion. If the ground truth has no "<tool_call>", reward is
+    # 0.0. Otherwise parses each newline-separated JSON line inside the gt tool_call block; for the
+    # response, requires both tool_call tags and parses its block the same way, then uses
+    # compute_tool_call_reward. Any failure on the response side gives min_possible_reward.
+    # Inputs/outputs as customize_format_reward_func. Exceptions: JSON errors in the ground truth
+    # propagate. Side effects: prints when do_print.
     responses = [completion[0]["content"] for completion in completions]
     rewards = []
 
@@ -196,6 +228,14 @@ def customize_correctness_reward_tool(
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info, step=0):
+    # [FUNCTION DOC]
+    # Extracts the assistant reply from solution_str using chat-template markers chosen by
+    # extra_info["experiment_name"] (contains "llama" -> Llama-3 header/eot markers; "qwen" -> im_start/
+    # im_end markers), then computes format reward in [0, 1] and tool correctness reward in [-3, 3].
+    # Debug printing is enabled randomly with probability 1/64.
+    # Outputs: dict with "score" (sum), "format_reward", "accuracy_reward".
+    # Exceptions: NotImplementedError for an unrecognized experiment name.
+    # KNOWN ISSUE: the docstring is copied from GSM8K and describes the wrong function and arguments.
     """The scoring function for GSM8k.
 
     Reference: Trung, Luong, et al. "Reft: Reasoning with reinforced fine-tuning."

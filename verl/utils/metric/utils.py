@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Metric reduction helpers: a key-name-based reducer for metric dicts and a Metric accumulator
+# class with explicit aggregation types, including aggregation across data-parallel ranks.
+# NumericType is the tuple of accepted value types (int, float, Tensor, ndarray); Numeric is the
+# matching union type alias.
+
 """
 Metrics utils.
 """
@@ -23,6 +30,12 @@ import torch
 
 
 def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Behavior: for each entry: Metric values are replaced by their aggregate(); otherwise key
+    # containing "max" -> np.max, containing "min" -> np.min (checked after "max"), else np.mean.
+    # Inputs: metrics - mapping name to Metric or list of values.
+    # Outputs: the same dict object with reduced values.
+    # Side effects: mutates the input dict in place.
     """
     Reduces a dictionary of metric lists by computing the mean, max, or min of each list.
     The reduce operation is determined by the key name:
@@ -59,6 +72,8 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, 
 
 
 class AggregationType(Enum):
+    # [CLASS DOC]
+    # Enum of aggregation methods: MEAN, SUM, MIN, MAX (string values "mean", "sum", "min", "max").
     MEAN = "mean"
     SUM = "sum"
     MIN = "min"
@@ -70,6 +85,8 @@ Numeric = int | float | torch.Tensor | np.ndarray
 
 
 class Metric:
+    # [CLASS DOC]
+    # Accumulates numeric values with a fixed AggregationType.
     """
     A metric aggregator for collecting and aggregating numeric values.
 
@@ -90,6 +107,13 @@ class Metric:
     """
 
     def __init__(self, aggregation: str | AggregationType, value: Optional[Numeric | list[Numeric]] = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: converts a string aggregation to AggregationType; stores an empty values list and
+        # appends the initial value if given.
+        # Inputs: aggregation - str or AggregationType; value - optional initial value.
+        # Exceptions: ValueError for unknown aggregation strings or non-enum types; errors from append.
+        # KNOWN ISSUE: the docstring says value may be a list, but append rejects lists (ValueError);
+        # only scalars or a Metric work.
         if isinstance(aggregation, str):
             self.aggregation = AggregationType(aggregation)
         else:
@@ -101,6 +125,11 @@ class Metric:
             self.append(value)
 
     def append(self, value: Union[Numeric, "Metric"]) -> None:
+        # [FUNCTION DOC]
+        # Behavior: a Metric is merged via extend; a tensor must have exactly one element and is converted
+        # to a Python scalar; then the value must be int/float/Tensor/ndarray and is appended.
+        # Inputs: value. Exceptions: ValueError for non-scalar tensors or unsupported types.
+        # Side effects: mutates values.
         if isinstance(value, Metric):
             self.extend(value)
             return
@@ -113,6 +142,9 @@ class Metric:
         self.values.append(value)
 
     def extend(self, values: Union["Metric", list[Numeric]]) -> None:
+        # [FUNCTION DOC]
+        # Behavior: if given a Metric, requires matching aggregation and uses its values; appends each value.
+        # Inputs: values - Metric or iterable of numerics. Exceptions: ValueError on aggregation mismatch.
         if isinstance(values, Metric):
             if values.aggregation != self.aggregation:
                 raise ValueError(f"Aggregation type mismatch: {self.aggregation} != {values.aggregation}")
@@ -121,10 +153,15 @@ class Metric:
             self.append(value)
 
     def aggregate(self) -> float:
+        # [FUNCTION DOC]
+        # Returns the aggregate of the stored values using this metric's aggregation (numpy scalar).
         return self._aggregate(self.values, self.aggregation)
 
     @classmethod
     def _aggregate(cls, values: list[Numeric], aggregation: AggregationType) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Applies np.mean / np.sum / np.min / np.max to values according to aggregation.
+        # Returns None for unmatched types.
         match aggregation:
             case AggregationType.MEAN:
                 return np.mean(values)
@@ -137,6 +174,12 @@ class Metric:
 
     @classmethod
     def aggregate_dp(cls, metric_lists: list["Metric"]) -> float:
+        # [FUNCTION DOC]
+        # Behavior: combines Metrics from DP ranks having equal value counts into a 2-D array
+        # (ranks x values). SUM/MEAN: average across ranks per position, then apply the aggregation over
+        # positions; MIN/MAX: apply over all values flattened. Uses the first metric's aggregation.
+        # Inputs: metric_lists - non-empty list of Metric. Outputs: scalar.
+        # Exceptions: ValueError for empty input or unequal lengths.
         if not metric_lists:
             raise ValueError("Cannot aggregate an empty list of metrics.")
         value_lists = [ml.values for ml in metric_lists]
@@ -157,7 +200,11 @@ class Metric:
 
     @classmethod
     def from_dict(cls, data: dict[str, Numeric], aggregation: str | AggregationType) -> dict[str, "Metric"]:
+        # [FUNCTION DOC]
+        # Behavior: returns a dict mapping each key to a new Metric with the given aggregation and value.
         return {key: cls(value=value, aggregation=aggregation) for key, value in data.items()}
 
     def init_list(self) -> "Metric":
+        # [FUNCTION DOC]
+        # Returns a new empty Metric with the same aggregation.
         return Metric(aggregation=self.aggregation)

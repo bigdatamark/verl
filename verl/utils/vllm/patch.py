@@ -14,6 +14,12 @@
 
 # To support different vLLM versions, we add the model into SUPPORTED_MOE_MODELS separately to avoid triggering
 # unsupported issues.
+# [MODULE DOC]
+# Post-instantiation patch for vLLM MoE models: at import, collects the vLLM MoE model classes
+# available in the installed version (DeepSeek V2/V3, Mixtral, Qwen2/3 MoE, Qwen3-VL MoE LLM,
+# Qwen3-Next, Kimi-VL, Qwen3.5 MoE) into a supported-model list, and provides a function that attaches
+# the expert weight_loader to fused expert parameters. Must be imported after the vLLM LLM exists.
+
 SUPPORTED_MOE_MODELS = []
 
 try:
@@ -75,6 +81,18 @@ except ImportError:
 
 
 def patch_vllm_moe_model_weight_loader(model):
+    # [FUNCTION DOC]
+    # Behavior: returns immediately if no supported classes were importable. Unwraps an ACL graph
+    # wrapper (type name contains ACLGraphWrapper) via its runnable attribute. Resolves the inner model
+    # (model, else language_model); returns if neither outer nor inner is a supported MoE class. For
+    # Qwen3-VL MoE / Qwen3.5 MoE inner models, descends one further model level. For each decoder layer,
+    # takes the MLP attribute ("block_sparse_moe" for Mixtral outer type, else "mlp") and its experts;
+    # clears a non-empty LoRA lora_base_layer_prefix on experts.base_layer.routed_experts; then, if
+    # experts has a weight_loader, sets it as weight_loader on every MLP parameter whose name contains
+    # w13_weight or w2_weight.
+    # Inputs: model - instantiated vLLM model. Outputs: None.
+    # Exceptions: ValueError if no inner model attribute exists.
+    # Side effects: mutates parameter attributes and LoRA prefix in place.
     # this is a work around to load the weight of vllm fused moe model
     # it is from a bug from vllm 0.8.2
     # all the weights are supposed to have a weight_loader, but the moe weights

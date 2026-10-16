@@ -85,6 +85,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Numeric and symbolic answer-equivalence checker (from Hendrycks MATH / ToRA / CRITIC / PRM800K).
+# math_equal tries string, numeric (with percentage variants), interval/tuple/matrix element-wise,
+# and finally sympy symbolic comparison, each sympy step guarded by timeout_limit.
 """
 This logic is largely copied from the Hendrycks' MATH release (math_equivalence), and borrowed from:
 - https://github.com/microsoft/ToRA/blob/main/src/eval/grader.py
@@ -107,6 +111,9 @@ from verl.utils.py_functional import timeout_limit
 
 
 def is_digit(s):
+    # [FUNCTION DOC]
+    # HELPER: Tries to parse s as a float after removing "{,}" (LaTeX thousands separator) or plain
+    # commas. Outputs: tuple (True, float) on success, (False, None) on ValueError.
     try:
         if "{,}" in str(s):
             num = float(str(s).replace("{,}", ""))
@@ -119,6 +126,10 @@ def is_digit(s):
 
 
 def normalize(answer, pi) -> str:
+    # [FUNCTION DOC]
+    # HELPER: If answer is a string matching "$<number>" (prefix match) returns it without the leading
+    # "$"; if it is "<number>%" or "<number>\%" returns it with percent signs removed; otherwise
+    # applies handle_base then handle_pi. Output may be a string, int or number (not always str).
     # checking if answer is $<number> and removing $ in that case to compare
     if isinstance(answer, str) and bool(re.match(r"\$\d+(\.\d+)?", answer)):
         return answer[1:]
@@ -139,6 +150,11 @@ def normalize(answer, pi) -> str:
 
 
 def handle_base(x) -> str:
+    # [FUNCTION DOC]
+    # HELPER: For strings containing "_" (base subscript like "101_2"), keeps the part before the first
+    # underscore and converts it to int via float; other inputs returned unchanged.
+    # Exceptions: ValueError if the prefix is not numeric (propagates to math_equal's caller).
+    # KNOWN ISSUE: the base is discarded, so the digits are interpreted as decimal.
     if isinstance(x, str) and "_" in x:
         # Due to base
         x = x.split("_")[0]
@@ -148,6 +164,11 @@ def handle_base(x) -> str:
 
 
 def handle_pi(string, pi):
+    # [FUNCTION DOC]
+    # HELPER: For strings containing "\pi", replaces each occurrence with "*<pi>" after a digit or
+    # "1*<pi>" otherwise, then tries to evaluate the string as an expression (errors suppressed).
+    # Outputs: evaluated number, or the rewritten/unchanged string.
+    # Side effects: evaluates arbitrary model-provided text with the interpreter's eval.
     if isinstance(string, str) and "\\pi" in string:
         # Find the first occurrence of "\pi"
         idx = string.find("\\pi")
@@ -179,6 +200,22 @@ def math_equal(
     timeout: float = 10.0,
     pi: float = math.pi,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Decides whether prediction equals reference.
+    # Behavior: normalize both (with given pi); truncate long string predictions to 1000 chars;
+    # (0) case-insensitive stripped or whitespace-free string equality; (1) if both parse as numbers,
+    # True if prediction is close (rel_tol=tolerance) to reference, reference/100 or reference*100
+    # (only reference if include_percentage false), else returns False; empty non-zero prediction ->
+    # False; (2) stringify, convert sympy Interval notation to brackets, strip outer brackets when
+    # bracket types are compatible and remove braces/parens, compare; element-wise recursion for
+    # same-bracket intervals, comma-separated lists (returns that result if same length), "Point(...)"
+    # vs tuple, and pmatrix references vs Matrix(...) or nested list predictions; finally symbolic_equal.
+    # Inputs: prediction, reference, include_percentage, tolerance, timeout (seconds for sympy steps),
+    # pi (value substituted for \pi).
+    # Outputs: bool. Exceptions: errors from normalize (e.g. handle_base) and eval of list-like
+    # predictions in the matrix branch can propagate.
+    # Side effects: eval of prediction text; prints sympy timeouts.
+    # KNOWN ISSUE: recursive calls do not pass timeout or pi, so they use defaults.
     """
     Exact match of math if and only if:
     1. numerical equal: both can convert to float and are equal
@@ -322,7 +359,14 @@ def math_equal(
 
 
 def symbolic_equal(a, b, tolerance, timeout=10.0):
+    # [FUNCTION DOC]
+    # Parses a and b with sympy parse_expr, else parse_latex (each under timeout; failures fall back to
+    # the raw string), then returns True if simplify(a - b) == 0, or if numeric evaluations are close
+    # (rel_tol=tolerance); each step under timeout with timeouts printed and other errors ignored.
+    # Outputs: bool.
     def _parse(s):
+        # [FUNCTION DOC]
+        # HELPER: Returns the first successful parse of s by parse_expr then parse_latex, or s unchanged.
         for f in [parse_expr, parse_latex]:
             try:
                 with timeout_limit(seconds=timeout):
@@ -360,6 +404,9 @@ def symbolic_equal(a, b, tolerance, timeout=10.0):
 
 
 def format_intervals(prediction):
+    # [FUNCTION DOC]
+    # HELPER: Converts sympy-style "Interval(a, b)", "Interval.Ropen", "Interval.Lopen", "Interval.open"
+    # strings into bracket notation "[a, b]", "[a, b)", "(a, b]", "(a, b)"; other strings unchanged.
     patterns = {
         "Interval(": r"^Interval\((.*)\)$",
         "Interval.Ropen(": r"^Interval\.Ropen\((.*)\)$",

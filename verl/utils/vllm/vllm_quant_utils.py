@@ -13,6 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Entry point for quantized vLLM weight refit (see module docstring). Requires vLLM's LinearBase at
+# import (raises ImportError otherwise). Resolves, per vLLM version, which module classes hold fused
+# expert weights and where module-tree traversal must stop. Keeps a module-global FP8State with
+# caches of seen / FP8 param names and the list of started vLLM patchers. Dispatches staging and
+# post-processing to the FP8 and MXFP4 sibling modules, and handles Ascend NPU MXFP8/MXFP4 quant.
+
 """Entry point for refitting a quantized vLLM engine during RL rollout.
 
 Everything the rollout worker calls lives here: startup patching
@@ -64,12 +71,17 @@ logger = logging.getLogger(__name__)
 
 
 def _get_vllm_version():
+    # [FUNCTION DOC]
+    # HELPER: Returns the installed vLLM version parsed as a packaging Version.
     return version.parse(importlib.metadata.version("vllm"))
 
 
 # Ref: https://github.com/NVIDIA-NeMo/RL/commit/bc24887c72a6e1b2699a228bc87c588546dfe6b7
 @dataclass()
 class FP8State:
+    # [CLASS DOC]
+    # Mutable global state: seen_params (names already classified), fp8_param_names (names classified
+    # as FP8 weights), vllm_patches (started mock patchers). All default to empty.
     # A cache of fp8 parameter names, we can check this cache to see if a
     # param name corresponds to a fp8 weight
     seen_params: set = field(default_factory=lambda: set())
@@ -81,6 +93,9 @@ fp8_state: FP8State = FP8State()
 
 
 def is_quantized_model(vllm_config):
+    # [FUNCTION DOC]
+    # Behavior: True if the config has a quant_config that is an Fp8Config or an Ascend MX quant config.
+    # Inputs: vllm_config. Outputs: bool. Exceptions: ImportError if vLLM fp8 module missing.
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
     if hasattr(vllm_config, "quant_config"):
@@ -127,6 +142,9 @@ else:
 
 
 def _is_expert_weight_module(module) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if module is an instance of the resolved expert-weight classes, or (duck typing) has
+    # both w13_weight and w2_weight attributes.
     """Return whether ``module`` directly owns fused expert weights.
 
     True for the pre-0.24 ``FusedMoE`` module and the post-0.24 ``RoutedExperts``
@@ -139,6 +157,9 @@ def _is_expert_weight_module(module) -> bool:
 
 
 def _is_fused_moe_block(module) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if module is an instance of the resolved stop classes, has a routed_experts child, or
+    # is an expert-weight module.
     """Return whether ``module`` is the fused-MoE block reached while walking the
     module tree, so traversal must stop before descending into per-expert name
     parts (e.g. the expert index) that are not real submodules."""
@@ -150,6 +171,8 @@ def _is_fused_moe_block(module) -> bool:
 
 
 def _resolve_expert_weight_module(module):
+    # [FUNCTION DOC]
+    # HELPER: Returns module.routed_experts if present and not None, else module itself.
     """Return the submodule that actually owns the fused expert weights.
 
     On vLLM >= 0.24 the walked module is a ``MoERunner`` whose ``routed_experts``
@@ -162,6 +185,18 @@ def _resolve_expert_weight_module(module):
 
 
 def get_module_from_param_name(model, name: str):
+    # [FUNCTION DOC]
+    # Behavior: splits the dotted name and drops the last part (the param name); maps the final module
+    # segment from an unpacked name to its packed owner using model.packed_modules_mapping. Walks the
+    # model from the root: stops early at a fused-MoE block (returning its expert-weight owner); indexes
+    # ModuleLists by integer; otherwise follows attributes. Returns the expert-weight owner of the final
+    # module reached.
+    # Inputs: model - must have packed_modules_mapping; name - dotted param name.
+    # Outputs: module.
+    # Exceptions: lookup errors during traversal are caught and printed as a warning; the partially
+    # traversed module is then returned.
+    # KNOWN ISSUE: on traversal failure it silently returns an ancestor module (and uses print rather
+    # than the logger); a name without any dot raises IndexError outside the try block.
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
     path_parts = name.split(".")
@@ -204,6 +239,12 @@ _FP8_CANDIDATE_LEAVES: frozenset = frozenset({"weight", "gate_up_proj", "down_pr
 
 
 def is_fp8_weight(name, model):
+    # [FUNCTION DOC]
+    # Behavior: on first sight of a name, records it as seen and, if its leaf is weight / gate_up_proj /
+    # down_proj, resolves its module and records it as FP8 if the module is a LinearBase with
+    # float8_e4m3fn weight, or an expert-weight module whose w13 and w2 weights are both float8_e4m3fn.
+    # Returns whether the name is in the FP8 set.
+    # Inputs: name; model. Outputs: bool. Side effects: mutates global caches.
     if name not in fp8_state.seen_params:
         fp8_state.seen_params.add(name)
         leaf = name.rsplit(".", 1)[-1]
@@ -222,6 +263,9 @@ def is_fp8_weight(name, model):
 
 
 def is_w4a8_weight(module) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: True if module is a LinearBase with uint8 weight, or an expert-weight module with uint8
+    # w13 and w2 weights. Inputs: module. Outputs: bool.
     """Check if a module holds W4A8 (FP4) quantized weights.
 
     W4A8 stores weights as packed FP4 in uint8 tensors, unlike W8A8 which
@@ -241,6 +285,10 @@ def is_w4a8_weight(module) -> bool:
 
 
 def is_vllm_ascend_mx_quant(quant_config):
+    # [FUNCTION DOC]
+    # Behavior: returns False if vllm_ascend is not installed or the config is not an
+    # AscendModelSlimConfig; otherwise True if any value in its quant_description is "W8A8_MXFP8" or
+    # "W4A8_MXFP". Inputs: quant_config. Outputs: bool.
     try:
         from vllm_ascend.quantization import AscendModelSlimConfig
     except ImportError:
@@ -253,6 +301,10 @@ def is_vllm_ascend_mx_quant(quant_config):
 
 
 def restore_mxfp8_weights_for_loading(model):
+    # [FUNCTION DOC]
+    # Behavior: for every named module flagged as MXFP8- or MXFP4-transformed whose nested
+    # quant_method.quant_method has restore_weights_for_rl_loading, calls it on the module to restore the
+    # load layout. Inputs: model. Outputs: None. Side effects: mutates module weights.
     for name, module in model.named_modules():
         if (
             (hasattr(module, "_mxfp8_transformed") or hasattr(module, "_mxfp4_transformed"))
@@ -264,6 +316,11 @@ def restore_mxfp8_weights_for_loading(model):
 
 
 def apply_mxfp8_transformation_after_loading(model):
+    # [FUNCTION DOC]
+    # Behavior: if LinearBase cannot be imported, logs a warning and returns. For each LinearBase or
+    # expert-weight module that recorded MXFP8/MXFP4 original shapes and whose quant_method has
+    # process_weights_after_loading, logs at debug and calls it.
+    # Inputs: model. Outputs: None. Side effects: mutates module weights; logs.
     """Re-apply MXFP8 transformations after weight loading.
 
     This function iterates through all linear modules in the model and applies
@@ -288,6 +345,12 @@ def apply_mxfp8_transformation_after_loading(model):
 
 
 def refresh_rocm_attention_weight_caches(model):
+    # [FUNCTION DOC]
+    # Behavior: no-op unless running on ROCm (HIP) with a DeepSeek-V4 model. Under inference mode, for
+    # each module holding a cached bf16 wo_a tensor: records its shape, deletes the cache attribute,
+    # rebuilds via vLLM's cache builder, copies the rebuilt values into the original tensor if it is a
+    # different allocation, and reattaches the original tensor.
+    # Inputs: model. Outputs: None. Side effects: in-place buffer update; module attribute churn.
     """Rebuild the bf16 ``wo_a`` copy vLLM derives from the loaded weight.
 
     ``rocm_aiter_mla_sparse._get_cached_wo_a_bf16`` caches a dequantized ``wo_a``
@@ -326,6 +389,10 @@ def refresh_rocm_attention_weight_caches(model):
 
 
 def _classify_quant_weight(name, model, is_ascend_mx):
+    # [FUNCTION DOC]
+    # HELPER: Classification per docstring: FP8 weights give "mx_fp8" on Ascend MX else "fp8"; on Ascend
+    # MX, names ending in "weight" whose module is W4A8 give "mx_fp4"; otherwise None.
+    # Side effects: populates global FP8 caches via the FP8 check.
     """Determine what kind of quantization a weight parameter needs.
 
     Returns
@@ -344,6 +411,18 @@ def _classify_quant_weight(name, model, is_ascend_mx):
 
 
 def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
+    # [FUNCTION DOC]
+    # Behavior: generator. For DeepSeek-V4 models, passes weights through the DSv4 reinterpret and stops.
+    # Otherwise clears the FP8 caches, determines Ascend MX mode (importing torch_npu), and for each
+    # (name, tensor): passes through unclassified weights; for "mx_fp8"/"mx_fp4" casts to dtype and runs
+    # the NPU dynamic MX quant (FP4 x2 or FP8 destination, last axis), flattens the last two scale dims,
+    # and reinterprets FP4 output as uint8; for "fp8" runs blockwise FP8 quantization with the config's
+    # weight block size. Squeezes the scale's last dim, then yields (name, quantized) followed by
+    # (name + "_scale", scale) on Ascend MX or (name + "_scale_inv", scale) otherwise.
+    # Inputs: weights - iterable of (name, tensor); model; quant_config; dtype.
+    # Outputs: generator of (name, tensor).
+    # Exceptions: torch.distributed must be initialized (rank query for debug logging).
+    # Side effects: mutates global caches; logs on rank 0.
     """Quantize weights to FP8 format using a memory-efficient generator.
 
 
@@ -408,6 +487,10 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
 
 
 def prepare_quanted_weights_for_loading(model):
+    # [FUNCTION DOC]
+    # Behavior: restores Ascend MX layouts, then stages FP8 and MXFP4 MoE params, returning a mapping
+    # with keys "fp8_layers" and "mxfp4_moe_modules" holding the staged lists.
+    # Inputs: model. Outputs: reload state dict. Side effects: mutates model parameters.
     """Restore quantized params to the layout their ``weight_loader`` expects.
 
     Must run once before the first bucket, and pairs with
@@ -426,6 +509,10 @@ def prepare_quanted_weights_for_loading(model):
 
 
 def process_quanted_weights_after_loading(model, reload_state):
+    # [FUNCTION DOC]
+    # Behavior: re-applies Ascend MX transforms, processes staged FP8 layers and MXFP4 modules from the
+    # reload state (None treated as empty), and finally refreshes the ROCm DSv4 wo_a cache.
+    # Inputs: model; reload_state - mapping from the prepare step or None. Outputs: None.
     """Re-apply the inference layout undone by ``prepare_quanted_weights_for_loading``."""
     apply_mxfp8_transformation_after_loading(model)
     reload_state = reload_state or {}
@@ -437,6 +524,17 @@ def process_quanted_weights_after_loading(model, reload_state):
 
 
 def load_quanted_weights(weights, model_runner, is_drafter=False):
+    # [FUNCTION DOC]
+    # Behavior: selects the target model (the drafter's model when is_drafter, else the main model),
+    # reads quant config and model dtype, materializes the incoming weights into a list, and builds the
+    # quantizing generator. Tags every model parameter with its qualified name, and temporarily swaps
+    # the class of params that carry subclass_type to that subclass (saving the original class). Loads
+    # weights with vLLM's MTP completeness check disabled (if available), and in a finally block restores
+    # original param classes.
+    # Inputs: weights - iterable of (name, tensor); model_runner - vLLM model runner; is_drafter - bool.
+    # Outputs: whatever model.load_weights returns (set of loaded names).
+    # Exceptions: AssertionError if drafter model is missing; loader errors propagate.
+    # Side effects: mutates parameter attributes and classes (restored), loads weights in place.
     if is_drafter:
         drafter = getattr(model_runner, "drafter", None)
         model = drafter.model if drafter is not None and hasattr(drafter, "model") else None
@@ -483,6 +581,10 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
 
 
 def apply_vllm_quant_patches():
+    # [FUNCTION DOC]
+    # Behavior: if patchers were already started, logs and returns; otherwise builds the FP8 method
+    # patchers for the installed vLLM version, starts each and records it in global state.
+    # Inputs: none. Outputs: None. Side effects: global monkey patches of vLLM quant methods.
     """Install the vLLM patches the refit path depends on. Must run pre-engine.
 
     These have to be in place before the engine builds, because recording each

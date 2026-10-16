@@ -13,6 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Accelerator (CUDA/NPU via get_torch_device) memory utilities: cache cleanup, memory stats and
+# logging, per-process memory fraction presets, allocator history recording across PyTorch /
+# torch-npu API variants, and memory snapshot dumping for pytorch.org/memory_viz. All functions
+# are no-ops (or return empty/None) when no accelerator is available. Module logger level comes
+# from VERL_LOGGING_LEVEL (default WARN).
+
 import gc
 import inspect
 import logging
@@ -30,6 +37,12 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> None:
+    # [FUNCTION DOC]
+    # Behavior: up to max_retries times: record reserved/allocated bytes, run Python GC, empty the
+    # device cache, optionally synchronize, log freed GB, and stop once less than 1 GiB of reserved
+    # memory was freed in an attempt.
+    # Inputs: force_sync - synchronize after emptying; max_retries. Outputs: none.
+    # Side effects: GC, cache release, device sync, info logs.
     """
     More aggressive GPU memory cleanup function, tries to release PyTorch reserved
     but unallocated memory.
@@ -76,6 +89,8 @@ def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> Non
 
 
 def reset_memory_stats() -> None:
+    # [FUNCTION DOC]
+    # Behavior: resets peak and accumulated memory stats on the device if available.
     """Reset GPU memory statistics"""
     if get_torch_device().is_available():
         device = get_torch_device()
@@ -84,6 +99,9 @@ def reset_memory_stats() -> None:
 
 
 def get_memory_info() -> dict:
+    # [FUNCTION DOC]
+    # Behavior: returns a dict of GB values for the current device: total_memory_gb, reserved, allocated,
+    # cached (reserved - allocated), max allocated and max reserved; {} without accelerator.
     """Get detailed GPU memory information"""
     if not get_torch_device().is_available():
         return {}
@@ -102,6 +120,9 @@ def get_memory_info() -> dict:
 
 
 def log_memory_usage(stage: str = "current") -> None:
+    # [FUNCTION DOC]
+    # Behavior: logs total/allocated/reserved/cached GB at info level tagged with stage.
+    # Inputs: stage label.
     """Log GPU memory usage"""
     if not get_torch_device().is_available():
         return
@@ -117,6 +138,9 @@ def log_memory_usage(stage: str = "current") -> None:
 
 
 def optimize_memory_for_inference() -> None:
+    # [FUNCTION DOC]
+    # Behavior: sets per-process memory fraction 0.95, aggressively empties cache with sync, logs.
+    # Side effects: global allocator setting.
     """Optimize GPU memory usage for inference"""
     if not get_torch_device().is_available():
         return
@@ -131,6 +155,9 @@ def optimize_memory_for_inference() -> None:
 
 
 def optimize_memory_for_training() -> None:
+    # [FUNCTION DOC]
+    # Behavior: sets per-process memory fraction 0.9, empties cache without forced sync, logs.
+    # Side effects: global allocator setting.
     """Optimize GPU memory usage for training"""
     if not get_torch_device().is_available():
         return
@@ -152,6 +179,18 @@ def enable_memory_visualize(
     devices=None,
     record_context: bool = True,
 ):
+    # [FUNCTION DOC]
+    # Behavior: introspects the signature of the device's private _record_memory_history and builds
+    # kwargs matching it: context/stacks (if named, or if it takes **kwargs and has no record_context),
+    # max entries under max_entries / trace_alloc_max_entries (or max_entries via **kwargs),
+    # stack_depth, device / devices (list) / device via **kwargs, and record_context. On TypeError falls
+    # back to legacy calls (enabled=True with trace_alloc_max_entries and record_context=True when both
+    # are named, else just enabled=True). Calls once for None/str/int/torch.device devices, otherwise
+    # once per device in the iterable. Then resets peak stats, synchronizes, and logs the mode/args
+    # with RANK from env.
+    # Inputs: trace_alloc_max_entries; stack_depth; context; stacks; devices; record_context.
+    # Outputs: none. Exceptions: errors from legacy fallback propagate.
+    # Side effects: enables allocator history recording; warns without accelerator.
     """
     Enables memory history recording for accelerator (CUDA/NPU) allocations.
     This function should be called before any large-scale allocations. For DDP
@@ -187,6 +226,10 @@ def enable_memory_visualize(
     accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     def _one_call(dev_kw=None):
+        # [FUNCTION DOC]
+        # HELPER: Performs a single recording-enable call for an optional device as described above.
+        # Inputs: dev_kw - device spec or None. Outputs: (mode string "native"/"legacy"/"legacy-min",
+        # kwargs used).
         kwargs = {}
         if "context" in params or (accepts_kwargs and "record_context" not in params):
             kwargs["context"] = context
@@ -246,6 +289,11 @@ def enable_memory_visualize(
 
 
 def clear_memory_history(trace_alloc_max_entries: int = 200_000, stack_depth: int = 32):
+    # [FUNCTION DOC]
+    # Behavior: disables history recording (enabled=None) then re-enables it via
+    # enable_memory_visualize with the given entries/depth, effectively clearing recorded history;
+    # failures are logged as warnings.
+    # Inputs: trace_alloc_max_entries; stack_depth. Outputs: none.
     device = get_torch_device()
     if not device.is_available():
         logger.warning("[memory_visualize] Memory history recording is only available on accelerator devices")
@@ -258,6 +306,8 @@ def clear_memory_history(trace_alloc_max_entries: int = 200_000, stack_depth: in
 
 
 class MemorySnapshotSampler:
+    # [CLASS DOC]
+    # Dumps allocator memory snapshots to pickle files.
     """
     A utility class that dumps CUDA/NPU memory snapshots.
     This is useful for monitoring memory usage over a long-running process.
@@ -270,12 +320,24 @@ class MemorySnapshotSampler:
     """
 
     def __init__(self, out_dir: str = "./mem_snapshots", tag: str = "periodic"):
+        # [FUNCTION DOC]
+        # Inputs: out_dir, tag - stored as attributes. Side effects: none.
         self.out_dir = out_dir
         self.tag = tag
 
     def dump_memory_snapshot(
         self, out_dir: str = "./mem_snapshots", tag: str = "snapshot", sub_dir: str = None, synchronize: bool = True
     ) -> Path | None:
+        # [FUNCTION DOC]
+        # Behavior: target directory is out_dir/<sub_dir> or out_dir/<YYYYmmdd-HHMM timestamp>, created if
+        # needed; file name "<tag>_rank<RANK env>_pid<pid>.pickle". Without accelerator warns and returns
+        # None. Optionally synchronizes; on NPU pickles device.memory._snapshot() manually, otherwise uses
+        # device.memory._dump_snapshot. Logs and returns the path; on any exception warns and returns None.
+        # Inputs: out_dir; tag; sub_dir; synchronize. Outputs: Path or None.
+        # Side effects: creates directories and writes a file.
+        # KNOWN ISSUE: ignores the instance's self.out_dir/self.tag set in __init__, always using the
+        # method's own defaults unless passed explicitly. The directory is created even when no
+        # accelerator is available.
         """
         Generates a memory snapshot and saves it as a pickle file in a specified directory.
         The files are organized by timestamp in subdirectories, with all ranks' files

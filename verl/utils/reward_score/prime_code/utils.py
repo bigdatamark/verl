@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Process-isolated wrapper (borrowed from the codeparrot APPS metric) around testing_util.run_test
+# that enforces a global timeout on top of run_test's per-case timeouts.
 
 # Borrowed from: https://huggingface.co/spaces/codeparrot/apps_metric/blob/main/utils.py
 
@@ -24,6 +27,11 @@ from .testing_util import run_test
 
 
 def _temp_run(sample, generation, debug, result, metadata_list, timeout):
+    # [FUNCTION DOC]
+    # HELPER: Target of the child process. Redirects stdout/stderr to devnull, runs run_test and
+    # appends its result list and metadata to the shared lists. On exception prints a traceback (to
+    # devnull) and appends a list of -1 per input plus an empty metadata dict.
+    # Side effects: mutates the shared manager lists; replaces the process's sys.stdout/stderr.
     with open(os.devnull, "w") as devnull:
         sys.stdout = devnull
         sys.stderr = devnull
@@ -39,6 +47,14 @@ def _temp_run(sample, generation, debug, result, metadata_list, timeout):
 
 
 def check_correctness(in_outs: Optional[dict], generation, timeout=10, debug=True):
+    # [FUNCTION DOC]
+    # Runs _temp_run in a new process with manager-backed shared lists, waits timeout + 1 seconds and
+    # kills the process if still alive. If no result was produced, treats every input as failed (-1)
+    # and prints "global timeout" when debug.
+    # Inputs: in_outs (dict with "inputs"/"outputs"), generation (code string), timeout (seconds per
+    # test, also used for the global wait), debug.
+    # Outputs: tuple (result list for the first run - True/False/-1/-2 per case, the shared metadata list).
+    # Side effects: starts a multiprocessing Manager and a child process executing untrusted code.
     """Check correctness of code generation with a global timeout.
     The global timeout is to catch some extreme/rare cases not handled by the timeouts
     inside `run_test`"""

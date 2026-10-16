@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Lightweight performance helpers: device memory reporting/logging (function and decorator forms),
+# caller-annotated printing, codetiming-based timers accumulating into a name->seconds mapping, and
+# torch.distributed reductions/gathers of timing dictionaries.
 import datetime
 import inspect
 import logging
@@ -27,6 +31,15 @@ from verl.utils.logger import DecoratorLoggerBase
 
 
 def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str]:
+    # [FUNCTION DOC]
+    # HELPER: Reads current device memory stats as formatted strings.
+    # Behavior: if the torch device module is torch.cpu, returns four "0.00" strings. Otherwise reads
+    # allocated and reserved bytes from the caching allocator and free/total from mem_get_info (driver
+    # level, so it sees vLLM sleep-mode memory), computes used = total - free, divides by 1024^3/^2/^1 for
+    # GB/MB/KB and formats with the given decimal precision.
+    # Outputs: tuple (allocated, reserved, used, total) strings.
+    # KNOWN ISSUE: CPU branch always uses two decimals regardless of precision.
+    # Exceptions: AssertionError for an unsupported unit. Side effects: none.
     """Get current memory usage.
 
     Note that CPU device memory info is always 0.
@@ -61,6 +74,11 @@ def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str]:
 
 
 def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging.DEBUG, rank: int = 0):
+    # [FUNCTION DOC]
+    # Behavior: if torch.distributed is not initialized, rank is None, or the current rank equals rank,
+    # reads memory info (GB) and emits a single message prefixed by head via print (logger None) or
+    # logger.log at level.
+    # Outputs: None. Exceptions: none explicit. Side effects: prints/logs.
     """Log GPU memory usage information.
 
     Args:
@@ -83,6 +101,9 @@ def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging
 
 
 class GPUMemoryLogger(DecoratorLoggerBase):
+    # [CLASS DOC]
+    # Decorator (via DecoratorLoggerBase) that logs device memory before and after each call of the wrapped
+    # function, tagged with a role. Rank-filtering and the logging function come from the base class.
     """A decorator class to log GPU memory usage.
 
     Example:
@@ -94,6 +115,10 @@ class GPUMemoryLogger(DecoratorLoggerBase):
     """
 
     def __init__(self, role: str, logger: logging.Logger = None, level=logging.DEBUG, log_only_rank_0: bool = True):
+        # [FUNCTION DOC]
+        # Behavior: determines the current rank (distributed rank when initialized with world size > 1, else 0)
+        # and initializes the base logger with role, logger, level, rank and log_only_rank_0.
+        # Side effects: none beyond attribute setup.
         if dist.is_initialized() and dist.get_world_size() > 1:
             rank = dist.get_rank()
         else:
@@ -101,12 +126,22 @@ class GPUMemoryLogger(DecoratorLoggerBase):
         super().__init__(role, logger, level, rank, log_only_rank_0)
 
     def __call__(self, decorated_function: callable):
+        # [FUNCTION DOC]
+        # Behavior: returns a plain wrapper that routes calls through self.log.
+        # KNOWN ISSUE: wrapper does not use functools.wraps, so name/docstring of the decorated function are lost.
+        # Outputs: wrapper function.
         def f(*args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Calls self.log with the decorated function and the call arguments; returns its result.
             return self.log(decorated_function, *args, **kwargs)
 
         return f
 
     def log(self, func, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: logs "Before <name>" memory message, calls func, logs "After <name>" message, returns output.
+        # Inputs: func and its args/kwargs. Outputs: func's return value.
+        # Exceptions: propagates func's exceptions (After message skipped). Side effects: logging.
         name = func.__name__
         mem_allocated, mem_reserved, mem_used, mem_total = _get_current_mem_info()
         message = (
@@ -128,6 +163,9 @@ class GPUMemoryLogger(DecoratorLoggerBase):
 
 
 def log_print(ctn: Any):
+    # [FUNCTION DOC]
+    # Behavior: prints "[<timestamp>-<file>:<line>:<function>]: <ctn>" using the caller's stack frame.
+    # Inputs: ctn - any printable object. Outputs: None. Side effects: stdout.
     current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     frame = inspect.currentframe().f_back
@@ -138,6 +176,13 @@ def log_print(ctn: Any):
 
 
 def _timer(name: str, timing_raw: dict[str, float]):
+    # [FUNCTION DOC]
+    # HELPER: Generator shared by the timer context managers.
+    # Behavior: runs a codetiming Timer around a single yield; after resuming, adds timer.last (seconds) to
+    # timing_raw[name], initializing it to 0 if absent.
+    # Inputs: name; timing_raw - mutable mapping. Outputs: generator yielding once.
+    # Exceptions: if the body raises, the exception propagates and no time is recorded.
+    # Side effects: mutates timing_raw.
     """Inner function that handles the core timing logic.
 
     Args:
@@ -153,6 +198,8 @@ def _timer(name: str, timing_raw: dict[str, float]):
 
 @contextmanager
 def simple_timer(name: str, timing_raw: dict[str, float]):
+    # [FUNCTION DOC]
+    # Behavior: context manager delegating to _timer (accumulates elapsed time). Side effects: mutates timing_raw.
     """Context manager for basic timing without NVTX markers.
 
     This utility function measures the execution time of code within its context
@@ -176,6 +223,9 @@ def marked_timer(
     domain: Optional[str] = None,
     category: Optional[str] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: fallback with the same signature as the NVTX/MSTX versions; ignores color/domain/category and
+    # only accumulates elapsed time via _timer. Side effects: mutates timing_raw.
     """Context manager for timing with platform markers.
 
     This utility function measures the execution time of code within its context,
@@ -198,6 +248,12 @@ def marked_timer(
 def reduce_timing(
     timing_raw: dict[str, float], reduce_op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.AVG
 ) -> dict[str, float]:
+    # [FUNCTION DOC]
+    # Behavior: returns input unchanged if torch.distributed is not initialized. Else sorts keys, packs
+    # values into a float32 tensor on the current device, all_reduces with reduce_op (default AVG, not sum
+    # as the docstring says), and rebuilds a dict from keys to reduced Python floats.
+    # Inputs: timing_raw - mapping (all ranks must have identical key sets); reduce_op.
+    # Outputs: new dict. Exceptions: collective errors. Side effects: collective communication, device sync.
     """Reduce timing information across all processes.
 
     This function uses distributed communication to gather and sum the timing
@@ -225,6 +281,14 @@ def reduce_timing(
 
 def topk_reduce_ratio_min_max(timing: float, k: int = 10) -> tuple[float, float, float]:
     """Calculate topk items take-up ratio, and min/max timing across all ranks."""
+    # [FUNCTION DOC]
+    # Behavior: returns (-1, -1, -1) when not distributed. Otherwise all_gathers each rank's scalar timing,
+    # computes min and max, the (1 - k/100) quantile, and the fraction of ranks strictly above that quantile.
+    # Inputs: timing - this rank's value; k - percentile size (top k%).
+    # Outputs: tuple (tail_ratio, min, max).
+    # KNOWN ISSUE: the local tensor is 0-dim while gather buffers have shape (1,); all_gather may reject the
+    # shape mismatch depending on backend.
+    # Side effects: collective communication.
     if not dist.is_initialized():
         return -1.0, -1.0, -1.0
 
@@ -241,6 +305,11 @@ def topk_reduce_ratio_min_max(timing: float, k: int = 10) -> tuple[float, float,
 
 
 def gather_timing(timing_raw: dict[str, float]) -> dict[str, list[float]]:
+    # [FUNCTION DOC]
+    # Behavior: if not distributed, wraps each value in a single-element list. Otherwise sorts keys, gathers
+    # each rank's ordered value list via all_gather_object, and maps each key to the per-rank list of values.
+    # Inputs: timing_raw - mapping with identical key sets across ranks.
+    # Outputs: dict key -> list of floats indexed by rank. Side effects: collective communication.
     if not dist.is_initialized():
         return {k: [v] for k, v in timing_raw.items()}
 

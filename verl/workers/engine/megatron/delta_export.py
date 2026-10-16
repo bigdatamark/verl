@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Megatron delta-export machinery: builds a per-parameter export index from Megatron-Bridge conversion tasks, creates communication-free "probe" copies of param mappings (size-faithful fake groups, stubbed gather helpers), exchanges per-row HF slot tables across ranks, and converts a shard-local sparse delta to HF-coordinate (slot, index, value) entries via NaN sentinels.
+# Module state: a pool of read-only NaN tensors keyed by (shape, dtype, device), kept for the process lifetime.
 """Megatron-side delta export machinery, built on Megatron-Bridge param mappings.
 
 The delta engine consumes final HF-coordinate entries; everything mcore-specific
@@ -63,6 +67,8 @@ logger = logging.getLogger(__name__)
 
 
 class _ProbeGroup:
+    # [CLASS DOC]
+    # HELPER: Fake process group exposing only size and rank; any other attribute access raises RuntimeError to catch unstubbed communication.
     """Size/rank-faithful stand-in for a process group on probe copies: value
     math inside ``megatron_to_hf`` (e.g. Mamba's per-rank de-interleave dims)
     sees the REAL parallel sizes, while any attempt to actually communicate
@@ -70,16 +76,24 @@ class _ProbeGroup:
     anything else reaching a group is an unstubbed communication pattern)."""
 
     def __init__(self, size: int, rank: int):
+        # [FUNCTION DOC]
+        # Stores size and rank as ints.
         self._size = int(size)
         self._rank = int(rank)
 
     def size(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the stored group size.
         return self._size
 
     def rank(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the stored rank.
         return self._rank
 
     def __getattr__(self, name):
+        # [FUNCTION DOC]
+        # Called only for missing attributes; always raises RuntimeError naming the attribute (signals communication outside the stubbed helpers).
         raise RuntimeError(
             f"probe process group asked for {name!r}: this mapping communicates outside "
             "the stubbed helpers (gather_from_tp_ranks / gather_from_ep_ranks[_scale] / "
@@ -91,6 +105,9 @@ _NAN_POOL: dict = {}
 
 
 def _nan_block(shape, dtype, device) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns a cached all-NaN tensor for (shape, dtype, device), creating and pooling it on first request. Callers must treat it as read-only.
+    # Side effects: grows the module-level pool (device memory).
     """Read-only all-NaN placeholder for another rank's gather chunk, pooled by
     (shape, dtype, device): the gather stub hands these out on every probe call
     for every param, and they are only ever READ (the transforms are functional),
@@ -105,6 +122,10 @@ def _nan_block(shape, dtype, device) -> torch.Tensor:
 
 
 def _warm_lazy_mappings(mapping, module) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Eagerly resolves an AutoMapping's lazy concrete delegate before probing.
+    # Behavior: if the mapping has the detection method and no resolved delegate, detects the parallelism type from the module, creates the delegate and records the detected type; failures are logged as warnings and swallowed. Only the mapping itself is warmed, not children.
+    # Side effects: mutates the mapping object.
     """Force AutoMapping's lazy concrete delegate into existence: AutoMapping
     resolves its Column/Row/Replicated delegate on first use, snapshotting
     whatever process groups exist at that moment -- if that first use happened
@@ -122,6 +143,11 @@ def _warm_lazy_mappings(mapping, module) -> None:
 
 
 def make_probe(mapping, module):
+    # [FUNCTION DOC]
+    # Creates a communication-free probe copy of a Megatron-Bridge mapping tree.
+    # Behavior: warms the root's lazy delegate, then recursively shallow-copies the mapping: on each copy sets pp_group to a (1, 0) probe group, replaces ep_group, _tp_group and _etp_group with probe groups carrying the original groups' real size/rank, replaces gather_from_tp_ranks with a function returning a list of tp_size entries (pooled NaN blocks, own tensor at tp_rank), gather_from_ep_ranks with a function returning a one-entry mapping from the bound name to the tensor, and gather_from_ep_ranks_scale likewise after unsqueeze/squeeze/unsqueeze(-1) reshaping. Child attributes that are MegatronParamMapping instances are warmed and recursively replaced by probe copies.
+    # Inputs: mapping - Megatron-Bridge param mapping; module - Megatron module the mapping reads.
+    # Outputs: the probe mapping copy (original untouched aside from warming).
     """Copy a Megatron-Bridge param mapping tree and turn ``megatron_to_hf``
     into a communication-free LOCAL transform that still runs the REAL
     (tp_size > 1) code paths: every copy's groups become size-faithful
@@ -136,6 +162,8 @@ def make_probe(mapping, module):
     _warm_lazy_mappings(mapping, module)
 
     def _stub(c):
+        # [FUNCTION DOC]
+        # HELPER: Mutates a mapping copy in place to use probe groups and local gather stubs (see make_probe) and returns it.
         # size-faithful groups, sizes/ranks read from the ORIGINAL (real) groups
         # BEFORE replacement. The probe only ever runs on the stage that OWNS
         # the param, where a pp broadcast is the identity -- a (1, 0) group
@@ -146,6 +174,8 @@ def make_probe(mapping, module):
             setattr(c, attr, _ProbeGroup(get_pg_size(g), get_pg_rank(g)))
 
         def _gather_tp(tensor, _c=c):
+            # [FUNCTION DOC]
+            # HELPER: Local stand-in for a TP all-gather: list of length tp_size with NaN blocks and the given tensor at this rank's index.
             # what a real all_gather over the tp group would produce, minus the
             # other ranks' data: our shard rides at its true rank index, every
             # other chunk is a pooled read-only NaN block (those ranks export
@@ -167,6 +197,8 @@ def make_probe(mapping, module):
         return c
 
     def _inject(m):
+        # [FUNCTION DOC]
+        # HELPER: Stubs a shallow copy of a mapping and recursively replaces its child mappings with probe copies; returns the stubbed copy.
         c = _stub(copy.copy(m))
         for attr, value in list(vars(c).items()):
             if isinstance(value, MegatronParamMapping):
@@ -181,6 +213,8 @@ def make_probe(mapping, module):
 
 @dataclass
 class McoreParamExport:
+    # [CLASS DOC]
+    # Dataclass export record for one Megatron parameter: megatron_name, param (None for params owned by another pipeline stage), spec (ShardSpec routing info), probe mapping, module handle, and slots (global (hf_name, hf_shape) table, filled by the slot exchange).
     """One mcore parameter's export record: geometry + probe + module handle.
     ``param is None`` marks a parameter owned by another pipeline stage: the
     rank ships a zero-count lockstep row for it (probe/module unused)."""
@@ -196,6 +230,13 @@ class McoreParamExport:
 
 
 def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -> list[McoreParamExport]:
+    # [FUNCTION DOC]
+    # Builds the export index of all parameters in global, rank-identical order.
+    # Behavior: iterates over bridge conversion tasks. Tasks with no param are skipped when PP is 1, else recorded as non-contributing lockstep rows with WORLD as gather group. For owned params: expert-ness requires mapping.is_expert and (EP or TP above 1); TP-sharded means the param's tensor_model_parallel flag and TP above 1. With PP above 1 all rows merge over WORLD and contributes is: expert-DP rank 0 for experts; DP(with CP) rank 0 for TP-sharded; TP rank 0 and DP rank 0 otherwise. With PP 1: experts gather over the expert tensor-and-model-parallel group; TP-sharded over the TP group; others are unsharded specs. Each owned row gets a probe. Then runs the slot-table exchange and drops (with a warning) rows that have no slots on any rank.
+    # Inputs: bridge - AutoBridge; megatron_model - model chunks; slot_cache - mapping from param name to slot list, reused across calls.
+    # Outputs: list of McoreParamExport.
+    # Side effects: collective all_gather_object over WORLD; populates slot_cache; logs.
+    # KNOWN ISSUE: slot_cache defaults to None, but the slot exchange performs membership tests on it, so calling without a cache raises TypeError. The docstring also references a nonexistent preseed-slot-tables function; the work is done by the slot exchange.
     """Enumerate every mcore parameter through the bridge's conversion tasks
     and precompute its probe + wire routing.
 
@@ -312,6 +353,12 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
 
 
 def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Collectively computes the global per-row slot tables.
+    # Behavior: for each owned row without a cached slot list, probes an empty delta (int64 indices, bf16 values) to populate the cache; builds a per-row local list (None for non-owned rows), all-gathers the lists over WORLD, asserts all ranks have the same row count, and sets each record's slots to the ordered first-seen union of (name, shape) across ranks in rank order, or None if empty.
+    # Inputs: index - records (mutated); slot_cache - name-to-slot-list mapping (mutated).
+    # Exceptions: AssertionError on diverging row counts.
+    # Side effects: collective communication; mutates records and cache.
     """One-time GLOBAL slot-table exchange, run at every world size, keyed by
     DIRECTORY ROW (not by param name).
 
@@ -359,6 +406,14 @@ def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict) -> No
 
 
 def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval: torch.Tensor, slot_cache: dict):
+    # [FUNCTION DOC]
+    # Converts one parameter's shard-local delta into an HF-coordinate entry.
+    # Behavior: dtype_str is the value dtype name without "torch.". For non-owned rows asserts a slot table exists and the delta is empty. If the delta is empty and slots are known, returns zero counts per slot with empty index/value tensors without probing. Otherwise builds a NaN buffer of the local param shape, scatters the delta values at the flat indices, runs the probe's megatron_to_hf, and determines the slot list (record slots, else cache, else derived from the outputs and stored in the cache). Asserts every output name is in the slot list. For each slot present in the outputs, finds the non-NaN flat positions; counts per slot (int64 on CPU), concatenated int32 indices and values.
+    # Inputs: rec - McoreParamExport; _place - unused; lidx - flat local indices; lval - delta values (floating point); slot_cache - mapping.
+    # Outputs: tuple (slots, dtype_str, counts, hf_idx, hf_val).
+    # Exceptions: AssertionError for non-float values, missing pre-seeded slots, delta on non-owned rows, or unknown output slots.
+    # Side effects: may populate slot_cache.
+    # KNOWN ISSUE: changed elements whose new value is itself NaN are indistinguishable from sentinels and are silently dropped from the delta.
     """Probe one mcore param's shard-local delta into its final HF-coordinate
     entry ``(slots, dtype_str, counts, hf_idx, hf_val)``.
 

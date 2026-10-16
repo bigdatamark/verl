@@ -13,6 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# In-place weight refit for vLLM MXFP4 fused-MoE experts (DeepSeek V4), per the module docstring:
+# stage checkpoint-layout buffers on each expert module (reusing live storage when byte sizes match),
+# let load_weights fill them, then replay the backend post-processing with replace_parameter
+# redirected so results are written into the original live (CUDA-graph-captured) parameters.
+# Constants: the MXFP4 scale block size (32) and the module attribute name used to stash live params.
+
 """Refit support for vLLM's ``Mxfp4MoEMethod`` (DeepSeek V4 routed experts).
 
 Reloading these experts means undoing the kernel's weight conversion: the refit
@@ -43,6 +50,11 @@ _MXFP4_LIVE_ATTR = "_verl_mxfp4_live_params"
 
 
 def is_deepseek_v4_model(model):
+    # [FUNCTION DOC]
+    # Behavior: returns False for None. Otherwise checks, in order, the model, its config and its
+    # hf_config; the first that has a non-None model_type decides (True iff it equals "deepseek_v4").
+    # If none has one, checks config.text_config.model_type.
+    # Inputs: model - any model-like object. Outputs: bool.
     if model is None:
         return False
 
@@ -55,6 +67,10 @@ def is_deepseek_v4_model(model):
 
 
 def iter_deepseek_v4_weights(weights):
+    # [FUNCTION DOC]
+    # Behavior: generator over (name, tensor) pairs; for names containing ".experts." with int8 or
+    # float8_e8m0fnu dtype, yields a uint8 view of the tensor, otherwise yields it unchanged.
+    # Inputs: weights - iterable of (name, tensor). Outputs: generator of (name, tensor).
     """Pass the refit stream through untouched apart from a dtype reinterpret.
 
     A DSv4 checkpoint already ships quantized experts, so unlike the BF16 path
@@ -68,6 +84,9 @@ def iter_deepseek_v4_weights(weights):
 
 
 def _is_mxfp4_fused_moe_module(module):
+    # [FUNCTION DOC]
+    # HELPER: True iff module is a vLLM RoutedExperts whose quant method is Mxfp4MoEMethod.
+    # Exceptions: ImportError if vLLM lacks these classes.
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
@@ -75,6 +94,9 @@ def _is_mxfp4_fused_moe_module(module):
 
 
 def _refittable_mxfp4_backends():
+    # [FUNCTION DOC]
+    # HELPER: Returns the tuple of supported MXFP4 MoE backends: DeepGEMM MXFP4, Marlin, batched
+    # Marlin and AITER MXFP4-BF16.
     """Backends whose weight conversion can be replayed onto live storage.
 
     Two properties qualify a backend. Its conversion must be a pure function of
@@ -98,6 +120,11 @@ def _refittable_mxfp4_backends():
 
 
 def _mxfp4_checkpoint_layout(module):
+    # [FUNCTION DOC]
+    # HELPER: Returns a mapping from expert param name to (checkpoint shape, dtype, quant-method tag)
+    # derived from the module's quant method (experts E, intermediate I, hidden H): w13_weight
+    # (E, 2I, H/2) uint8; w2_weight (E, H, I/2) uint8; w13/w2 weight scales with last dim divided by 32
+    # (uint8, tag "block"); w13_bias (E, 2I) and w2_bias (E, H) bfloat16. Non-scale entries have tag None.
     """Layout of the expert params before kernel post-processing rewrites them.
 
     Mirrors ``Mxfp4MoEMethod.create_weights``. These are not guesses: vLLM
@@ -125,6 +152,11 @@ def _mxfp4_checkpoint_layout(module):
 
 
 def _mxfp4_staging_data(param, shape, dtype):
+    # [FUNCTION DOC]
+    # HELPER: Returns the param data itself if dtype and shape already match; a reshaped reinterpret of
+    # the contiguous storage if total bytes match; otherwise a fresh zero tensor of the target
+    # shape/dtype on the param's device.
+    # Inputs: param; shape; dtype. Outputs: tensor.
     """Checkpoint-layout tensor for ``load_weights`` to write into.
 
     Reuses the live storage whenever it spans the same number of bytes, which
@@ -152,6 +184,12 @@ def _mxfp4_staging_data(param, shape, dtype):
 
 
 def _stage_mxfp4_moe_params(module):
+    # [FUNCTION DOC]
+    # HELPER: For each layout entry present on the module as a Parameter, records the live param and
+    # replaces the attribute with a non-trainable staging Parameter (see staging data) carrying the
+    # module's weight_loader and, for scales, the quant_method tag. Stores the live-param mapping on the
+    # module under the stash attribute.
+    # Side effects: mutates module attributes.
     """Expose checkpoint-layout buffers without moving any live storage.
 
     Each expert param is handed a buffer in the layout its ``weight_loader``
@@ -176,6 +214,15 @@ def _stage_mxfp4_moe_params(module):
 
 
 def _replace_parameter_in_place(layer, param_name, new_data, prefer_copy=False):
+    # [FUNCTION DOC]
+    # HELPER: Stand-in for vLLM replace_parameter during post-processing. Pops the live param for
+    # param_name from the stash; if absent (or new_data is None) delegates to the real replace_parameter.
+    # Otherwise unwraps a Parameter to its data, requires identical shape and dtype, copies into the live
+    # storage unless already the same memory, and reattaches the live param to the layer.
+    # Inputs: layer; param_name; new_data; prefer_copy (forwarded only on delegation).
+    # Outputs: None (or the delegate's result).
+    # Exceptions: RuntimeError on shape/dtype mismatch.
+    # Side effects: in-place copy; mutates layer attributes and the stash.
     """Fold post-processing output into the parameter the CUDA graph captured.
 
     Reinstating the live parameter here rather than after
@@ -206,6 +253,11 @@ def _replace_parameter_in_place(layer, param_name, new_data, prefer_copy=False):
 
 
 def _process_mxfp4_moe_params(module):
+    # [FUNCTION DOC]
+    # HELPER: Runs the module quant method's process_weights_after_loading with vLLM mxfp4's
+    # replace_parameter patched to the in-place version, then removes the stash attribute.
+    # Exceptions: RuntimeError if any staged live params were not reinstated.
+    # Side effects: mutates module parameters in place.
     from vllm.model_executor.layers.quantization import mxfp4 as vllm_mxfp4
 
     with patch.object(vllm_mxfp4, "replace_parameter", _replace_parameter_in_place):
@@ -225,6 +277,12 @@ def _process_mxfp4_moe_params(module):
 
 
 def stage_mxfp4_moe_params_for_loading(model):
+    # [FUNCTION DOC]
+    # Behavior: for every MXFP4 fused-MoE module in the model, requires its mxfp4_backend to be
+    # supported, stages its params, and collects it. Logs how many were staged and the backends.
+    # Inputs: model. Outputs: list of staged modules (empty if none).
+    # Exceptions: NotImplementedError for an unsupported backend (modules staged before it remain staged).
+    # Side effects: mutates modules; logs.
     """Hand ``load_weights`` checkpoint-layout expert buffers.
 
     Returns the staged modules for ``process_mxfp4_moe_weights_after_loading``.
@@ -262,6 +320,10 @@ def stage_mxfp4_moe_params_for_loading(model):
 
 
 def process_mxfp4_moe_weights_after_loading(modules):
+    # [FUNCTION DOC]
+    # Behavior: runs the in-place post-processing for each staged module.
+    # Inputs: modules - list from the staging function. Outputs: None.
+    # Exceptions: RuntimeError from post-processing checks.
     """Repack the loaded experts into the kernel layout inside the live storage."""
     for module in modules:
         _process_mxfp4_moe_params(module)

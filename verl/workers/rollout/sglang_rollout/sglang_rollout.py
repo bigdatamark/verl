@@ -13,6 +13,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# SGLang ServerAdapter rollout: the trainer-side client that lives in each hybrid /
+# checkpoint worker and talks over HTTP to the colocated SGLangHttpServer actor to
+# release/resume memory and push weights (bucketed CUDA-IPC full updates, LoRA adapter
+# tensors, or delta-checkpoint sparse flushes). Also provides a patched
+# _set_envs_and_config for SGLang engine launch.
+# Import side effects: sets logger level from VERL_LOGGING_LEVEL (default WARN) and
+# replaces sglang.srt.entrypoints.engine._set_envs_and_config with this module's version.
 from __future__ import annotations
 
 import logging
@@ -53,12 +61,18 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def _strip_lora_base_layer(name: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Remove a ".base_layer." segment from a parameter name (inserted by the LoRA
+    # wrapper for vLLM) by replacing it with "."; other names are returned unchanged.
     """Drop the ``.base_layer`` segment ``replace_lora_wrapper()`` inserts for vLLM; SGLang
     has no such level and its loader raises KeyError on it."""
     return name.replace(".base_layer.", ".") if ".base_layer." in name else name
 
 
 def _to_ipc_device(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Move a CPU tensor to the current accelerator device (non-blocking) so it can be
+    # IPC-shared; non-CPU tensors are returned unchanged.
     """Move a CPU tensor to the device, one at a time: sglang's IPC patch indexes a reducer slot
     that only device tensors have."""
     return tensor.to(get_device_id(), non_blocking=True) if tensor.device.type == "cpu" else tensor
@@ -66,6 +80,17 @@ def _to_ipc_device(tensor: torch.Tensor) -> torch.Tensor:
 
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
 def _set_envs_and_config(server_args: ServerArgs):
+    # [FUNCTION DOC]
+    # HELPER: Replacement for SGLang's engine environment setup (works around sglang issue
+    # 6723). Sets env vars TF_CPP_MIN_LOG_LEVEL=3, NCCL_CUMEM_ENABLE=0, NCCL_NVLS_ENABLE from
+    # server_args.enable_nccl_nvls, TORCH_NCCL_AVOID_RECORD_STREAMS=1,
+    # CUDA_DEVICE_MAX_CONNECTIONS=4, CUDA_MODULE_LOADING=AUTO, PYTHONFAULTHANDLER=1; sets the
+    # prometheus multiprocess dir when metrics are enabled; raises the file ulimit; checks
+    # flashinfer_python >= 0.2.5 when the flashinfer backend is used; on CUDA checks
+    # sglang_kernel >= 0.1.1, falling back to sgl_kernel >= 0.1.1; forces the multiprocessing
+    # start method to "spawn". Unlike upstream it does not install signal handlers.
+    # Exceptions: propagates package-version assertion failures.
+    # Side effects: process-global env, ulimit and multiprocessing configuration.
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
@@ -115,6 +140,15 @@ sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
 # because chatCompletion is an async method, it makes the whole ray actor be an async actor
 # which can not call loop.run_until_complete. So we need to make the engine to be an async class
 class ServerAdapter(BaseRollout):
+    # [CLASS DOC]
+    # BaseRollout implementation acting as HTTP client to the replica's SGLang server. Each
+    # trainer rank computes its replica rank, rollout rank, node/local rank and (for PD
+    # disaggregation) its role, server index and TP-local rank; only the TP-rank-0 of each
+    # server group creates an AsyncHttpServerAdapter (lazily) and dispatches HTTP calls, but
+    # all ranks iterate weight generators so collectives do not deadlock.
+    # Attributes: replica_rank, rollout_rank, node_rank, local_rank, _pd_role/_pd_server_index/
+    # _pd_tp_local_rank, _has_server, sleep_level (1 = keep weights for LoRA adapter, 2 = full),
+    # _engine (adapter or None), server_actor (after init).
     """SGLang server adapter used in native http server mode, serve as http client to request SGLang server
     to resume/release/update weights and kv_cache.
 
@@ -129,6 +163,20 @@ class ServerAdapter(BaseRollout):
         device_mesh: DeviceMesh,
         replica_rank: int = -1,
     ):
+        # [FUNCTION DOC]
+        # Behavior: initializes BaseRollout; for fp8 quantization requires sglang >= 0.5.5 and
+        # stores the FP8 block quant config on hf_config.quantization_config. Reads RANK and
+        # RAY_LOCAL_WORLD_SIZE env vars. rollout_world_size = tp * dp * pp, or with PD
+        # (prefill_tp * prefill_replicas + decode_tp * decode_replicas) * dp * pp (decode_tp
+        # defaults to tp). replica_rank = rank // rollout_world_size unless given;
+        # rollout_rank = rank mod rollout_world_size; node_rank and local_rank derived from
+        # local_world_size. With PD, maps rollout_rank (mod prefill_tp + n_decode*decode_tp) to
+        # prefill (server 0) or decode server index and TP-local rank. Sets sleep_level from
+        # whether LoRA is served as an adapter.
+        # Inputs: config, model_config, device_mesh (may be None), replica_rank (-1 = derive).
+        # Exceptions: KeyError if RANK/RAY_LOCAL_WORLD_SIZE missing; AssertionError for old sglang
+        # with fp8.
+        # Side effects: mutates model_config.hf_config for fp8.
         super().__init__(config, model_config, device_mesh)
         if self.config.get("quantization", None) == "fp8":
             import sglang
@@ -206,6 +254,19 @@ class ServerAdapter(BaseRollout):
         self.sleep_level = 1 if lora_served_as_adapter(self.model_config) else 2
 
     async def _init_server_adapter(self):
+        # [FUNCTION DOC]
+        # HELPER: Lazily create the HTTP adapter (idempotent).
+        # Behavior: no-op if already created or this rank has no server. If device_mesh is None,
+        # builds a CPU mesh (dp, infer_tp, infer_pp) from the world size (requires torch.distributed
+        # initialized). Returns early for non-TP-leader ranks (PD TP-local rank != 0, or
+        # infer_tp local rank != 0). Picks the server actor name: prefill
+        # "sglang_server_{replica}_0", decode "sglang_server_decode_{replica}_{index}" with a
+        # shorter timeout (10 s, 2 attempts), otherwise "sglang_server_{replica}_{node_rank}".
+        # Looks up the actor, gets its address (IPv6 bracketed), logs, and creates an
+        # AsyncHttpServerAdapter without launching a server.
+        # Exceptions: AssertionError if distributed is not initialized when a mesh is needed;
+        # Ray errors if the actor is missing.
+        # Side effects: sets device_mesh, server_actor and _engine.
         if self._engine is not None:
             return
 
@@ -263,6 +324,9 @@ class ServerAdapter(BaseRollout):
         )
 
     def _is_server_tp_leader(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if this rank is TP rank 0 of its server group (PD TP-local rank when PD is
+        # active, otherwise the infer_tp mesh local rank).
         """True if this rank is TP-rank-0 of its server's group.
 
         In PD, the role's TP (prefill_tp or decode_tp) may differ from the
@@ -274,6 +338,9 @@ class ServerAdapter(BaseRollout):
         return self.device_mesh["infer_tp"].get_local_rank() == 0
 
     async def resume(self, tags: list[str]):
+        # [FUNCTION DOC]
+        # Resume memory occupation for the given tags on the server (TP leader only and only when
+        # free_cache_engine is set). Lazily initializes the adapter; no-op without an engine.
         """Resume rollout weights or kv cache in GPU memory.
 
         Args:
@@ -286,6 +353,9 @@ class ServerAdapter(BaseRollout):
             await self._engine.resume_memory_occupation(tags=tags)
 
     async def release(self):
+        # [FUNCTION DOC]
+        # Release server memory (TP leader, free_cache_engine set): kv_cache only when
+        # sleep_level is 1, otherwise kv_cache and weights. Lazily initializes the adapter.
         """Release weights and kv cache in GPU memory.
 
         When sleep_level=1 (LoRA adapter mode), only releases kv_cache
@@ -309,6 +379,26 @@ class ServerAdapter(BaseRollout):
         wire_format: str = "named_tensors",
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Push new weights to the SGLang server.
+        # Behavior: lazily initializes the adapter. If wire_format is "delta_flush", delegates to
+        # _update_weights_delta and returns. If kwargs carry a peft_config and base_sync_done is
+        # true (LoRA adapter sync): the infer_tp rank 0 lists served models, unloads the existing
+        # verl LoRA adapter if present, serializes the adapter config/tensors and loads them via
+        # load_lora_adapter_from_tensors. Otherwise: optionally quantizes weights to FP8 by name,
+        # selects DeepSeek-V4 fusion groups for that model type, groups weights into buckets of
+        # checkpoint_engine.update_weights_bucket_megabytes MiB, and for each bucket calls
+        # SGLang's update_weights with names stripped of ".base_layer." and tensors moved to the
+        # device (collective over infer_tp). Finally, on the TP leader with an engine, flushes the
+        # server cache and records global_steps on the server actor when given.
+        # Inputs: weights - (async or sync) generator of (name, tensor); global_steps - weight
+        # version; wire_format - "named_tensors" or "delta_flush"; kwargs - peft_config,
+        # base_sync_done.
+        # Exceptions: propagates HTTP/collective errors; ValueError from bucketing.
+        # Side effects: network calls, GPU memory, collectives.
+        # KNOWN ISSUE: the LoRA branch gates on the infer_tp mesh rank rather than
+        # _is_server_tp_leader and does not consume the weights generator on other ranks, and it
+        # calls self._engine without checking it is not None (e.g. a PD/non-server rank).
         """
         Update model weights using tensor buckets, similar to THUDM/slime's implementation.
 
@@ -390,6 +480,11 @@ class ServerAdapter(BaseRollout):
                 await self.server_actor.set_global_steps.remote(global_steps)
 
     async def _update_weights_delta(self, flushes, global_steps: int = None) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Apply a stream of delta flushes: for each (named_tensors, is_last) item calls
+        # _update_weights_delta_flush with flush_cache only on the last flush, then records
+        # global_steps on the server (TP leader with engine) and logs the count.
+        # Exceptions: AssertionError when PD disaggregation is active.
         """Apply the delta engine's sparse flushes in place.
 
         ``flushes`` is ``CheckpointEngine.receive_weights``'s generator of
@@ -411,6 +506,16 @@ class ServerAdapter(BaseRollout):
         logger.info("delta apply v=%s flushes=%d (in-place via sglang loader)", global_steps, applied)
 
     async def _update_weights_delta_flush(self, params_batch, flush_cache: bool) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Send one sparse flush via same-GPU CUDA IPC.
+        # Behavior: patches torch reductions for IPC, serializes every local tensor; gathers the
+        # per-rank lists to the infer_tp group's first rank; non-leaders return. The leader zips
+        # the gathered lists position-wise into (name, LocalSerializedTensor of per-rank handles)
+        # pairs, builds an UpdateWeightsFromTensorReqInput with one serialized copy per TP rank,
+        # load_format set to the delta loader FQN and the given flush_cache, and posts it.
+        # Inputs: params_batch - list of (name, tensor) on this GPU; flush_cache flag.
+        # Exceptions: ValueError from strict zip if ranks send different numbers of tensors.
+        # Side effects: collective gather, HTTP call, global torch reduction patch.
         """Hand one sparse flush to the colocated SGLang server via same-GPU CUDA IPC.
 
         SPMD across the replica's CheckpointEngineWorkers: every rank serializes its
@@ -459,6 +564,11 @@ class ServerAdapter(BaseRollout):
         await self._engine.update_weights_from_tensor(req)
 
     def wrap_lora_params(self, peft_config: dict, weights: Generator[tuple[str, torch.Tensor]]):
+        # [FUNCTION DOC]
+        # Prepare a LoRA adapter for SGLang: normalizes the PEFT config, builds a mapping from
+        # name to detached, SGLang-preprocessed, device-resident tensor, and serializes that
+        # mapping once per infer_tp rank.
+        # Outputs: (normalized peft config dict, list of serialized payloads of length tp_size).
         # peft config
         peft_config_json = normalize_peft_config_for_sglang(peft_config)
 

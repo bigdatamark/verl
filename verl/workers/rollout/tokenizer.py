@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Defines the abstract tokenizer interface that a hybrid-engine rollout must provide so
+# that vLLM can use a non-HF tokenizer. Exports HybridEngineBaseTokenizer only.
 """
 The base tokenizer class, required for any hybrid engine based rollout or inference with vLLM.
 """
@@ -24,11 +27,17 @@ __all__ = ["HybridEngineBaseTokenizer"]
 
 
 class HybridEngineBaseTokenizer(ABC):
+    # [CLASS DOC]
+    # Abstract base class mirroring the subset of the HuggingFace tokenizer API vLLM relies
+    # on: vocab/special-token properties, encode/decode, id/token conversion, added vocab.
+    # Subclasses must implement every abstract member; is_fast defaults to False.
     """the tokenizer property and function name should align with HF's to meet vllm requirement"""
 
     @property
     @abstractmethod
     def vocab_size(self):
+        # [FUNCTION DOC]
+        # Abstract property: size of the base vocabulary (int), excluding added tokens.
         """
         `int`: Size of the base vocabulary (without the added tokens).
         """
@@ -37,6 +46,8 @@ class HybridEngineBaseTokenizer(ABC):
     @property
     @abstractmethod
     def pad_token_id(self):
+        # [FUNCTION DOC]
+        # Abstract property: padding token id, or None when unset.
         """
         `Optional[int]`: Id of the padding token in the vocabulary. Returns `None` if the token has not been set.
         """
@@ -45,6 +56,8 @@ class HybridEngineBaseTokenizer(ABC):
     @property
     @abstractmethod
     def eos_token_id(self):
+        # [FUNCTION DOC]
+        # Abstract property: end-of-sequence token id, or None when unset.
         """
         `Optional[int]`: Id of the end of sentence token in the vocabulary. Returns `None` if the token has not been
         set.
@@ -54,6 +67,8 @@ class HybridEngineBaseTokenizer(ABC):
     @property
     @abstractmethod
     def all_special_ids(self) -> list[int]:
+        # [FUNCTION DOC]
+        # Abstract property: list of ids of all special tokens.
         """
         `List[int]`: List the ids of the special tokens(`'<unk>'`, `'<cls>'`, etc.) mapped to class attributes.
         """
@@ -62,6 +77,8 @@ class HybridEngineBaseTokenizer(ABC):
     @property
     @abstractmethod
     def all_special_tokens(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Abstract property: list of unique special token strings (AddedToken converted to str).
         """
         `List[str]`: A list of the unique special tokens (`'<unk>'`, `'<cls>'`, ..., etc.).
 
@@ -71,6 +88,9 @@ class HybridEngineBaseTokenizer(ABC):
 
     @abstractmethod
     def encode(self, text):
+        # [FUNCTION DOC]
+        # Abstract: encode text (string, list of tokens, or ids) into a list of token ids.
+        # KNOWN ISSUE: docstring documents a text_pair argument that the signature does not accept.
         """
         Converts a string to a sequence of ids (integer), using the tokenizer and vocabulary.
 
@@ -93,6 +113,10 @@ class HybridEngineBaseTokenizer(ABC):
         clean_up_tokenization_spaces: bool = None,
         **kwargs,
     ) -> str:
+        # [FUNCTION DOC]
+        # Abstract: decode ids (int, list, numpy array or tensor) to a string, optionally skipping
+        # special tokens and cleaning tokenization spaces; extra kwargs go to the model-specific
+        # decoder.
         """
         Converts a sequence of ids in a string, using the tokenizer and vocabulary with options to remove special
         tokens and clean up tokenization spaces.
@@ -117,6 +141,9 @@ class HybridEngineBaseTokenizer(ABC):
 
     @abstractmethod
     def convert_ids_to_tokens(self, ids: int | list[int], skip_special_tokens: bool = False) -> str | list[str]:
+        # [FUNCTION DOC]
+        # Abstract: map an id or list of ids to the corresponding token or list of tokens,
+        # optionally skipping special tokens.
         """
         Converts a single index or a sequence of indices in a token or a sequence of tokens, using the vocabulary and
         added tokens.
@@ -134,6 +161,8 @@ class HybridEngineBaseTokenizer(ABC):
 
     @abstractmethod
     def get_added_vocab(self) -> dict[str, int]:
+        # [FUNCTION DOC]
+        # Abstract: return a mapping from added-token string to id.
         """
         Returns the added tokens in the vocabulary as a dictionary of token to index. Results might be different from
         the fast call because for now we always add the tokens even if they are already in the vocabulary. This is
@@ -146,6 +175,8 @@ class HybridEngineBaseTokenizer(ABC):
 
     @abstractmethod
     def convert_tokens_to_string(self, tokens: list[str]) -> str:
+        # [FUNCTION DOC]
+        # Abstract: join a list of tokens into a string, removing sub-word artifacts.
         """
         Converts a sequence of tokens in a single string. The most simple way to do it is `" ".join(tokens)` but we
         often want to remove sub-word tokenization artifacts at the same time.
@@ -160,4 +191,6 @@ class HybridEngineBaseTokenizer(ABC):
 
     @property
     def is_fast(self):
+        # [FUNCTION DOC]
+        # Property: whether this is a fast (Rust) tokenizer; always False here.
         return False

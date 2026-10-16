@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Helpers for the NeMo Automodel engine: rank/size queries on Automodel device meshes (dims named dp, dp_cp, cp, tp, pp), distributed-config and mesh construction, model building via NeMoAutoModelForCausalLM, and CPU/GPU offload of models and optimizer state.
+
 """Utility functions for the Automodel engine integration."""
 
 import torch
@@ -21,6 +24,8 @@ from verl.utils.device import get_device_id, get_torch_device
 
 
 def get_dp_rank(device_mesh, include_cp=False):
+    # [FUNCTION DOC]
+    # HELPER: Returns the data-parallel local rank: 0 for no mesh; the "dp_cp" rank when include_cp and a cp dim larger than 1 exists; otherwise the "dp" rank.
     """Get data-parallel rank from device mesh."""
     if device_mesh is None:
         return 0
@@ -30,6 +35,8 @@ def get_dp_rank(device_mesh, include_cp=False):
 
 
 def get_tp_rank(device_mesh):
+    # [FUNCTION DOC]
+    # HELPER: Returns the "tp" local rank, or 0 when there is no mesh, no tp dim, or tp size is 1.
     """Get tensor-parallel rank from device mesh."""
     if device_mesh is None or "tp" not in device_mesh.mesh_dim_names or device_mesh["tp"].size() == 1:
         return 0
@@ -37,6 +44,8 @@ def get_tp_rank(device_mesh):
 
 
 def get_pp_rank(device_mesh):
+    # [FUNCTION DOC]
+    # HELPER: Returns the "pp" local rank, or 0 when there is no mesh, no pp dim, or pp size is 1.
     """Get pipeline-parallel rank from device mesh."""
     if device_mesh is None or "pp" not in device_mesh.mesh_dim_names or device_mesh["pp"].size() == 1:
         return 0
@@ -44,6 +53,8 @@ def get_pp_rank(device_mesh):
 
 
 def get_dp_group_size(device_mesh, include_cp=False):
+    # [FUNCTION DOC]
+    # HELPER: Returns data-parallel group size: global world size without a mesh; "dp_cp" size when include_cp and cp is larger than 1; "dp" size if present; else global world size.
     """Get data-parallel group size from device mesh."""
     if device_mesh is None:
         return torch.distributed.get_world_size()
@@ -55,6 +66,8 @@ def get_dp_group_size(device_mesh, include_cp=False):
 
 
 def maybe_fully_shard_optimizer(model, optimizer, distributed_config):
+    # [FUNCTION DOC]
+    # HELPER: For MegatronFSDP configs with more than one process, calls megatron_fsdp's fully_shard_optimizer on model/optimizer; otherwise no-op. Side effects: rewires optimizer state sharding.
     """Call fully_shard_optimizer for MegatronFSDP strategy."""
     from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 
@@ -65,6 +78,13 @@ def maybe_fully_shard_optimizer(model, optimizer, distributed_config):
 
 
 def build_distributed_config_from_engine_config(engine_config, world_size):
+    # [FUNCTION DOC]
+    # Builds the Automodel distributed config and device/MoE meshes.
+    # Behavior: strategy "fsdp2" - FSDP2Config with a MixedPrecisionPolicy from mp_param/reduce/output dtypes (cast_forward_inputs true), sequence_parallel, activation_checkpointing, defer_fsdp_grad_sync; "megatron_fsdp" - MegatronFSDPConfig; "ddp" - DDPConfig (both with activation_checkpointing). Then calls Automodel create_device_mesh with tp/pp/cp/ep/dp_replicate sizes and world_size.
+    # Inputs: engine_config - AutomodelEngineConfig; world_size - int.
+    # Outputs: (distributed_config, device_mesh, moe_mesh).
+    # Exceptions: ValueError on unknown strategy.
+    # Side effects: creates process groups.
     """Build v5 distributed config, device_mesh, and moe_mesh from engine config.
 
     Args:
@@ -125,6 +145,12 @@ def build_distributed_config_from_engine_config(engine_config, world_size):
 
 
 def build_automodel_model(model_config, engine_config, distributed_config, device_mesh, moe_mesh):
+    # [FUNCTION DOC]
+    # Builds the distributed model with NeMoAutoModelForCausalLM.from_pretrained.
+    # Behavior: assembles kwargs: fp8_config when enable_fp8; compile_config when enable_compile; force_hf true when ep_size is at most 1 and the first HF architecture name contains "qwen" or "llama" (reads AutoConfig from the model path); a BackendConfig from backend_config unless force_hf; a MoEParallelizerConfig from moe_config (defaulting mp_policy from distributed_config) when ep_size above 1; attn_implementation and torch_dtype from model_dtype. Then calls from_pretrained with meshes, distributed config, activation checkpointing and trust_remote_code.
+    # Inputs: model_config - HFModelConfig; engine_config; distributed_config; device_mesh; moe_mesh.
+    # Outputs: the parallelized HF model.
+    # Side effects: reads model config/weights from disk; allocates device memory.
     """Build a model using NeMoAutoModelForCausalLM.from_pretrained().
 
     Args:
@@ -196,6 +222,11 @@ def build_automodel_model(model_config, engine_config, distributed_config, devic
 
 @torch.no_grad()
 def offload_automodel_model_to_cpu(model, empty_cache=True):
+    # [FUNCTION DOC]
+    # HELPER: Offloads an FSDP2 model to CPU under no-grad.
+    # Behavior: forces every FSDP param group's training state to IDLE (so reshard is allowed), reshards the model, moves it to CPU and optionally empties the device cache.
+    # Inputs: model - FSDP2-wrapped module; empty_cache - bool.
+    # Side effects: mutates FSDP internal state; device memory release.
     """Offload an FSDP2-wrapped model to CPU (reshard, move to CPU, optional cache clear)."""
     from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
     from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
@@ -219,6 +250,8 @@ def offload_automodel_model_to_cpu(model, empty_cache=True):
 
 @torch.no_grad()
 def load_automodel_model_to_gpu(model):
+    # [FUNCTION DOC]
+    # HELPER: Moves the model to the current device id (non-blocking) under no-grad.
     """Load model back to GPU."""
     device = get_device_id()
     model.to(device, non_blocking=True)
@@ -226,6 +259,8 @@ def load_automodel_model_to_gpu(model):
 
 @torch.no_grad()
 def offload_automodel_optimizer(optimizer):
+    # [FUNCTION DOC]
+    # HELPER: Moves every tensor in the optimizer's per-parameter state to CPU (non-blocking); no-op when state is empty. Mutates optimizer.state in place.
     """Offload optimizer state to CPU."""
     if not optimizer.state:
         return
@@ -239,6 +274,8 @@ def offload_automodel_optimizer(optimizer):
 
 @torch.no_grad()
 def load_automodel_optimizer(optimizer, device_id):
+    # [FUNCTION DOC]
+    # HELPER: Moves every tensor in the optimizer's per-parameter state to device_id (non-blocking); no-op when state is empty. Mutates optimizer.state in place.
     """Load optimizer state back to GPU."""
     if not optimizer.state:
         return

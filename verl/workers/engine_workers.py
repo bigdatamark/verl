@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Engine-based Ray workers for verl's single-controller design. TrainingWorker wraps one
+# training engine (selected from the engine registry by model type and backend) behind
+# coarse-grained remote APIs (train a batch, train mini-batches over epochs, inference,
+# checkpointing, offload). ActorRolloutRefWorker composes an actor TrainingWorker, an optional
+# reference TrainingWorker, a rollout engine and a checkpoint engine into a hybrid worker, and
+# implements weight synchronization from trainer to rollout. Module logger level comes from
+# VERL_LOGGING_LEVEL (default WARN).
 import asyncio
 import functools
 import logging
@@ -60,11 +68,20 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def _with_routing_replay_flag(enabled: bool):
+    # [FUNCTION DOC]
+    # HELPER: Decorator factory that, when the worker has routing replay enabled, stores the given
+    # boolean as non-tensor field "enable_routing_replay" on the data TensorDict before calling the
+    # wrapped method. Inputs: enabled - flag value to set. Outputs: a decorator.
+    # Side effects: mutates the data argument.
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
 
     def decorator(func):
+        # [FUNCTION DOC]
+        # HELPER: Wraps func with the flag-setting wrapper, preserving metadata.
         @functools.wraps(func)
         def wrapper(self, data: TensorDict, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Sets the flag on data if self.enable_routing_replay, then delegates to func with all args.
             if self.enable_routing_replay:
                 tu.assign_non_tensor_data(data, "enable_routing_replay", enabled)
             return func(self, data, *args, **kwargs)
@@ -75,6 +92,9 @@ def _with_routing_replay_flag(enabled: bool):
 
 
 class TrainingWorker(Worker, DistProfilerExtension):
+    # [CLASS DOC]
+    # Ray worker holding one training engine with dispatch/collect info for the "train" mesh, an
+    # optional FLOPs counter, and a pluggable loss function.
     """
     TrainingWorker provides a Tinker-like API (https://thinkingmachines.ai/tinker/) as a RayWorkerGroup
     to a single controller. Currently, we only provide more coarse grained APIs,
@@ -82,6 +102,19 @@ class TrainingWorker(Worker, DistProfilerExtension):
     """
 
     def __init__(self, config: TrainingWorkerConfig):
+        # [FUNCTION DOC]
+        # Behavior: initializes the base worker and the Ray-backed global process group (no timeout), sets
+        # NUMA affinity, stores sub-configs and device name. If no engine config is given, requires no
+        # optimizer config and an auto-select function, and calls it with (model config, device name) to
+        # obtain both. Copies use_remove_padding and use_fused_kernels from the model config onto the engine
+        # config. Builds the profiler extension (tool config looked up by tool name; file prefix = model
+        # type). Sets the model config's model_type and creates the engine via the registry using the engine
+        # strategy as backend. Registers dispatch/collect info for mesh "train" from the engine's DP rank and
+        # output-holder status. Creates a FLOPs counter when the model config has an HF config.
+        # Inputs: config - TrainingWorkerConfig.
+        # Exceptions: ValueError when neither engine config nor auto-select function is available;
+        # AssertionError if optimizer config given without engine config.
+        # Side effects: initializes distributed state, process affinity, and profiler.
         Worker.__init__(self)
 
         from verl.workers.engine import BaseEngine, EngineRegistry
@@ -158,6 +191,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
+        # [FUNCTION DOC]
+        # Behavior: (remote, one-to-all) asserts device is "cpu" or "device" (the latter mapped to the
+        # accelerator name) and moves model/optimizer/grads via the engine.
+        # Exceptions: AssertionError for other device strings.
         """Manual control of load/offload"""
         assert device in ["cpu", "device"]
 
@@ -168,10 +205,16 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
+        # [FUNCTION DOC]
+        # Behavior: (remote, one-to-all) stores the loss function used by train/infer.
         self.loss_fn = loss_fn
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reset(self):
+        # [FUNCTION DOC]
+        # Behavior: (remote, one-to-all) calls engine.initialize (builds model/optimizer etc.).
+        # KNOWN ISSUE: docstring says it reloads checkpoints/resets state when already initialized, but the
+        # code always just calls initialize.
         """
         Reset the model engine to the initial state. If the engine is not initialized,
         we initialize it. Otherwise, reload ckpt and reset states
@@ -179,6 +222,18 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self.engine.initialize()
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
+        # [FUNCTION DOC]
+        # HELPER: Converts raw engine output into a TensorDict of model outputs plus aggregated metrics.
+        # Behavior: pops metrics; sums the per-micro-batch losses into a tensor and averages across the DP
+        # group (if any). Pops grad_norm (converted to float if tensor) and lr. All-gathers remaining
+        # metrics across DP (if group exists), then sets loss, grad_norm and lr when present. Adds peak
+        # allocated/reserved device memory and used host memory in GB. For keys starting with "mtp_losses",
+        # replaces the value with the mean of each sublist's first element. If token counts and a FLOPs
+        # counter exist, computes MFU as estimated/promised FLOPs divided by world size (divided by 3 more
+        # for forward-only). Builds a TensorDict from the model outputs with metrics as non-tensor data.
+        # Inputs: output - dict with loss, metrics, model_output; global_token_num - list of token counts
+        # or None; delta_time - seconds; forward_only - bool; images_seqlens - optional for FLOPs.
+        # Outputs: TensorDict. Side effects: collectives over DP group.
         """
 
         Args:
@@ -241,6 +296,21 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     def train_mini_batch(self, data: TensorDict) -> TensorDict:
+        # [FUNCTION DOC]
+        # Behavior: (remote, non-blocking, train-mesh dispatch) fixes 3-D position ids, pops controls from
+        # data: disable_auto_offload (false), mini_batch_size, num_mini_batch, epochs (1), seed (42),
+        # dataloader_kwargs. Requires one of mini_batch_size/num_mini_batch; per-GPU mini-batch size is
+        # batch/num_mini_batch (must divide) or mini_batch_size/dp_size (must divide). Builds a shuffling
+        # iterator over epochs seeded with seed + DP rank. Inside train mode and a timer, for each
+        # mini-batch: fixes position ids; if input_ids exists, all-gathers per-sequence token counts across
+        # DP into one flat list; stores token counts, update_lr_scheduler (true only on the last
+        # iteration), and disable_auto_offload true; runs train_batch inside a named profiler range;
+        # steps the profiler; collects outputs. On output-holder ranks, flattens list metrics per output
+        # (aggregating Metric objects across DP, otherwise chaining nested lists) and merges them into one
+        # metrics dict; returns a CPU TensorDict with metrics; other ranks return None.
+        # Inputs: data - TensorDict with batch and control fields.
+        # Exceptions: AssertionError on missing/indivisible sizes.
+        # Side effects: training updates; collectives; profiler steps.
         """Split a batch into N mini-batches run for multiple epochs
 
         Args:
@@ -341,6 +411,15 @@ class TrainingWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     @DistProfiler.annotate(color="red", role="train_batch")
     def train_batch(self, data: TensorDict) -> TensorDict:
+        # [FUNCTION DOC]
+        # Behavior: (remote, non-blocking, profiled) asserts a loss function exists and the engine is not
+        # forward-only. Reads global_token_num, disable_auto_offload, images_seqlens. Fills missing
+        # non-tensor defaults (use_remove_padding, use_dynamic_bsz, max_token_len_per_gpu,
+        # micro_batch_size_per_gpu, use_fused_kernels) from configs. Runs engine.train_batch under train
+        # mode and a timer. Steps the LR scheduler when update_lr_scheduler is set. On output-holder ranks,
+        # drops model_output, adds lr to metrics if stepped, and postprocesses (forward_only false) to a
+        # CPU TensorDict; other ranks return None.
+        # Exceptions: AssertionError on missing loss or forward-only engine.
         assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
         assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
         # global_token_num should be a list of number of tokens of each seq in this batch
@@ -396,6 +475,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     def infer_batch(self, data: TensorDict) -> TensorDict:
+        # [FUNCTION DOC]
+        # Behavior: (remote, non-blocking) reads global_token_num, compute_loss (default true),
+        # disable_auto_offload, pops no_lora_adapter, reads images_seqlens; fills missing defaults using
+        # the infer token-length and infer micro-batch-size configs. Uses the loss function only when
+        # compute_loss. Runs engine.infer_batch in eval mode under a timer, inside the engine's
+        # disable-adapter context when no_lora_adapter. On output-holder ranks postprocesses with
+        # forward_only true to a CPU TensorDict; otherwise None.
         # add mfu calculator
         global_token_num = tu.get(data, key="global_token_num")
         compute_loss = tu.get(data, key="compute_loss", default=True)
@@ -442,14 +528,21 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        # [FUNCTION DOC]
+        # Behavior: (remote, one-to-all) delegates checkpoint save to the engine and returns its result.
         return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        # [FUNCTION DOC]
+        # Behavior: (remote, one-to-all) delegates checkpoint load to the engine and returns its result.
         return self.engine.load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
 
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+    # [CLASS DOC]
+    # Hybrid Ray worker for a role among actor, rollout, ref, actor_rollout, actor_rollout_ref.
+    # Class attributes choose the worker classes for actor and ref (both TrainingWorker by default).
     """Hybrid worker that includes actor model, rollout and optional ref model.
     For standalone actor or rollout, use ActorWorker or BaseRollout respectively.
 
@@ -462,6 +555,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def __init__(
         self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
     ):
+        # [FUNCTION DOC]
+        # Behavior: initializes base worker; stores config, distillation config and whether distillation is
+        # enabled, and role; derives is-actor/rollout/ref flags. Chooses the profiler config from actor,
+        # else rollout, else ref section; converts it to ProfilerConfig and, for known tools (npu, nsys,
+        # torch, torch_memory, precision_debugger), converts the tool-specific config. Determines router
+        # replay from actor strategy (megatron or veomni router_replay.mode; otherwise disabled). Keeps the
+        # raw profiler config for inner workers and builds the profiler extension prefixed by role.
+        # Inputs: config - DictConfig with actor/rollout/ref/model sections; role; distillation_config;
+        # kwargs ignored. Exceptions: AssertionError for unknown role.
         Worker.__init__(self)
         self.config = config
         self.distillation_config = distillation_config
@@ -528,15 +630,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
+        # [FUNCTION DOC]
+        # Behavior: (remote, one-to-all) forwards the loss function to the actor worker.
         self.actor.set_loss_fn(loss_fn=loss_fn)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
+        # [FUNCTION DOC]
+        # Behavior: (remote, one-to-all) forwards device move to the actor worker.
         """Manual control of load/offload"""
         self.actor.to(device=device, model=model, optimizer=optimizer, grad=grad)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        # [FUNCTION DOC]
+        # Behavior: (remote, one-to-all) converts model config. (1) If role includes ref: rewrites ref config
+        # fields from log_prob_* keys (mini batch from actor, micro batch sizes, dynamic bsz default false,
+        # max token len), builds the ref ActorConfig with a deep-copied model config with MTP disabled,
+        # builds a ref profiler config, a TrainingWorkerConfig, assigns infer batching and remove-padding to
+        # its engine config, creates and resets the ref worker, and registers "ref" dispatch info.
+        # (2) If role includes actor: builds actor config and optional distillation config and profiler,
+        # TrainingWorkerConfig; asserts actor dynamic bsz equals rollout log_prob dynamic bsz; assigns
+        # infer (from rollout log_prob settings) and train batching settings and remove padding; asserts the
+        # required token-length or micro-batch sizes are set; sets the loss function to the distillation PPO
+        # loss or the PPO loss bound to the config; creates/resets the actor worker, sets its loss and
+        # registers "actor" dispatch info. (3) If role includes rollout: builds a device mesh
+        # (dp, infer_tp = tp*dp_size, infer_pp) requiring world size divisible by tp*pp, creates the rollout
+        # via get_rollout_class, records base_sync_done (false when load format contains "dummy"),
+        # layered_summon, and whether LoRA merge is set. (4) If actor: creates the checkpoint engine from
+        # rollout.checkpoint_engine config (bucket size MB to bytes, backend kwargs, optional plugin import;
+        # master is global rank 0). Finally aggressively empties device cache.
+        # Exceptions: AssertionError for config mismatches.
+        # Side effects: mutates self.config.ref; builds models; allocates device memory.
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
         # 1. build reference model
@@ -694,6 +819,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        # [FUNCTION DOC]
+        # Behavior: (remote, ref mesh, profiled; routing replay flag false) runs ref inference on data and
+        # returns the output on CPU, or None on non-holder ranks.
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -701,6 +829,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        # [FUNCTION DOC]
+        # Behavior: (remote, actor mesh, profiled; routing replay flag true) runs actor inference and returns
+        # CPU output or None.
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
@@ -711,21 +842,44 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update", scheduled=True)
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        # [FUNCTION DOC]
+        # Behavior: (remote, actor mesh, profiled as scheduled stage; routing replay flag true) runs
+        # train_mini_batch on the actor and returns CPU output or None.
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        # [FUNCTION DOC]
+        # Behavior: (remote) asserts role includes actor and loads actor checkpoint.
+        # Exceptions: AssertionError otherwise.
         assert "actor" in self.role, "load_checkpoint only support actor role"
         self.actor.load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        # [FUNCTION DOC]
+        # Behavior: (remote) asserts role includes actor and saves actor checkpoint.
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+        # [FUNCTION DOC]
+        # Behavior: (remote async, non-blocking) resolves mode ("auto" uses configured checkpoint engine
+        # backend). For non-"naive" modes: "delta_sharded" lets the checkpoint engine drive the actor engine
+        # directly; otherwise obtains the actor's per-tensor param generator and sends it through the
+        # checkpoint engine; returns metrics or empty dict. For "naive": disables expandable segments and
+        # empties cache; resumes rollout weights memory when free_cache_engine is set (for sglang only if
+        # sleep level is not 1); gets per-tensor params (base_sync_done true); if LoRA is not merged and a
+        # peft config exists, sets rollout sleep level 1 and does a base sync first when not yet done
+        # (params with base_sync_done false); then updates rollout weights with the main params. Offloads
+        # the actor model to CPU if param offload is enabled, synchronizes and empties cache; if
+        # free_cache_engine, barriers all ranks (in a thread) and resumes the KV cache. Marks base sync done
+        # and re-enables expandable segments.
+        # Inputs: global_steps - step count for tracking; mode - "auto", "naive", or a backend name.
+        # Outputs: metrics dict for non-naive modes; None for naive.
+        # Side effects: GPU memory changes, collective barrier, rollout state changes.
         """Update weights from trainer to rollout.
 
         1. For sync training with colocated trainer and rollout, update rollout directly from model engine.
@@ -828,6 +982,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: (remote, DP-compute dispatch, non-blocking) calls the named method on the checkpoint
+        # engine with the given args and returns its result.
+        # Exceptions: AttributeError for unknown method names.
         """Execute checkpoint engine method.
 
         Args:
